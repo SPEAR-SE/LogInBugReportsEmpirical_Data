@@ -1,0 +1,356 @@
+[The problem is that a speculative task attempt can cause a previously SUCCEEDED task to transition to SCHEDULED (or FAILED).
+
+1. A task attempt is started.
+2. A speculative task attempt for the same task is started.
+3. The speculative task attempt completes and causes the task to transition to SUCCEEDED.
+4. The initial task attempt fails and causes the task to transition to SCHEDULED.
+
+No more task attempts are scheduled so the job never completes. I have written a unit test to demonstrate this, which fails.
+
+The situation occurs because TaskEventType.T_ATTEMPT_FAILED can cause a task to transition from the SUCCEEDED state (see attached state diagram). This type is caused by one of:
+
+* FailedTransition - when a task attempt fails 
+* DeallocateContainerTransition - when a task attempt goes from assigned/unassigned to killed/failed
+* TooManyFetchFailureTransition - when a reducer fails to get the map output
+
+Only the last one seems like a good reason to transition a task from a previously SUCCEEDED state. The first two should leave a task in the SUCCEEDED state, and the third should be handled with a new type (T_ATTEMPT_FAILED_RETROSPECTIVELY or T_ATTEMPT_TOO_MANY_FETCH_FAILURE) which transitions to SCHEDULED (or FAILED).
+
+
+, Here's a patch that implements the suggested change in my previous comment. It passes the test I wrote that was otherwise failing; however, I'd like to hear if folks think this is the right way to fix the problem., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12526660/MAPREDUCE-4252.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 1 new or modified test files.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2385//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2385//console
+
+This message is automatically generated., The patch looks good to me.  I have read through the code and looked at the state transition graphs and I don't see any issues with it.  +1
+
+On a side note I would like to get this into branch-0.23 as well, patch applies with no problems there., I hesitate at the idea of introducing more events, unless absolutely necessary. FAILED seems to be a good enough event to inform the task that an attempt has failed. FAIL_FETCH_FAILURE now means for any other kind of failure in the future I would have to introduce more events and introduce more arcs in the state machine. Large state machines are hard to understand. 
+
+While the change itself seems correct, I am not able to convince myself that it is the best fix.
+
+What surprises me is that the success of an attempt did not end up terminating the concurrent attempts. I would expect the speculative attempt to be Killed during the call to AttemptTransitionSucceeded(). Did that not work?
+
+Or was there a close race condition that the speculative task failed at the same time as the succeeded attempt completed? So the KILLED event from the SUCCEEDED task raced against the FAILED event in the TaskAttemptImpl state machine, with the FAILED event winning?
+
+What do you think about the following approach? Allow MapRetroActiveFailureTransition to return SUCCEEDED as a possible state. In that transition, if the failed attempt is not the same as the attempt that SUCCEEDED, then that failure would not change the state of the Task. Task would remain in succeeded state. We can rename MapRetroActiveFailureTransition to something more appropriate.
+, One more bit which should be fixed - While in TaskState.SUCCEEDED, T_ATTEMPT_FAILED, T_ATTEMPT_KILLED should decrement "numberUncompletedAttempts". Otherwise, if there's a subsequent TOO_MANY_FETCH_FAILURE event - another task attempt will not be started and the job will not complete.
+2 additional lines at the end of the new unit test for this
+{code}
+mockTask.handle(new TaskTAttemptEvent(taskAttempts.get(1).getAttemptId(), TaskEventType.T_ATTEMPT_TOO_MANY_FETCH_FAILURE));
+    Assert.assertEquals(3, taskAttempts.size());
+{code}, Do you mean decrement numberUncompletedAttempts when a RUNNING attempt fails/killed after the task is in SUCCEEDED state? Normally they would trigger their own Failed/Killed transition that takes care of the decrement., Thanks for taking a look, Bikas.
+
+bq. I hesitate at the idea of introducing more events, unless absolutely necessary. FAILED seems to be a good enough event to inform the task that an attempt has failed. FAIL_FETCH_FAILURE now means for any other kind of failure in the future I would have to introduce more events and introduce more arcs in the state machine. Large state machines are hard to understand.
+
+I agree that we should strive to minimize the number of events, but the two types of failure are qualitatively different (failure of task attempts vs. failure due to fetch errors long after the task attempts have completed). Also, we already have TaskAttemptEventType.TA_TOO_MANY_FETCH_FAILURE, which this changes mirrors.
+
+bq. What surprises me is that the success of an attempt did not end up terminating the concurrent attempts. I would expect the speculative attempt to be Killed during the call to AttemptTransitionSucceeded(). Did that not work?
+
+No, the speculative attempt was the one that succeeded, so it wasn't killed.
+
+bq. Or was there a close race condition that the speculative task failed at the same time as the succeeded attempt completed? So the KILLED event from the SUCCEEDED task raced against the FAILED event in the TaskAttemptImpl state machine, with the FAILED event winning?
+
+The original attempt failed after the speculative attempt succeeded, and overwrote the SUCCEEDED state. I'm not sure this is a race condition, so much as an error in the allowed state machine transitions.
+
+bq. What do you think about the following approach? Allow MapRetroActiveFailureTransition to return SUCCEEDED as a possible state. In that transition, if the failed attempt is not the same as the attempt that SUCCEEDED, then that failure would not change the state of the Task. Task would remain in succeeded state. We can rename MapRetroActiveFailureTransition to something more appropriate.
+
+That would work (I wrote a patch for it, but JIRA won't let me attach it). All things being equal, however, I'd rather add more events or transitions to the state machine, than special case the logic for an event.
+, bq. Do you mean decrement numberUncompletedAttempts when a RUNNING attempt fails/killed after the task is in SUCCEEDED state? Normally they would trigger their own Failed/Killed transition that takes care of the decrement.
+After a task goes to SUCCEEDED, FAILED/KILLED attempts are ignored.
+1. attemp1 starts
+2. speculative attempt starts
+3. attempt 1 completes - Task moves to SUCCEEDED state
+4. speculative attempt is KILLED
+5. T_ATTEMPT_KILLED is ignored.
+6. attemp1 1 fails with TOO_MANY_FETCH_FAILURES
+The job will effectively hang, since a new task attempt isn't started.
+
+@Tom, this is another case which leads to the same situation of a stuck job. I can open a separate jira if you plan to commit this patch as is., @Sid ,thanks for clarifying.
+
+@Tom, Let me clarify a bit. When the speculative attempt succeeded, then AttemptSucceededTransition would have KILLED the other running attempts. In this case, the other attempt was not KILLED but it FAILED on its own., Here's a new patch which implements Bikas' suggestion of not allowing task attempt failures override a previously successful task attempt. This passes the same unit test as before.
+
+Siddharth - please open another JIRA for the case you described above., Thanks! I like this because it makes sure that failures of other attempts do not end up erroneously failing the succeeded attempt. +1., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12535714/MAPREDUCE-4252.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 1 new or modified test files.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2560//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2560//console
+
+This message is automatically generated., The patch applies with no changes to branch-0.23 as well.  It would be great if you could pull it in there too.  For what it is worth a quick look at the patch looks good, but I don't want to +1 it without a more in-depth look., In the transitions for MapRetroactiveFailureTransition the postStates are listed as only TaskState.SCHEDULED and TaskState.FAILED.  TaskState.SUCCEEDED needs to also be in there. 
+
+This is causing an exception which results in internal error event to be sent, that we are not detecting in the tests.  It would be good to have the tests look for these internal error events, for all of the TaskImpl Tests (but that might be a separate JIRA).
+
+{noformat}
+2012-07-09 15:00:22,423 ERROR [main] impl.TaskImpl (TaskImpl.java:handle(606)) - Can't handle this event at current state for task_1341864022346_0001_m_000001
+org.apache.hadoop.yarn.state.InvalidStateTransitonException: Invalid event: T_ATTEMPT_FAILED at SUCCEEDED
+        at org.apache.hadoop.yarn.state.StateMachineFactory$MultipleInternalArc.doTransition(StateMachineFactory.java:383)
+        at org.apache.hadoop.yarn.state.StateMachineFactory.doTransition(StateMachineFactory.java:298)
+        at org.apache.hadoop.yarn.state.StateMachineFactory.access$300(StateMachineFactory.java:43)
+        at org.apache.hadoop.yarn.state.StateMachineFactory$InternalStateMachine.doTransition(StateMachineFactory.java:443)
+        at org.apache.hadoop.mapreduce.v2.app.job.impl.TaskImpl.handle(TaskImpl.java:604)
+        at org.apache.hadoop.mapreduce.v2.app.job.impl.TestTaskImpl.testSpeculativeTaskAttemptSucceedsEvenIfFirstFails(TestTaskImpl.java:485)
+        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:39)
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)
+        at java.lang.reflect.Method.invoke(Method.java:597)
+        at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:44)
+        at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:15)
+        at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:41)
+        at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:20)
+        at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:28)
+        at org.junit.internal.runners.statements.RunAfters.evaluate(RunAfters.java:31)
+        at org.junit.runners.BlockJUnit4ClassRunner.runNotIgnored(BlockJUnit4ClassRunner.java:79)
+        at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:71)
+        at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:49)
+        at org.junit.runners.ParentRunner$3.run(ParentRunner.java:193)
+        at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:52)
+        at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:191)
+        at org.junit.runners.ParentRunner.access$000(ParentRunner.java:42)
+        at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:184)
+        at org.junit.runners.ParentRunner.run(ParentRunner.java:236)
+        at org.apache.maven.surefire.junit4.JUnit4TestSet.execute(JUnit4TestSet.java:53)
+        at org.apache.maven.surefire.junit4.JUnit4Provider.executeTestSet(JUnit4Provider.java:123)
+        at org.apache.maven.surefire.junit4.JUnit4Provider.invoke(JUnit4Provider.java:104)
+        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:39)
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)
+        at java.lang.reflect.Method.invoke(Method.java:597)
+        at org.apache.maven.surefire.util.ReflectionUtils.invokeMethodWithArray(ReflectionUtils.java:164)
+        at org.apache.maven.surefire.booter.ProviderFactory$ProviderProxy.invoke(ProviderFactory.java:110)
+        at org.apache.maven.surefire.booter.SurefireStarter.invokeProvider(SurefireStarter.java:175)
+        at org.apache.maven.surefire.booter.SurefireStarter.runSuitesInProcessWhenForked(SurefireStarter.java:81)
+        at org.apache.maven.surefire.booter.ForkedBooter.main(ForkedBooter.java:68)
+{noformat}
+, +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12535714/MAPREDUCE-4252.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 1 new or modified test files.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2564//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2564//console
+
+This message is automatically generated., Well spotted, Bobby. I updated the patch to fail if there is an internal error, and I've also fixed the bug so the error doesn't occur any more., Assuming Jenkins comes back OK I am a +1 on this patch (I did my thorough review)., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12535854/MAPREDUCE-4252.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 1 new or modified test files.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2565//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2565//console
+
+This message is automatically generated., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12535854/MAPREDUCE-4252.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 1 new or modified test files.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2566//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2566//console
+
+This message is automatically generated., Thanks for the patch Tom.
+
+I put this into trunk, branch-2 and branch-0.23., Thanks Bobby., Integrated in Hadoop-Common-trunk-Commit #2438 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/2438/])
+    MAPREDUCE-4252. MR2 job never completes with 1 pending task (Tom White via bobby) (Revision 1359747)
+
+     Result = SUCCESS
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1359747
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestTaskImpl.java
+, Integrated in Hadoop-Hdfs-trunk-Commit #2506 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/2506/])
+    MAPREDUCE-4252. MR2 job never completes with 1 pending task (Tom White via bobby) (Revision 1359747)
+
+     Result = SUCCESS
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1359747
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestTaskImpl.java
+, Integrated in Hadoop-Mapreduce-trunk-Commit #2456 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Commit/2456/])
+    MAPREDUCE-4252. MR2 job never completes with 1 pending task (Tom White via bobby) (Revision 1359747)
+
+     Result = FAILURE
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1359747
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestTaskImpl.java
+, Integrated in Hadoop-Hdfs-trunk-Commit #2508 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/2508/])
+    MAPREDUCE-4252. MR2 job never completes with 1 pending task (Tom White via bobby) (Revision 1359747)
+
+     Result = SUCCESS
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1359747
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestTaskImpl.java
+, Integrated in Hadoop-Common-trunk-Commit #2441 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/2441/])
+    MAPREDUCE-4252. MR2 job never completes with 1 pending task (Tom White via bobby) (Revision 1359747)
+
+     Result = SUCCESS
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1359747
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestTaskImpl.java
+, Integrated in Hadoop-Hdfs-trunk #1100 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1100/])
+    MAPREDUCE-4252. MR2 job never completes with 1 pending task (Tom White via bobby) (Revision 1359747)
+
+     Result = FAILURE
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1359747
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestTaskImpl.java
+, Integrated in Hadoop-Hdfs-0.23-Build #310 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/310/])
+    svn merge -c 1359747. FIXES: MAPREDUCE-4252. MR2 job never completes with 1 pending task (Tom White via bobby) (Revision 1359750)
+
+     Result = UNSTABLE
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1359750
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestTaskImpl.java
+, Integrated in Hadoop-Mapreduce-trunk #1133 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1133/])
+    MAPREDUCE-4252. MR2 job never completes with 1 pending task (Tom White via bobby) (Revision 1359747)
+
+     Result = SUCCESS
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1359747
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestTaskImpl.java
+, Hi Tom,
+
+This problem has been handled when speculative task launched for map task and other attempt got failed (not killed)
+Can the similar kind of scenario can happen in case of reduce task?
+
+Consider the following scenario for reduce task in case of speculation (one attempt got killed):
+{quote}
+1. A task attempt is started.
+2. A speculative task attempt for the same task is started.
+3. The first task attempt completes and causes the task to transition to SUCCEEDED.
+4. Then speculative task attempt will be killed because of the completion of first attempt.
+{quote}
+
+As a result, internal error will be thrown from this attempt (*TaskImpl.MapRetroactiveKilledTransition*) and hence task attempt failure leads to job failure.
+
+{code:title=TaskImpl.MapRetroactiveKilledTransition|borderStyle=solid}
+if (!TaskType.MAP.equals(task.getType())) {
+        LOG.error("Unexpected event for REDUCE task " + event.getType());
+        task.internalError(event.getType());
+      }
+{code}
+
+So, do we need to have following code in MapRetroactiveKilledTransition also just like in MapRetroactiveFailureTransition.
+
+{noformat}
+if (event instanceof TaskTAttemptEvent) {
+        TaskTAttemptEvent castEvent = (TaskTAttemptEvent) event;
+        if (task.getState() == TaskState.SUCCEEDED &&
+            !castEvent.getTaskAttemptID().equals(task.successfulAttempt)) {
+          // don't allow a different task attempt to override a previous
+          // succeeded state
+          return TaskState.SUCCEEDED;
+        }
+      }
+{noformat}
+
+please check whether this is a valid case and give your suggestion.
+
+Thanks, Chackaravarthy, that does seem like a valid case - either in case of reduce speculation or a race between a reduce completing and a node being marked as unhealthy. The 'successful attempt' check already exists in MapRetroactiveKilledTransition. However, the REDUCE check will fail before this. Could you please open a separate jira. 
+From a quick look, ignoring the event for Reduce tasks should be sufficient., We could move the check for TaskType after the check for successful task attempt has been made. This is similar to the pattern for MapRetroActiveFailureTransition(). So the fix is a simple downward movement of the check for TaskType.
+
+The check for whether the task is MAP should still be there (and is also there for MapRetroActiveFailureTransition()) because after a REDUCE has completed with SUCCEEDED there is no reason to fail it because its outputs are already preserved in HDFS. So any attempt to fail it would be a bug in the code.
+
+We could also potentially improve the check of a successful attempt in MapRetroActiveKilledTransition() by using the condition in MapRetroActiveFailureTransition().
+
+I opened YARN-61 to track this. Currently assigned to me because I wrote MapRetroactiveKilledTransition. [~chaku88] Feel free to assign this to yourself.
+]

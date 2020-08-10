@@ -1,0 +1,242 @@
+[There is some discussion on YARN-1374.
+
+While it may be useful to allow adding services during init, we should do it in a way we don't introduce any races or non-determinism. It might make more sense to have a method different from the typical addService() to add a service during init., Need to handle race conditions. How to guarantee that such services will be properly inited?, I would propose
+# clone the list before doing the iteration -that way, changes in the list do not affect the ongoing interation.
+# simply add a check to addService() that the service must be in the same role as the service is itself.
+
+{code}
+  protected void addService(Service service) {
+    if (service.getServiceState() != getServiceState()) {
+     throw new RuntimeException("Cannot add ... ")
+   }
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Adding service " + service.getName());
+    }
+    synchronized (serviceList) {
+      serviceList.add(service);
+    }
+  }
+{code}
+
+We could be more generous and allow you to add services later on in the lifecycle, making the check {{service.getServiceState() != getServiceState()}}.
+
+I actually think this may be an-unnoticed bug in the code today: I could add a service in state UNINITED during my own code's init, 
+
+{code}
+
+  protected void serviceInit() throws Exception {
+    super.serviceInit();
+    addService(new CompositeService());  
+  }
+{code}
+
+call start() on my service, it will try to start the service, which is in the wrong state., I'm just doing the tests for this and the fixes. Stopping the concurrency condition is trivial (indeed, the javadocs imply I thought creating an UnmodifiableList() around a service list did this. Moving to a clone is the solution.
+
+With that fix, you do get a stack trace after you add a service that is behind the state of parent, in the specific case that the parent is in inited or uninited
+
+{code}
+testAddUninitedSiblingInInit(org.apache.hadoop.service.TestCompositeService)  Time elapsed: 0.035 sec  <<< ERROR!
+org.apache.hadoop.service.ServiceStateException: BreakableService cannot enter state STARTED from state NOTINITED
+	at org.apache.hadoop.service.ServiceStateModel.checkStateTransition(ServiceStateModel.java:129)
+	at org.apache.hadoop.service.ServiceStateModel.enterState(ServiceStateModel.java:111)
+	at org.apache.hadoop.service.AbstractService.start(AbstractService.java:190)
+	at org.apache.hadoop.service.CompositeService.serviceStart(CompositeService.java:126)
+	at org.apache.hadoop.service.AbstractService.start(AbstractService.java:193)
+	at org.apache.hadoop.service.TestCompositeService.testAddUninitedSiblingInInit(TestCompositeService.java:358)
+
+{code}
+
+You get a similar stack trace if any service adds a child to a composite that is not in the current state -or in the one next (because it is not an error to call start() from the started state -it's just a no-op.
+
+{code}
+Running org.apache.hadoop.service.TestCompositeService
+Tests run: 1, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: 0.184 sec <<< FAILURE! - in org.apache.hadoop.service.TestCompositeService
+testAddStartedChildBeforeInit(org.apache.hadoop.service.TestCompositeService)  Time elapsed: 0.037 sec  <<< ERROR!
+org.apache.hadoop.service.ServiceStateException: BreakableService cannot enter state INITED from state STARTED
+	at org.apache.hadoop.service.ServiceStateModel.checkStateTransition(ServiceStateModel.java:129)
+	at org.apache.hadoop.service.ServiceStateModel.enterState(ServiceStateModel.java:111)
+	at org.apache.hadoop.service.AbstractService.enterState(AbstractService.java:449)
+	at org.apache.hadoop.service.AbstractService.init(AbstractService.java:160)
+	at org.apache.hadoop.service.CompositeService.serviceInit(CompositeService.java:113)
+	at org.apache.hadoop.service.AbstractService.init(AbstractService.java:163)
+	at org.apache.hadoop.service.TestCompositeService.testAddStartedChildBeforeInit(TestCompositeService.java:371)
+
+testAddStoppedChildBeforeInit(org.apache.hadoop.service.TestCompositeService)  Time elapsed: 0.036 sec  <<< ERROR!
+org.apache.hadoop.service.ServiceStateException: BreakableService cannot enter state INITED from state STOPPED
+	at org.apache.hadoop.service.ServiceStateModel.checkStateTransition(ServiceStateModel.java:129)
+	at org.apache.hadoop.service.ServiceStateModel.enterState(ServiceStateModel.java:111)
+	at org.apache.hadoop.service.AbstractService.enterState(AbstractService.java:449)
+	at org.apache.hadoop.service.AbstractService.init(AbstractService.java:160)
+	at org.apache.hadoop.service.CompositeService.serviceInit(CompositeService.java:113)
+	at org.apache.hadoop.service.AbstractService.init(AbstractService.java:163)
+	at org.apache.hadoop.service.TestCompositeService.testAddStoppedChildBeforeInit(TestCompositeService.java:384)
+{code}
+
+While we could have this inconsistent child problem picked up in the {{addService()}} call -though there is a risk that someone may be adding started services during the init phase -which is legitimate and harmless today, but an error if a strict child state == parent state check was added.
+
+
+, This patch adds more tests and fixes the concurrency modification exception that is the core problem -but the code to test and reject additions in the wrong service state is disabled.
+
+As a result, 3 tests fail, showing cases when a child was added in the wrong state -and the following transition fails. 
+
+Two fix strategies
+# very strict: only allow current state in a service add.
+# current or future: you can add INITED, STARTED and STOPPED to a composite in INITED; STARTED and STOPPED to a STARTED service. I'd argue against adding an INITED before service, because the child wouldn't share a Configuration instance with all the others, Do we have places in the code that could benefit from this?, Assigning it to Steve as he is actively working on it., # the Concurrency modification is a bug in the composite service -one that showed up first in the HA RM, but something fairly basic.
+# the stricter state of additions goes one further and ensures that the next state transition of the composite will not fail due to an illegal state transition attempt of a child.
+
+Lots of child services are added by containers, and I've got some that actually make the {{addService}} method public for better service composition. The check locks down what state the children can be in and stops people making mistakes -at the time of insertion, not state transition., I like the very strict model better. Unless there is a usecase for the latter, the stricter model is, well, stricter and easy to reason about., I've been through all the hadoop-trunk code & looked at when {{addService()} is called. Mostly its called in {{serviceInit()}} before a call to {{super.serviceInit()}} -adding UNINITED services which get inited during the loop through the children. {{ResourceManager}} is the busiest class here.
+
+{{ContainerManagerImpl }}adds a service in its constructor which is mildly hazardous as if that method were overridden in a test subclass then the subclass would be in use before it had fully constructed. That doesn't impact service states though.
+
+now, some fun arises in calling {{addService()}} in your {{serviceInit()}} operation, because although the run through to init the child services hasn't started yet (i.e. the operations to move the children from UNINITED -> INITED, the parent is already in the INITED state. A check to validate that you can add an UNINITED service fails, because the parent is actually mid-init.
+
+There's no easy solution here, so I propose
+# don't implement any checks on service state when adding a child.
+# if you do a state transition that isn't legal, you'll find out at the time.
+# we make the new tests verify today's operation: you can insert children in any state, but when the parent tries to enter any state other than stopped, if there is a mismatch in versions a {{ServiceStateException}} gets thrown.
+
+, Patch with the concurrency condition fixed (tests included) and with tests to verify that there is no validation on state of services added as children -but the next state change will raise an exception., patch. Note this moves {{TestCompositeService}} from yarn to -common so it is closer to the code, {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12613633/HADOOP-10085-003.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/3282//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/3282//console
+
+This message is automatically generated., Sorry for the delay in getting around to this. Looks like the patch doesn't apply anymore - was hard to see the changes to tests themselves, mind refreshing the patch? I ll try to review before it goes stale this time. 
+
+Let me make sure I understand the fix here. Without the fix, adding a child service to a CompositeService while the CompositeService is initing all its child services leads to ConcurrentModificationException. The patch allows adding these services even during this time, but the newly added child service will never be inited if it not already. So, the patch allows adding services but places the onus on the caller to make sure it is in the correct state; otherwise, bad things can happen. 
+
+I am not sure if it is better to have deterministic behavior where we force users to add all the services before CompositeService#serviceInit is called or to allow adding services but leave the onus on the users. 
+
+It would have been nicer to have a check for the child being in at least the parent's state. Would it make sense to have the parent service enter INIT only after all its child services have been INITed? That way, if the parent is already in INIT, we can disallow adding a service in UNINITED state. Also, the current usage pattern of adding services followed by a call to super.serviceInit() will remain valid? , patch rebased to trunk, {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12626120/HADOOP-10085-004.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/3506//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/3506//console
+
+This message is automatically generated., I'll rebuild it.
+
+I looked at adding stricter checks but it broke things -some services were adding services in an incomplete state. Which is fine, because it will show up later
+
+bq. It would have been nicer to have a check for the child being in at least the parent's state.
+As start() on a STARTED service is a no-op, it's legal to add a started service to a service still in the inited state. Add an inited child while started -you'll need to start it yourself. It won't break anything though, as it's only transition is stop(), which must be valid from INITED anyway.
+
+bq. Would it make sense to have the parent service enter INIT only after all its child services have been INITed? That way, if the parent is already in INIT, we can disallow adding a service in UNINITED state.
+
+root service model MUST check for the valid transition before calling its execution operations -the whole YARN-117 work was to fix the situation where a lot of services were doing their init logic before super.init(), so could be called repeatedly before checking state, and weren't doing thread-safe operations either. 
+
+the only way could address this is to rework the service model with extra transitional states (initing, starting, stopping), the way some service lifecycles do (such as [Guava|https://code.google.com/p/guava-libraries/wiki/ServiceExplained]. That gets to break everything as it is a major change in the service model.
+
+bq. the current usage pattern of adding services followed by a call to super.serviceInit() will remain valid?
+
+yes, and I went through the entire source tree looking at every single place the calls were being made to see what was going on. 
+
+This is the lowest risk patch: it doesn't change any of the semantics of adding a service, merely guarantees there are  no re-entrancy problems. Anything more sophisticated breaks things., Reading through the issues addressed by YARN-117 and the related discussions, I now see the reason behind the current approach of parent service entering a state before child services. Agree we ll probably have to add transient states like INITING, STARTING etc. to address to go the other way, and that it is too large a change to just bring in.
+
+I think there is merit to getting this patch in. Let me take a closer look at the tests., Really like the use of AddBlockingService.
+
+Comments:
+# Is there a need for the static method AddBlockingService#addChildService()? Why not just call parent.addService? 
+# Nit: Would be nice to have the tests in an order - adding (Uninited, Inited, Started, Stopped) children to Uninited parent, Inited parent etc. - 16 tests in all. Then, the test serves as a rubric for someone to understand the behavior.  
+# Nit: Rename testAddSiblingInStart to testAddStartedSiblingInStart
+# Nit: Rename testAddSiblingInStop to testAddStartedSiblingInStop
+# Nit: Rename testAddSiblingInInit to testAddInitedSiblingInInit, bq. Nit: Would be nice to have the tests in an order - adding (Uninited, Inited, Started, Stopped) children to Uninited parent, Inited parent etc. - 16 tests in all. Then, the test serves as a rubric for someone to understand the behavior.
+
+Given we have already spent enough time on this, we can may be do this in a follow up JIRA - filed HADOOP-10321 for the same., -I don't agree with adding new states as (a) it adds a lot more complexity and is generally irrelevant. (b) breaks compabitility of an API that is already in use in external applications. You are free to file a JIRA on the topic, but I won't support it. , updated with tests renamed, bq. Is there a need for the static method AddBlockingService#addChildService()? Why not just call parent.addService?
+
+Yes, as {{parent.addService()}} is protected. 
+
+
+
+, {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12626476/HADOOP-10085-005.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/3521//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/3521//console
+
+This message is automatically generated., bq. I don't agree with adding new states as (a) it adds a lot more complexity and is generally irrelevant. (b) breaks compabitility of an API that is already in use in external applications. You are free to file a JIRA on the topic, but I won't support it.
+As I already said in my previous comment, I agree with your assessment here completely. So, yeah, I was/am not planning to file a JIRA. The JIRA I was filing was to add more tests - adding a child in every state to a parent in every state. 
+
+The latest patch looks good to me. +1. Committing this., SUCCESS: Integrated in Hadoop-trunk-Commit #5093 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/5093/])
+HADOOP-10085. CompositeService should allow adding services while being inited. (Steve Loughran via kasha) (kasha: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1563694)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/service/CompositeService.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/service/TestCompositeService.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/util/TestCompositeService.java
+, Thanks Steve for the extensive investigation of various options and the fix. 
+
+Just committed this to trunk and branch-2. , I don't necessarily see this as a blocker for 2.3. If you think it is, please feel free to commit this to branch-2.3 or let me know and I can. , SUCCESS: Integrated in Hadoop-Yarn-trunk #470 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/470/])
+HADOOP-10085. CompositeService should allow adding services while being inited. (Steve Loughran via kasha) (kasha: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1563694)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/service/CompositeService.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/service/TestCompositeService.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/util/TestCompositeService.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1687 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1687/])
+HADOOP-10085. CompositeService should allow adding services while being inited. (Steve Loughran via kasha) (kasha: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1563694)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/service/CompositeService.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/service/TestCompositeService.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/util/TestCompositeService.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #1662 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1662/])
+HADOOP-10085. CompositeService should allow adding services while being inited. (Steve Loughran via kasha) (kasha: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1563694)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/service/CompositeService.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/service/TestCompositeService.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/test/java/org/apache/hadoop/yarn/util/TestCompositeService.java
+]

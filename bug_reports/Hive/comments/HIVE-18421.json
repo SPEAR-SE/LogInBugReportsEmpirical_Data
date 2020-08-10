@@ -1,0 +1,665 @@
+[[~mmccline] Have you seen this issue before? I think it may be happening because we use longs for all the numeric types in the vectorizedRowBatch. Any thoughts? Thanks!, Yes, this is a known issue for integer types in vectorization.  Vectorized integer arithmetic currently does not check for underflow/overflow.  I thought there was a JIRA for it, but I can't find it.
+
+Solving this problem is a fairly major project.  Particularly because we want to preserve good performance., Do you have any ideas on how can we fix it? I can help fixing it. Correctness trumps performance in my opinion so I think we should fix this soon., Well, I hear you but given how crucial performance it isn't that simple.  Since Java does not have built in support for detecting underflow/overflow (e.g. $OVERFLOW), you would end up adding if stmts (a Google search will show you some) with each arithmetic operation that often destroy the use of the fancy SIMD instructions and good performance.  And, even with $OVERFLOW, that would probably be the case.
+
+One option might be to generate 2 sets of vectorization classes: checked and unchecked.
+
+Writing the checked alternatives will take some care to make sure they are fast.  And, it isn't just +/-, but it is also the sum and avg aggregations, etc., bq. One option might be to generate 2 sets of vectorization classes: checked and unchecked.
+
+That looks like a good option - the checking problem is that the same code is used for bigint and tinyint. Bigint doesn't need ovf and tinyint does.
+
+The vectorcodegen means that this is actually possible to do via a template variable rather than writing all code from scratch.
+
+bq. And, it isn't just +/-, but it is also the sum and avg aggregations, etc.
+
+sum(tinyint) -> bigint - that has no overflow case there (which is different from the non-vec).
+
+https://github.com/apache/hive/blob/master/ql/src/java/org/apache/hadoop/hive/ql/udf/generic/GenericUDAFSum.java#L122
+, bq. One option might be to generate 2 sets of vectorization classes: checked and unchecked.
+
+Just to clarify what you mean by 2 sets here. Do you mean that vectorcodegen will generate one with the overflow checks and another which is unchecked. So for example there would be two versions LongColAddLongColumn generated and when we instantiate the vectorExpression we check some global config and make sure we instantiate the correct variation. How would annotations for {{VectorizedExpressions}} look like in that case?
+
+Also, do you think it would be easier to just introduce a ByteColumnVector, ShortColumnVector and IntegerColumnVector for tinyint, short and int respectively?, Yes, like you said, 2 different sets of LongColAddLongColumn[Checked] classes controlled by an env variable.  An optional attribute could be added to VectorExpressionDescriptor to mark a class as checked.
+
+You could add class sub-variations for checked for byte, short, and int that still use LongColumnVector.  Adding {Byte|Short|Int}ColumnVector is difficult because of all the other things like comparision, aggregation etc, that would explode in the number of classes.  And, I think Gopal would point out that longs have the best performance even though there are wasted bits.  And, further, adding new integer column types would impact ORC, Parquet, etc, and large swathes of other code (e.g. GroupBy).  I don't believe it would be worth the extensive plumbing cost., New Column vectors are generally a bad idea - OOB checks are much easier to apply to Long.
+
+I'm expecting that we'll add something like a 
+
+{code}
+if (checked) {
+    checkBounds(outV, typeRange);
+}
+{code}
+
+to https://github.com/apache/hive/blob/master/ql/src/gen/vectorization/ExpressionTemplates/ColumnArithmeticColumn.txt
+
+This allows the initial operation to be SIMD and the checking to be L1 cache efficient (i.e check & overwrite same memory).
+
+This is somewhat inline with the NullUtil.setNullDataEntries., GenVectorCode on master a variation on how to do template-ing.  I added #IF #ELSE #ENDIF C define-like statements you can add to a template so you don't always have to do <variable> substitution.  You can have different lines of code for different variations.
+
+{noformat}
+#IF FINAL
+    outputColVector.vector[batchIndex] = myagg.mergeSum / myagg.mergeCount;
+#ENDIF FINAL
+{noformat}, I think one easy way to solve this is to cast the values in the long vector to the outputType. Based on my testing it works (atleast for the arithmetic expressions for which I tested). Currently, I am compiling a list of expressions which are affected by this issue. Any thoughts on the cast operator? I can do some benchmarks if there are automated tests in the source code and verify how much it affects the performance. Here is the snippet code which if I add solves the problem. For example, if the outputType is {{int}} you add the following code after the expression is evaluated on the LongColumnVector. 
+
+{code}
++      //int
++      if (v.isRepeating) {
++        v.vector[0] = (int) v.vector[0];
++      } else if (selectedInUse) {
++        for (int j = 0; j != n; j++) {
++          int i = sel[j];
++          v.vector[i] = (int) v.vector[i];
++        }
++      } else {
++        for (int i = 0; i != n; i++) {
++          v.vector[i] = (int) v.vector[i];
++        }
++      }
+{code}
+
+I think the good news here is AFAIK only the supportedGenericUDFs in the vectorizer will be affected because the rest will use {{VectorUDFAdapter}} which should not be affected by this issue. That reduces the scope of the problem than earlier thought. However, we will have to be careful while adding to new UDFs to the supported list.
+
+[~gopalv] [~mmccline] any thoughts on the down casting the values in the Column vector like the snippet is doing above?
+, Updated the Jira description appropriately. This patch doesn't add code to handle overflows in a "right" manner. It only makes vectorized code execution handle overflow in a "consistent" manner when compared to non-vectorized execution.
+
+I feel that handling overflows according to a configurable policy (wraparound, warn, error, set to null) would be a good addition and it can be taken up as a separate effort.
+
+Attaching the first version of this patch. I reviewed almost all the vector expressions (phew ..;))  and found a subset of expressions which do not handle overflows in a consistent manner. As discussed above, it introduces a new config which enables usage of checked expressions when available., [~mmccline] [~gopalv] [~aihuaxu]  Can you please take a look?, adding reviewboard link, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 13s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 28s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 21s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  3s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  9s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 21s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 18s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 10s{color} | {color:red} vector-code-gen: The patch generated 53 new + 306 unchanged - 2 fixed = 359 total (was 308) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 40s{color} | {color:red} ql: The patch generated 17 new + 501 unchanged - 0 fixed = 518 total (was 501) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 13s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 12s{color} | {color:red} The patch generated 2 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 16m 38s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Optional Tests |  asflicense  javac  javadoc  findbugs  checkstyle  compile  |
+| uname | Linux hiveptest-server-upstream 3.16.0-4-amd64 #1 SMP Debian 3.16.36-1+deb8u1 (2016-09-03) x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /data/hiveptest/working/yetus/dev-support/hive-personality.sh |
+| git revision | master / 4a33ec8 |
+| Default Java | 1.8.0_111 |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-8999/yetus/diff-checkstyle-vector-code-gen.txt |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-8999/yetus/diff-checkstyle-ql.txt |
+| asflicense | http://104.198.109.242/logs//PreCommit-HIVE-Build-8999/yetus/patch-asflicense-problems.txt |
+| modules | C: common vector-code-gen ql U: . |
+| Console output | http://104.198.109.242/logs//PreCommit-HIVE-Build-8999/yetus.txt |
+| Powered by | Apache Yetus    http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 31s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 43s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 20s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  6s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 12s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 22s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 22s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 11s{color} | {color:red} vector-code-gen: The patch generated 53 new + 306 unchanged - 2 fixed = 359 total (was 308) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 42s{color} | {color:red} ql: The patch generated 17 new + 501 unchanged - 0 fixed = 518 total (was 501) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 10s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 11s{color} | {color:red} The patch generated 2 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 17m 15s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Optional Tests |  asflicense  javac  javadoc  findbugs  checkstyle  compile  |
+| uname | Linux hiveptest-server-upstream 3.16.0-4-amd64 #1 SMP Debian 3.16.36-1+deb8u1 (2016-09-03) x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /data/hiveptest/working/yetus/dev-support/hive-personality.sh |
+| git revision | master / 0a328f0 |
+| Default Java | 1.8.0_111 |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9014/yetus/diff-checkstyle-vector-code-gen.txt |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9014/yetus/diff-checkstyle-ql.txt |
+| asflicense | http://104.198.109.242/logs//PreCommit-HIVE-Build-9014/yetus/patch-asflicense-problems.txt |
+| modules | C: common vector-code-gen ql U: . |
+| Console output | http://104.198.109.242/logs//PreCommit-HIVE-Build-9014/yetus.txt |
+| Powered by | Apache Yetus    http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Copy pasting the test result from precommit job since its not posting it to the Jira for some reason.
+
+ [Test Result|https://builds.apache.org/job/PreCommit-HIVE-Build/9014/testReport/] (312 failures / +285)
+
+Most of these test failures are due to explain plan differences since the {{hive.vectorized.use.checked.expressions}} is set to true by default in the patch. We can either update all these q.out files or change the default value of this config to false.
+
+The tests TestColumnScalarOperationVectorExpressionEvaluation are failing because they do not set the OutputTypeInfo in the test case. This will also get resolved if we set the outputTypeInfo appropriately in the test template. I think I will change the patch so that {{OverflowUtils.accountForOverflow[Double|Long]}} will not throw an exception if the outputTypeInfo is set to null since based on the tests, it doesn't look like its always going to be true for all the expression. [~mmccline] do you know if this understanding is correct?
+
+I will update the patch which should fix most of these test failures., latest patch should fix most of the tests. Also, made changes to keep yetus happy., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 32s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 41s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 20s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  7s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 13s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 25s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 49s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 25s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 12s{color} | {color:red} vector-code-gen: The patch generated 29 new + 345 unchanged - 3 fixed = 374 total (was 348) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 43s{color} | {color:red} ql: The patch generated 8 new + 501 unchanged - 0 fixed = 509 total (was 501) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 17s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 14s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 17m 47s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Optional Tests |  asflicense  javac  javadoc  findbugs  checkstyle  compile  |
+| uname | Linux hiveptest-server-upstream 3.16.0-4-amd64 #1 SMP Debian 3.16.36-1+deb8u1 (2016-09-03) x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /data/hiveptest/working/yetus/dev-support/hive-personality.sh |
+| git revision | master / 1bcc88f |
+| Default Java | 1.8.0_111 |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9033/yetus/diff-checkstyle-vector-code-gen.txt |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9033/yetus/diff-checkstyle-ql.txt |
+| modules | C: common vector-code-gen ql U: . |
+| Console output | http://104.198.109.242/logs//PreCommit-HIVE-Build-9033/yetus.txt |
+| Powered by | Apache Yetus    http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12909277/HIVE-18421.03.patch
+
+{color:green}SUCCESS:{color} +1 due to 4 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 26 failed/errored test(s), 13648 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestAccumuloCliDriver.testCliDriver[accumulo_queries] (batchId=240)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[avrocountemptytbl] (batchId=83)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[mapjoin_hook] (batchId=13)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[ppd_join5] (batchId=36)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[row__id] (batchId=79)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vectorization_numeric_overflows] (batchId=69)
+org.apache.hadoop.hive.cli.TestEncryptedHDFSCliDriver.testCliDriver[encryption_move_tbl] (batchId=175)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[llap_smb] (batchId=152)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[bucket_map_join_tez1] (batchId=172)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=167)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid] (batchId=171)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid_fast] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[mergejoin] (batchId=166)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[resourceplan] (batchId=164)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[sysdb] (batchId=161)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[ppd_join5] (batchId=122)
+org.apache.hadoop.hive.cli.control.TestDanglingQOuts.checkDanglingQOut (batchId=221)
+org.apache.hadoop.hive.ql.TestTxnNoBuckets.testCTAS (batchId=280)
+org.apache.hadoop.hive.ql.TestTxnNoBucketsVectorized.testCTAS (batchId=280)
+org.apache.hadoop.hive.ql.exec.TestOperators.testNoConditionalTaskSizeForLlap (batchId=282)
+org.apache.hadoop.hive.ql.exec.vector.expressions.TestVectorMathFunctions.testVectorPosMod (batchId=284)
+org.apache.hadoop.hive.ql.io.TestDruidRecordWriter.testWrite (batchId=256)
+org.apache.hive.beeline.cli.TestHiveCli.testNoErrorDB (batchId=188)
+org.apache.hive.jdbc.TestSSL.testConnectionMismatch (batchId=234)
+org.apache.hive.jdbc.TestSSL.testConnectionWrongCertCN (batchId=234)
+org.apache.hive.jdbc.TestSSL.testMetastoreConnectionWrongCertCN (batchId=234)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/9033/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/9033/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-9033/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.YetusPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 26 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12909277 - PreCommit-HIVE-Build, Fixed TestVectorMathFunctions
+
+TestCliDriver.testCliDriver[vectorization_numeric_overflows] is working for my on my laptop. I am not sure why it fails on the precommit job. Will investigate further. While I fix that it would be great if you can please take a look [~mmccline] [~aihuaxu]., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 36s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 58s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 20s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  6s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 14s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 23s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 23s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 23s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 12s{color} | {color:red} vector-code-gen: The patch generated 29 new + 345 unchanged - 3 fixed = 374 total (was 348) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 40s{color} | {color:red} ql: The patch generated 8 new + 505 unchanged - 0 fixed = 513 total (was 505) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 11s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 13s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 17m 43s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Optional Tests |  asflicense  javac  javadoc  findbugs  checkstyle  compile  |
+| uname | Linux hiveptest-server-upstream 3.16.0-4-amd64 #1 SMP Debian 3.16.36-1+deb8u1 (2016-09-03) x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /data/hiveptest/working/yetus/dev-support/hive-personality.sh |
+| git revision | master / 443b10b |
+| Default Java | 1.8.0_111 |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9051/yetus/diff-checkstyle-vector-code-gen.txt |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9051/yetus/diff-checkstyle-ql.txt |
+| modules | C: common vector-code-gen ql U: . |
+| Console output | http://104.198.109.242/logs//PreCommit-HIVE-Build-9051/yetus.txt |
+| Powered by | Apache Yetus    http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12909388/HIVE-18421.04.patch
+
+{color:green}SUCCESS:{color} +1 due to 5 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 25 failed/errored test(s), 13653 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestAccumuloCliDriver.testCliDriver[accumulo_queries] (batchId=240)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[auto_sortmerge_join_2] (batchId=49)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[mapjoin_hook] (batchId=13)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[ppd_join5] (batchId=36)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[row__id] (batchId=79)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vectorization_numeric_overflows] (batchId=69)
+org.apache.hadoop.hive.cli.TestEncryptedHDFSCliDriver.testCliDriver[encryption_move_tbl] (batchId=175)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[llap_smb] (batchId=152)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[bucket_map_join_tez1] (batchId=172)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=167)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid] (batchId=171)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid_fast] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[resourceplan] (batchId=164)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[sysdb] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[bucketizedhiveinputformat] (batchId=180)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[ppd_join5] (batchId=122)
+org.apache.hadoop.hive.cli.control.TestDanglingQOuts.checkDanglingQOut (batchId=221)
+org.apache.hadoop.hive.ql.TestTxnNoBuckets.testCTAS (batchId=280)
+org.apache.hadoop.hive.ql.TestTxnNoBucketsVectorized.testCTAS (batchId=280)
+org.apache.hadoop.hive.ql.exec.TestOperators.testNoConditionalTaskSizeForLlap (batchId=282)
+org.apache.hadoop.hive.ql.io.TestDruidRecordWriter.testWrite (batchId=256)
+org.apache.hive.beeline.cli.TestHiveCli.testNoErrorDB (batchId=188)
+org.apache.hive.jdbc.TestSSL.testConnectionMismatch (batchId=234)
+org.apache.hive.jdbc.TestSSL.testConnectionWrongCertCN (batchId=234)
+org.apache.hive.jdbc.TestSSL.testMetastoreConnectionWrongCertCN (batchId=234)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/9051/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/9051/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-9051/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.YetusPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 25 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12909388 - PreCommit-HIVE-Build, latest patch fixes TestCliDriver.testCliDriver[vectorization_numeric_overflows] and some Yetus checkstyle changes., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 33s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 59s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 24s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  8s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 13s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 22s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 26s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 12s{color} | {color:red} vector-code-gen: The patch generated 29 new + 345 unchanged - 3 fixed = 374 total (was 348) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 39s{color} | {color:red} ql: The patch generated 9 new + 505 unchanged - 0 fixed = 514 total (was 505) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 13s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 13s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 18m  2s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Optional Tests |  asflicense  javac  javadoc  findbugs  checkstyle  compile  |
+| uname | Linux hiveptest-server-upstream 3.16.0-4-amd64 #1 SMP Debian 3.16.36-1+deb8u1 (2016-09-03) x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /data/hiveptest/working/yetus/dev-support/hive-personality.sh |
+| git revision | master / acc62e3 |
+| Default Java | 1.8.0_111 |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9071/yetus/diff-checkstyle-vector-code-gen.txt |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9071/yetus/diff-checkstyle-ql.txt |
+| modules | C: common vector-code-gen ql U: . |
+| Console output | http://104.198.109.242/logs//PreCommit-HIVE-Build-9071/yetus.txt |
+| Powered by | Apache Yetus    http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12909579/HIVE-18421.06.patch
+
+{color:green}SUCCESS:{color} +1 due to 5 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 25 failed/errored test(s), 13657 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestAccumuloCliDriver.testCliDriver[accumulo_queries] (batchId=240)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[auto_sortmerge_join_2] (batchId=49)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[ppd_join5] (batchId=36)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[row__id] (batchId=79)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vectorization_numeric_overflows] (batchId=69)
+org.apache.hadoop.hive.cli.TestEncryptedHDFSCliDriver.testCliDriver[encryption_move_tbl] (batchId=175)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[llap_smb] (batchId=152)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[bucket_map_join_tez1] (batchId=172)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=167)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid] (batchId=171)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid_fast] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[mergejoin] (batchId=166)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[resourceplan] (batchId=164)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[sysdb] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[bucketizedhiveinputformat] (batchId=180)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[ppd_join5] (batchId=122)
+org.apache.hadoop.hive.cli.control.TestDanglingQOuts.checkDanglingQOut (batchId=221)
+org.apache.hadoop.hive.ql.TestTxnNoBuckets.testCTAS (batchId=280)
+org.apache.hadoop.hive.ql.TestTxnNoBucketsVectorized.testCTAS (batchId=280)
+org.apache.hadoop.hive.ql.exec.TestOperators.testNoConditionalTaskSizeForLlap (batchId=282)
+org.apache.hadoop.hive.ql.io.TestDruidRecordWriter.testWrite (batchId=256)
+org.apache.hive.beeline.cli.TestHiveCli.testNoErrorDB (batchId=188)
+org.apache.hive.jdbc.TestSSL.testConnectionMismatch (batchId=234)
+org.apache.hive.jdbc.TestSSL.testConnectionWrongCertCN (batchId=234)
+org.apache.hive.jdbc.TestSSL.testMetastoreConnectionWrongCertCN (batchId=234)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/9071/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/9071/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-9071/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.YetusPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 25 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12909579 - PreCommit-HIVE-Build, +1 LGTM, vectorization_numeric_overflows.q failure is very weird. I tested it locally (macOS) and also on a ubuntu VM (Linux with OpenJDK). I also tested it with the exact same batch as being run by the precommit job. It always works for me without any changes., Okay, I finally figured out the problem with vectorization_numeric_overflows.q. Turns out on CentOS the ordering of rows is different for a query result when compared to Ubuntu/MacOS. Both the results are valid since the key on which the order by clause was issued have same value on 2 rows. So the order of these 2 rows with the same value of key is non-deterministic. Fixed the query so that it orders by a different column which is always deterministic., [~mmccline] would you be able to take a look at this? This patch introduces new checked vector expressions and uses them when we set the newly introduced config {{hive.vectorized.use.checked.expressions}}. I introduced checked expressions for the arithmetic operators and some others where I could see the issue could cause different results after overflow based on my analysis., [~vihangk1] Sorry for the late reply. I left comment in RB. Basically I don't follow why we need both CHECKED and UNCHECKED implementations. Seems we should only have CHECKED one if UNCHECKED one would generate incorrect result. The user would get incorrect result without notice, right?
+
+Of course, even we want to support UNCHECKED implementation, we should still error out/fail the query if there is overflow so the user knows to set the flag to true. BTW: how much performance impact for this and why (don't exactly follow previous discussion)?, Talked to [~vihangk1] offline and got better understanding. The non-vectorization version actually is also not handling the overflow properly and that is a larger problem to address overall. 
+
+[~vihangk1] Do you think we should enable this property to true by default or just have the CHECKED version? , I can enable this config by default but that would trigger an q.out update of over 300 q files. Also, there were concerns raised by [~mmccline] and [~gopalv] above regarding performance. I didn't investigate the performance overhead of the fix. The issue is there is no well-defined policy within Hive overall on how to handle overflows. So it is arguable if users would want to enable this config by default or not since Hive itself doesn't handle overflows well overall. The config does handle overflows in the "right" way. It only makes vectorized execution overflow handling similar to non-vectorized handling. That was the reason I disabled the config by default. I can investigate the overhead and turn it on by default if there is no significant overhead. Any thoughts [~gopalv] [~aihuaxu] on this?, The performance question was primarily about inserting the check in the inner loop.
+
+What you have done with the Util doing a second traversal is likely to be an overhead only where the checked impl is needed for correctness.
+
+If you add a small test to VectorizedBench in hive-jmh, I can go over the assembly and make sure we're JIT'ing the bigint operators exactly the same way and also check the L1 cache rate (the 2nd iteration in the overflow util should get a 100% hit-rate, hopefully)., I briefly looked it over – I'm concentrating on HIVE-18622.
+
+I do not think this should be enabled by default (yet)., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  1s{color} | {color:green} The patch does not contain any @author tags. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 25s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 47s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 20s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  5s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 14s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 22s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 21s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 11s{color} | {color:red} vector-code-gen: The patch generated 29 new + 345 unchanged - 3 fixed = 374 total (was 348) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 42s{color} | {color:red} ql: The patch generated 9 new + 505 unchanged - 0 fixed = 514 total (was 505) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 18s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 12s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 17m 37s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Optional Tests |  asflicense  javac  javadoc  findbugs  checkstyle  compile  |
+| uname | Linux hiveptest-server-upstream 3.16.0-4-amd64 #1 SMP Debian 3.16.36-1+deb8u1 (2016-09-03) x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /data/hiveptest/working/yetus/dev-support/hive-personality.sh |
+| git revision | master / 3464df4 |
+| Default Java | 1.8.0_111 |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9105/yetus/diff-checkstyle-vector-code-gen.txt |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9105/yetus/diff-checkstyle-ql.txt |
+| modules | C: common vector-code-gen ql U: . |
+| Console output | http://104.198.109.242/logs//PreCommit-HIVE-Build-9105/yetus.txt |
+| Powered by | Apache Yetus    http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12909678/HIVE-18421.07.patch
+
+{color:green}SUCCESS:{color} +1 due to 5 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 23 failed/errored test(s), 13674 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestAccumuloCliDriver.testCliDriver[accumulo_queries] (batchId=240)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[ppd_join5] (batchId=36)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[row__id] (batchId=79)
+org.apache.hadoop.hive.cli.TestEncryptedHDFSCliDriver.testCliDriver[encryption_move_tbl] (batchId=175)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[llap_smb] (batchId=152)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[bucket_map_join_tez1] (batchId=172)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=167)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid] (batchId=171)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid_fast] (batchId=162)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[resourceplan] (batchId=164)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[sysdb] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[tez_bmj_schema_evolution] (batchId=153)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[bucketizedhiveinputformat] (batchId=180)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[spark_opt_shuffle_serde] (batchId=180)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[ppd_join5] (batchId=122)
+org.apache.hadoop.hive.cli.TestSparkPerfCliDriver.testCliDriver[query1] (batchId=250)
+org.apache.hadoop.hive.cli.control.TestDanglingQOuts.checkDanglingQOut (batchId=221)
+org.apache.hadoop.hive.ql.exec.TestOperators.testNoConditionalTaskSizeForLlap (batchId=282)
+org.apache.hadoop.hive.ql.io.TestDruidRecordWriter.testWrite (batchId=256)
+org.apache.hive.beeline.cli.TestHiveCli.testNoErrorDB (batchId=188)
+org.apache.hive.jdbc.TestSSL.testConnectionMismatch (batchId=234)
+org.apache.hive.jdbc.TestSSL.testConnectionWrongCertCN (batchId=234)
+org.apache.hive.jdbc.TestSSL.testMetastoreConnectionWrongCertCN (batchId=234)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/9105/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/9105/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-9105/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.YetusPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 23 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12909678 - PreCommit-HIVE-Build, Originally I thought non-vectorization version was handling the overflow but since both are returning the incorrect results, I'm fine with current patch. I will leave to [~mmccline] and [~gopalv] for a second review since you are more familiar on this part.
+
+ 
+
+ , Hi [~gopalv] I added a couple of tests to the VectorizedArithmeticBench in the latest patch. Can you please take a look?, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 48s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 13s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 53s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 25s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 35s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m  8s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red}  0m 16s{color} | {color:red} hive-jmh in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red}  0m 27s{color} | {color:red} ql in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  0m 14s{color} | {color:red} hive-jmh in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  0m 14s{color} | {color:red} hive-jmh in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m  9s{color} | {color:red} itests/hive-jmh: The patch generated 2 new + 9 unchanged - 0 fixed = 11 total (was 9) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 42s{color} | {color:red} ql: The patch generated 9 new + 505 unchanged - 0 fixed = 514 total (was 505) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 12s{color} | {color:red} vector-code-gen: The patch generated 29 new + 345 unchanged - 3 fixed = 374 total (was 348) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:red}-1{color} | {color:red} javadoc {color} | {color:red}  0m 11s{color} | {color:red} itests_hive-jmh generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 13s{color} | {color:red} The patch generated 49 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 19m 33s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Optional Tests |  asflicense  javac  javadoc  findbugs  checkstyle  compile  |
+| uname | Linux hiveptest-server-upstream 3.16.0-4-amd64 #1 SMP Debian 3.16.36-1+deb8u1 (2016-09-03) x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /data/hiveptest/working/yetus/dev-support/hive-personality.sh |
+| git revision | master / 9a02aa8 |
+| Default Java | 1.8.0_111 |
+| mvninstall | http://104.198.109.242/logs//PreCommit-HIVE-Build-9193/yetus/patch-mvninstall-itests_hive-jmh.txt |
+| mvninstall | http://104.198.109.242/logs//PreCommit-HIVE-Build-9193/yetus/patch-mvninstall-ql.txt |
+| compile | http://104.198.109.242/logs//PreCommit-HIVE-Build-9193/yetus/patch-compile-itests_hive-jmh.txt |
+| javac | http://104.198.109.242/logs//PreCommit-HIVE-Build-9193/yetus/patch-compile-itests_hive-jmh.txt |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9193/yetus/diff-checkstyle-itests_hive-jmh.txt |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9193/yetus/diff-checkstyle-ql.txt |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-9193/yetus/diff-checkstyle-vector-code-gen.txt |
+| javadoc | http://104.198.109.242/logs//PreCommit-HIVE-Build-9193/yetus/diff-javadoc-javadoc-itests_hive-jmh.txt |
+| asflicense | http://104.198.109.242/logs//PreCommit-HIVE-Build-9193/yetus/patch-asflicense-problems.txt |
+| modules | C: common itests/hive-jmh ql vector-code-gen U: . |
+| Console output | http://104.198.109.242/logs//PreCommit-HIVE-Build-9193/yetus.txt |
+| Powered by | Apache Yetus    http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12910346/HIVE-18421.08.patch
+
+{color:green}SUCCESS:{color} +1 due to 5 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 21 failed/errored test(s), 13853 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestAccumuloCliDriver.testCliDriver[accumulo_queries] (batchId=241)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[annotate_stats_filter] (batchId=9)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[mapjoin_hook] (batchId=13)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[ppd_join5] (batchId=36)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[row__id] (batchId=79)
+org.apache.hadoop.hive.cli.TestEncryptedHDFSCliDriver.testCliDriver[encryption_move_tbl] (batchId=175)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[bucket_map_join_tez1] (batchId=172)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=167)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid] (batchId=171)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid_fast] (batchId=162)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[resourceplan] (batchId=164)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[results_cache_1] (batchId=168)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[sysdb] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[spark_opt_shuffle_serde] (batchId=180)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[ppd_join5] (batchId=122)
+org.apache.hadoop.hive.cli.TestSparkPerfCliDriver.testCliDriver[query1] (batchId=251)
+org.apache.hadoop.hive.cli.control.TestDanglingQOuts.checkDanglingQOut (batchId=222)
+org.apache.hive.beeline.cli.TestHiveCli.testNoErrorDB (batchId=188)
+org.apache.hive.jdbc.TestSSL.testConnectionMismatch (batchId=235)
+org.apache.hive.jdbc.TestSSL.testConnectionWrongCertCN (batchId=235)
+org.apache.hive.jdbc.TestSSL.testMetastoreConnectionWrongCertCN (batchId=235)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/9193/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/9193/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-9193/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.YetusPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 21 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12910346 - PreCommit-HIVE-Build, I would like to commit this patch today. I have a +1 from [~stakiar] and I have added a test case in benchmark suite as suggested by [~gopalv]. Since [~mmccline] is busy with HIVE-18622, I will create a separate JIRA if he raises any serious concerns with this patch in the future.  The config defaults to false as suggested by him above., Patch merged in the master branch. Thanks for the review [~stakiar], This jira is resolved and released with Hive 3.0 If you find an issue with it, please create a new jira.]

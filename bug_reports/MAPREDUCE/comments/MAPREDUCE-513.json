@@ -1,0 +1,168 @@
+[The intent of the original fix was to solve the following problem: if  job has high memory requirements, you want to return no task to the TT. However, you want to do this only if the job has tasks to run (otherwise, you underutilize the TTs). Thsi problem still needs to be solved, but not in the way it was done earlier. Not having any pending tasks does not mean that a job does not have any task to run. , I can see two ways to solve this problem. 
+# Check if the TT has enough mem for the job. If yes, obtain a task from the job, as before. If not, determine whether the job has a task to run. Determining this can be performance intensive (it should be similar to _obtainNewMapTask_ or _obtainNewReduceTask_; in fact, we can call the same methods, but pass in a flag that just doesn't update data structures), but we only do it for high mem jobs and where the TT does not have enough memory, so we're no worse off than the normal case. 
+# First obtain a task from the job. If a task is returned, then check for mem requirements. If TT does not have enough mem, 'return the task' back to the job. This code to return a task can be complicated, as we need to undo all the data structures we updated in obtaining a task. 
+
+Option 1 looks better. I've attached a patch (4981.1.patch) where I add two new methods to _JobInProgress_: _hasNewMapTask_ and _hasNewReduceTask_. Both of these just call the respective _obtainNewXXXTask_, but with a flag which says the call is read-only. I have modified the _obtainNewXXXTask_ to take in the 'readOnly' flag and update data structures and log message only if the flag is false (thanks, Devaraj, for the idea). Only thing I don't like about this patch is the number of if statements that check the flag before logging or updating any data structure. Another option is to refactor the JobInProgress code to separate out the detection of a task from updating data structures, but that seems much more messy. 
+, Actually, I think we can go ahead and check for a speculative task as if it is a normal execution. I realized that the main datastructure updates happen only after a task fails/completes. But need to confirm that., bq. Check if the TT has enough mem for the job. If yes, obtain a task from the job, as before. If not, determine whether the job has a task to run.
+
+If the TT doesn't have enough memory for the job's tasks, what is the point trying to check if the job has a task to run?
+
+I think the capacity scheduler should just ask for a task iff the TT has enough memory and the let the JobInProgress hand out normal, failed or speculative tasks as is done in the default scheduler., bq. Actually, I think we can go ahead and check for a speculative task as if it is a normal execution. I realized that the main datastructure updates happen only after a task fails/completes. But need to confirm that.
+
+Devaraj, I don't follow. Are you suggesting a better way to find out if a job has a task to run? Can you elaborate? , bq. If the TT doesn't have enough memory for the job's tasks, what is the point trying to check if the job has a task to run? I think the capacity scheduler should just ask for a task iff the TT has enough memory and the let the JobInProgress hand out normal, failed or speculative tasks as is done in the default scheduler.
+
+Suppose the TT does not have enough memory to run a high-mem job's task. This usually happens because the TT is running other tasks which are consuming memory. In order to prevent the high-mem job from starving, we'd like to return nothing to the TT, in the hope that eventually the TT will finish all its tasks and will have enough memory to run this job's tasks. In the meantime, if another TT comes along with enough mem, great. However, suppose the high-mem job has no further task to run: no pending tasks and no speculative tasks (assume all running tasks are making adequate progress). In this case, returning nothing to the TT is a waste. You should move on to the next job. So I need a way to tell me if the job potentially has a task to run. Granted this is not perfect. At that moment, the job may decide that it can run a speculative task, but when you actually ask it for a task (which happens at a later heartbeat), it may return nothing because at that point, the potentially speculative task has made enough progress. But still, you want to minimize under-utilizing TTs while at the same time, preventing starvation of high-mem jobs. 
+
+I was mainly soliciting ways to better detect if a job has a task to run. The approach in the patch is to use the same code path that obtains a new task, but not update any data structures. The only thing I didn't like much about this approach is the if-blocks to prevent updating data structures.  
+, Vivek, I had separate conversations with Arun and Devaraj about this patch. Your patch does solve the requirement we have. However, we share your concern about the code structure - the passing of the flag top down to all APIs from the start, and the number of conditional checks. Also, we understand that the motivation to make the changes to obtainNewMapTask and family is so that we can retain the exact same code for looking up tasks, and thus take care of conditions like black listed trackers etc. So, it's a tradeoff between the code structure and the generic solution that is proposed.
+
+We can make the tradeoff in the other way, by handling the condition for speculative tasks alone. Something like:
+{code}
+if (memory requirements pass) {
+  return task from jobinprogress;
+} else {
+  if (job has pending or speculative tasks) {
+    block;
+  } else {
+    move on to next job;
+  }
+}
+{code}
+This may require an API like findSpeculativeTask which only looks at code dealing with speculative tasks, and does not need to make changes to the core APIs like obtainNewMapTask. It seems (haven't looked at deeply), that this could simplify the code structure quite a bit, while addressing the requirement we currently have. The other cases do not seem to require special handling as of now. For e.g. if a tracker is blacklisted, it would anyway not return any task, so this is equivalent to the condition of job has no pending tasks. Would something on these lines work ?
+, For the sake of this discussion, let's consider my original proposal (which modifies JobInProgress.findNewXXXTask(), and for which a patch is provided) as Proposal 1, and your suggestion about detecting only if a job has speculative tasks as Proposal 2. 
+
+I did consider Proposal 2, but I frankly didn't see a big difference. If you look at the code for JobInProgress.findNewMapTask(), which really is the big core method that needs to be updated, the first part of it deals with finding a pending task to run, and the second part of it deals with finding a speculative task. The latter code is non-trivial, i.e., it involves 3 stages and about 60 lines of code. Proposal 2 will result in fewer if-blocks, but the changes will qualitatively be the same (i.e., you'll still have to pass the readOnly parameter and still wrap data structure changes and log methods with if-blocks, albeit only for these 60 lines). A quick glance at my patch shows that you'll cut down the if-blocks from about 17 to about 7. On one hand, that is a decrease, but it's not qualitatively different and you'll likely move the code to find speculative tasks into a separate method, thus adding to the refactoring of this core method. Either way, it looks like we'll have to bite the bullet no matter what, if you're considering only these two proposals. 
+
+One issue I do have with Proposal 2 is that we're replicating the logic of finding a task to run, in the Capacity Scheduler. In your code example, you're assuming that if a job does not have pending or speculative tasks, JobInProgress.obtainNewMapTask() will return null. That's not such a good assumption for a couple of related reasons: 
+a. if this logic changes in JobInProgress, you have to update the Capacity Scheduler code. Granted that this logic is likely not going to change, or that eventually all this code belongs in a Scheduler module anyways, so maybe this is not a big issue. 
+b. findNewMapTask() has additional logic that you should consider: whether the TT is blacklisted (shouldRunOnTaskTracker()), and whether the TT has enough disk space. The latter we probably don't care about much, because the disk space, like the amount of free memory, gets better if we let the TT finish its tasks. The former,however, is important. If no task in the job can run on the TT (because many tasks of the job have failed on that TT), then the scheduler logic needs to reflect that (i.e., the scheduler blocks if there are pending or speculative tasks AND the TT is not blacklisted). Which ties in to my first point: you're replicating the logic of findNewMapTask() in the scheduler, which doesn't buy you much, and if you do it, you'll need to separate out the various steps in the logic (finding a pending tasks, finding a speculative task ) into separate methods, and make JobInProgress.shouldRunOnTaskTracker() public.
+
+Basically, I don't see Proposal 2 as qualitatively better than Proposal 1, which is why I didn't consider it. In its favor, it cuts down the if-blocks by more than half. But is that enough reason to replicate the findNewMapTask() logic in the scheduler? I personally think not. 
+
+Also remember that in proposal 1, we're not altering the signature of JobInProgress in the sense that its current callers do not change. It still exposes obtainNewMapTask(), with the same parameters. We've added a new method, hasNewMapTask(). It's only internally that we use the ugly readOnly flag. A minor point, but I wanted to point it out.
+
+bq. This may require an API like findSpeculativeTask which only looks at code dealing with speculative tasks, and does not need to make changes to the core APIs like obtainNewMapTask
+
+Depends on how you see it. The code that deals with finding speculative tasks is, today, within the core API findNewMapTask(). You'll still affect the core API if you move it out, but yes, I get your point that you won't have to surround the remaining code by if-blocks. 
+, Attaching new patch (4981.2.patch). I'd missed updating one section of code. , bq. In this case, returning nothing to the TT is a waste. You should move on to the next job. So I need a way to tell me if the job potentially has a task to run.
+
+I have a slightly different take - I agree with the motivation, not with the conclusion. We could just check if the highest priority job is _starved_ as defined by our discussion in HADOOP-4667 (http://issues.apache.org/jira/browse/HADOOP-4667?focusedCommentId=12665726#action_12665726) and use those apis to decide if we should move to the next job. Thoughts?
+
+, If I understand correctly, you're suggesting that we skip a job if it has mem requirements that cannot be met, while making sure we don't skip it too many times to starve it. As opposed to blocking right way (i.e, returning no task to the TT).
+
+We did consider this approach a while back, and the general consensus was that it's better to block right away than to selectively block. Regardless, I don't think that solves the problem this Jira is addressing. Whether you do it once in a while, or always, you're still going to need to look at a high-mem job at some point and decide whether to block the TT or not. And you're still going to need to see if the high-mem job has at least one task to run. of course, you could skip this step by always blocking the TT, but then you would have underutilized TTs if the high-mem job does not have any more task to run. 
+
+I thought the real issue here was how to write clean code to detect if a job has a task to run, i.e., it's more of a software design problem rather than a performance issue. We can certainly discuss/re-discuss whether it makes sense to block always or once in a while, but that seems like another discussion. Am I missing something? , +1 on having a clean way to detect whether a job has tasks to run. This will likely grow more important as we add more functionality to the scheduler., bq. I thought the real issue here was how to write clean code to detect if a job has a task to run, i.e., it's more of a software design problem rather than a performance issue. We can certainly discuss/re-discuss whether it makes sense to block always or once in a while, but that seems like another discussion. Am I missing something?
+
+I'd support a clean abstraction, but this change modifies substantial parts of the Map-Reduce framework in ways difficult to understand for a relatively uncommon corner-case. In any case a high-mem job might not have a task to run at a given moment, but what happens when it's running tasks fail, tasktrackers go down etc. ?
+
+From a design perspective we have to recognize that currently the Map-Reduce framework isn't fundamentally setup for what you are trying to do; maybe it might be possible if we move the scheduling-related aspects from JobInProgress to the respective Schedulers - a bigger discussion.
+
+Given these I'd rather sacrifice utilization for maintainable code... 
+
+-1 for trying to add capabilities to detect whether a job has tasks to run without significant redesign.
+, bq. ...but this change modifies substantial parts of the Map-Reduce framework in ways difficult to understand for a relatively uncommon corner-case.
+Even if you think this is a 'relatively uncommon corner-case', I don't believe it will remain so. I agree with Matei - detecting if a job has a task to run does seem to be an a relatively important functionality that can be used in scheduling (see another use-case below). 
+
+bq. In any case a high-mem job might not have a task to run at a given moment, but what happens when it's running tasks fail, tasktrackers go down etc. ?
+I don't see any problem here. If a high-mem job doesn't currently have tasks to run, you move on to the next job. If running tasks fail or TTs go down, the high-mem job will eventually have tasks to run, so that at some point, when we check if it has tasks to run, the answer is yes, and we will block the TT. The opposite case is a bit more interesting. A job may say it has tasks to run because, at that point, one of the tasks is a candidate for speculation as it's progressing slowly. So you block the TT. Eventually, the task that could have been speculated catches up, so that when a slot is actually free, you don't really need to run a speculative task. So you did block a TT unnecessarily. But I think that's OK, rare, and probably unavoidable. 
+
+bq. From a design perspective we have to recognize that currently the Map-Reduce framework isn't fundamentally setup for what you are trying to do
+That's not clear to me. You ask a JobInProgress to give you a task. In terms of design, it seems perfectly natural to ask a JobInProgress object if it has a task (a 'peek' versus a 'get'). Or, if it gives you a task, you can ask it to take it back. This feature can be very useful in some other use cases. We've heard of jobs that deal with third party licenses. Maps in different jobs may need to access different licenses to run (or, instead of licenses, you can think of rate limiting: at any given time, only, say, 30 maps can have an open connection to some external resource).What is needed then is to first find out which task from which job would run, then check if the license for that particular task is valid. If not, you want to put the task back in the job, so to speak. So design-wise, I see this as a useful feature and logical to have in JobInProgress. If you're suggesting that there's too much code to untangle to support this feature, that's a slightly different situation. Are you? Granted that a read-only flag is somewhat ugly, does it make the code so much un-maintainable that we prefer taking a performance hit? I'm not so sure. Sure, the performance hit can be mitigated by ignoring the high-mem job occasionally, but you can end up with a not-insignificant number of TTs being blocked if the high-mem job also has a large number of tasks.
+
+I also think that skipping a high mem job for a certain period can really hurt. The code, based on comments in HADOOP-4667, will look like this: 
+{code}
+if (TT has enough space for the high-mem job) {
+  get task from high-mem job;
+}
+else {
+  if (we've skipped this job too many times already) {
+    block TT (return no task to it);
+  }
+  else {
+    note that we're skipping this job;
+    look at next job;
+  }
+}
+{code}
+
+The whole point of blocking a TT is that you want it to finish its existing tasks quickly so it has enough space for the high-mem job, i..e, you're improving the chances of the TT to satisfy this job's request the next time. If you delay the blocking, you do NOT improve the chances of a high-mem job being satisfied by the TT as much. By delaying blocking, you're going to end up starving high-mem jobs even more. 
+
+I realize that the fix involves a non-trivial refactoring of critical code, but I'm not convinced we can't or shouldn't do it. Anybody else agree/disagree? Again, does the read-only flag really make the code so un-maintainable? My first patch was just a way to see how we can do something. Let me see if I (or someone else) can make it better, but it'll be good to understand how ugly or un-maintainable it really makes the code. , Attaching patch incorporating the approach mentioned in [Hemanth's Comment| https://issues.apache.org/jira/browse/HADOOP-4981?focusedCommentId=12663260&page=com.atlassian.jira.plugin.system.issuetabpanels%3Acomment-tabpanel#action_12663260]
+
+Added two new test cases:
+* Case to check normal jobs with speculative maps and reduces.
+* Case to check High ram job having speculative maps when pending tasks are zero, In general, we would like to have some support from JobInProgress itself. However, given that we are not *finding* a speculative task, only want to know if there's one, and the impact of this decision is not drastic, I am fine with this for now. I've also spoken to Devaraj to try and see if HADOOP-2141 can provide such an API in JobInProgress.
+
+That said, few comments on the current patch:
+
+- Use getMapTasks, getReduceTasks and getStatus() instead of directly accessing the members.
+- We should check if this job has speculation enabled. JobInProgress.getJobConf().getMapSpeculativeExecution() and similar for reduce.
+
+In test cases:
+- For speculative tasks is the attempt # the same, or does it increment. If it does, then when new taskattemptid is being created, shouldn't the last two params be interchanged ? 
+- Rather than extending Fake[Job|Task]InProgress for the speculative case, we should just set speculation on in the job conf of the job and have the corresponding speculation code on in the appropriate methods check for this condition and work accordingly. This will make the class more easy to change without breaking subclasses.
+- Need a documentation summarizing the new tests.
+- assert pending tasks are 0 before checking for speculative assignment, so we can be sure the code path for hasSpeculativeTask is traversed.
+- I think the Test case for HighRAM jobs should be as follows:
+-- Submit a High RAM job with spec enabled. Do not have a reduce for this, so that when the map is scheduled, pending becomes 0 for both maps and reduces. Submit a normal job that would fit after the high RAM job without speculation.
+-- Schedule the task from high ram job on tt
+-- Same TT comes back, and it shouldn't get a task to run though normal job's task can fit.
+-- Another TT comes and the speculative task should get executed.
+-- Then finish the first task, the other job should get scheduled.
+- Add a similar test case for testing speculative reduces as well, on similar lines., Attaching new patch incorporating Hemanths comments:
+
+* Added a new check to see if the task has already run on the same tracker while returning if job has speculative task or not.
+* Added documentation to methods, added summary to the two test cases.
+* Modified {{testHighRamJobWithSpeculativeExecution()}} to have two cases, one with speculative maps and other with speculative reduces., - Please check for the condition tip.isRunning() before other conditions in hasSpeculativeTask()
+- Don't you need to override the speculation related methods in FakeTaskInProgress ?
+- The high RAM jobs test case isn't still covering the code path for hasSpeculativeTask. To do that, I guess you need a tasktracker with 2 maps slots. Please rework the test along those lines., Incorporating Hemanths comment in the test case:
+
+* Made modification to {{FakeTaskInProgress}} adding two new methods {{isRunning()}} and {{hasSpeculativeTasks()}}.
+* Made modification to high ram jobs test case. It does following now.
+, Attaching new patch fixing test case issues:
+
+Currently following is steps used to test out  high ram jobs with speculative execution.
+- Configure two task trackers each having 3 GB vmem and 1 GB physical memory and 2 maps and 2 reduce slots each.
+- Submit one high memory job which has 2 GB vmem task requirement which has a map task and a speculative map task and zero reduce.
+- Submit another job which has low memory requirement of 100 MB vmem which has a map task and no reduce task.
+- First map from first job would be scheduled on tt1.
+- Check that cluster is blocked until, speculative task of high memory job is scheduled.
+- Once high memory job's speculative map is scheduled, the map task of normal job should be scheduled.
+
+- Now submit high memory job which has 2 GB vme requirement and has 1 map and 1 reduce with a speculative reduce.
+- Now submit a normal job which has memory requirement of 100 MB.
+- First high memory job's map is scheduled on tt1.
+- When tt1 gets back to scheduler asking for a task, it is blocked because the scheduler would try to assign a task from job3 which is a high memory job and it has already taken the map slot in the tracker, so there would not be any space.
+- When tt2 gets back to the scheduler asking for a task, it would be assigned map from job4.
+- when tt2 gets back again to scheduler, then reduce of job3 would start running.
+- Now cluster is blocked till speculative reduce of job3 runs.
+- Finish map tasks.
+- Make tt1 come to scheduler, it would be assigned speculative reduce task of job3.
+- Make tt1 come back to scheduler,. it would be assigned normal reduce task of job4 as it would fit the memory.
+
+
+The {{FakeJobInProgress}} resets the {{hasSpeculativeMap}} and {{hasSpeculativeReduce}} fields in {{FakeJobInProgress}} after a speculative task is given to the scheduler., +1 for the code changes. One minor point is to comment in the test case for the Fake objects that we are supporting only 1 speculative map / reduce at this point. I think this is enough for now. We can expand as needed., Attaching patch with changes to Comment in {{FakeJobInProgess}} object to state that it supports only one speculative map/reduce., output from ant test-patch:
+
+{noformat}
+     [exec] +1 overall.
+     [exec]
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+     [exec]
+     [exec]     +1 tests included.  The patch appears to include 3 new or modified tests.
+     [exec]
+     [exec]     +1 javadoc.  The javadoc tool did not generate any warning messages.
+     [exec]
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+     [exec]
+     [exec]     +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+     [exec]
+     [exec]     +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+     [exec]
+     [exec]     +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+{noformat}, The patch doesn't apply to 0.20. Since this is a bug fix, I think we should commit to 0.20. Also, I hope you have run the capacity scheduler tests. Can you please mention the results., Attaching branch 20 patch.
+
+All test cases passed except {{TestQueueCapacities}} which is failing even in trunk due to fetch failures. I have filed the JIRA HADOOP-5869 for the same.
+, I committed this to trunk and branch 0.20. Thanks, Sreekanth !, [edit - correct issue]
+TestQueueCapacities is failing in 0.20. When HADOOP-5792 is reverted, this causes TestQueueCapacities to fail in trunk., The TestQueueCapacities have been fixed in HADOOP-5869
+]

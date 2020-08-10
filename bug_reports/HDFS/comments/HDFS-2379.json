@@ -1,0 +1,109 @@
+[As discussed in the above-referenced JIRA, I think we can do something like the following pseudocode:
+
+{code}
+Set<Block> blocksFoundByScan = inconsistentScanVolume(); // ignore any file-not-founds we get due to concurrent FS modifications
+synchronized (volume) {
+  Set<Block> missingFromScan = Sets.difference(volumeMap.keySet(), blocksFoundByScan);
+  Set<Block> missingFromMem = Sets.difference(blocksFoundByScan, volumeMap.keySet());
+  for (Block b : missingFromScan) { // block is in memory but not in scan
+    if (b exists on disk) {
+      // it got added after we scanned that part of the tree!
+      add it to block report
+    }
+  }
+  for (Block b : missingFromMem) { // block was on disk but not in memory
+    if (b no longer exists on disk) {
+       // remove from block report - it was deleted after we scanned that part
+    }
+  }
+}
+{code}
+
+Anyone see a reason why this wouldn't work? Basically the idea is to do a "rough sketch" scan first, then anywhere we detect inconsistency, we touch it up, while holding the lock., I made this kinda-complicated patch against 20-security, and then realized that, in fact, today's current behavior isn't even really synchronized. It's synchronized only on FSVolumeSet, which only blocks block allocation (since getNextVolume is synchronized). It doesn't block finalization, invalidation, etc, while scanning. So maybe we can simply remove the "synchronized" keyword on "getBlockInfo"?
+
+I'm testing this more complicated one on a cluster now, running teragen with 256KB blocks, and block report interval dropped to 90s., this is an expanded patch which does the following:
+
+- introduces a method in FSDataSet called roughBlockScan() which scans the data directories but takes no locks and guarantees no consistency. Another method, reconcileRoughBlockScan, is used to diff it against the in-memory state, and find any cases where concurrent modifications need to be accounted for
+
+- introduces a simple inner class which calls roughBlockScan in a thread, and then allows a caller to poll for when the results are ready
+
+- the DN heartbeat loop now triggers a block report when the block report interval is expired, but doesn't block on the report being ready. Instead, it just triggers the thread to start calculating the "rough" report. Once the rough report is ready, it finishes the report by reconciling it while holding the lock.
+
+I've been testing this by doing concurrent terasort + hbase on a cluster where I prepopulated with a few hundred thousand small blocks per node (using teragen with 256KB block size). I've set the block report interval to 90seconds. With no load, the block reports take some 15 seconds to generate. With heavy MR load, they take up to 8-10 minutes. Without the patch, I had lots of SocketTimeoutExceptions, etc - with the patch, the block reports proceed in the background and the MR job succeeds without failed tasks., Our HDFS cluster scans disks in parallel when generating block reports. For a 24 TB node with 12 disks, its block report could be generated in about 1 second. Would this help eliminate SocketTimeoutException? I like your idea. The trick is that it is hard to get it right., We have some customers who have lots of small blocks (unfortunately they don't make good use of HAR). So, a single drive may have 400k+ blocks. When there's a lot of page cache pressure and the dentry/inode caches get pushed out, we're seeing it take several minutes per drive to do the scan. I've been experimenting with tuning /proc/sys/vm/vfs_cache_pressure which seems to help some, but even still it's taking many seconds when under lots of load. (eg in the middle of a terasort)
+
+It was a little tricky to get right, but this patch includes a "sanity check" mode which I used to catch several bugs. I think given that, today, we don't even properly synchronize it, the chance that this introduces more bugs is low. Still, I'm running some continuous cluster tests with this patch -- HBase write workloads with block report interval 90s. This shuffles through a lot of blocks quickly and helped me find some issues while working on the patch., I've been testing this latest patch for several days now, with terasorts, teragens, etc, and no issues to be seen. I tested both with a small number of blocks per node, and with a large number per node (by adding a few TB with 256KB block size), Todd, this patch does not apply to the latest 20-security branch., Sorry about that. Here's a patch against current branch-0.20-security., Suresh pointed out an error I made in resolving conflicts in the previous patch. This patch is the same except that DataNode needs to call retrieveAsyncBlockReport, rather than getBlockReport., Comments:
+# In the new version of the patch, FSDatasetInterface.java changes are missing. Also asynchronous scan thread change is missing as well. Want to make sure that it is intentional.
+#* There are some lines that are more than 80 chars.
+# FSDataset.java
+#* Why do you want to deprecate #getBlockInfo()? If you have a valid reason, can you please add information on the new method/mechanism that should be used instead of the deprecated method.
+#* Add javadoc to scanBlockFilesInconsistent() - add info about why it is not synchronized.
+#* SANITY_CHECK code can be removed.
+#* reconcileInconsistentDiskScan
+#** What happens to cases when volumeMap contains block but scanned block File does not exist or scanned block file exists but volumeMap does not contain it?
+#** In the end, the scanned block info is made to look same as the in memory state. I am just wondering, what is the need of the scan then?
+, bq. In the new version of the patch, FSDatasetInterface.java changes are missing. Also asynchronous scan thread change is missing as well. Want to make sure that it is intentional.
+
+Not sure what you mean - I see them there.
+
+bq. There are some lines that are more than 80 chars.
+Fixed
+
+bq. Why do you want to deprecate #getBlockInfo()? If you have a valid reason, can you please add information on the new method/mechanism that should be used instead of the deprecated method.
+These methods were left only for the sake of the sanity-check code path. But given the below comment, I've removed both the sanity check code path and the getBlockInfo method, since that's the only spot it was used. (and it was private)
+
+bq. SANITY_CHECK code can be removed.
+Fixed
+
+bq. What happens to cases when volumeMap contains block but scanned block File does not exist or scanned block file exists but volumeMap does not contain it?
+
+The goal of this JIRA is to preserve the existing semantics - ie to produce an identical block report as to what would have been produced if the whole scan had happened while under the lock. So:
+
+- If the block is in memory, but not on disk, the block is not reported. Note that we re-check the existence on disk when we see this situation, to make sure it wasn't just that the block was added after the scan. This code path handles the case where an administrator accidentally rm -Rfs some blocks - we want to make sure they don't show up in the block report, so that the NN can re-replicate.
+- If the block is on disk, but not in memory, we do report it, but only after checking that it's still there (with the lock held).
+I've updated the comments in the code to clarify the above behaviors.
+
+In the above cases, it might make some sense to actually update the in-memory map based on what was seen on disk. But, that would change the semantics, which would be harder to verify.
+
+bq. In the end, the scanned block info is made to look same as the in memory state. I am just wondering, what is the need of the scan then?
+The scan is made to look the same as the disk state. Anything places where we see a diff vs memory, we then _recheck_ the disk for those blocks while holding the lock. So the semantics should be the same as before.
+
+Will upload another patch momentarily with the above fixes. I'll also run through a basic manual test scenario of rm -Rfing some blocks and making sure they get re-replicated., Updated patch. I ran a manual test with 4 datanodes where I inserted a few hundred blocks, then on one of the datanodes did "rm blk_*" in one of the data directories. I had configured the block report interval to 10 seconds, and on the next block report, the NN counted these blocks as under-replicated. After a minute or two, everything was fully replicated again., I was reviewing the older version of the patch (thanks to default sort order for attachments), will post comments soon., FSDatasetInterface.java
+# getBlockReport() javadoc is unnecessary.
+# minor: "Request that an block report" -> "Request that a "
+# retrieveAsyncBlockReport - javadoc is not very clear. Also change to javadoc of getBlockReport() is not necessary.
+
+FSDataset.java
+# Indentation of {{String metaPart = ...}} could be better.
+# Why do you want to deprecate #getBlockInfo()? If you have a valid reason, can you please add information on the new method/mechanism that should be used instead of the deprecated method.
+# Make asyncBlockReport final.
+# Why do you choose to notifyAll when requested is set to true, but not when scan is set to null or requested is set to false?
+# AsyncBlockReport#run - Why are you sleeping for 2 seconds on catching Throwable?
+#  (!requested || scan != null) is better readable as !(requested && scan == null)
+
+Datanode.java
+# Optional - This might be a good time to move some of the block reported code into a separate method, outside offerService().
+
+, bq. Why do you choose to notifyAll when requested is set to true, but not when scan is set to null or requested is set to false?
+Ignore this comment., bq. getBlockReport() javadoc is unnecessary
+bq. minor: "Request that an block report" -> "Request that a "
+bq. Make asyncBlockReport final.
+bq. (!requested || scan != null) is better readable as !(requested && scan == null)
+Fixed
+
+bq. Indentation of String metaPart = ... could be better
+Fixed - also added a constant for METADATA_EXTENSION_LENGTH instead of the bare constant 5.
+
+bq. Why do you want to deprecate #getBlockInfo()? If you have a valid reason, can you please add information on the new method/mechanism that should be used instead of the deprecated method.
+Answered this in the comment above. It's now removed.
+
+bq. Why are you sleeping for 2 seconds on catching Throwable?
+Added this comment:
++            // Avoid busy-looping in the case that we have entered some invalid
++            // state -- don't want to flood the error log with exceptions.
+(my experience in other parts of the DN was that these types of busy loops caused big problems)
+
+bq. Optional - This might be a good time to move some of the block reported code into a separate method, outside offerService().
+I agree it would be a nice cleanup, but wanted to keep this change minimal.
+, Suresh: do you have any further comments on this or can I commit pending test-patch results?, Change looks good. +1., Committed to 0.20-security. Thanks for the reviews, Suresh., There's been a request to include this in 1.0.1, but the patch doesn't apply; it conflicts with another patch on several files.
+
+Todd, would you be able to look at making the patch work in branch-1.0, please?, I'm currently pretty slammed with work on the HA branch at the moment, so it would probably be a couple weeks before I could get to this, sorry., Matt, I merged the changes from branch 1 to 1.0., Thanks, Suresh!, Closing upon release of 1.0.1.]

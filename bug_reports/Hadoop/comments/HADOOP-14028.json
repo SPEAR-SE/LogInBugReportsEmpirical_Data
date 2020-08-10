@@ -1,0 +1,946 @@
+[https://github.com/apache/hadoop/blob/6c348c56918973fd988b110e79231324a8befe12/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ABlockOutputStream.java#L490 suggests that it should.
+
+Once I get this file created and uploaded, I'll try enabling debug logging for S3A to get a clearer idea of what's happening., that Block.close() doesn't delete the file, it's one in {{org.apache.hadoop.fs.s3a.S3ADataBlocks.DiskBlock.FileDeletingInputStream}}; the AWS transfer manager is doing the close
+
+
+What are your various queue options....I'd like to know how many blocks are going up in parallel, or at least being queued? It might be there's enough of a backlog that there is that much pending data. Or, as you suggest, we aren't deleting things., Reading through the AWS SDK code, it looks like this is the line ultimately responsible for closing the input stream: https://github.com/aws/aws-sdk-java/blob/master/aws-java-sdk-core/src/main/java/com/amazonaws/internal/ReleasableInputStream.java#L85
+
+I'm using the default settings (other than {{fs.s3a.fast.upload=true}}).
+
+From watching the atimes, it looks like there's only 1 block going up at a time while the next one fills up. (My producer is relatively slow and I'm running in EC2, so it makes sense that the uploader can keep up)., With logging enabled (and extra debug code added), I can confirm that {{FileDeletingInputStream}} isn't being closed as expected. Everything else is working as expected (on my slower uplink at home the producer blocks as hoped for).
+
+Here's the workaround I'm going to use for the time-being (tested and working):
+
+{code}
+diff --git i/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ADataBlocks.java w/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ADataBlocks.java
+index 0fe2af7943..3848ecc3f8 100644
+--- i/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ADataBlocks.java
++++ w/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ADataBlocks.java
+@@ -758,7 +758,13 @@ protected void innerClose() throws IOException {
+         break;
+ 
+       case Closed:
+-        // no-op
++        if (bufferFile.exists()) {
++          LOG.debug("Deleting buffer file {} after completion", bufferFile);
++          boolean deleted = bufferFile.delete();
++          if (!deleted && bufferFile.exists()) {
++            LOG.warn("Failed to delete buffer file {}", bufferFile);
++          }
++        }
+         break;
+ 
+       default:
+{code}, OK, I'll look at this.
+
+One issue I hit in the past is this: if the blocks aren't being deleted, the input stream is still open, which is wrong, and will lead to problems if the output is still ongoing. That's why the delete call is where it is right now
+
+I plan to add some metric tracking of #of outstanding blocks; then modify the scale tests to verify that for all output mechanisms the output is cleaned up. But I don't just want to do that clean up in that closed call without understanding what's happening.
+
+thanks for looking into this; we should be able to fix it fairly quickly, Yup, totally makes sense.
+
+Thanks for diving in. If I can be of any more help, please let me know., I've added some instrumentation and can confirm that this appears to be the case on branch-2+ for multipart uploads
+
+If you are doing single block PUTs, then the stream is being closed correctly. Which is presumably why I have memories of problems when I was deleting the input in the block.close(): because if the stream was still open then, problems
+
+Put differently: single block PUT: stream closes; multipart upload: stream stays open.
+
+single block put completion; look for "close stream" at debug to indicate stream was explicitly closed
+{code}
+2017-01-31 16:06:43,358 [JUnit-testBlocksClosed] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:startUpload(260)) - Start datablock[1] upload
+2017-01-31 16:06:43,358 [JUnit-testBlocksClosed] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:enterState(167)) - FileBlock{index=1, destFile=target/build/test/s3a/s3ablock-0001-2613007414198033258.tmp, state=Writing, dataSize=16, limit=5242880}: entering state Upload
+2017-01-31 16:06:43,359 [JUnit-testBlocksClosed] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:clearActiveBlock(209)) - Clearing active block
+2017-01-31 16:06:43,360 [s3a-transfer-shared-pool1-t2] DEBUG amazonaws.request (AmazonHttpClient.java:executeOneRequest(1046)) - Sending Request: PUT https://hwdev-steve-ireland-new.s3-eu-west-1.amazonaws.com /test/testBlocksClosed Headers: (User-Agent: Hadoop 2.9.0-SNAPSHOT, aws-sdk-java/1.11.45 Mac_OS_X/10.12.2 Java_HotSpot(TM)_64-Bit_Server_VM/25.102-b14/1.8.0_102, amz-sdk-invocation-id: 4596ee4b-a9bd-da45-6c8c-67b6c8ff18a2, Content-Length: 16, Content-Type: application/octet-stream, ) 
+2017-01-31 16:06:43,361 [s3a-transfer-shared-pool1-t2] DEBUG auth.AWS4Signer (CommonsLog.java:debug(33)) - AWS4 Canonical Request: '"PUT
+/test/testBlocksClosed
+
+amz-sdk-invocation-id:4596ee4b-a9bd-da45-6c8c-67b6c8ff18a2
+amz-sdk-retry:0/0/500
+content-length:16
+content-type:application/octet-stream
+host:hwdev-steve-ireland-new.s3-eu-west-1.amazonaws.com
+user-agent:Hadoop 2.9.0-SNAPSHOT, aws-sdk-java/1.11.45 Mac_OS_X/10.12.2 Java_HotSpot(TM)_64-Bit_Server_VM/25.102-b14/1.8.0_102
+x-amz-content-sha256:UNSIGNED-PAYLOAD
+x-amz-date:20170131T160643Z
+
+amz-sdk-invocation-id;amz-sdk-retry;content-length;content-type;host;user-agent;x-amz-content-sha256;x-amz-date
+UNSIGNED-PAYLOAD"
+2017-01-31 16:06:43,361 [s3a-transfer-shared-pool1-t2] DEBUG auth.AWS4Signer (CommonsLog.java:debug(33)) - AWS4 String to Sign: '"AWS4-HMAC-SHA256
+20170131T160643Z
+20170131/eu-west-1/s3/aws4_request
+3d06bfd2a67d99075b7bda392543c0d537232b95f22e66457c87c2e1445aa166"
+2017-01-31 16:06:43,417 [s3a-transfer-shared-pool1-t2] DEBUG amazonaws.request (AwsResponseHandlerAdapter.java:handle(87)) - Received successful response: 200, AWS Request ID: AC9D7DE63C4BA32D
+2017-01-31 16:06:43,417 [s3a-transfer-shared-pool1-t2] DEBUG amazonaws.requestId (AwsResponseHandlerAdapter.java:logHeaderRequestId(136)) - x-amzn-RequestId: not available
+2017-01-31 16:06:43,417 [s3a-transfer-shared-pool1-t2] DEBUG amazonaws.requestId (AwsResponseHandlerAdapter.java:logResponseRequestId(156)) - AWS Request ID: AC9D7DE63C4BA32D
+2017-01-31 16:06:43,417 [s3a-transfer-shared-pool1-t2] INFO  s3a.S3ADataBlocks (S3ADataBlocks.java:close(886)) - Block[1] closing stream of buffer file target/build/test/s3a/s3ablock-0001-2613007414198033258.tmp
+2017-01-31 16:06:43,418 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:closeBlock(860)) - block[1]: closeBlock()
+2017-01-31 16:06:43,418 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:enterState(167)) - FileBlock{index=1, destFile=target/build/test/s3a/s3ablock-0001-2613007414198033258.tmp, state=Upload, dataSize=16, limit=5242880}: entering state Closed
+2017-01-31 16:06:43,418 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:close(282)) - Closed FileBlock{index=1, destFile=target/build/test/s3a/s3ablock-0001-2613007414198033258.tmp, state=Closed, dataSize=16, limit=5242880}
+2017-01-31 16:06:43,418 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:innerClose(807)) - Closing FileBlock{index=1, destFile=target/build/test/s3a/s3ablock-0001-2613007414198033258.tmp, state=Closed, dataSize=16, limit=5242880}
+2017-01-31 16:06:43,419 [JUnit-testBlocksClosed] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:close(354)) - Upload complete for {bucket=hwdev-steve-ireland-new, key='test/testBlocksClosed'}
+2017-01-31 16:06:43,419 [JUnit-testBlocksClosed] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:close(359)) - Closing block and factory
+2017-01-31 16:06:43,419 [JUnit-testBlocksClosed] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:close(362)) - Statistics: OutputStreamStatistics{blocksSubmitted=1, blocksInQueue=1, blocksActive=0, blockUploadsCompleted=0, blockUploadsFailed=0, bytesPendingUpload=0, bytesUploaded=16, blocksAllocated=1, blocksReleased=1, blocksActivelyAllocated=0, exceptionsInMultipartFinalize=0, transferDuration=0 ms, queueDuration=0 ms, averageQueueTime=0 ms, totalUploadDuration=0 ms, effectiveBandwidth=0.0 bytes/s}
+{code}, I'm not setting that close stream message in the logs for the huge file upload, and when I add an assert that the number of outstanding blocks == 0 in the upload tests, the assertion falls for the disk block upload
+
+implication: the stream isn't being closed, either due to multipart put, or the progress callback (which does wrap the input stream, judging by the AWS source)
+
+Except: the byte buffer and byte array test runs do pass: their stream.close() methods are being triggered enough for them to release blocks. Which means that I'm not seeing consistent behaviour here.
+
+I know I could simply trigger the cleanup in the Block.close() operation, but I want to understand why the stream closure hasn't happened yet before I rush to do that, log of the multple disk block put, no stream closed events, 
+{code}
+2017-01-31 16:36:50,459 [JUnit-test_010_CreateHugeFile] INFO  scale.AbstractSTestS3AHugeFiles (AbstractSTestS3AHugeFiles.java:test_010_CreateHugeFile(188)) - [100%] Buffered 10.00 MB out of 10 MB; PUT 0 bytes (8388608 pending) in 2 operations (1 active); elapsedTime=0.21s; write to buffer bandwidth=48.40 MB/s
+2017-01-31 16:36:50,459 [JUnit-test_010_CreateHugeFile] INFO  scale.AbstractSTestS3AHugeFiles (AbstractSTestS3AHugeFiles.java:test_010_CreateHugeFile(203)) - Closing stream org.apache.hadoop.fs.FSDataOutputStream@7067fa8a
+2017-01-31 16:36:50,460 [JUnit-test_010_CreateHugeFile] INFO  scale.AbstractSTestS3AHugeFiles (AbstractSTestS3AHugeFiles.java:test_010_CreateHugeFile(204)) - Statistics : OutputStreamStatistics{blocksSubmitted=1, blocksInQueue=0, blocksActive=1, blockUploadsCompleted=0, blockUploadsFailed=0, bytesPendingUpload=8388608, bytesUploaded=0, blocksAllocated=2, blocksReleased=0, blocksActivelyAllocated=2, exceptionsInMultipartFinalize=0, transferDuration=0 ms, queueDuration=3 ms, averageQueueTime=3 ms, totalUploadDuration=3 ms, effectiveBandwidth=0.0 bytes/s}
+2017-01-31 16:36:50,460 [JUnit-test_010_CreateHugeFile] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:close(329)) - S3ABlockOutputStream{{bucket=hwdev-steve-ireland-new, key='tests3ascale/scale/hugefile'}, blockSize=8388608, activeBlock=FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-2667023026802684004.tmp, state=Writing, dataSize=2097152, limit=8388608}}: Closing block #2: current block= FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-2667023026802684004.tmp, state=Writing, dataSize=2097152, limit=8388608}
+2017-01-31 16:36:50,460 [JUnit-test_010_CreateHugeFile] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:uploadCurrentBlock(298)) - Writing block # 2
+2017-01-31 16:36:50,460 [JUnit-test_010_CreateHugeFile] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:uploadBlockAsync(469)) - Queueing upload of FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-2667023026802684004.tmp, state=Writing, dataSize=2097152, limit=8388608}
+2017-01-31 16:36:50,460 [JUnit-test_010_CreateHugeFile] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:startUpload(260)) - Start datablock[2] upload
+2017-01-31 16:36:50,460 [JUnit-test_010_CreateHugeFile] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:enterState(167)) - FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-2667023026802684004.tmp, state=Writing, dataSize=2097152, limit=8388608}: entering state Upload
+2017-01-31 16:36:50,461 [JUnit-test_010_CreateHugeFile] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:clearActiveBlock(209)) - Clearing active block
+2017-01-31 16:36:50,461 [s3a-transfer-shared-pool1-t3] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:call(490)) - Uploading part 2 for id 'i8AV2cnBFI5JymBdObYinUZh9Fl.JF.DN9w91B9UtOq08Y02Jj1W3uNGyBYLUg5VmNscz3xzMr5naAh6R.O.Ew--'
+2017-01-31 16:36:50,461 [JUnit-test_010_CreateHugeFile] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:waitForAllPartUploads(511)) - Waiting for 2 uploads to complete
+2017-01-31 16:36:50,462 [s3a-transfer-shared-pool1-t3] DEBUG amazonaws.request (AmazonHttpClient.java:executeOneRequest(1046)) - Sending Request: PUT https://hwdev-steve-ireland-new.s3-eu-west-1.amazonaws.com /tests3ascale/scale/hugefile Parameters: ({"uploadId":["i8AV2cnBFI5JymBdObYinUZh9Fl.JF.DN9w91B9UtOq08Y02Jj1W3uNGyBYLUg5VmNscz3xzMr5naAh6R.O.Ew--"],"partNumber":["2"]}Headers: (User-Agent: STestS3AHugeFileCreate, Hadoop 2.9.0-SNAPSHOT, aws-sdk-java/1.11.45 Mac_OS_X/10.12.2 Java_HotSpot(TM)_64-Bit_Server_VM/25.102-b14/1.8.0_102, amz-sdk-invocation-id: 94996caa-80e5-a609-d1e8-edf313bc06a2, Content-Length: 2097152, Content-Type: application/octet-stream, ) 
+2017-01-31 16:36:50,462 [s3a-transfer-shared-pool1-t3] DEBUG auth.AWS4Signer (CommonsLog.java:debug(33)) - AWS4 Canonical Request: '"PUT
+/tests3ascale/scale/hugefile
+partNumber=2&uploadId=i8AV2cnBFI5JymBdObYinUZh9Fl.JF.DN9w91B9UtOq08Y02Jj1W3uNGyBYLUg5VmNscz3xzMr5naAh6R.O.Ew--
+amz-sdk-invocation-id:94996caa-80e5-a609-d1e8-edf313bc06a2
+amz-sdk-retry:0/0/500
+content-length:2097152
+content-type:application/octet-stream
+host:hwdev-steve-ireland-new.s3-eu-west-1.amazonaws.com
+user-agent:STestS3AHugeFileCreate, Hadoop 2.9.0-SNAPSHOT, aws-sdk-java/1.11.45 Mac_OS_X/10.12.2 Java_HotSpot(TM)_64-Bit_Server_VM/25.102-b14/1.8.0_102
+x-amz-content-sha256:UNSIGNED-PAYLOAD
+x-amz-date:20170131T163650Z
+
+amz-sdk-invocation-id;amz-sdk-retry;content-length;content-type;host;user-agent;x-amz-content-sha256;x-amz-date
+UNSIGNED-PAYLOAD"
+2017-01-31 16:36:50,463 [s3a-transfer-shared-pool1-t3] DEBUG auth.AWS4Signer (CommonsLog.java:debug(33)) - AWS4 String to Sign: '"AWS4-HMAC-SHA256
+20170131T163650Z
+20170131/eu-west-1/s3/aws4_request
+df85cf8cefd073de4a259d0eb4a5d22242ede33b3b402ccf73e7a43c81ac9f31"
+2017-01-31 16:36:53,370 [s3a-transfer-shared-pool1-t3] DEBUG amazonaws.request (AwsResponseHandlerAdapter.java:handle(87)) - Received successful response: 200, AWS Request ID: 1B4A1673E51E1FE9
+2017-01-31 16:36:53,370 [s3a-transfer-shared-pool1-t3] DEBUG amazonaws.requestId (AwsResponseHandlerAdapter.java:logHeaderRequestId(136)) - x-amzn-RequestId: not available
+2017-01-31 16:36:53,370 [s3a-transfer-shared-pool1-t3] DEBUG amazonaws.requestId (AwsResponseHandlerAdapter.java:logResponseRequestId(156)) - AWS Request ID: 1B4A1673E51E1FE9
+2017-01-31 16:36:53,372 [s3a-transfer-shared-pool1-t3] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:call(494)) - Completed upload of FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-2667023026802684004.tmp, state=Upload, dataSize=2097152, limit=8388608}
+2017-01-31 16:36:53,372 [s3a-transfer-shared-pool1-t3] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:call(495)) - Stream statistics of OutputStreamStatistics{blocksSubmitted=2, blocksInQueue=0, blocksActive=1, blockUploadsCompleted=1, blockUploadsFailed=0, bytesPendingUpload=5242880, bytesUploaded=5242880, blocksAllocated=2, blocksReleased=0, blocksActivelyAllocated=2, exceptionsInMultipartFinalize=0, transferDuration=2909 ms, queueDuration=4 ms, averageQueueTime=2 ms, totalUploadDuration=2913 ms, effectiveBandwidth=1799821.4898729832 bytes/s}
+2017-01-31 16:36:53,372 [s3a-transfer-shared-pool1-t3] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:enterState(167)) - FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-2667023026802684004.tmp, state=Upload, dataSize=2097152, limit=8388608}: entering state Closed
+2017-01-31 16:36:53,372 [s3a-transfer-shared-pool1-t3] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:close(282)) - Closed FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-2667023026802684004.tmp, state=Closed, dataSize=2097152, limit=8388608}
+2017-01-31 16:36:53,372 [s3a-transfer-shared-pool1-t3] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:innerClose(811)) - Closing FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-2667023026802684004.tmp, state=Closed, dataSize=2097152, limit=8388608}
+2017-01-31 16:36:57,131 [s3a-transfer-shared-pool1-t2] DEBUG amazonaws.request (AwsResponseHandlerAdapter.java:handle(87)) - Received successful response: 200, AWS Request ID: 9D1707B157420F81
+2017-01-31 16:36:57,132 [s3a-transfer-shared-pool1-t2] DEBUG amazonaws.requestId (AwsResponseHandlerAdapter.java:logHeaderRequestId(136)) - x-amzn-RequestId: not available
+2017-01-31 16:36:57,132 [s3a-transfer-shared-pool1-t2] DEBUG amazonaws.requestId (AwsResponseHandlerAdapter.java:logResponseRequestId(156)) - AWS Request ID: 9D1707B157420F81
+2017-01-31 16:36:57,132 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:call(494)) - Completed upload of FileBlock{index=1, destFile=target/build/test/s3a/s3ablock-0001-8866456036483591474.tmp, state=Upload, dataSize=8388608, limit=8388608}
+2017-01-31 16:36:57,132 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:call(495)) - Stream statistics of OutputStreamStatistics{blocksSubmitted=2, blocksInQueue=0, blocksActive=0, blockUploadsCompleted=2, blockUploadsFailed=0, bytesPendingUpload=0, bytesUploaded=10485760, blocksAllocated=2, blocksReleased=0, blocksActivelyAllocated=2, exceptionsInMultipartFinalize=0, transferDuration=9587 ms, queueDuration=4 ms, averageQueueTime=2 ms, totalUploadDuration=9591 ms, effectiveBandwidth=1093291.6275675113 bytes/s}
+2017-01-31 16:36:57,132 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:enterState(167)) - FileBlock{index=1, destFile=target/build/test/s3a/s3ablock-0001-8866456036483591474.tmp, state=Upload, dataSize=8388608, limit=8388608}: entering state Closed
+2017-01-31 16:36:57,132 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:close(282)) - Closed FileBlock{index=1, destFile=target/build/test/s3a/s3ablock-0001-8866456036483591474.tmp, state=Closed, dataSize=8388608, limit=8388608}
+
+// ** This is where the owner block is being closed **
+
+2017-01-31 16:36:57,132 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:innerClose(811)) - Closing FileBlock{index=1, destFile=target/build/test/s3a/s3ablock-0001-8866456036483591474.tmp, state=Closed, dataSize=8388608, limit=8388608}
+2017-01-31 16:36:57,133 [JUnit-test_010_CreateHugeFile] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:complete(550)) - Completing multi-part upload for key 'tests3ascale/scale/hugefile', id 'i8AV2cnBFI5JymBdObYinUZh9Fl.JF.DN9w91B9UtOq08Y02Jj1W3uNGyBYLUg5VmNscz3xzMr5naAh6R.O.Ew--' with 2 partitions 
+2017-01-31 16:36:57,135 [JUnit-test_010_CreateHugeFile] DEBUG amazonaws.request (AmazonHttpClient.java:executeOneRequest(1046)) - Sending Request: POST https://hwdev-steve-ireland-new.s3-eu-west-1.amazonaws.com /tests3ascale/scale/hugefile Parameters: ({"uploadId":["i8AV2cnBFI5JymBdObYinUZh9Fl.JF.DN9w91B9UtOq08Y02Jj1W3uNGyBYLUg5VmNscz3xzMr5naAh6R.O.Ew--"]}Headers: (User-Agent: STestS3AHugeFileCreate, Hadoop 2.9.0-SNAPSHOT, aws-sdk-java/1.11.45 Mac_OS_X/10.12.2 Java_HotSpot(TM)_64-Bit_Server_VM/25.102-b14/1.8.0_102, amz-sdk-invocation-id: aa9cda11-857e-fbe5-86b4-05640be1e7b0, Content-Length: 219, Content-Type: application/xml, ) 
+2017-01-31 16:36:57,136 [JUnit-test_010_CreateHugeFile] DEBUG auth.AWS4Signer (CommonsLog.java:debug(33)) - AWS4 Canonical Request: '"POST
+/tests3ascale/scale/hugefile
+{code}, Patch 001
+
+# cleanup takes place in the block close() call
+# pass down index (for logging) and stream statistics (for counting and tests)
+# {{ITestS3AHugeFiles* }} tests verify that uploads do release all blocks by way of the statistics counters
+# the callables on the uploads always call Block.close() in a finally clause. This would have leaked buffers/files otherwise.
+# probably some log at info that could be cut back on
+
+I can't replicate the problem which I referred to in HADOOP-13560 about stream being active after block closure. I think if we used the transfer manager and didn''t block for the uploads to complete this would happen (as the original S3aOutputStream does), but as single part puts are put direct, &multiparts  block for the end tag, all uploads appear to be synchronous.
+
+As noted, I'm not seeing the multipart uploads closing the output streams *at all*, not from the logs.
+
+I want to apply this to branch-2,8 to see what happens on the older SDK, testing, s3a ireland, backported to branch-2.8 and tested against s3a ireland there, no problems., | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 13s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 23s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 19s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 14s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 24s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 14s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 35s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 12s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 14s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 13s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 11 new + 31 unchanged - 0 fixed = 42 total (was 31) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 11s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 12s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 20s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 14m 27s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HADOOP-14028 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12850274/HADOOP-14028-branch-2-001.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux eee18554bd74 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / ccf33bc |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11545/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11545/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11545/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, BTW, on branch-2.8 the logs of the test also showed that on the multipart upload there, the stream *was not* being saved. That is: the problem exists on that branch-2. Because the temp files were all allocated on deleteOnExit(), clean process exits will clean up files anyway
+
+{code}
+2017-01-31 18:33:43,148 [s3a-transfer-shared-pool1-t4] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:call(501)) - Completed upload of FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-4995600247628610940.tmp, state=Upload, dataSize=2097152, limit=8388608} to part db1f7d786f6e0317456fac1628349973
+2017-01-31 18:33:43,148 [s3a-transfer-shared-pool1-t4] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:call(503)) - Stream statistics of OutputStreamStatistics{blocksSubmitted=2, blocksInQueue=0, blocksActive=1, blockUploadsCompleted=1, blockUploadsFailed=0, bytesPendingUpload=5734400, bytesUploaded=4751360, blocksAllocated=2, blocksReleased=0, blocksActivelyAllocated=2, exceptionsInMultipartFinalize=0, transferDuration=3028 ms, queueDuration=5 ms, averageQueueTime=2 ms, totalUploadDuration=3033 ms, effectiveBandwidth=1566554.566435872 bytes/s}
+2017-01-31 18:33:43,148 [s3a-transfer-shared-pool1-t4] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:call(506)) - Closing block at end of multipart PUT FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-4995600247628610940.tmp, state=Upload, dataSize=2097152, limit=8388608}
+2017-01-31 18:33:43,148 [s3a-transfer-shared-pool1-t4] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:enterState(167)) - FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-4995600247628610940.tmp, state=Upload, dataSize=2097152, limit=8388608}: entering state Closed
+2017-01-31 18:33:43,148 [s3a-transfer-shared-pool1-t4] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:close(282)) - Closed FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-4995600247628610940.tmp, state=Closed, dataSize=2097152, limit=8388608}
+2017-01-31 18:33:43,148 [s3a-transfer-shared-pool1-t4] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:innerClose(805)) - Closing FileBlock{index=2, destFile=target/build/test/s3a/s3ablock-0002-4995600247628610940.tmp, state=Closed, dataSize=2097152, limit=8388608}
+2017-01-31 18:33:43,149 [s3a-transfer-shared-pool1-t4] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:closeBlock(857)) - block[2]: closeBlock()
+{code}, Although we have that cleanup patch, I'm still worried about streams not being closed when sent up with the xfer manager. I think we should be explicitly closing them ourselves just to make sure.
+
+I've tweaked the code so that the disk output stream logs a full stack trace at debug in close(), which makes it easier to spot in the logs, and shows where closure kicks in
+
+single blob PUT
+{code}
+2017-02-01 13:28:51,451 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:close(884)) - Block[1] closing stream of buffer file target/build/test/s3a/s3ablock-0001-8454965610295305282.tmp
+2017-02-01 13:28:51,452 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:close(889)) - stack: 
+java.io.IOException: Output stream closed
+	at org.apache.hadoop.fs.s3a.S3ADataBlocks$DiskBlock$DiskBlockInputStream.close(S3ADataBlocks.java:888)
+	at com.amazonaws.internal.ReleasableInputStream.doRelease(ReleasableInputStream.java:84)
+	at com.amazonaws.internal.ReleasableInputStream.close(ReleasableInputStream.java:68)
+	at com.amazonaws.internal.SdkFilterInputStream.close(SdkFilterInputStream.java:89)
+	at com.amazonaws.internal.SdkFilterInputStream.close(SdkFilterInputStream.java:89)
+	at java.io.BufferedInputStream.close(BufferedInputStream.java:483)
+	at com.amazonaws.internal.SdkBufferedInputStream.close(SdkBufferedInputStream.java:93)
+	at com.amazonaws.internal.SdkFilterInputStream.close(SdkFilterInputStream.java:89)
+	at com.amazonaws.event.ProgressInputStream.close(ProgressInputStream.java:182)
+	at com.amazonaws.util.IOUtils.closeQuietly(IOUtils.java:71)
+	at com.amazonaws.http.AmazonHttpClient.execute(AmazonHttpClient.java:322)
+	at com.amazonaws.services.s3.AmazonS3Client.invoke(AmazonS3Client.java:3785)
+	at com.amazonaws.services.s3.AmazonS3Client.putObject(AmazonS3Client.java:1472)
+	at org.apache.hadoop.fs.s3a.S3AFileSystem.putObjectDirect(S3AFileSystem.java:1090)
+	at org.apache.hadoop.fs.s3a.S3ABlockOutputStream$1.call(S3ABlockOutputStream.java:397)
+	at org.apache.hadoop.fs.s3a.S3ABlockOutputStream$1.call(S3ABlockOutputStream.java:392)
+	at org.apache.hadoop.fs.s3a.SemaphoredDelegatingExecutor$CallableWithPermitRelease.call(SemaphoredDelegatingExecutor.java:222)
+	at org.apache.hadoop.fs.s3a.SemaphoredDelegatingExecutor$CallableWithPermitRelease.call(SemaphoredDelegatingExecutor.java:222)
+	at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+	at java.lang.Thread.run(Thread.java:745)
+2017-02-01 13:28:51,455 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ABlockOutputStream (S3ABlockOutputStream.java:call(399)) - Closing block {} after put operation
+2017-02-01 13:28:51,455 [s3a-transfer-shared-pool1-t2] DEBUG s3a.S3ADataBlocks (S3ADataBlocks.java:enterState(167)) - FileBlock{index=1, destFile=target/build/test/s3a/s3ablock-0001-8454965610295305282.tmp, state=Upload, dataSize=16, limit=5242880}: entering state Closed
+{code}
+
+There is no stack trace in the multipart upload via {{S3client.uploadPart()}} anywhere in the test run. It's streams are not being closed., ..looking into {{com.amazonaws.services.s3.model.S3DataSource}}, the cleanup code call at the end of the multipart put doesn't 
+
+{code}
+// restore the original input stream so the caller could close                   
+// it if necessary                                                               
+req.setInputStream(inputStreamOrig);                                             
+req.setFile(fileOrig);                                                           
+{code}
+
+Conclusion: uploadPart really doesn't close input streams, we need to do it ourselves. As putObject *does*, I'm going to leave it alone, and rely on our new tests to pick up regressions in future, Patch 002
+
+explicitly closes the stream on the multipart put. Still now only doing the close/buffer release &c in the actual block.close, but being consistent and closing the stream to guarantee file handles aren't leaked until the GC., patch 002 is for 2.8+; tested on 2.8, branch-2 and trunk, all against s3a ireland, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 18m  3s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  9m 34s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 19s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 16s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 26s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  1m  3s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 36s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 14s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 15s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 14s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 17s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 11s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 11 new + 27 unchanged - 1 fixed = 38 total (was 28) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 10s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 20s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 21s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 36m 30s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Issue | HADOOP-14028 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12850437/HADOOP-14028-branch-2.8-002.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux b951db0510f5 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / 4f13564 |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11553/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11553/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11553/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, It's confirmed that the multipart part upload does not close streams; the docs will make it clearer in future. So yes, we do need to close it on a multipart commit, and no, not on a single part one.
+
+code will be updated accordingly, HADOOP-14028 Patch 003
+pulls in some of the changes coming in to HADOOP-13786 just to move the put/multipart put operations into the right place, and to do more diagnostics on block operations, plus the various checkstyle complaints.
+
+Based on some feedback from the SDK team, we must explicitly close the blocks on multipart, releasing the files. We do not need to do this for the putObject call. The disk block is now modified to delete the file in its close() as well as the stream: whichever closes first wins., | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 14s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 16s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 20s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 22s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 15s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 26s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 16s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 39s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 14s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 17s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 19s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 15s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 15s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 17s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 12s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 5 new + 26 unchanged - 2 fixed = 31 total (was 28) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 11s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 21s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 15m 52s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Issue | HADOOP-14028 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12850704/HADOOP-14028-branch-2.8-003.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux ae17cd972161 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / 4e423ed |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11565/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11565/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11565/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Patch 004; fix those bits of the checkstyle warnings I agreed with.
+
+testing: s3a ireland, all well, I'd like to get this into 2.8.0 if [~cnauroth] , [~jnp] or others could look @ this. [~Thomas Demoor] and [~ehiggs] should care about this too, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 21s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 25s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 17s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 18s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 14s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 24s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  1m  2s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 35s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 16s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 11s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 3 new + 26 unchanged - 2 fixed = 29 total (was 28) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 11s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 20s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 16s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 16m 28s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Issue | HADOOP-14028 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12850887/HADOOP-14028-branch-2.8-004.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 738c7a6cb3e4 3.13.0-103-generic #150-Ubuntu SMP Thu Nov 24 10:34:17 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / 2bbcaa8 |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11578/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11578/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11578/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, the two checkstyles are about having final read-only fields marked as protected rather than private+accessors, which, if the class in question were part of a public API would matter. As it is, the classes in S3ADataBlocks are all package private, so all uses will exist in our codebase, and encapsulating them would only be obsessive, I'll do some testing tomorrow., Quick review of v4 patch
+
+{noformat}
+@@ -392,8 +391,15 @@ private void putObject() throws IOException {
+         executorService.submit(new Callable<PutObjectResult>() {
+           @Override
+           public PutObjectResult call() throws Exception {
+-            PutObjectResult result = fs.putObjectDirect(putObjectRequest);
+-            block.close();
++            PutObjectResult result;
++            try {
++              // the put object call automatically closes the input
++              // stream afterwards.
++              result = writeOperationHelper.putObject(putObjectRequest);
++              block.close();
++            } finally {
++              closeCloseables(LOG, block);
++            }
+             return
+{noformat}
+
+Do you still need block.close() above finally block?
+
+{noformat}
+-      /**
+-       * Return the buffer to the pool after the stream is closed.
+-       */
+-      @Override
+-      public synchronized void close() {
+-        if (byteBuffer != null) {
+-          LOG.debug("releasing buffer");
+-          releaseBuffer(byteBuffer);
++        /**
++         * Return the buffer to the pool after the stream is closed.
++         */
++        @Override
++        public synchronized void close() {
++          LOG.debug("ByteBufferInputStream.close() for {}",
++              ByteBufferBlock.super.toString());
+           byteBuffer = null;
+         }
+-      }
+  
+-      /**
+-       * Verify that the stream is open.
+-       * @throws IOException if the stream is closed
+-       */
+-      private void verifyOpen() throws IOException {
+-        if (byteBuffer == null) {
+-          throw new IOException(FSExceptionMessages.STREAM_IS_CLOSED);
+{noformat}
+
+This part of diff was hard to read due to indent change, but did you eliminate the call to releaseBuffer(byteBuffer)?
+If so can you explain that a bit?
+
+
+, I'm running into HADOOP-14071 when using {{HADOOP-14028-branch-2.8-003.patch}}.
+
+It manages to complete intermittently and usually takes a few hours to fail., Regarding marker/stream rollback, Thomas [~Thomas Demoor] has suggested calling {{getRequestClientOptions().setReadLimit()}} for the memory block streams, to say "rollback as far as you want". Thomas: is this what you are thinking: set the limit to the block size to indicate that you can go back to the end
+
+{code}
+putObjectRequest.getRequestClientOptions().setReadLimit(size);
+{code}, patch 005.
+
+File references are passed in direct to s3 multipart puts, leaving it to deal with the reset on failure logic. This isn't done for single part puts, as that can only apparently be done at the expense of creating custom metadata, which we need so as to set encryption keys &c. Essentially, {{DataBlock.startUpload()}} moves from returning a stream to a {{BlockUploadData}} structure containing a stream *or* a file. In a multipart put, the file is explicitly picked up. For a single put, {{BlockUploadData.asInputStream()}} is called either to return that input stream or to open one for the file.
+
+
+
+# been through the code, method names and javadocs in the {{S3ADataBlocks}} file to make it consistent with current behaviour.
+# addressed aaron's comments about duplicate close() calls; both single and multipart puts will close things in the finally clause
+# Tested: s3a ireland, 128MB scale, all well apart from that intermittent root delete consistency failure.
+
+(my laptop died last week and I'm only slowly recovering with a dev setup...testing has been someone complicated here, and more review & testing very much appreciated), | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 19s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  9m  2s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 17s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 19s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 15s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 30s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  1m  1s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 39s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 14s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 16s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 17s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 13s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 3 new + 26 unchanged - 2 fixed = 29 total (was 28) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 12s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 21s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 16s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 18m 42s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Issue | HADOOP-14028 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12852840/HADOOP-14028-branch-2.8-005.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 702889bc5280 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / 4c47cb6 |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11633/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11633/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11633/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Not sure yet, looking at the aws sdk code but I'm still confused.
+
+This is the comment for readlimit in {{com.amazonaws.RequestClientOptions}}
+{code}
+ /**
+     * Used to enable mark-and-reset for
+     * non-mark-and-resettable non-file input stream for up to 128K memory
+     * buffering by default. Add 1 to get around an implementation quirk of
+     * BufferedInputStream.
+     *
+     * Retries after reading {@link #DEFAULT_STREAM_BUFFER_SIZE} bytes would
+     * fail to reset the underlying input stream as the mark position would
+     * have been invalidated.
+     *
+     */
+{code}
+The upload / partupload code gets this from a legacy system property and puts it in awsreq variable but the awsreq variable doesn't seem to be used anymore.  
+Code is here {{com/amazonaws/services/s3/AmazonS3Client.java:1627}} and here 
+{{com/amazonaws/services/s3/AmazonS3Client.java:3130}} (sdk 1.11.86)
+
+So don't think it's set for our inputstreams. I guess we currently use the default 128K+1byte?
+
+, it that case its not relevant, then mark  & reset should be doing the move, which is something that all the output streams we work with should support. So why the error message in HADOOP-14071 saying "use the option"
+
+
+maybe we should a a test to TestBlocks which verifies that mark & reset works for a multi MB block; straightforward enough., Looking at the latest code (the stuff we get with HADOOP-14040). The check is purely about mark supported and rollback
+{code}
+                if (requestInputStream.markSupported()) {
+                    try {
+                        requestInputStream.reset();
+                    } catch (IOException ex) {
+                        throw new ResetException("Failed to reset the request input stream", ex);
+                    }
+                }
+{code}
+I will do a test to verify that all blocks are supporting reset of the full datablock, and that new test shows..file streams don't support mark/reset
+{code}
+Tests run: 5, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 6.235 sec <<< FAILURE! - in org.apache.hadoop.fs.s3a.ITestS3ABlockOutputDisk
+testMarkReset(org.apache.hadoop.fs.s3a.ITestS3ABlockOutputDisk)  Time elapsed: 0.533 sec  <<< FAILURE!
+java.lang.AssertionError: Mark not supported in java.io.FileInputStream@7143d536
+	at org.junit.Assert.fail(Assert.java:88)
+	at org.junit.Assert.assertTrue(Assert.java:41)
+	at org.apache.hadoop.fs.s3a.ITestS3ABlockOutputArray.markAndResetDatablock(ITestS3ABlockOutputArray.java:134)
+	at org.apache.hadoop.fs.s3a.ITestS3ABlockOutputArray.testMarkReset(ITestS3ABlockOutputArray.java:147)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:498)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:47)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:44)
+	at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:26)
+	at org.junit.internal.runners.statements.RunAfters.evaluate(RunAfters.java:27)
+	at org.junit.rules.TestWatcher$1.evaluate(TestWatcher.java:55)
+	at org.junit.internal.runners.statements.FailOnTimeout$StatementThread.run(FailOnTimeout.java:74)
+{code}
+
+Looks like a valid complaint. 
+
+Looking at the AWS code, they have a special class, {{com.amazonaws.internal.ResettableInputStream}} which does the mark/reset operation by using the FileChannel behind a File; we need to always pass it down for mark/reset to work with file sources
+, patch 006 pass file down to the put request, simplify blockUploadData and tune tests,
+
+I've been into the AWS SDK now, as well as testing what's happening in the java.io code
+
+# we MUST pass in the File instance for reliable uploads of file data.
+# cleanup must therefore always be in the block close() call.
+
+tested: s3 ireland, with scale tests at 128M, cancel patch to rebase onto latest branch-2.8, Patch 007; patch 006 rebased to branch-2.8 after I put in rajesh's HADOOP-14081 patch
+
+Testing: s3a ireland with scale block size -> 128M, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  4s{color} | {color:red} HADOOP-14028 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HADOOP-14028 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12853598/HADOOP-14028-007.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11660/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, patch 007 named to be applied to same branch. Not sure how trunk has diverged, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  7m 40s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 6 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 34s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 19s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 15s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 24s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 14s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 34s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 12s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 16s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 11s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 4 new + 27 unchanged - 2 fixed = 31 total (was 29) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 10s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 20s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 22m  4s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Issue | HADOOP-14028 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12853765/HADOOP-14028-branch-2.8-007.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 80e2c0a596ee 3.13.0-103-generic #150-Ubuntu SMP Thu Nov 24 10:34:17 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / 2b3e8b7 |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11676/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11676/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11676/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Checkstyle complaints unimportant
+{code}
+./hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ABlockOutputStream.java:382:        : writeOperationHelper.newPutRequest(uploadData.getUploadStream(), size);: Line is longer than 80 characters (found 81).
+./hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ADataBlocks.java:212:    protected final long index;:26: Variable 'index' must be private and have accessor methods.
+./hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ADataBlocks.java:213:    protected final S3AInstrumentation.OutputStreamStatistics statistics;:63: Variable 'statistics' must be private and have accessor methods.
+./hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java:1:/*: File length is 2,374 lines (max allowed is 2,000)
+{Code}
+
+# 81 chars is acceptable for readability IMO
+# the visible fields are all final and for package private classes. We are in control of where these fields are referenced; wrapping them is needless.
+# File length is insurmountable (and getting worse). I've already moved stuff out of S3aFileSystem (e.g. all the listing stuff); not sure what else can be done. I worry more about class complexity, especially with the s3guard changes, than about overall length.
+
+This patch is ready for review, and it is important. Volunteers?, Really, really need urgent review here. [~liuml07], [~eddyxu], [~cnauroth] , [~Thomas Demoor] — others?, Will do a review this week. Any more reviews will be appreciated as I've just started looking at the problem/solution here., Functionality-wise, the patch has been working well for me on up to 70GB output files., Err, actually, with one caveat: if the process is killed (OOM, typically), uploaded files are somehow still marked as complete (but not always), even though the write didn't actually complete successfully., That's interesting, because we don't issue the complete until the final close kicked in. When you say "write didn't complete" do you mean "data hasn't been fully flushed?"; maybe the upload stream is being closed before some flush() is called by the source, I mean "data hasn't been fully created" (because the producer gets killed before it finishes generating it), but what's there may have been fully flushed (the "file" hasn't ended yet).
+
+It smelled like a {{finally}} block, but I'm not sure how the OOM killer ends up interacting with Java (specifically how much cleanup can be done)., Hi, Steve
+
+The patch LGTM. +1 pending the following changes. 
+ 
+{code}
+public static void closeAll(Logger log,
+      java.io.Closeable... closeables) {
+    for (java.io.Closeable c : closeables) {
+      if (c != null) {
+        try {
+          LOG.debug("Closing {}", c);
+          c.close();
+        } catch (Exception e) {
+          if (log != null && log.isDebugEnabled()) {
+            log.debug("Exception in closing {}", c, e);
+          }
+        }
+      }
+    }
+  }
+{code}
+
+Can be  {{package-private}}?  And {{LOG.debug("Closing {}", c);}} should be {{log.debug(...)}} to use the logger passed in.
+
+{code}
+static final class BlockUploadData implements Closeable {
+    public final File file;
+{code}
+
+It should be {{private final File file}}.
+
+Thanks a lot for the effort., +1
+
+I learned a lot from the threads here: how to debug and identify the problem from logging/stats, how to evaluate direct idea to solve the problem and end up with a comprehensive one. I'd suggest we change the subject to "not closing" instead of "don't delete temporary files" to make the problem clearer.
+
+One nit: can we use the {{IOUtilsClient#cleanup()}} instead of newly added {{closeAll()}}? Adding one more line of debug info to that method should just work fine.
+
+, Hadn't seen {{IOUtilsClient}}...it's in HDFS and we don't actually depend on it. Move those methods into hadoop common & I can use them, patch 008; patch feedback
+* make field private
+* use passed in log (with check for null first) in closeAll
+Also: used xor in precondition check so its clearer; added comment too.
+
+I've not moved to the hdfs-client {{IOUtilsClient#cleanup()}} because its in the wrong package. Also, looking at it and the Hadoop client one, both are at risk of failing if a closeable raises an exception in close() and then throws an NPE in {{toString()}}. The one here relies on SLF4J to be more robust in its string evaluation. I'd have pulled it into hadoop-common, except then I'd have to write the test to create the failure conditions., | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 16s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 6 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 34s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 19s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 15s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 24s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 16s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 34s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 12s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 15s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 14s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 11s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 4 new + 27 unchanged - 2 fixed = 31 total (was 29) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 10s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 20s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 16s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 14m 49s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Issue | HADOOP-14028 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12854467/HADOOP-14028-branch-2.8-008.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux de828f17db34 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / ff87ca8 |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11708/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11708/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11708/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, {quote}
+IOUtilsClient#cleanup() because its in the wrong package
+{quote}
+I missed that... sorry for the noise.
+
++1, Committed to branch-2.8. Here's the branch-2 patch for checkstyle to look at; it's slightly different due to some minor merge conflicts with the SSE code of HADOOP-13075, You can disregard my comments about prematurely / incorrectly closing the output file when the process terminates. It turns out that the input producer was the process being OOM killed, so I need to fix handling of premature end of inputs., Seth: thanks for that.
+
+regarding the branch-2 patch (which I consider +1'd in anyway, just the small diff going through yetus), tested s3 frankfurt with -Dscale & 32M files, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 18s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 6 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 37s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 19s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 16s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 27s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 16s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 34s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 12s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 12s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 11 new + 31 unchanged - 1 fixed = 42 total (was 32) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m  9s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 21s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 16s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 14m 51s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HADOOP-14028 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12854576/HADOOP-14028-branch-2-008.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 08d517f49f19 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 5c509f5 |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11712/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11712/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11712/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Interesting: the branch-2 yetus checkstyle run complained about stuff that was in the -2.8 branch patch, but not picked up on.
+
+patch 009 shuts up checkstyle as far as makes sense; no other changes
+
+tested @ scale, s3a ireland, AES256 encryption turned on, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 19s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 6 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 35s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 18s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 14s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 27s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 33s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 12s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 15s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 15s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 17s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 12s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 6 new + 31 unchanged - 1 fixed = 37 total (was 32) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 23s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 10s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 20s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 16s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 14m 45s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HADOOP-14028 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12854597/HADOOP-14028-branch-2-009.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux c6458574a225 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 5c509f5 |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11713/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11713/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11713/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, OK, final patch is in to branch-2.8+. 
+
+[~mojodna] —thank you for helping with the beta testing, finding this, and giving us the information we needed to track down and fix the problem. The next beta releases will have the patches. This is why participation in OSS beta releases is so important to users as well as us developers: the beta test phase is the best chance to get the bugs you see fixed within a few days to weeks., SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #11308 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/11308/])
+HADOOP-14028. S3A BlockOutputStreams doesn't delete temporary files in (stevel: rev dab00da19f25619ccc71c7f803a235b21766bf1e)
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3ABlockOutputArray.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ABlockOutputStream.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3ABlockOutputByteBuffer.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3ABlockOutputDisk.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/AbstractSTestS3AHugeFiles.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AInstrumentation.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestDataBlocks.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ADataBlocks.java
+]

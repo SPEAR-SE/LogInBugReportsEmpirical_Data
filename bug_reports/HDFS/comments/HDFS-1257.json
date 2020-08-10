@@ -1,0 +1,381 @@
+[ConcurrentModificationException is not a read-loack protection issue. Usually it means that you are modifying the collection while iterating on it. Is that the case?, I am quite sure it is not a case of modifying while iterating over the collection. ConcurrentModificationException is typically seen when a collection is modified while iterating on it,but that is not the case here. This is a case of two threads actually performing read/write without protection. The collection is not guaranteed to catch the multi-threaded case, but I have seen it happen.
+, My proposal is to wrap FSNamesystem#recentInvalidateSets in Collections.synchronizedMap(). That should fix this problem.
+
+
+--- a/src/hdfs/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
++++ b/src/hdfs/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+@@ -189,7 +189,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean, FSClusterSt
+   // Mapping: StorageID -> ArrayList<Block>
+   //
+   private Map<String, Collection<Block>> recentInvalidateSets = 
+-    new TreeMap<String, Collection<Block>>();
++    Collections.synchronizedMap(new TreeMap<String, Collection<Block>>());
+ 
+   //
+   // Keeps a TreeSet for every named node.  Each treeset contains
+, Is you test case reproducible / testable? A unit test would be the best.
+Using synchronizedMap is inefficient. We should rather see what went wrong with the existing locks., I will try to reproduce this with a unit-test, and will update with the results., Is ConcurrentHashMap an option here?  It is significantly more efficient than Collections.synchronizedMap().
+
+
+I believe ConcurrentModificationException can happen if a put() on a key happens at the same time as a get() with the normal HashMap.  Furthermore, if a put() or other operation causes the map to re-size, and there is a get() concurrently in progress, it can lead to the get ending up in an infinite loop.  I've seen that one many times.  ConcurrentHashMap doesn't have that issue., > Is ConcurrentHashMap an option here?
+
+I don't think so. Instead of introducing new synchronization points wee should totally rely on the existing locks. There is just a few., RecentInvalidateSets were protected by FSNamesystem lock. It seems to me that the ConcurrentModificationException might be caused by computeInvalidateWork accessing recentInvalidateSets without holding FsNamesystem lock. The following code should be surrounded by "synchronized (this)".
+{code}
+int numOfNodes = recentInvalidateSets.size();
+nodesToProcess = Math.min(numOfNodes, nodesToProcess);
+    
+// get an array of the keys
+ArrayList<String> keyArray =
+      new ArrayList<String>(recentInvalidateSets.keySet());
+{code}, Use protected access as suggested by Hairong., This doesn't solve the problem in general. We should make sure that access to {{blockManager}} methods is protected by {{FSNamesystem}} lock on the {{FSNamesystem}} level. Particularly in this example {{BlockManager.computeInvalidateWork()}} is called by {{FSNamesystem.computeDatanodeWork()}}, which correctly updates metrics in BlockManager under {{FSNamesystem}} lock, but calls to {{computeReplicationWork()}} and {{computeInvalidateWork()}} are done outside of the lock., Hi Konstantin, sorry for the delay in getting back to this.
+
+It seems difficult to come up with a general solution to this since some methods in {{BlockManager}} do fine grained locking with {{namesystem.readLock()/writeLock()}}. In particular, the call to {{BlockManager.computeReplicationWork}} that you referred to seems safe because of locking inside {{BlockManager.computeReplicationWorkForBlock()}}.
+
+BlockManager has several calls to {{namesystem.readLock()}} and {{namesystem.writeLock()}} apart from the one I mention. Are you suggesting a restructuring of those calls?, What is the status of this Jira?
+
+I believe that I am also running into this issue. I am using the yahoo_merge branch, but it should be the same in all branches.
+
+When running stress tests, the NameNode daemon receives a ConcurrentModificationException and exits during certain race conditions.
+
+This seems to be a fairly critical bug that could cause the NameNode to exit under stress conditions.
+
+The node configuration I am using is running a single indepent namenode on one machine and hundreds of simulated (by MiniDFSCluster) datanodes on each of 9 other machines, for a total of up to 2000 simulated datanodes.
+
+Than, in this environment, the DataNodeGenerator test is run, which does random reads, creates, writes, and deletes. The goal is to stress the NameNode with hundreds of operations per second.
+
+In some race conditions, when ReplicationMonitor() is calculating invalid blocks, the recentInvalidateSets TreeMap within BlockManager is being modified by one thread while the ReplicationMonitor() is iterating over it.
+
+Here is the exception and stack traceback:
+
+2011-06-08 15:33:41,551 WARN org.apache.hadoop.hdfs.server.namenode.FSNamesystem: ReplicationMonitor thread received Runtime exception.  
+java.util.ConcurrentModificationException
+        at java.util.TreeMap$PrivateEntryIterator.nextEntry(TreeMap.java:1100)
+        at java.util.TreeMap$KeyIterator.next(TreeMap.java:1154)
+        at java.util.AbstractCollection.toArray(AbstractCollection.java:124)
+        at java.util.ArrayList.<init>(ArrayList.java:131)
+        at org.apache.hadoop.hdfs.server.namenode.BlockManager.computeInvalidateWork(BlockManager.java:682)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.computeDatanodeWork(FSNamesystem.java:2978)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem$ReplicationMonitor.run(FSNamesystem.java:2925)
+        at java.lang.Thread.run(Thread.java:619)
+
+
+
+One thing I did try was to go into the BlockManager and put 'synchronized()' around all places that iterate over, add to, or remove from the recentInvalidateSets TreeMap variable.
+
+I'm not sure what performance (or other unforseen) ramifications this may have.
+
+However, I was able to eliminate the ConcurrentModificationException by using this fix, at least in my test
+environment.
+
+, @eric
+Can you post a patch for the proposed fix. We can review/study and figure out the proper locking method/granularity., Hi Konstantin and Ramkumar,
+
+I am running into this problem under stress conditions. In my case, it is a case of iteration and modification of recentInvalidateSets happening at the same time (reference the stack traceback). I can reproduce this fairly often using an environment that stresses the namenode.
+
+Was there a resolution to this issue? I agree that there needs to be a general solution to protect recentInvalidateSets.
+
+If you don't have any objections, I will go ahead and post a patch that is (possibly) more of a general solution.
+
+Thanks,
+-Eric, hi,
+
+I believe that I am running into this problem 2 times.  
+, I am still seeing this race condition on trunk.
+
+I have attached a patch that seems to fix it for me.
+
+I have synchronized() around the recentInvalidateSets Map in the BlockManager class.
+
+Most of the changes are whitespace that needed to happend because the code is now contained within synchronized() blocks.
+
+Since iterations through Map lists will cause the ConcurrentModificationException if something is modifying the list, I synchronized() around adds, removes, and iterations to the Map.
+
+I have not yet included a unit test. It's not so easy to unit test a race condition that only shows up under stress. I'm still working on it, but I wanted to get the patch out there for your consideration.
+
+Thanks,
+-Eric, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12490006/HDFS-1257.1.20110810.patch
+  against trunk revision 1155998.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these core unit tests:
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestReplicationPolicy
+                  org.apache.hadoop.hdfs.server.datanode.TestBlockRecovery
+                  org.apache.hadoop.hdfs.server.datanode.TestDataDirs
+                  org.apache.hadoop.hdfs.server.namenode.TestCheckpoint
+                  org.apache.hadoop.hdfs.server.namenode.TestGetImageServlet
+                  org.apache.hadoop.hdfs.server.namenode.TestINodeFile
+                  org.apache.hadoop.hdfs.server.namenode.TestNNLeaseRecovery
+                  org.apache.hadoop.hdfs.server.namenode.TestNNThroughputBenchmark
+                  org.apache.hadoop.hdfs.server.namenode.TestValidateConfigurationSettings
+                  org.apache.hadoop.hdfs.TestHDFSServerPorts
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+    +1 system test framework.  The patch passed system test framework compile.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/1076//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/1076//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1076//console
+
+This message is automatically generated., The test errors fall into 2 categoris:
+1) Failing in exactly the same way for me either when I build trunk or when I build with the 1257 patch.
+2) Not failing for me in trunk.
+
+There are no failures that fail in the patch build that did not also fail in the trunk build.
+
+----
+1) Failing in trunk 'ant test' build as well as in patch build:
+    org.apache.hadoop.hdfs.server.blockmanagement.TestReplicationPolicy
+    org.apache.hadoop.hdfs.server.namenode.TestCheckpoint
+        Failing for both on testSeparateEditsDirLocking()
+    org.apache.hadoop.hdfs.server.namenode.TestNNThroughputBenchmark
+        Failing for both on testNNThroughput()
+    org.apache.hadoop.hdfs.server.namenode.TestValidateConfigurationSettings
+        Failing for both on testThatMatchingRPCandHttpPortsThrowException()
+        Failing for both on testThatDifferentRPCandHttpPortsAreOK()
+    org.apache.hadoop.hdfs.TestHDFSServerPorts
+        Failing for both on testSecondaryNodePorts()
+
+----
+2) Not failing with patched code when I run 'ant test':
+    org.apache.hadoop.hdfs.server.datanode.TestBlockRecovery
+    org.apache.hadoop.hdfs.server.datanode.TestDataDirs
+    org.apache.hadoop.hdfs.server.namenode.TestGetImageServlet
+    org.apache.hadoop.hdfs.server.namenode.TestINodeFile
+    org.apache.hadoop.hdfs.server.namenode.TestNNLeaseRecovery
+, Included unit test TestProtectedBlockManager, Hi Eric, thanks for working on this.  Some comments on the patch.
+
+- belongsToInvalidates(..) is not synchronized.
+
+- In dumpRecentInvalidateSets(..), recentInvalidateSets.values().size() is not synchronized.
+
+- In invalidateWorkForOneNode(..), recentInvalidateSets.get(nodeId) is not synchronized.
+
+- Please use junit 4 in the test (i.e. org.junit.* instead of junit.framework.*).
+
+- Suggestion: how about move recentInvalidateSets and the related method to a standalone class?, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12490289/HDFS-1257.2.20110812.patch
+  against trunk revision 1157232.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these core unit tests:
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestReplicationPolicy
+                  org.apache.hadoop.hdfs.server.namenode.TestCheckpoint
+                  org.apache.hadoop.hdfs.server.namenode.TestNNThroughputBenchmark
+                  org.apache.hadoop.hdfs.server.namenode.TestValidateConfigurationSettings
+                  org.apache.hadoop.hdfs.TestHDFSServerPorts
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+    -1 system test framework.  The patch failed system test framework compile.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/1101//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/1101//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1101//console
+
+This message is automatically generated., Again, I just want to point out that the unit tests that are failing were failing on trunk without this patch., Hi Nicholas. Thank you for reviewing this patch.
+
+> belongsToInvalidates(..) is not synchronized.
+> In dumpRecentInvalidateSets(..), recentInvalidateSets.values().size() is not synchronized.
+> In invalidateWorkForOneNode(..), recentInvalidateSets.get(nodeId) is not synchronized.
+My thinking was that since these are "gets" and not iterations or modifications, they didn't need to be synchronized. However, that assumption is based on a dependency that the underlying implementation doesn't iterate in order to do the "get" or "size". So, I went ahead and put a synchronized() around these places as well, just as you suggested.
+
+
+> Please use junit 4 in the test (i.e. org.junit.* instead of junit.framework.*).
+Done
+
+
+> Suggestion: how about move recentInvalidateSets and the related method to a standalone class?
+I looked into doing this, and the methods that manipulate the recentInvalidateSets object are fairly dependent on and intertwined with the BlockManager class. These methods use several private BlockManager variables, for example. I think the separation is do-able, but introduces more risk and would require more care and testing. Can we create a separate Jira for this?
+, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12490469/HDFS-1257.3.20110815.patch
+  against trunk revision 1157232.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these core unit tests:
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestReplicationPolicy
+                  org.apache.hadoop.hdfs.server.datanode.TestBlockRecovery
+                  org.apache.hadoop.hdfs.server.datanode.TestDataDirs
+                  org.apache.hadoop.hdfs.server.namenode.TestCheckpoint
+                  org.apache.hadoop.hdfs.server.namenode.TestGetImageServlet
+                  org.apache.hadoop.hdfs.server.namenode.TestINodeFile
+                  org.apache.hadoop.hdfs.server.namenode.TestNNLeaseRecovery
+                  org.apache.hadoop.hdfs.server.namenode.TestNNThroughputBenchmark
+                  org.apache.hadoop.hdfs.server.namenode.TestValidateConfigurationSettings
+                  org.apache.hadoop.hdfs.TestHDFSServerPorts
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+    -1 system test framework.  The patch failed system test framework compile.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/1104//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/1104//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1104//console
+
+This message is automatically generated., Thanks for the update.  Some comments on the new patch:
+
+- In belongsToInvalidates(..), the call to invalidateSet.contains(block) is not synchronized.
+
+- In computeInvalidateWork(..), the call to recentInvalidateSets.size() is not synchronized.
+
+- In invalidateWorkForOneNode(..), two synchronized block should be combined.  Otherwise, the invalidateSet may be modified in-between.
+
+- Is TestProtectedBlockManager reliable?  It sometimes timed out in my machine.  It would be great if it can finish within 1 minute., Thanks Nicholas.
+
+> In belongsToInvalidates(..), the call to invalidateSet.contains(block) is not synchronized.
+Done.
+
+> In computeInvalidateWork(..), the call to recentInvalidateSets.size() is not synchronized.
+Done.
+
+> In invalidateWorkForOneNode(..), two synchronized block should be combined. Otherwise, the invalidateSet may be modified in-between.
+Done. For invalidateWorkForOneNode(), I also included the blocksToInvalidate processing inside of the synchronized() section because this is modifying individual invalidateSet lists from the recentInvalidateSets.
+
+> Is TestProtectedBlockManager reliable? It sometimes timed out in my machine. It would be great if it can finish within 1 minute.
+I changed the processing time from 180 seconds to 55 seconds.
+, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12490600/HDFS-1257.4.20110816.patch
+  against trunk revision 1158025.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these core unit tests:
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestReplicationPolicy
+                  org.apache.hadoop.hdfs.server.namenode.TestCheckpoint
+                  org.apache.hadoop.hdfs.server.namenode.TestNNThroughputBenchmark
+                  org.apache.hadoop.hdfs.server.namenode.TestValidateConfigurationSettings
+                  org.apache.hadoop.hdfs.TestDFSRollback
+                  org.apache.hadoop.hdfs.TestHDFSServerPorts
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+    -1 system test framework.  The patch failed system test framework compile.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/1107//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/1107//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1107//console
+
+This message is automatically generated., TestProtectedBlockManager still has some problems.
+
+- There was an AssertionError in [build #1107|https://builds.apache.org/job/PreCommit-HDFS-Build/1107/testReport/org.apache.hadoop.hdfs/TestProtectedBlockManager/testProtectedBlockManager/].
+{noformat}
+Exception in thread "Thread-278" java.lang.AssertionErro...[truncated 201 chars]...ue(Assert.java:43)
+	at org.apache.hadoop.hdfs.TestProtectedBlockManager$Workload.run(TestProtectedBlockManager.java:171)
+Exception in thread "Thread-281" java.lang.AssertionError: java.lang.AssertionError: ----- File 0.14402 has 3 blocks:  The 0 block has only 2 replicas but is expected to have 3 replicas.
+	at org.junit.Assert.fail(Assert.java:91)
+	at org.junit.Assert.assertTrue(Assert.java:43)
+	at org.apache.hadoop.hdfs.TestProtectedBlockManager$Workload.run(TestProtectedBlockManager.java:171)
+{noformat}
+
+- It still timed out in my machine.
+
+If it is too hard to add a new test, how about we remove it?, Hi Nicholas. Thanks for your patience in getting through the reviews of this.
+
+I'm confused as to why 1) you are seeing this error and 2) it is timing out for you. I'm not seeing that error in my environment. And, as for the timeout, even before when it was taking 3 minutes, it should not have timed out. There are a lot of unit tests that take longer than 3 minutes.
+
+Anyway, as for taking it out, the reason for doing so would be that the test is not sufficient to thoroughly test the race condition. A unit test just can't stress the namenode in the MiniDFSCluster enough to exercise this race condition. To hit this race condition, a test must be in a large cluster with a very active set of DFS actions happening over an extended period of time. There just isn't enough memory on a single host to create enough DNs in the MiniDFSCluster. And, even if there were enoubh memory, a unit test should not be running for a very long period.
+, > ... 1) you are seeing this error ...
+
+The error is in the Jenkins machine.  Here is the link 
+https://builds.apache.org/job/PreCommit-HDFS-Build/1107/testReport/org.apache.hadoop.hdfs/TestProtectedBlockManager/testProtectedBlockManager/, Removed TestProtectedBlockManager.java
+
+The following manual tests were performed:
+
+   1. On node 0, start the namenode daemon.
+   2. On nodes 1-9, run org.apache.hadoop.hdfs.DataNodeCluster which uses MiniDFSCluster to start 170 simulate datanodes per hardware node.
+   3. On Client, run org.apache.hadoop.fs.loadGenerator.LoadGenerator for several minutes to simulate a very heavy load of creates, writes, reads, and deletes.
+
+RESULTS:
+Before this patch, the NameNode would exit with ConcurrentModificationException while iterating / modifying the recentInvalidateSets.
+
+After this patch, the NameNode stays stable for the length of the test.
+
+, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12490689/HDFS-1257.5.20110817.patch
+  against trunk revision 1158743.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these core unit tests:
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestReplicationPolicy
+                  org.apache.hadoop.hdfs.server.namenode.TestCheckpoint
+                  org.apache.hadoop.hdfs.server.namenode.TestNNThroughputBenchmark
+                  org.apache.hadoop.hdfs.server.namenode.TestValidateConfigurationSettings
+                  org.apache.hadoop.hdfs.TestHDFSServerPorts
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+    -1 system test framework.  The patch failed system test framework compile.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/1111//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/1111//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1111//console
+
+This message is automatically generated., +1 patch looks good., I have committed this.  Thanks, Eric!, Great! Thanks a lot Nicholas!, {quote}
+> Suggestion: how about move recentInvalidateSets and the related method to a standalone class?
+... Can we create a separate Jira for this?
+{quote}
+I created HDFS-2273.
+, Patch for branch-0.20-security is uploaded. The patch for this branch is much simpler (as it seems to me) because there was no read-write lock and namesystem object lock was used., I just realized that Ramkumar uploaded a patch same as mine long time back. I still believe this patch is sufficient for the fix in 20 branch., The only unsync access to recentInvalidateSets is InvalidateQueueProcessingStats.postCheckIsLastCycle(..).  It is calling isEmpty() and so it not a problem.
+
+After looking at QueueProcessingStatistics a little bit, I suspect that there is a bug in counting cycles.  The potential bug is not related the patch.
+
++1 the 0.20s patch looks good., Committed to 205.1, Closed upon release of version 1.0.0.]

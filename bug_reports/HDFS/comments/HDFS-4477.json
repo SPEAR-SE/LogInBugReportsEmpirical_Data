@@ -1,0 +1,177 @@
+[Yes, the TSM has a thread that does things like roll secret keys, remove expired tokens, etc.  This thread isn't started in the 2NN because it mutates state, ie. you can't be generating and rolling keys in the 2NN.
+
+My first thought was for the TSM to discard expired tokens when reading & writing its state.  However, I think HA standby NNs will retain the tokens "forever" until they become the active.  We may need to generate edits for naturally expired tokens, just like we do for explicitly cancelled tokens., Untested, proposed patch, for feedback.  I think the solution is simple, but with the complexity of locking and HA interactions, I need feedback:
+* Add a hook method for subclasses of ADTSM to intercept token expiration
+* Modify NN's DTSM to notify FSN of the expiration
+* Add method to FSN that generates a cancel token edit op
+
+The new FSN method is unsynchronized because it will be called from the ADTSM's background thread.  The edit log op builders are thread-local, and the logEdit is synch'ed, so I think it's ok and preferable to not lock the whole namespace., I haven't had time to check 1.x, but I'm almost certain the bug is there.  This is one of those "I can't believe this when unnoticed for so long".
+
+Expired, ie. non-cancelled, tokens are discarded in a background thread.  The background thread is only started after leaving safemode.  No edits are produced unlike explicitly cancelled tokens.  So the 2NN loads up the image, applies edits, dumps out the image -- the 2NN never knows to discard the expired tokens, just the cancelled ones.  Now the NN loads up the mountain of tokens in the image, but then discards the expired ones after leaving safemode.  The fsimage just keeps bloating.  Forever.
+
++Long Term Impact+
+The severity of the problem is a 2NN was consuming ~15% more memory than the active NN and trashing in GC.  The 2NN holds less state, so that was surprising.  The image was discovered to contain ~42 MILLION tokens dating back to mid-2011.  Not 2012, yes, 2011.  Loading all the tokens added a significant ~8min to the startup time.
+
++Aggravating Factors+
+The main contributor to uncanceled tokens are a JT/RM conf hack to prevent cancellation of tokens after a job completes.  Otherwise an oozie job would have its tokens killed after the first sub-job completes.  It's not oozie/pig's fault that tokens aren't cancelled, it just aggravates the bug in the namenode.
+
+I'll dust off an old patch that reference counts tokens against jobs, so tokens will be cancelled but only when no other jobs are running with those tokens., Sigh, I think the problem also affects token secret keys., I'm updating for tokens and keys, and to handle startup discarding expired ones, and properly using the interrupts lock., Secret keys are never purged.  We have fsimages with years worth of every key ever created since the cluster was deployed.
+
+Again, completely untested, but please provide feedback on whether this is a viable approach before I spend more time:
+# Use edit log ops for expired tokens and secret keys to ensure NN, 2NN, and HA standbys stay in sync
+# Support noInterruptsLock for all expiration calls from background ADTSM thread handling expiration.
+# Removed odd behavior with rolling of secret key that would complicate the edit logging.  Namely, new secret keys have the expiration "keyroll + token max life".  Every keyroll, it added token max life to the previous key, so the prev key persisted for "keyroll + 2*(token max life)".  Huh?
+# Reduced scope of synch on the expire token/key methods to avoid log syncs stalling the ADTSM.
+
+I was going to have the ADTSM discard expired tokens & secret keys to allow the 2NN to "self-repair" during checkpoints.  I realized this would foul the offline image and edit viewers - they wouldn't accurate report what is in the image at a given point in time.
+
+I think the best way to repair the debris-filled namespace is during the NN upgrade to put the NN in safemode and explicitly save the namespace.  The NN will have already expunged expired secrets and tokens, so this will be a clean fsimage of only valid secrets and tokens for the 2NN to download., Please provide feedback on whether I should pursue this approach., Daryn, alternatively, could the expired tokens be ignored and not written to fsimage, during checkpointing?, Per my first comment, my initial thought was to ignore expired tokens when writing the image.  However, won't HA NNs in standby accumulate expired tokens and secrets until they go active and their TSM thread is activated to remove expired tokens & secrets?, bq. Per my first comment, my initial thought was to ignore expired tokens when writing the image. However, won't HA NNs in standby accumulate expired tokens and secrets until they go active and their TSM thread is activated to remove expired tokens & secrets?
+Sorry I missed the earlier comment.
+
+We should perhaps start TokenRemover thread in standby mode. I find it as a better alternative than writing those operations into editlog., Thinking it through, I have a few concerns for consideration.  It's not as easy as starting the TSM thread because it not only removes expired tokens but also starts generating and rolling secret keys - which we definitely don't want.  There would have to be a way to enable/disable secret key management independent of token expiration.
+
+I'm a bit nervous about:
+* Getting the enabling/disabling of token expiration and secret key management right for the primary NN, 2NN, backup NN, and standby NNs.  Some would have slightly unique properties.
+* Will also have to be careful to not break the JHS and RM that also use the ADTSM.  Changes to secret key management cannot impact them.
+* The 2NN changes from being a "dumb" data vessel, that only does what's it's told, to mutating state.  If the config values don't match the primary NN, the 2NN may start expiring tokens or secret keys too early.
+* The offline image/edit viewers may be misleading.  If I want to see what should be the state of the NN, for instance to verify this jira works, it will claim the NN is retaining tokens/secrets that it's not.
+
+I think writing expiration to the edit logs is a low-risk change because it simply parallels an explicit cancellation and avoids the concerns cited above.  However I'm open to alternatives.  Further thoughts?, Just looked at the code, starting the thread makes the TSM think it's "running" which disallows token ops from the edit log.  We'd need two booleans like "tokenExpireRunning" and "secretKeyManagementRunning"., After a discussion/agreement with Suresh, I'm implementing a quick fix for the 2NN with HADOOP-9341 and HDFS-4539.  These changes will not address HA issues.
+
+I do believe the best long-term solution is to treat token expiration identical to token cancellation.  We know the latter works, and won't require any special case handling of expiration.  This jira will remain open until the comprehensive solution is implemented., The quick-fix is marred by a race condition I was concerned about.  Kihwal and have studied the problem and found it's much worse than originally thought.
+
+The NN rolls the edits, followed by the 2NN downloading the image and rolled edits.  Tokens set to be expired during the duration of the download, but actually renewed during the download, will erroneously be removed from the image because the 2NN doesn't know about this edits.  The 2NN will now fail all future checkpoints when it can't apply edits for the non-existent token.  The 2NN will now start trying to checkpoint every minute, and always fail.
+
+Tokens are renewed at 90% of the expiration.  With the default 24h, that's a 2.4h window in which the checkpoint downloads must occur.  If the window is blown, you can try to delete the current fsimage on the NN, bounce the 2NN to clear its internal state, and let the 2NN use the prior image and reapply all the older and newer edits.  However, if the checkpoint blew the 2.4h window because of anything but a transient load or network congestion, it's going to blow the window again.  It'll require NN downtime to force a save of the namespace.
+
+Under normal load, some of our grids routinely take 1.5h+ to checkpoint due to the size of our images/edits and throttled download to avoid saturating the NIC.  Under heavy load, we are almost certain to lose the race.  Or if the 2NN is out of commission for long, we will hit this issue.  Incurring at least 15m of cluster downtime is not an option.
+
+We need another solution...
+, Hey Daryn,
+
+Are you still working on the fix here? I agree with you that explicitly logging token expiration as if it were a cancellation is the best bet for a fix that uses already-stable code paths and wouldn't be prone to races, clock skew issues, etc., Yes, I'm still working on it but it's been on the back-burner.  I hope to get back to it this week., Here is a stripped down patch that expires tokens as cancellations.  It mimics the behavior of updating the master key.
+
+Note that secret keys will continue to be retained forever, which is far less severe than the token leak, but that can be addressed on a separate jira.
+
+If this approach is reasonable, I'll write tests., Regarding earlier concern about the extra edits:  If the RM does its job correctly then tokens will be cancelled when the job completes - which means we've already taken the hit for the edit - and the NN won't have to issue internal cancels for expired tokens.  However, a "hack" for oozie/pig causes the RM to never cancel tokens for those jobs.  After the hack is removed (YARN-503 is the start), the NN should rarely have to expire tokens itself., Hey Daryn. I like the approach. Couple quick questions:
+- it looks like the new patched code no longer actually removes the expired tokens from the original token set when it adds them to the expiredTokens list. Am I missing something?
+- can you write a unit test for this for either the SBN in HA or for the 2NN in non-HA? Seems like it should be reasonably straightforward to set the token expiration time to 100millis, create a token, and make sure that the token gets purged from the SBN's namespace.
+
+I'm leaving on a trip for a couple weeks tonight, so may not be able to do more rounds of review until I get back. Feel free to commit based on +1s from other folks, though, after addressing the above., Yeah, looks like in my quick strip down of the patch I took out the "i.remove();".  Tests would have caught that. :)  Will get started on them., I was just thinking, do I really need to test anything more than the NN generates the cancel edit for an expire?  I would expect there's plenty of tests that verify edit replay for 2NN and SBN?, That's fair, makes sense. I think we even have some test utility somewhere which counts how many edits of each type are in a given edit log segment., In logExpireDelegationToken(), is it necessary to call logSync()?  Even if NN crashes before syncing these entries, there will be much consistency or security issues since they are expired ones. When NN comes back up, the token cancellation edit entries will be regenerated right away.  If you take out logSync(), you don't need to synchronize on noInterruptsLock.  As long as the same one thread is calling logExpireDelegationToken(), no further locking is necessary., >there will be much consistency or security issues since they are expired ones. 
+Sorry. it should be "there won't be"., bq. As long as the same one thread is calling logExpireDelegationToken(), no further locking is necessary.
+
+I feel a bit unconfortable about this. If we cannot guaranty/enforce this, the namespace lock should be acquired before calling logExpireDelegationToken().  If we can check the thread identity of the caller in this method, we can avoid the locking., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12578241/HDFS-4477.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4220//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4220//console
+
+This message is automatically generated., bq. I feel a bit unconfortable about this.
+I think it should be okay. The only data that is unprotected is the thread local ones being manipulated inside the log method. The caller thread won't corrupt other threads' local data or any other thread will corrupt the caller thread's data even without a lock., We still need to synchronize on {{noInterruptsLock}} because logEdit() calls logSync() for autosync. So in the end, the only suggested change will be taking out logSync(). Other than logSync() the patch looks good. +1., Only change is removal of the logSync.  Kihwal and I both puzzled over the edit log code so his comments reflect our joint findings., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12578282/HDFS-4477.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4225//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4225//console
+
+This message is automatically generated., I've committed this to trunk and branch-2. I hold branch-0.23 merge until HDFS-4690 is done., Integrated in Hadoop-trunk-Commit #3608 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/3608/])
+    HDFS-4477. Secondary namenode may retain old tokens. Contributed by Daryn Sharp. (Revision 1467307)
+
+     Result = SUCCESS
+kihwal : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1467307
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenSecretManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenSecretManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+, Integrated in Hadoop-Yarn-trunk #182 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/182/])
+    HDFS-4477. Secondary namenode may retain old tokens. Contributed by Daryn Sharp. (Revision 1467307)
+
+     Result = SUCCESS
+kihwal : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1467307
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenSecretManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenSecretManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+, Integrated in Hadoop-Hdfs-trunk #1371 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1371/])
+    HDFS-4477. Secondary namenode may retain old tokens. Contributed by Daryn Sharp. (Revision 1467307)
+
+     Result = FAILURE
+kihwal : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1467307
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenSecretManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenSecretManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+, Integrated in Hadoop-Mapreduce-trunk #1398 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1398/])
+    HDFS-4477. Secondary namenode may retain old tokens. Contributed by Daryn Sharp. (Revision 1467307)
+
+     Result = SUCCESS
+kihwal : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1467307
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenSecretManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenSecretManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+, Token#decodeIndentifier() is not present in branch-0.23, so the new test case won't compile in 0.23, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12583512/HDFS-4477.branch-23.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4402//console
+
+This message is automatically generated., The modified test compiles and runs fine on 0.23. I've committed it to branch-0.23., Integrated in Hadoop-Hdfs-0.23-Build #610 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/610/])
+    HDFS-4477. Secondary namenode may retain old tokens. Contributed by Daryn Sharp. (Revision 1483513)
+
+     Result = SUCCESS
+kihwal : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1483513
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/AbstractDelegationTokenSecretManager.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenSecretManager.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+]

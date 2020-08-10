@@ -1,0 +1,224 @@
+[Also the number of reducers shown in the golden files are 2, and based on the configuration I think it should be 4. See for example:
+https://github.com/apache/hive/blob/master/ql/src/test/results/clientpositive/spark/spark_dynamic_partition_pruning_2.q.out#L197
+
+I think this has to has some connection with the creation and - in case of the config change - the recreation of the RpcServer, which for the first time.
+
+I will dig further into it, but any pointers would be nice [~stakiar], or [~xuefuz].
+
+Thanks,
+Peter, I'm not sure why the MiniSparkOnYarn cluster shows only 1 executor. My best guess is that the tests get are started as soon as 1 executor has started (see {{QTestUtil#createSessionState}}). Its possible the test just finishes before the second executor even gets created.
+
+When running against a real cluster, it depends if {{spark.dynamicAllocation.enabled}} is set to true or not. If it is true, then the number of executors will be scaled up and down depending on the resource load.
+
+{{spark.dynamicAllocation.enabled}} is {{false]} by default, so I don't think its enabled fro the MiniSparkOnYarn tests (although maybe we should change that).
+
+I'm not sure I understand your comment about the reducers. Why should it be 4 instead of 2?, ??I'm not sure why the MiniSparkOnYarn cluster shows only 1 executor. My best guess is that the tests get are started as soon as 1 executor has started (see QTestUtil#createSessionState). Its possible the test just finishes before the second executor even gets created.??
+
+The strange thing is, that not only the first query is showing only 1 executor in the test files, but all of them. But when I was running the tests on the cluster the first run shows 1 executor, the following ones 2 (until I change some spark configuration and the next one is only 1 executor again)
+
+On the cluster I have unset {{spark.dynamicAllocation.enabled}}, to match the config of the {{MiniSparkOnYarn}} tests
+
+The number of reducers are printed by this:
+{code:title=ExplainTask}
+  private JSONObject outputMap(Map<?, ?> mp, boolean hasHeader, PrintStream out,
+      boolean extended, boolean jsonOutput, int indent) throws Exception {
+[..]
+            boolean isFirst = true;
+            for (SparkWork.Dependency dep: (List<SparkWork.Dependency>) ent.getValue()) {
+              if (!isFirst) {
+                out.print(", ");
+              } else {
+                out.print("<- ");
+                isFirst = false;
+              }
+              out.print(dep.getName());
+              out.print(" (");
+              out.print(dep.getShuffleType());
+              out.print(", ");
+              out.print(dep.getNumPartitions());
+              out.print(")");
+            }
+[..]
+    return jsonOutput ? json : null;
+  }
+{code}
+
+The GenSparkUtils.getEdgeProperty sets this:
+{code:title=GenSparkUtils}
+  public static SparkEdgeProperty getEdgeProperty(ReduceSinkOperator reduceSink,
+      ReduceWork reduceWork) throws SemanticException {
+    SparkEdgeProperty edgeProperty = new SparkEdgeProperty(SparkEdgeProperty.SHUFFLE_NONE);
+    edgeProperty.setNumPartitions(reduceWork.getNumReduceTasks());
+[..]
+    return edgeProperty;
+  }
+{code}
+
+Which is set by SetSparkReducerParallelism:
+{code:title=SetSparkReducerParallelism}
+  @Override
+  public Object process(Node nd, Stack<Node> stack,
+      NodeProcessorCtx procContext, Object... nodeOutputs)
+      throws SemanticException {
+[..]
+        LOG.info("Set parallelism for reduce sink " + sink + " to: " + numReducers +
+            " (calculated)");        <-- I see this in the logs which are matching the values in the explain plans
+        desc.setNumReducers(numReducers);
+[..]
+    return false;
+  }
+{code}
+
+This is the depth where I had to go home today :)
+If no new pointers, then I will dig deeper tomorrow :)
+
+Thanks,
+Peter, 1. The number of executors could be a matter of MiniSparkOnYarn configuration. By default, it has only one node manager. However, I'm not sure how many containers are allowed by that node manager. cc: [~lirui].
+2. I didn't get why the reducer should be 4. Though the number of available cores/memory plays a role, data size is also a factor. {{SetSparkReducerParallelism}} is the right place to look., {code:title=SparkSessionImpl}
+  @Override
+  public ObjectPair<Long, Integer> getMemoryAndCores() throws Exception {
+    SparkConf sparkConf = hiveSparkClient.getSparkConf();
+    int numExecutors = hiveSparkClient.getExecutorCount();
+[..]
+    int totalCores;
+    String masterURL = sparkConf.get("spark.master");
+    if (masterURL.startsWith("spark")) {
+[..]
+    } else {
+      int coresPerExecutor = sparkConf.getInt("spark.executor.cores", 1);
+      totalCores = numExecutors * coresPerExecutor;
+    }
+    totalCores = totalCores / sparkConf.getInt("spark.task.cpus", 1);
+
+    long memoryPerTaskInBytes = totalMemory / totalCores;
+    LOG.info("Spark cluster current has executors: " + numExecutors
+        + ", total cores: " + totalCores + ", memory per executor: "
+        + executorMemoryInMB + "M, memoryFraction: " + memoryFraction);
+    return new ObjectPair<Long, Integer>(Long.valueOf(memoryPerTaskInBytes),
+        Integer.valueOf(totalCores));
+  }
+{code}
+
+So my guess is the problem with {{hiveSparkClient.getExecutorCount()}}
+
+This seems right, but... Who knows :)
+{code:title=SparkClientImpl.GetExecutorCountJob}
+  private static class GetExecutorCountJob implements Job<Integer> {
+      private static final long serialVersionUID = 1L;
+
+      @Override
+      public Integer call(JobContext jc) throws Exception {
+        // minus 1 here otherwise driver is also counted as an executor
+        int count = jc.sc().sc().getExecutorMemoryStatus().size() - 1;
+        return Integer.valueOf(count);
+      }
+
+  }
+{code}, When automatically deciding numReducers, it should be no less than numCores. On the other side, {{spark.executor.instances}} is numContainers spark will request from YARN. How many containers can be really allocated is up to YARN.
+So I can think of two possible reasons why we have 2 instead of 4 here.
+# Only 1 container is allocated, in which case 2 is the right way to go.
+# 2 containers are allocated but only 1 has started running when we get the executor count. This is a common case in real cluster and can make our test result unstable. We should find a way to fix it.
+
+I guess we can monitor the log of the mini-yarn test to see how many cores we really have during execution., Ok, I think I understand now what is happening.
+
+When running {{TestMiniSparkOnYarnCliDriver}} tests, we set the number of execution instances to 2 in the {{data/conf/spark/yarn-client/hive-site.xml}}:
+{code}
+<property>
+  <name>spark.executor.instances</name>
+  <value>2</value>
+</property>
+{code}
+
+When running this code against a {{Hadoop23Shims.MiniSparkShim}} we create the cluster with this {{new MiniSparkOnYARNCluster("sparkOnYarn")}}. This means that the cluster is created with 1 nodeManager. So no matter what we set in the configuration we will have only 1 executor (SparkClientImpl.GetExecutorCountJob will return 1). Thus the resulting explain output will show 2*1 reducers:
+{code}
+   Stage: Stage-1
+     Spark
+       Edges:
+         Reducer 2 <- Map 1 (GROUP, 2)      <-- number of reducers are instances * cores
+         Reducer 3 <- Reducer 2 (SORT, 1)
+{code}
+
+The good news is, that the resulting output is consistent - always will show {{2}}.
+No change is absolutely needed, but I would prefer to use consistent configuration - so I propose one of the followings:
+# Change the {{spark.executor.instances}} to 1 in the hive-site.xml, or
+# Change the cluster creation to have more nodes {{new MiniSparkOnYARNCluster("sparkOnYarn", 1, 2)}}
+
+I expect these changes will not affect the test outputs at all. I personally prefer the 1st, since it will require less resource to run the tests, and I do not see the point of having more cores for every test.
+
+
+Another change I propose is that when we are not able to get the executors we should fall back to the one provided by the configuration, so we can provide better experience in the first run too. So instead of this:
+{code:title=SparkClientImpl}
+  public ObjectPair<Long, Integer> getMemoryAndCores() throws Exception {
+    SparkConf sparkConf = hiveSparkClient.getSparkConf();
+    int numExecutors = hiveSparkClient.getExecutorCount();
+    // at start-up, we may be unable to get number of executors
+    if (numExecutors <= 0) {
+      return new ObjectPair<Long, Integer>(-1L, -1);
+    }
+[..]
+  }
+{code}
+
+We should read the configuration:
+{code}
+  @Override
+  public ObjectPair<Long, Integer> getMemoryAndCores() throws Exception {
+    SparkConf sparkConf = hiveSparkClient.getSparkConf();
+    int numExecutors = hiveSparkClient.getExecutorCount();
+    // at start-up, we may be unable to get number of executors, use the configuration values in this case
+    if (numExecutors <= 0) {
+      numExecutors = sparkConf.getInt("spark.executor.instances", 1);
+    }
+[..]
+  }
+{code}
+
+What do you think about this [~stakiar], [~xuefuz], [~lirui]? If we agree, I can create the required patches / jiras etc.
+And many thanks for your pointers! Those are helped me tremendously!
+
+Peter, Thanks for the investigation, [~pvary].
+
+Auto determining the number of reducers seems rather complicated. Currently, we don't try to get memory/core when dynamic allocation is enabled because of the dynamic nature of the executors. While it seems reasonable to use {{spark.executor.instances}} as an input, the help is limited in my opinion as static allocation is expected to be rare in real production.
+
+I also had some doubts on the original idea which was to automatically and dynamically deciding the parallelism based on available memory/cores. Maybe we should back to the basis, where the number of reducers is solely determined (statically) by the total shuffled data size (stats) divided by the configuration "bytes per reducer". I'm open to all proposals, including doing this for dynamic allocation and using {{spark.executor.instances}} for static allocation.
+, Hi [~pvary], I don't understand why 1 NM means we can only have 1 executor. IIUC, NM can allocate executor/container if there's enough memory. Each executor requires 512MB mem, and the AM take another 512MB. So we use 1536MB in total. We start the NM with [2048MB total mem|https://github.com/apache/hive/blob/master/shims/0.23/src/main/java/org/apache/hadoop/hive/shims/Hadoop23Shims.java#L493], which should be able to satisfy all the requests., Thanks [~lirui] for the pointers. Based on that i was able to finally identify the source of the problem {{yarn.scheduler.minimum-allocation-mb}}. By default it is 1024 (MB), so the FairScheduler will use it as an increment. If we set it to 512, the we will have 4 reducers as expected.
+
+[~xuefuz]: If I understand the code correctly, when {{spark.dynamicAllocation.enabled}} is set to {{true}} then {{SetSparkReducerParallelism.getSparkMemoryAndCores()}} will set {{SetSparkReducerParallelism.sparkMemoryAndCores}} to {{null}}. And if this is null, then the number of reducers should be based only on the size of the data. So everything should be great.
+In code:
+{code:title=SetSparkReducerParallelism.process()}
+[..]
+          // Divide it by 2 so that we can have more reducers
+          long bytesPerReducer = context.getConf().getLongVar(HiveConf.ConfVars.BYTESPERREDUCER) / 2;
+          int numReducers = Utilities.estimateReducers(numberOfBytes, bytesPerReducer,
+              maxReducers, false);
+
+          getSparkMemoryAndCores(context);        <-- this will return null, if dynamicAllocation is enabled
+          if (sparkMemoryAndCores != null &&
+              sparkMemoryAndCores.getFirst() > 0 && sparkMemoryAndCores.getSecond() > 0) {
+            // warn the user if bytes per reducer is much larger than memory per task
+            if ((double) sparkMemoryAndCores.getFirst() / bytesPerReducer < 0.5) {
+              LOG.warn("Average load of a reducer is much larger than its available memory. " +
+                  "Consider decreasing hive.exec.reducers.bytes.per.reducer");
+            }
+
+            // If there are more cores, use the number of cores
+            numReducers = Math.max(numReducers, sparkMemoryAndCores.getSecond());
+          }
+          numReducers = Math.min(numReducers, maxReducers);
+          LOG.info("Set parallelism for reduce sink " + sink + " to: " + numReducers +
+              " (calculated)");
+          desc.setNumReducers(numReducers);
+[..]
+{code}
+
+So I will provide a patch to use the configuration values if dynamicAllocation is turned off, and the {{SparkSessionImpl.getExecutorCount()}} returns negative number.
+
+One more question remains - or after [~lirui] comment - we have a better  option:
+How to handle the misconfiguration in the tests:
+# Change the spark.executor.instances to 1 in the hive-site.xml, or
+# Change the yarn.scheduler.minimum-allocation-mb to 512, so we really will have 2 executors
+
+Thanks for your help [~lirui], [~xuefuz]!
+
+Peter
+, All subtasks are closed, so closing this too, Hive 3.0.0 has been released so closing this jira.]

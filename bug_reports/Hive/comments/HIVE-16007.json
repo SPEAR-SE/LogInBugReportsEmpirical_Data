@@ -1,0 +1,293 @@
+[When the execute of the statement in HiveStatement.runAsyncOnServer() is not successful, then the stmtHandle is never set. See:
+{code:title=HiveStatement.runAsyncOnServer}
+  private void runAsyncOnServer(String sql) throws SQLException {
+[..]
+    try {
+      TExecuteStatementResp execResp = client.ExecuteStatement(execReq);
+      Utils.verifySuccessWithInfo(execResp.getStatus());
+      stmtHandle = execResp.getOperationHandle();
+      isExecuteStatementFailed = false;
+    } catch (SQLException eS) {
+      isExecuteStatementFailed = true;
+      throw eS;
+    } catch (Exception ex) {
+      isExecuteStatementFailed = true;
+      throw new SQLException(ex.toString(), "08S01", ex);
+    }
+  }
+{code}
+
+The problem is caused by HiveStatement.hasMoreLogs() returning true, since the isLogBeingGenerated is true by default, and not set in any of the catch statements above.
+The LogRunnable.updateQueryLog() will call HiveStatement.getQueryLog() will throw an exception since the stmtHandle is null, and the isExecuteStatementFailed is true {{Method getQueryLog() failed. Because the stmtHandle in HiveStatement is null and the statement execution might fail.}}, and later when BeeLine closed the statement the HiveStatement.getQueryLog() will throw {{Can't getConnection after statement has been closed}} exception. But still the hasMoreLogs() will return true, so we have an infinite loop here:
+{code:title=LogRunnable.run()}
+    @Override public void run() {
+      while (hiveStatement.hasMoreLogs()) {
+        try {
+          updateQueryLog();
+          Thread.sleep(queryProgressInterval);
+        } catch (SQLException e) {
+          commands.error(new SQLWarning(e));
+        } catch (InterruptedException e) {
+          commands.debug("Getting log thread is interrupted, since query is done!");
+          commands.showRemainingLogsIfAny(hiveStatement);
+        }
+      }
+    }
+{code}, The patch proposes two changes:
+- Set the {{isLogBeingGenerated}} to false if there is an exception executing the statement
+- Handle the interruption more agressively
+-- When interrupt arrives then try to fetch the logs and then finish running the LogRunnable thread
+-- We check the interruption status before fetching the logs, and if the thread is interrupted then fetch the remaining logs and exit. This prevents the possible active loop when we get an exception so we does not sleep, and will not get the InterruptedException even though the parent thread finished the statement execution, +1 pending tests, I am not entirely satisfied with the patch. There are still 2 extra lines in the output:
+{code}
+jdbc:hive2://localhost:10000> k;
+Warning: java.sql.SQLException: Method getQueryLog() failed. Because the stmtHandle in HiveStatement is null and the statement execution might fail. (state=,code=0)
+Warning: java.sql.SQLException: Method getQueryLog() failed. Because the stmtHandle in HiveStatement is null and the statement execution might fail. (state=,code=0)
+0: jdbc:hive2://localhost:10000> Error: Error while compiling statement: FAILED: ParseException line 1:0 cannot recognize input near 'k' '<EOF>' '<EOF>' (state=42000,code=40000)
+{code}, Added checks before querying the logs, so will not call {{hiveStatement.getQueryLog}} if the statement could not provide it.
+
+This removes the last 2 unnecessary warnings., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12854210/HIVE-16007.2.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 5 failed/errored test(s), 10251 tests executed
+*Failed tests:*
+{noformat}
+TestDerbyConnector - did not produce a TEST-*.xml file (likely timed out) (batchId=235)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[vector_if_expr] (batchId=140)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query14] (batchId=223)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query23] (batchId=223)
+org.apache.hadoop.hive.cli.TestSparkNegativeCliDriver.org.apache.hadoop.hive.cli.TestSparkNegativeCliDriver (batchId=230)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/3731/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/3731/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-3731/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 5 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12854210 - PreCommit-HIVE-Build, The failures are unrelated:
+- HIVE-15744 - Flaky test: TestPerfCliDriver.query23, query14
+- HIVE-15776 - Flaky test: TestMiniLlapLocalCliDriver vector_if_expr
+- HIVE-15165 - Flaky test: TestSparkNegativeCliDriver
+
+[~sershe]: Could you please review?
+
+Thanks,
+Peter, Rebasing patch after HIVE-16045.
+
+After HIVE-16045 (refactoring the log fetching while loop) the LogRunnable thread now stops after an invalid query, but beeline still prints out several invalid error lines with {{--showWarnings=true}} when the query does not compile.
+
+To reproduce:
+{code}
+$ ./beeline -u "jdbc:hive2://localhost:10000 pvary pvary" --showWarnings=true
+[..]
+Connecting to jdbc:hive2://localhost:10000
+Connected to: Apache Hive (version 2.2.0-SNAPSHOT)
+Driver: Hive JDBC (version 2.2.0-SNAPSHOT)
+Transaction isolation: TRANSACTION_REPEATABLE_READ
+Beeline version 2.2.0-SNAPSHOT by Apache Hive
+0: jdbc:hive2://localhost:10000> k;
+k;
+Warning: java.sql.SQLException: Method getQueryLog() failed. Because the stmtHandle in HiveStatement is null and the statement execution might fail. (state=,code=0)
+Warning: java.sql.SQLException: Method getQueryLog() failed. Because the stmtHandle in HiveStatement is null and the statement execution might fail. (state=,code=0)
+Error: Error while compiling statement: FAILED: ParseException line 1:0 cannot recognize input near 'k' '<EOF>' '<EOF>' (state=42000,code=40000)
+0: jdbc:hive2://localhost:10000> 
+{code}
+
+Could you please review: [~thejas], [~anishek].
+
+Thanks,
+Peter
+, [~pvary] showWarnings seems to indicate warnings for connection problems.  parse failures does not relate to connection problems and hence the change in patch to make *isLogBeingGenerated = false;* is good. 
+
+how ever i think we should from method
+{code}
+public List<String> getQueryLog(boolean incremental, int fetchSize)
+      throws SQLException, ClosedOrCancelledStatementException
+{code}
+
+remove the code block
+{code}
+        if (isExecuteStatementFailed) {
+          throw new SQLException("Method getQueryLog() failed. Because the stmtHandle in " +
+              "HiveStatement is null and the statement execution might fail.");
+        }
+{code}
+
+[~thejas] what do you think ?, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12855595/HIVE-16007.3.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 12 failed/errored test(s), 10283 tests executed
+*Failed tests:*
+{noformat}
+TestCommandProcessorFactory - did not produce a TEST-*.xml file (likely timed out) (batchId=272)
+TestDbTxnManager - did not produce a TEST-*.xml file (likely timed out) (batchId=272)
+TestDummyTxnManager - did not produce a TEST-*.xml file (likely timed out) (batchId=272)
+TestHiveInputSplitComparator - did not produce a TEST-*.xml file (likely timed out) (batchId=272)
+TestIndexType - did not produce a TEST-*.xml file (likely timed out) (batchId=272)
+TestSplitFilter - did not produce a TEST-*.xml file (likely timed out) (batchId=272)
+org.apache.hadoop.hive.cli.TestBeeLineDriver.testCliDriver[escape_comments] (batchId=229)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[schema_evol_text_vec_table] (batchId=147)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query14] (batchId=224)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query23] (batchId=224)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vector_between_in] (batchId=119)
+org.apache.hive.beeline.TestBeeLineWithArgs.testEmbeddedBeelineOutputs (batchId=212)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/3892/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/3892/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-3892/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 12 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12855595 - PreCommit-HIVE-Build, [~anishek], [~thejas]: Any thoughts?
+
+Thanks,
+Peter, tests
+* org.apache.hive.beeline.TestBeeLineWithArgs.testEmbeddedBeelineOutputs (batchId=212)
+* org.apache.hadoop.hive.cli.TestBeeLineDriver.testCliDriver[escape_comments] (batchId=229)  
+
+are beeline related, ca you please verify them once to make sure they pass.
+otherwise 
+
++1
+
+sorry about the delay!, Reattaching the same patch, to see the test results., Trying again - pre-commit jenkins was not working, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12859545/HIVE-16007.4.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 4 failed/errored test(s), 10478 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestBeeLineDriver.testCliDriver[drop_with_concurrency] (batchId=231)
+org.apache.hadoop.hive.cli.TestBeeLineDriver.testCliDriver[escape_comments] (batchId=231)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[comments] (batchId=35)
+org.apache.hive.beeline.TestBeeLineWithArgs.testEmbeddedBeelineOutputs (batchId=214)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/4247/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/4247/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-4247/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 4 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12859545 - PreCommit-HIVE-Build, Rebased the patch, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12859726/HIVE-16007.5.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 4 failed/errored test(s), 10480 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestBeeLineDriver.testCliDriver[drop_with_concurrency] (batchId=231)
+org.apache.hadoop.hive.cli.TestBeeLineDriver.testCliDriver[escape_comments] (batchId=231)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[comments] (batchId=35)
+org.apache.hive.beeline.TestBeeLineWithArgs.testEmbeddedBeelineOutputs (batchId=214)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/4266/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/4266/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-4266/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 4 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12859726 - PreCommit-HIVE-Build, The BeeLine tests error were relevant. The last lines of the log was not fetched. Removed the Exception instead., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12859757/HIVE-16007.6.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 1 failed/errored test(s), 10480 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[comments] (batchId=35)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/4270/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/4270/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-4270/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 1 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12859757 - PreCommit-HIVE-Build, Hi [~anishek],
+
+I have rebased the changes. Still had issues with the tests where BeeLine did not fetch the final few lines of the test logs.
+In the end, I have used your suggestion and removed the following code block:
+{code}
+        if (isExecuteStatementFailed) {
+          throw new SQLException("Method getQueryLog() failed. Because the stmtHandle in " +
+              "HiveStatement is null and the statement execution might fail.");
+        }
+{code}
+
+The last test failure is not related. See: HIVE-16256 - Flaky test: TestCliDriver.testCliDriver(comments)
+
+Could you please review?
+
+Thanks,
+Peter
+
+, Pressed the cancel patch on this jira instead the other one.
+This patch is ready to review/commit, [~pvary] looks good +1 , did not get any notification for https://issues.apache.org/jira/browse/HIVE-16007?focusedCommentId=15935966&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15935966
+
+not sure why. , Thanks [~anishek]!
+
+Than it was a happy coincidence, that I canceled the wrong patch :D, [~pvary] The patch looks good to me too. +1 . Since it has already been reviewed days ago, I will commit it now., Fix has been pushed to master for {{3.0.0}} and to branch-2 for {{2.3.0}}. Thank you [~pvary] for your contribution., Hive 3.0.0 has been released so closing this jira.]

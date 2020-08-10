@@ -1,0 +1,790 @@
+[Good catch, marking for 3.4.0 (we should verify both java and c clients), Pat/Ryan, 
+ Anyone of you working on this for 3.4?, Moving this to 3.5. Not a blocker., This problem is due to server closing the connection silently when Client's lastSeenZxid is greater than Server's current zxid.
+
+This is due to following snippet code in NIOServerCnxn.
+{code}
+        if (connReq.getLastZxidSeen() > zk.getZKDatabase().getDataTreeLastProcessedZxid()) {
+            String msg = "Refusing session request for client "
+                + sock.socket().getRemoteSocketAddress()
+                + " as it has seen zxid 0x"
+                + Long.toHexString(connReq.getLastZxidSeen())
+                + " our last zxid is 0x"
+                + Long.toHexString(zk.getZKDatabase().getDataTreeLastProcessedZxid())
+                + " client must try another server";
+
+            LOG.info(msg);
+            throw new CloseRequestException(msg);
+        }
+{code}
+
+In which case this may happen apart from data dir deletion scenario mentioned in current issue?
+
+What is the impact of removal of this check so that it will throw SessionExpired and Client can establish a new session rather falling into infinite loop?, Because it is always possible that a client will have been connected to a server with a valid zxid, gotten disconnected and reconnected to a server that is lagging behind. That does not mean the client's session is invalid, merely that the client cannot work against this cluster member until it gets up to date.
+
+I have a proposal to send an error code that will allow the client to detect that all servers are at a lower zxid and close the session that I will probably implement for the release after 3.4, unless people are really clamoring for it., i don't think it is possible that all servers are at a lower zxid since the only way a client will see a zxid is if that zxid has been committed, which means a quorum has seen it, which means eventually all correct servers will see it., with regard to the data directory deletion scenario, we really need to use the dbid for this., It's possible when you have an issue whereby you roll back datadir changes because your cluster is being DOS'ed and you don't know why :) This is how we managed this. But it is a usability problem from the client side when it happens., ah ok, so camille in your scenario you are also still talking about the deleted datadir case right?, actually in the reset the data dir case the session should become invalid. i wonder if we should just reorder the code so that we validate the session before doing the zxid check. when the datadir is reset, it should invalidate the session as well., Camille and Ben, Thanks for your response.
+
+From Camille's explanation I understand there are two scenarios.
+*scenario #1* Deletion of datadirs without stopping client.
+*scenario #2* Deletion of some snapshots and restart of quorum without stopping client.
+
+To summarize there are two approaches here.
+
+*approach #1*
+{quote}just reorder the code so that we validate the session before doing the zxid check{quote}
+
+This will resolve the scenario #1 only. Removal of some snapshots may not delete the session data and session may be still valid. In this case, the infinite loop problem still persists as the session expiry will never happen as we are updating the expiry interval while validating a session.
+
+*approach #2*
+{quote}I have a proposal to send an error code that will allow the client to detect that all servers are at a lower zxid and close the session that I will probably implement for the release after 3.4, unless people are really clamoring for it.{quote}
+
+Initially, our thoughts were inline with this approach. But on deeper analysis, we found this involves more complexity and also may need some protocol [Client-Server] changes. Here are some of the points identified.
+
+** Introduce a new error code in ConnectionResponse.[Backward incompatibility and Protocol change]
+** Client has to interpret this error code. On this error, Client has to exclude the server from retries. At the same time, Client should not exclude a server which is timeout.
+
+So, I feel the *approach #2* brings unnecessary complexity to the system to handle a negative scenario/usecase.
+
+Correct me if my understanding is wrong or if I'm missing something here.
+
+*Camille*, if you agree I can work on the approach #2. Suggest me if you have any better solution., We do need client-server protocol changes. There is a thread on the mailing list between me and Patrick titled "devops/admin/client question: What do you do when you rollback?" that addresses this:
+http://mail-archives.apache.org/mod_mbox/zookeeper-user/201108.mbox/%3C69D3016305F9084FBD2C4A0DF189BD5C1770F901E0@GSCMAMP02EX.firmwide.corp.gs.com%3E
+
+There's no reason this needs to be backwards-incompatible. It won't fix the problem in earlier clients, but it won't break them either.
+, Thanks for the info Camille. I've gone through the mail thread.
+I was also referring to the similar solution in my *approach #2* with some difference. In our approach we thought of introducing error code in existing ConnectResponse itself which could cause incompatibility. So, I agree with you that we can implement without incompatibility.
+
+Discussion in the mail thread you have provided is focused on server side. Can you please explain "How this negative response needs to interpreted on Client side?"
+
+If I understand correctly, Client has to maintain a list of servers [servers responded with negative ConnectResponse] to be excluded and retry to remaining servers. A server should not be excluded if its not reachable/timing out/down. Whether we will be able to handle these cases clean? Or does this solution brings more unnecessary complexity to the system for a negative use-case?
+, So, at least for the case where the zxid is off, I think for the Java client all you have to do is track the number of servers that have given you the error. Since you will round robin through all servers, if you hit the error N times for N servers, you know that your zxid is never going to succeed and you can view it as an expired session. 
+
+Obviously this breaks down if, for example, one of the servers isn't reachable, and you will have to decide what to do in that case. I haven't really thought through all the edge cases yet. But I think upgrading the server ConnectResponse to encode an error code will be useful for a number of cases, so this to me seems like the right approach despite some possible complexity., i'm wondering about the wisdom of allowing clients (or servers for that matter) to run against rolled back state. if a you rollback the state and new operations come in such that the client doesn't realize there was a rollback, the client's view will diverge undetected from the service. a similar case happens with the server, if you rollback and a disconnected server comes back by the time that the zxid is up to where the server was when it went down, the servers state will diverge from the others.
+
+i think, you want to press a big reset button when you rollback: make sure that clients and servers restart., I'd want to, but unfortunately I can't always do that. I don't have access to all of my clients and the owners of those clients get quite cranky when I try to force them to do anything. 
+
+I guess my view is that any client that sees a session expiration should assume that they need to regather/reset whatever state. For servers, yes, I agree it is a dangerous operation and I wouldn't propose people do any kind of rolling back lightly., This issue becomes more frequent if a ramdisk is used to store ZooKeeper server data and there are not many servers in the cluster (3 or 5). There is a possibility that all the nodes go through a complete restart without allowing for the election to complete and that means data will be lost (in our case that is not important since data that is more than a few seconds old is not relevant any more). When that happens, all ZooKeeper clients of the cluster need to be restarted as well., What is the status of this issue?
+
+I'm experiencing it through a Kafka (0.8.0-beta1) client connecting to a ZK (1 node) launched by a standalone HBase 0.94.9 install, forcing a Kafka consumer restart when ZK is restarted.
+, I would like to propose a fix to this.
+The fix is easy, but it requires a change in the protocol. The server needs to inform the client about the problem so that the client takes a different action.
+It can be done in a backwards compatible manner (server only sends the info to a client that supports it).
+Maybe there are other options, but I don't see them. Maybe the change in the protocol is not worth it, but anyway at least there will be a proposal on the table., ... which means I would like to propose a patch implementing "approach 2" above ([#comment-13089357]), not a different way to fix the problem., i think approach 1 might be better. a session validation flushes the proposals and commits to a follower, so if the session validates, but the client zxid is still too high then something is obviously wrong and the client should be killed.
+
+although the scenario in which your session data is intact, but your data is reset is very bogus to start with. nothing good will happen in that scenario. if a server finds session data but the data has been reset, it should also reset the session information., Hello Ben,
+thank you for your help. After reading your comment, I am thinking now in a different line. Please help me understand how this works.
+- We have a client that has seen a higher zxid than the follower to which it is trying to connect.
+- This might be because a really sick situation in which the transactions for that client were lost or just a timing problem.
+- If this is a really sick situation, then we want to detect it. Otherwise just sync and continue.
+- First question: Could the sync be solved by issuing a sync from the follower to the leader?
+- Second question: Is there a reliable way to detect the very sick situation always? Because there might be one possibility if we use the check in ZOOKEEPER-1777.
+- Then we have to take the decision of what to do if the really sick situation is detected. Session information should be reset. The client should be informed somehow. And the general contract of how ZooKeeper works has been broken, so depending on how ZooKeeper is used in some systems it may even make sense to halt the system and report a fatal failure, and others will be happy with a warning and keep working (which would be my case).
+
+Not easy to solve at all. Did I get this right?, Hello again,
+would it make sense to have the client API report a new event to the application ("INCONSISTENCY DETECTED"), and then the application takes whatever action is required?
+The server still needs to reset session information, so that event would need to be sneaked in before the client is disconnected (I guess that after the session information is reset in the server, the client will be disconnected)., The behavior in trunk is not consistent.
+For an ensemble, if the client has a higher zxid, then the session is closed. On the other hand, the standalone server produces the same loop reported in this JIRA. The change in the attached patch, closes the session also in the standalone server avoiding the loop.
+Even though closing the session might not be the optimal solution, it is much better than an endless loop., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12607349/ZOOKEEPER-832.patch
+  against trunk revision 1530166.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1656//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1656//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1656//console
+
+This message is automatically generated., I might have made a mistake when testing this and there is a consistent infinite loop in trunk for standalone and ensemble. Anyway, I still think this is a bug and the infinite loop should be removed.
+
+Isn't it right that the leader of the quorum and the standalone server have seen all the transaction history? If that is so, then a possible solution for this would be to just close the client connection in followers, but close the client connection and kill the session in the leader and the standalone server. Would that make sense?, Working on this proposal now:
+- If this is a leader or an standalone server and the zxid of the client is higher than ours, then we close the session.
+- If this is a learner and the zxid of the client is higher than ours, then we issue a SYNC to the leader. If after the SYNC is responded the zxid is still higher, then we close the session, otherwise we proceed with the connection.
+- Add a test case., I didn't find an easy way to issue a SYNC request from the Learner to the Leader, so the proposal is just waiting for syncLimit instead.
+If this is ok, then I will prepare the patch for branch 3.4 (it just needs changes in the test case )., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12608519/ZOOKEEPER-832.patch
+  against trunk revision 1532152.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1698//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1698//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1698//console
+
+This message is automatically generated., I have changed the proposal for a very simple solution (just 10 lines in ZooKeeperServer.java). It keeps the current behaviour for learners and closes the connection for leader, standalone and read-only servers. The test case is also very simple. The patch applies to both trunk and branch 3.4.
+In my opinion this is clearly a bug fix, specially when we put read-only mode into the picture, which was not there when we issue was created. The steps to reproduce would be these:
+- A server goes to read-only mode and it hasn't had the time to receive the last transaction from a client.
+- The client connects to that server.
+- There is an full-speed endless loop of connection retries (filling up the logs, and using CPU and network resources).
+I hope that it can be considered for 3.4.6. Sorry for adding work to the release procedure., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12608637/ZOOKEEPER-832.patch
+  against trunk revision 1532152.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1699//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1699//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1699//console
+
+This message is automatically generated., it has failed in the multithreaded C API test:
+/home/jenkins/jenkins-slave/workspace/PreCommit-ZOOKEEPER-Build/trunk/src/c/tests/TestReconfig.cc:473: Assertion: assertion failed [Expression: found != string::npos]
+The current patch has less impact than the previous one, which passed the test. And the failure doesn't seem related with the change. I wonder what happens if I run it again ..., ... or it might be related.
+It might be that the TestReconfig tests becomes flaky because now in some cases sessions are closed. I think that this must be a problem with the test case, but it might take time to figure it out, so I am reverting my proposal of having this for 3.4.6., It seems to pass now with the current trunk. No changes in the patch at all., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12609269/ZOOKEEPER-832.patch
+  against trunk revision 1533161.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1709//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1709//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1709//console
+
+This message is automatically generated., formatting changes, +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12612815/ZOOKEEPER-832.patch
+  against trunk revision 1539529.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1753//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1753//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1753//console
+
+This message is automatically generated., It sounds right if we hit the condition that the last zxid seen by the client is higher than the one of a leader server and of a standalone, then there is something wrong with the session. But, if we simply close the session, how does the client figure out what's going? Someone would have to look into the server logs to find out, which is not great.
+
+I was also wondering if this case also applies to the ro-server. What if the client is talking to a leader/follower, connection drops, and it connects to an ro-server? I'm actually wondering if this case is even possible..., [~breed], could you also have a look here, please?, Can we make some progress here, please, [~abranzyck], [~breed]?, The case described here is more or less as likely to happen as TRUNC synchronisation.
+If it is possible for a server to see a higher zxid than the rest, then it is possible for a client to see a higher zxid than the servers.
+If the server is running stand-alone, then the only possibility that I can think of for it to happen is when the operator cleans the data in the disk.
+This is not likely at all, but still I think that closing the session is a better behaviour than the infinite loop. Closing the session means that the application will receive a CONNECTION LOST event, and that means that it can not make any assumptions about the state of the server when it connects again. That sounds right.
+The strictest solution possible would be to send a new error code to the client, and forward this new error condition to the application through the API, so that the client takes whatever action is required in this case (assuming there is any extra action to take in this case). But for a case that occurs only in extraordinary situations, impacting the protocol and the API seems overkill to me.
+So I actually still think that the patch contains the best option that I can think of., There are 10 people watching this issue, surely there must be opinions.
+I am sure e.g. [~randgalt] must be able to tell if this is ok from the client point of view or not.
+Please, speak up., bq. still I think that closing the session is a better behaviour than the infinite loop
+
+I'm not arguing whether it is better or worse. My problem with it is that it changes the semantics of closing a session. The contract is that the server side terminates a session only when it expires, but this is proposing to terminate it earlier. Could it cause any problem at the client because we are terminating the lease earlier?
+
+bq. Closing the session means that the application will receive a CONNECTION LOST event.
+
+I think you meant to say SESSION EXPIRED here, no?
+
+bq. There are 10 people watching this issue, surely there must be opinions.
+
+It would be great if the folks who discussed this issue earlier could chime in here., I guess you are right about the SESSION EXPIRED event, I don't know very well how this is mapped., FYI, the bug that led to this report was triggered by ensemble partitioning. This, in turn, was caused by unstable VM clocks. It took several days to figure out what was going on. The infinite loop and resulting log noise didn't help very much, but at least it was obvious that something was wrong. My concern with using SESSION EXPIRED for this case is that it would effectively hide the issue and make it even more difficult to diagnose. I think the ideal fix will make it possible to handle this situation gracefully without making it more difficult to discover. That probably means introducing a new error code.
+
+, i can't quite see how any of the fixes talked about can really be used in a reasonable way. i think there are two issues:
+
+1) if a server's data gets reset, it should not come up as if nothing happened. in reality it should not vote or participate in a quorum until it can sync with an active leader. otherwise can lose data.
+
+2) if we do get in a situation where data loss has happened (for example too many servers lose data or we ignore issue 1), do we want active clients to stay active? i would think we would want to invalidate all client sessions.
+
+the discussions on this issue seem to look at working around (while ignoring) these two issues and letting clients that are able to keep going continue to work as normal.
+
+is this an accurate assessment? (sorry i lost track of this thread.), I think your assesment is quite accurate.
+One of my final goals is to be able to run zookeeper with data in a ramdisk without problems. That means I want to be able to assume that things will continue working if all data is lost in the disk for one server. In any case, maybe the best solution is a new error code as suggested.
+1) I don't know any way for the server to detect that data has been lost. Is there any?
+2) Invalidating client sessions is the goal of this patch. The client application is still alive, but the session is reset.
+, i think the solution to this is to use the dbid. it would fix a couple of things.
+
+the dbid is supposed to be a globally unique id that tags the zookeeper data. we have it in the file headers, but we never really finished integrating it. one key purpose was to make it so the clients could always know that they are talking to a server that is using the same zookeeper data instance as all the other servers it has been talking too. it would also ensure that the zookeeper servers are using the same db instance. in addition i think it could be extended to your purposes.
+
+for issue 1) the nice thing about using a ramdisk is that everything gets lost on reboot, so if you don't have anything you know it. now when a server tries to connect to the ensemble it can signal that it will not participate in quorum establishment because its dbid is 0. once it connects to an established leader it can sync with the leader and take on its dbid.
+
+for issue 2) we would need to add the dbid to ConnectRequest (something that we've needed to do anyway). if the client connects to a server with a different dbid, the server can reliably tell the client that the zookeeper instance that is was connected to is gone and it should close its handle. this would work even if the server has a later zxid than the last seen by the client., Using dbid sounds good. I have been working on a different option. 
+Could you please send me your opinion?
+The option is using the hash number in ZOOKEEPER-1794.
+That is a number that is unique per db for each of the zxids. It can be used between the ZooKeeper servers to validate that they have the same transaction history. It can also be used by the client to validate that the client has seen the same history as the server.
+It would need to be sent to the client in each reply (together with the last seen zxid), and then it would be verified by the server on the connection request.
+The advantage is that this validation number detects any inconsistency in the database, whatever the cause., I am moving this to 3.4.7 since the current solution doesn't seem right., i think ZOOKEEPER-1794 would mostly cover the issues, but i don't think it handles the scenario of this jira :)
+
+the scenario is that the zxid seen by the client is less than that of the ZK servers, so the clients spin.  that would still happen with ZOOKEEPER-1794.
+
+using the dbid (assuming it is sent in the connect) the clients could fail fast and hard., No, it doesn't handle the scenario as such, but it provides the means for another option for handing it.
+What I meant is we could send the hash validation check number to the client (instead of the dbid) in the reply header of each client request. And then the client could send the last validation check number received together with the last zxid seen in the connection request (instead of the dbid).
+This will give the same guarantees of failing fast and hard for the clients. There will be an additional guarantee, and it is that if anything happens (e.g. the case in ZOOKEEPER-1777, including data loss for one server while in minority) and the transactions that this client made are lost, we will be able to notify the client of this event and mark the session as invalid. , Is there any chance we can make some progress with this patch? [~abranzyck], are you still looking at it?, ZooKeeper is used by Fabric ( https://issues.jboss.org/browse/FABRIC ) to store the configuration of a cluster of services, and in that configuration, every client of the cluster accesses ZooKeeper to discover the cluster topology. This bug means than when the ZooKeeper data is "out of continuity", every single client is DOS'ing the server and, consequently, must be stopped and restarted, and that kind of defeats the "always on" aspect of this type of architectures that you would implement with ZK.
+Furthermore, in the Fabric context, there are two distinct kinds of ZooKeeper clients: "Fabric Services" providers and consumers. In the case of the providers, the discrepancy in the data means that somewhat the cluster has been corrupted. In the case of the consumers, well, it doesn't mean anything, the service must not care at all about that kind of changes. So, basically, those two kind of ZK clients must be (technically) able to implement two different strategies of handling the change., I can prepare a fix using the dbid as proposed by [~breed]. It will take some time (two or three weeks). The protocol between client and server needs to be modified., By the way, [~damienb] this (using the dbid solution) means clients will find their handle closed when the problem occurs. That means providers will need to reconnect, and I assume that upon reconnection they check data consistency. I guess that consumers will just reconnect and continue working. Does that sound right?, Hello again,
+I am having second thoughts here.
+After looking at the current code, this dbid is basically non-existing at the moment. It is just a hardcoded value that is inserted in the transaction log and snapshot and is never checked or shared in the quorum.
+So, comparing it with ZOOKEEPER-1794:
+- I would have to implement the use of dbid, while in ZOOKEEPER-1794 there is already a patch using a hash.
+- dbid doesn't cover potential inconsistencies that happened after the dbid is created, while the hash does.
+- Both provide a number that uniquely identifies the database of the cluster (but how to distribute this number to the cluster needs to be solved for the dbid).
+- Both require an update of the protocol to the client.
+So, it seems that the hash provides better results with less work (assuming I am right with my reasoning), but it is more complex and it needs to be understood by sufficient people leading this project. It would be a pleasure for me to discuss this topic, but doing it in an email thread will take forever. Any suggestions?, If the zxid is not recognized by the server, the client will attempt reconnects indefinitely and never succeed. This can contribute gigabytes to service logging and bring down the service with the embedded ZK client *and others*. The client should error out somehow permanently. Can this be fixed here? Perhaps other issues can be addressed in follow up? Unquestionably the continuous and perpetual client retries is a bug, they will never succeed, and a fleet of clients in such state can impact network services.
+
+If we otherwise recreate application znode state in the reinitialized cluster, why should applications be prevented from riding over a loss of transient ZK state, if the use case supports it? For example if the ZK client would error out with a session expired status under these conditions, HBase would create a new ZooKeeper client object, attempt a reconnect using it, and might succeed. (I think, haven't tested it.) Understood this is not a normal case but it comes up frequently in federated test environments where the ZK cluster is under your control but not necessarily the applications., Hello there,
+it seems I might have a bit of time to work on this now and it seems it is still there.
+Can we review the discussion?
+Is it acceptable to just invalidate the client session as initially proposed?, There seems to be a related thread on the mailing list on this too ...
+Note that in a normal cluster only the leader cancels the session, the followers just don't accept the connection so that the client eventually connects to the leader., Hi guys,
+
+I have the same issue - we have 1 standalone server and when restarting it (its data gets reset) the client keeps trying to reconnect, while the server refuses the request due to greater client's zxid. We are using version 3.3.6.
+
+I wonder if any progress has been made on this bug or we still haven't decided what would be the best solution?, Hi [~ylopotun],
+as far as I know there is no decision yet.
+The proposed patch would solve your issue. In the proposed patch (if I remember correctly) the client tries to connect to a different server of the cluster until it either succeeds or finds the leader (or stand-alone server). If it finds the leader and there zxid is still higher it just restarts the connection. With an stand-alone server it will just immediately reconnect and end the loop of connection retries.
+The caveat is that something very wrong has happened (e.g. server lost all its data) and the client should be notified of this problem an not just reset the connection and continue. But on the other hand, every time that a client reconnects this client cannot make any assumptions at all about what might have happened with the data in that interval, so in my view this shouldn't be that bad. In any case it is better than an endless loop (again in my opinion).
+I think this is a good enough solution for now. If this issue is considered a blocker, I would propose to go for that. If there are any positive comments on that line, I will update the patch.
+I tried to introduce a more elaborated solution back then, but I believe this would need for me to provide a better explanation of why it would be good to follow that path.
+Regards to all,
+/German , Actually there seems to be no need to update anything.
+The patch still works for trunk, branch-3.5 and branch 3.4., Hmm, given this introduces some risk (i.e.: in a catastrophic failure scenario we'd be expiring sessions, which would allow them to reconnect, which might mean they'll see invalid data) should this new behavior be opt-in/gated by a property?
+
+Another way to handle would be a purely client-side solution (not sure if this was already proposed, haven't checked all the backlog) like Kazoo does it: https://github.com/python-zk/kazoo/blob/master/kazoo/client.py#L129. That is, have a max_retries param after which the client would give up. By default this would be 0 (infinite), so the current behavior would be retained. 
+
+, There is no such risk.
+Expiring sessions do not reconnect.
+The client reconnects, but it has to create a new session. Expiring sessions die., Well, most users do setup a handler to create a new session when the current/old one expires (i.e.: Curator, for instance, does this; so does Kazoo, etc)., If a cluster travels back in time because of server-side intervention by the Operator (i.e.: data deletion), it seems that it should require a client-side intervention as well to restore things. Or, if we want this to be automatic it should be opt-in. , Ok then, which should be the options?
+One option is to kill the session when there is a problem with the zxid (older in the server than in the client), and the other is? to loop endlessly?
+I believe that if we are going to provide options, both options should work decently., Let's see if this passes jenkins tests in the server., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12612815/ZOOKEEPER-832.patch
+  against trunk revision 1680994.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2715//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2715//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2715//console
+
+This message is automatically generated., /home/jenkins/jenkins-slave/workspace/PreCommit-ZOOKEEPER-Build/trunk/src/c/tests/TestReconfig.cc:183: Assertion: equality assertion failed [Expected: 1, Actual  : 0]
+One of the C client tests fails. I didn't do those locally because I didn't expect any impact, but there is. So there is some work to be done here in any case. I can look at this, but if anybody else wants to take over, please just let me know. , Hi German,
+
+The test is a known flaky test. 
+
+Regarding this issue, I thought this is a client issue because it has a history that's not in the server. The right thing to do is to expire/close the client., It seems to me that with this patch applied the test is not flaky any more. It fails consistently. I have an intuition of why that might be, and I would like to fix the test (or the c client if the problem happens to be there). But I don't know the C code as well as I know the Java code, so help is very welcome.
+
+You can call it a client issue, and the proposal in my opinion does "the right thing" just as you propose (expire/close the *session*, which is what is under control of ZooKeeper code)., Before I spend time looking at the issue in the test in the C library, could I please get a feeling of whether the proposal is acceptable or not?
+This might take two or three days for me, and it is not my daytime job, so I would appreciate it very much if the people in this community expresses their opinion on whether the patch looks like something to be merged or not., Yeah — that's kind of what I was thinking. So we would have an option like:
+
+{code}
+zookeeper.killSessionsWithBadZxid
+{code}
+
+which would activate the code in the patch. If that's disabled (the default), then things stay as is. And in the future we can turn it on by default, it makes sense to people.
+
+What do you think Germán? Also,thanks for working on this!, Yeah — that's kind of what I was thinking. So we would have an option like:
+
+{code}
+zookeeper.killSessionsWithBadZxid
+{code}
+
+which would activate the code in the patch. If that's disabled (the default), then things stay as is. And in the future we can turn it on by default, it makes sense to people.
+
+What do you think Germán? Also,thanks for working on this!, Yeah — that's kind of what I was thinking. So we would have an option like:
+
+{code}
+zookeeper.killSessionsWithBadZxid
+{code}
+
+which would activate the code in the patch. If that's disabled (the default), then things stay as is. And in the future we can turn it on by default, it makes sense to people.
+
+What do you think Germán? Also,thanks for working on this!, What's your intuition on why the C test is failing? It's this snippet right:
+
+{code}
+    void setServers(const string new_hosts)
+    {
+        int rc = zoo_set_servers(zh, new_hosts.c_str());
+        CPPUNIT_ASSERT_EQUAL((int)ZOK, rc);
+    }
+{code}
+
+?
+
+Happy to help with the C code. , What's the proposal?, We crossed messages there, sorry.
+My intuition was actually wrong. There doesn't seem to be anything wrong with the C code. It seems this is a synchronization issue. The thread that listens for connections starts before the ZkDatabase is loaded, so it reads a low zxid and kills the session. This was not noticeable before, because the client looped until the zxid in the server was high enough and then connected. I think that the cleanest thing is to put a Latch and wait for the ZkDatabase to load before accepting connections.
+I will update the patch with this fix (the Latch to wait for the ZkDatabase to load) on top of the previous patch and that should pass the tests., I mean expire the session on client side. It's client who's not consistent with the view. We should fix it on client (by crashing it) not server., I mean expire the session on client side. It's client who's not consistent with the view. We should fix it on client (by crashing it) not server., I mean expire the session on client side. It's client who's not consistent with the view. We should fix it on client (by crashing it) not server., Adding a check for the initialization of the ZkDatabase, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12736075/ZOOKEEPER-832.patch
+  against trunk revision 1680994.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2718//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2718//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2718//console
+
+This message is automatically generated., testCurrentObserverIsParticipantInNewConfig fails.
+This time it completely beats me. No idea., does it fail consistently for you locally?
+
+also, for this line:
+
+{code}
++                   || getState().equals("read-only"))
+{code}
+
+do we really want to close a session from a read-only server? wouldn't that mean that partitioned members would be closing valid sessions? (i.e.: if i am connected to a healthy server, i get a disconnect and then i land on a read-only server connReq.getLastZxidSeen() > getZKDatabase().getDataTreeLastProcessedZxid() will be true, but the session is still valid!)., Launched 5 times and failed only once, so it could be one of these flakies.
+Regarding read-only, I don't know what to do. Maybe it would be safer to let it loop until the isolated node recovers connection, right?, Yeah, I think for read-only it would be incorrect to close the session. So the client should keep looping. Thought, presumably the client would try other servers until it finds one that isn't read-only and resumes from there. , When the client with an older zxid hits a read-only server it will try to connect to another server instead of losing the session., Trying again, the last test fail seemed to be a flaky test., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12736770/ZOOKEEPER-832.patch
+  against trunk revision 1683042.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2741//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2741//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2741//console
+
+This message is automatically generated., Lets assert the return value here:
+
+{code}
++        // invalidate the session by using a very high zxid
++        sessionCreation(sessionId, Long.MAX_VALUE, true, hostPort);
+{code}
+
+Also, why is the protocolVersion not 0 here:
+
+{code}
++        ConnectRequest conReq = new ConnectRequest(0x10000, zxid, 30000, sessionId, passwd);
+{code}
+
+Use LOG statements, not prints:
+
+{code}
++            System.out.println("Length of the received input message is: " + len);
+...
++                System.out.println("Length indicated in the message is: " + receivedLen);
+...
++                System.out.println("Created session with id: " + sessionId);
+{code}
+, Thank you for pointing this out!
+I had actually completely forgotten about reviewing the test itself in the last patches. I apologize for that.
+I believe it covers your suggestions now., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12737093/ZOOKEEPER-832.patch
+  against trunk revision 1683163.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2744//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2744//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2744//console
+
+This message is automatically generated., Interestingly, if you happen by chance to change an "assertFalse" with an "assertTrue" in the junit test, the test doesn't pass any more :-P.
+Sorry, that sneaked in., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12737117/ZOOKEEPER-832.patch
+  against trunk revision 1683163.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2745//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2745//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2745//console
+
+This message is automatically generated., testHighContentionWithTimeout failed this time.
+It seems another different flaky test., that has been fixed now: https://github.com/apache/zookeeper/commit/fac170aa2e82c63aeea60d756a450ce343c43e6d, A few comments:
+
+In:
+
+{code}
++        Assert.assertNotNull(sessionCreation(sessionId, Long.MAX_VALUE, true, hostPort));
+{code}
+
+can we change the sessionCreation() so that it returns 0 if the session is invalid, otherwise the sessionId (as happens in the protocol)? And then just assert == 0 when the session is invalid. 
+
+Nits in:
+
+{code}
++            LOG.debug("Length of the received input message is: " + len);
+..
++                LOG.debug("Length indicated in the message is: " + receivedLen);
+{code}
+
+use {} instead of +. 
+
+And finally, can we make this opt-in? I don't think it should (initially) be the default behavior since some operators would rather know when this happens instead of having things expire and moving forward. , Unfortunately I can't spend any more time on this right now, I invite you to please take over., [~abranzyck], Good work!
+
+I've few comments on the proposed patch:
+
+# Presently the connected server is validating the revalidation request and close the session if the server is 'leader' or 'standalone'. I could see few gaps like, say there are three servers A,B,C. C is Leader. Assume I've a client which has connectionstring only to A(For example zkcli.sh shell). Again the client will indefinitely retry, right. IMHO we could do few improvements to handle this situation. Can we modify the algorithm like,
+ #* case-1) If connected server is 'standlone', then add error log and close session
+ #* case-2) Else the connected server is 'leader', then add error log and close session
+ #* case-3) Else the connected server is 'follower/observer', then forward the request to the Leader to reopen the session. Invoke Leader.REVALIDATE with lastZxidSeen {{getLearner().validateSession(cnxn, sessionId, sessionTimeout, lastZxidSeen);}}. On the other side , [LearnerHandler.java#L553|https://github.com/apache/zookeeper/blob/trunk/src/java/main/org/apache/zookeeper/server/quorum/LearnerHandler.java#L553] can do the validation logic and close the session.
+{code}
+                    if (qp.getZxid() > leader.zk.getLastProcessedZxid()) {
+                        leader.zk.closeSession(id);
+                        valid = false;
+                        //  add error logs
+                    } else{
+{code}
+# Please add test case to see the behavior in quorum.
+# Please remove unused imports from the test class., [~rakeshr]: would you have some cycles to wrap this up given that Germán won't be working on it?, OK, will take this ahead. Some time back [~arshad.mohammad] has discussed with me about this problem and shown interest to take up this task. I'm assigning to him., Thanks [~rakeshr]. I will soon submit a patch on top of [~abranzyck]'s latest patch, +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12737117/ZOOKEEPER-832.patch
+  against trunk revision 1697227.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2835//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2835//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2835//console
+
+This message is automatically generated., Submitted new patch, please review, +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12752793/ZOOKEEPER-832.patch
+  against trunk revision 1698058.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 2 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2847//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2847//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2847//console
+
+This message is automatically generated., Thanks for the patch [~arshad.mohammad]. It lgtm, but I'll give it one more look tomorrow.
+
+Can you think of any cases in which this would break when talking with older servers (i.e.: when the QuorumPacket for revalidate sends -1 as the zxid)?, This patch handles scenario where zxid is greater than last seen zxid at the server. -1 zxid from client will always be less than the last seen zxid at the server, so will enter into this patch functionality flow itself. So no impact for zxid  -1 scenario, bq. Can you think of any cases in which this would break when talking with older servers (i.e.: when the QuorumPacket for revalidate sends -1 as the zxid)?
+
+[~rgs], its an interesting thought. The datatype of {{hzxid}} is long. What if {{hzxid}} value reaches Long.MAX_VALUE limit. A function call {{zks.getNextZxid()}} will start returning negative values. Now, any revalidation message will be rejected due to the condition {{qp.getZxid() > leader.zk.getLastProcessedZxid()}}. 
+
+Truly, I never seen a negative zxid in my cluster, but from the logic I could see this possibility. What others opinion to skip his case now considering this is a very corner case?
+
+Apart from this I'm not seeing any other possibilities of revalidate message sending -1 as zxid., [~rakeshr]: any further thoughts here?, Hi All, Since this is critical and long pending validation logic. It would be good to see inputs from few more folks. Reference [algorithm|https://issues.apache.org/jira/browse/ZOOKEEPER-832?focusedCommentId=14642655&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14642655]
+
+cc:  [~fpj], [~michim], [~fournc], [~hdeng], [~ikelly]
+
+Could you please go through the current approach and would like to see your thoughts on {{negative zxid value}} which can break the condition
+{code}
+connReq.getLastZxidSeen() > getZKDatabase().getDataTreeLastProcessedZxid()
+{code}
+
+{code}
+qp.getZxid() > leader.zk.getLastProcessedZxid()
+{code}, Hello,
+Sorry for leaving like that. I have changed country of residence and company of work in the meantime.
+[~rgs]: with "older servers" you mean those that haven't been corrected with ZOOKEEPER-1277, right?
+But that server would be more than one version step away from the versions that will be corrected with this patch, and upgrades always go step by step, or? so how can that possibly happen?
+It also seems difficult to see how this potential negative zxid goes from the obsolete server to the client and then to the updated server. Most likely something breaks in the way because of the negative zxid., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12752793/ZOOKEEPER-832.patch
+  against trunk revision 1712218.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 2 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2948//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2948//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2948//console
+
+This message is automatically generated., 3.4.6 is also affected :/
+
+Could we update the ticket label to reflect this?, In addition, 3.4.4 is affected.
+
+:(, Since we have only bug fix releases for {{branch-3.4}}, I feel affected version 3.4.5 reflecting the bug in branch-3.4. Its just my thoughts. Please feel free to change the affected version for better tracking., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12752793/ZOOKEEPER-832.patch
+  against trunk revision 1728577.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 2 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3036//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3036//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3036//console
+
+This message is automatically generated., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12752793/ZOOKEEPER-832.patch
+  against trunk revision 1748630.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 2 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3228//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3228//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3228//console
+
+This message is automatically generated., I am moving this out to 3.4.10 for now. Hope, will be able to reach an agreement by that time., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12752793/ZOOKEEPER-832.patch
+  against trunk revision 8771ffdaacb87126a485ae740558f6a288ab980b.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 2 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 3.0.1) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3569//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3569//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3569//console
+
+This message is automatically generated., Just for a general info - we've also faced the same issue with Zookeeper 3.4.5 and Hive 1.2.
+Because this patch in not yet committed we were able to handle this problem by increasing zxid value via external script, which updates some dummy Znode value., Can you give me more informations about how you succeed to increase zxid via an external script in order to update some dummy Znode and to face this really annoying issue ?, We created java application which updates some dummy znode specified number of times, on every znode update zxid is increased by 1.
+{code}
+
+public class ZkWorkarounderMultiThreaded {
+  private ZooKeeper zk;
+  private CountDownLatch connSignal = new CountDownLatch(0);
+
+  public ZooKeeper connect(String hostPort) throws Exception {
+    zk = new ZooKeeper(hostPort, 3000, new Watcher() {
+      public void process(WatchedEvent event) {
+        if (event.getState() == KeeperState.SyncConnected) {
+          connSignal.countDown();
+        }
+      }
+    });
+    connSignal.await();
+    return zk;
+  }
+
+  public void close() throws InterruptedException {
+    zk.close();
+  }
+
+  public void createNode(String path, byte[] data) throws Exception
+  {
+    zk.create(path, data, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+  }
+
+  public void updateNode(String path, byte[] data) throws Exception
+  {
+    zk.setData(path, data, zk.exists(path, true).getVersion());
+  }
+
+  public void deleteNode(String path) throws Exception
+  {
+    zk.delete(path,  zk.exists(path, true).getVersion());
+  }
+
+  public static void main (String args[]) throws Exception
+  {
+    final String[] params = args;
+    final byte[] value = new byte[0];
+
+    ExecutorService es = Executors.newCachedThreadPool();
+    for(int j=0;j<Integer.valueOf(params[2]);j++)
+      es.execute(new Runnable() {
+        @Override
+        public void run() {
+          ZkWorkarounderMultiThreaded connector = new ZkWorkarounderMultiThreaded();
+          try {
+            connector.connect(params[0]);
+            String fakeNode = params[1];
+            try {
+              connector.createNode(fakeNode, value);
+            } catch (Exception e) {
+            }
+            fakeNode = params[1]+ "/" +connector.toString();
+            connector.createNode(fakeNode, value);
+            for (long i=0;i<Long.valueOf(params[3]);i++) {
+              connector.updateNode(fakeNode, value);
+            }
+            connector.deleteNode(fakeNode);
+          connector.close();
+          } catch (Exception e) {
+            e.printStackTrace();
+          }
+        }
+      });
+    es.shutdown();
+  }
+}
+{code}
+
+Parameters are zookeeper_host:port znode_name number_of_threads number_of_updates_per_thread]

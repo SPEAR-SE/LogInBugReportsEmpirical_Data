@@ -1,0 +1,293 @@
+[This patch uses a pool of threads to delete block files on the datanodes. By default, a pool of 5 threads is used but this value canbe overridden by a config parameter hdfs.datanode.delete.threadpool.size.
+, Why not instead have a queue of blocks to delete and a single thread that deletes them?, That os certainly possible. On the other hand, what I have learnt is that deleting a file in ext3 is slow, especially if the file is big because ext3 will synchornously access all indirect blocks and free them, thus requiring more disk IOs. The speed of deletion is dependent on the size of the file. This means that if we have a single thread in the Datanode doing all the deletes, it might not be able to keep up if the incoming rate of blocks-to-be-deleted is high. , If it's i/o bound it could make sense to have one thread per volume.  The datanode knows the number of volumes and could use that instead of a config option.  But do you really think a single thread would get so far behind that the queue of blocks to delete would exhaust the datanode's heap?  Most datanodes only have a few thousand blocks, don't they?  And not using all of the i/o bandwidth for block deletion might be a feature., > The datanode knows the number of volumes and could use that instead of a config option
+
+This makes sense to me.
+
+> But do you really think a single thread would get so far behind that the queue of blocks to delete would exhaust the datanode's heap
+
+I will test how fact a file deletion on ext3 is. will report back with some numbers.
+
+Another thing that I am keeping in mind is that if a thread asyncronously processes block file deletions while freeing the heartbeat thread to continue hearbeating to the namenode might introduce new race conditions. Let's assume that a blockfile deletion request is queud up. Then the datanode decides to send a block report and will report that block to the NN. Then the async trhead will start prcessing items from the queue and delete the block file. This could be bad! The Nameode will think that the datanode has this block whereas actually it is now gone from the datanode. 
+, Why is the heartbeat thread involved with block deletion?  
+
+Per the fifth comment in HDFS-599 can someone explain in general why the failure detection code is not encapsulated from the rest of the daemon? If it were a separate module it seems that we wouldn't have to worry about RPC priorities, JVM GC, block deletion, etc interfering with it.
+
+Thanks,
+Eli, > Why is the heartbeat thread involved with block deletion?
+
+The namenode returns lists of blocks to delete in heartbeat responses.
+
+>  The Nameode will think that the datanode has this block whereas actually it is now gone from the datanode.
+
+The datanode might remove blocks immediately from its in-memory lists that are used to generate block reports but the background thread could remove the actual block files.  If the datanode crashes then the discrepancy between what's on disk and what the namenode thinks should be on disk will be resolved at restart when it sends its initial block report.  Could that work?, > The datanode might remove blocks immediately from its in-memory lists that are used to generate block reports but the background thread could remove the actual block files
+
+that will work too. will submit a patch soon., +1 on the idea.
+
+Encountered this bug on 0.19 when doing a HDFS stress test - DataNode was not able to send received block list, so client gets "block not replicated" exception.
+
+I think we can start with 1 thread per volumn, and in case it cannot keep up, we can make that "1" configurable.
+, This patch adds a new class BlockFileDeleter, which delete block files asynchronously using one ThreadPoolExecutor for each volume. BlockFileDeleter is used internally in FSDataset.
+, Tested on a 4-node hadoop-0.19 cluster. We are able to write new large files smoothly (without any BlockNotReplicateException which is caused by slow heartbeats) right after deleting a lot of blocks.
+, I looked at the version for trunk.
+
+The call to volume.decDfsUsed(blockSize)() is being called from the background BlockFileDeleter thread. This might not be protected by the FSDataSet lock anymore., There are 3 approaches:
+A1. Decrement the dfs usage when we schedule the task.
+A2. Pass a handle of FSDataset to BlockFileDeleter ctor, so we can do "synchronized(fsdataset) { ... }" in the BlockFileDeleteTask
+A3. Add a method in FSDataset for decrementing the dfs usage for a volume.
+
+A1 is not good because the dfs usage won't be accurate.
+A3 is changing the interface - but the method to decrement dfs usage shouldn't be exposed from FSDataset I think.
+I prefer A2.
+
+Will that work?, A4. Do "synchronized(fsdataset)" in "void decDfsUsed(...)". That function is called only from "BlockFileDeleteTask" now.
+A5. Do "synchronized void decDfsUsed(...)". This will move the lock down to the volume, to make it faster.
+
+Although A5 might help us avoid some contentions, I don't see any code that locks a volume. I guess we always lock the FSDataset.
+
+I prefer A4 the best.
+, # Do we still need to send a partial list of blocks from the name-node in the BlockCommand? This was the reason we did it in the first place, right? So may be now we can send all blocks at once while data-node controls how fast it removes them.
+# I'd suggest something with Replica instead of Block, like ReplicaFileDeleter. Data-nodes store *replicas* of *blocks* known to the name-node.
+# There are 27 unnecessary imports in the new file, it would be good to clean this up., 4. In {{FSDataset.invalidate(Block[])}} you expose inner class {{BlockFileDeleteClass}}. I think it would be better to hide everything inside the {{BlockFileDeleter}}. Just replace lines 1610-1617 with one call {{deleter.deleteFile(v, file, metaFile, ...)}}, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12423501/HDFS-611.trunk.patch
+  against trunk revision 830003.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/86/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/86/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/86/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/86/console
+
+This message is automatically generated., Made 2 changes:
+# Follow the approach A4 above for the lock
+# Removed the used imports
+
+Regarding the other comments:
+1. Most of the classes in DataNode are named Block* although some of them represent a replica as well. From consistency point of view, it seems to me BlockFileDeleter is a better name.
+2. I think it still makes sense to limit the number of block invalidation requests per heartbeat. We don't want a single heartbeat to be too big. I agree the limit can set to something much bigger, e.g. 1000 or 5000.
+3. I like the abstraction of creating a task using the 5 arguments, and then do "execute(Task)". This makes it easy to add new fields to the Task. Also it mimics the ThreadPoolExecutor.execute(...) function which makes it clearer that the operation is asynchronous.
+, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12423525/HDFS-611.trunk.v2.patch
+  against trunk revision 830804.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/88/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/88/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/88/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/88/console
+
+This message is automatically generated., Added a test case. Also changed the maximum number of block invalidation commands per heartbeat to 1000. That will make heartbeat response size ~ 100K, which maps to ~1ms on a 1Gbps NIC. This in turn maps to the capability of serving ~3000 nodes with 3 second heartbeat latency.
+, The change of maximum block invalidation commands per heartbeat is for Konstantin's point 4 above.
+, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12423671/HDFS-611.trunk.v3.patch
+  against trunk revision 831170.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 4 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/90/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/90/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/90/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/90/console
+
+This message is automatically generated., > This in turn maps to the capability of serving ~3000 nodes with 3 second heartbeat latency. 
+
+This makes sense. I hope it's not going to come to that all heartbeats will remove 1000 blocks on all nodes.
+
+> Most of the classes in DataNode are named Block* 
+
+Traditionally hdfs did not distinguish between blocks and their replicas, which we found very confusing while implementing append and tried to call new classes Replica*. So yes you see a lot of Block* classes, but it would be really good to turn this in the right direction. Wouldn't you agree that "replica" is a more precise term for a copy of a block on a specific data-node.
+
+> I like the abstraction of creating a task using the 5 arguments, and then do "execute(Task)". 
+
+I think the abstraction should provide an api to delete replica files independently on whether it is multi-threaded or single-threaded, so it makes sense to me to keep the implementation details concealed in the deleter.
+
+Looked into the implementation details a bit. By default ThreadPoolExecutor sets allowCoreThreadTimeOut to false, which means the threads never shutdown even if there are no deletes. I would rather pay the price of restarting threads when new deletes arrive than keep those threads running forever. Data-nodes spawn a lot of threads besides the deletion. Besides, it will also automatically take care of the condition when a volume dies and we remove it from FSVolumeSet. It would be a waist to keep a thread around for a dead volume.
+
+The key for the HashMap of threads is the reference to the volume. This is based on that you do not explicitly define equals() and hashCode() for FSVolume. Currently we do not alter instances of volumes, but if we ever do this could be a problem. May be it is better to use volume's directory as the key in the HashMap.
+You still need to remove the HashMap entry, when the volume is removed from the system., In light of some other discussions related to async deletion in JobTracker when it restarts, I will rename BlockFileDeleter to AsyncDiskService, and move BlockFileDeleteTask inside the FSDataset class. In this way, it will be easier to move AsyncDiskService to common and reuse it in the JobTracker in the future.
+
+> Traditionally hdfs did not distinguish between blocks and their replicas, which we found very confusing while implementing append and tried to call new classes Replica*. So yes you see a lot of Block* classes, but it would be really good to turn this in the right direction. Wouldn't you agree that "replica" is a more precise term for a copy of a block on a specific data-node.
+
+I agree. My initial thought was that we should do that change in a single transaction for everything, otherwise having both old and new conventions will make the things even more confusing. 
+
+> I think the abstraction should provide an api to delete replica files independently on whether it is multi-threaded or single-threaded, so it makes sense to me to keep the implementation details concealed in the deleter.
+
+Users might need to know if an operation is sync or async. I will add a deleteAsync method.
+
+> allowCoreThreadTimeOut 
+
+Agree. I will add that.
+
+> The key for the HashMap of threads is the reference to the volume
+
+That makes sense. I will change the key of the HashMap to File, which represents the currentDir of the FSVolume.
+, HDFS-611.trunk.v4.patch does the job of what I described above.
+, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12423872/HDFS-611.trunk.v4.patch
+  against trunk revision 832118.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 4 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/92/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/92/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/92/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/92/console
+
+This message is automatically generated., Re-trigger unit tests., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12423872/HDFS-611.trunk.v4.patch
+  against trunk revision 832118.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 4 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/93/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/93/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/93/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/93/console
+
+This message is automatically generated., I like AsyncDiskService. Not sure about MR usage but we can definitely add more data-node operations under the class that require async operations.
+Two things:
+# It would look really good if you could move the deleteAsync() method together with the static class ReplicaFileDeleteClass inside AsyncDiskService. I understand your motivation that you want to keep AsyncDiskService independent of data-node connotations if the goal is to reuse it in MR, but this could be done by simple factoring our the common base class if such usage in MR will ever materialize.
+# A nit: could you convert the comment for AsyncDiskService to JavaDoc comment by just adding one more star.
+
+Other than that the patch looks good. Test failure is related to HDFS-733., 
+bq. It would look really good if you could move the deleteAsync() method together with the static class ReplicaFileDeleteClass inside AsyncDiskService. I understand your motivation that you want to keep AsyncDiskService independent of data-node connotations if the goal is to reuse it in MR, but this could be done by simple factoring our the common base class if such usage in MR will ever materialize.
+
+For the MR usage, I am think about moving the AsyncDiskService class directly to common. Aggregation seems better than inheritance here, just like ThreadPool (I guess we don't extend ThreadPoolExecutor for different types of Tasks).
+
+It seems to me that AsyncDiskService should not need to have knowledge of whatever Task is requested by the caller. In particular, the decDfsUsage call in the ReplicaFileDeletionTask is closely related to FSDataSet, and should be maintain inside FSDataSet. What do you think?
+
+bq. A nit: could you convert the comment for AsyncDiskService to JavaDoc comment by just adding one more star.
+
+Added the missing "*" for javadoc.
+, It is better to keep the whole implementation in one place rather than sread it between classes. That makes it modifications easier.
+When you decide to move AsyncDiskService to common you can move current implementation of it and create a new class DataNodeAsyncDiskService, which either extends AsyncDiskService or encapsulates it, whatever is better., bq. It is better to keep the whole implementation in one place rather than sread it between classes. That makes it modifications easier.
+I agree with the principle but I feel the ReplicaFileDeleteTask is part of the implementation of FSDataset, not part of AsyncDiskService.
+
+bq. When you decide to move AsyncDiskService to common you can move current implementation of it and create a new class DataNodeAsyncDiskService, which either extends AsyncDiskService or encapsulates it, whatever is better.
+
+If we do the way as in the patch, we just need to move the AsyncDiskService - no code change (except the package name) is required.
+
+By the way, do you think it makes sense to add an option to delete in async or sync mode? I can easily add an option for that by calling "task.run()" instead of "asyncDiskService.execute(task)".
+, Moved ReplicaFileDeletionTask and deleteAsync into FSDatasetAsyncDiskService., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12424171/HDFS-611.trunk.v6.patch
+  against trunk revision 832585.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 4 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h2.grid.sp2.yahoo.net/67/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h2.grid.sp2.yahoo.net/67/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h2.grid.sp2.yahoo.net/67/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h2.grid.sp2.yahoo.net/67/console
+
+This message is automatically generated., +1 This looks good., I was able to recreate the test failure with TestBlockReport... not sure yet on whether this test failure is because of this patch or not., Dhruba, can you check if your workspace has HDFS-733 in? That was committed on 11/6 by Konstantin, and it should fix the TestBlockReport test failure.
+, I committed it to trunk. Thanks Zheng!, The reason I did not commit it to 0.20 and 0.21 is because this is not a regression., Integrated in Hadoop-Hdfs-trunk-Commit #103 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Hdfs-trunk-Commit/103/])
+    . Prevent DataNode heartbeat times from increasing even when
+the DataNode has many blocks to delete. (Zheng Shao via dhruba)
+, Integrated in Hadoop-Hdfs-trunk #136 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Hdfs-trunk/136/])
+    . Prevent DataNode heartbeat times from increasing even when
+the DataNode has many blocks to delete. (Zheng Shao via dhruba)
+, Attaching the patch for hadoop 0.20.
+Although we don't need it for apache hadoop 0.20, we can include it into Yahoo and Cloudera's hadoop 0.20 distribution if it approves to be useful.
+, Integrated in Hdfs-Patch-h5.grid.sp2.yahoo.net #104 (See [http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/104/])
+    , Integrated in Hdfs-Patch-h2.grid.sp2.yahoo.net #72 (See [http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h2.grid.sp2.yahoo.net/72/])
+    , hi, all, Heartbeats times from Datanodes will also increase when there are plenty of blocks to report. 
+
+partial Datanode log of Hadoop-0.19.2:
+2009-12-18 01:45:19,434 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: BlockReport of 67275 blocks got processed in 862837 msecs, Patch for branch-0.20-security is attached., I am out of office on a business trip for next couple of days. I will
+be slower than usual in responding to emails. If this is urgent then
+please call my cell phone (or send an SMS), otherwise I will reply to
+your email next week when I get back.
+
+Thanks for your patience,
+
+-- amr
+, +1 the 0.20s patch looks good.]

@@ -1,0 +1,142 @@
+[The following shows relevant info from jmap for a datanode that had a lot fds open.
+
+- {noformat}
+#jmap with out full-GC. Includes stale objects:
+# num of fds for the process : 5358
+
+#java internal selectors
+ 117:          1780          42720  sun.nio.ch.Util$SelectorWrapper
+ 118:          1762          42288  sun.nio.ch.Util$SelectorWrapper$Closer
+
+#Hadoop selectors
+  93:          3026         121040  org.apache.hadoop.net.SocketIOWithTimeout$SelectorPool$SelectorInfo
+ 844:             1             40  org.apache.hadoop.net.SocketIOWithTimeout$SelectorPool$ProviderInfo
+
+#Datanode threads 
+  99:          2229         106992  org.apache.hadoop.dfs.DataNode$DataXceiver
+{noformat}
+
+- {noformat}
+#jmap -histo:live immediately after the previous. This does a full-GC before counting.
+#num of fds : 5187
+
+  64:          1759          42216  sun.nio.ch.Util$SelectorWrapper
+  65:          1759          42216  sun.nio.ch.Util$SelectorWrapper$Closer
+
+ 465:             4            160  org.apache.hadoop.net.SocketIOWithTimeout$SelectorPool$SelectorInfo
+ 772:             1             40  org.apache.hadoop.net.SocketIOWithTimeout$SelectorPool$ProviderInfo
+
+ 422:             4            192  org.apache.hadoop.dfs.DataNode$DataXceiver
+{noformat} This shows that there is no fd leak in Hadoop's selector cache. DN has 4 threads doing I/O and there are 4 selectors. But there are a lot of java internal selectors open.
+
+- {noformat}
+# 'jmap -histo:live' bout 1 minute after the previous full-GC
+#num of fds : 57
+
+# There are no SelectorWrapper objects. All of these must have been closed.
+
+ 768:             1             40  org.apache.hadoop.net.SocketIOWithTimeout$SelectorPool$SelectorInfo
+
+ 730:             1             48  org.apache.hadoop.dfs.DataNode$DataXceiver
+{noformat}
+
+I will try to reproduced this myself and try out a patch for connect(). 
+, 
+Suggest fix is attached. Datanodes have no instances of Sun's SelectorWrapper objects with this patch. 
+
+This adds {{NetUtils.connect(socket, addr, timeout)}} which invokes {{SocketIOWithTimeout.connect()}} for channels.
+
+connect seems to work fine. If you anyone wants to try this patch out, I can attach a version for 0.17 or 0.18. , I'd love to try this out on 0.18.1. Sounds like my exact problem., Bryan: out of curiosity, what is your upper limit on FD's?  In theory, you should be able to work around this by increasing the fd limit.  (rlim_fd_max in /etc/sytsem on solaris, nofile in /etc/security/limits.conf on Linux, ...), Patch for 0.18 is attached., Originally I had 1024 per machine. I recently increased it to 4096 and I haven't seen the problem as much, but it was intermittent before, so I don't know if it's resolved or not., We're running ours with 8192, which is likely why we've never seen this. :), I doubt 8K would be enough for a moderately busy datanode with out this patch. Ultimately it depends on what goes on in blackbox of GC and phantom references.. it might be fine for some users or some loads., I guess our datanodes aren't that busy then... ;), bq. I guess our datanodes aren't that busy then
+
+It also depends on the heapsize which would change the frequency of fullGC.
+We use default heapsize of 1000M for the datanode.
+Cluster that hit this issue was using 2048M (with 1024 file descriptor limit)
+, Updated patch closes the channel as javadoc for SocketChannel.connect() requires., Could someone review this patch for trunk? 
+
+Eventually we should write a Socket a socket factory and return our own Socket so that we don't need NetUtils.connect(), NetUtils.getOuptStream() etc., That would explain the kind of file handle leaks we are observing when writing from Apache HTTp server via a custom logwriter to HDFS. The log-writer opens up a file for writing every X min and keeps writing the apache log entries that it receives through a pipe. Underneath the log writer the DFSClient opens up a new blocking connection (DFSClient.connect()) and transfers the data via data streamer threads. In our case X is sufficiently large to cause the wrapped selector objects to move to "old space" and not get garbage collected because a full GC never runs since the program never exceeds its memory requirements.
+
+I think having this patch will alleviate the problem. Another way for client applications is to force full GC at regular intervals. I will try forcing full GC and see if that works for my case., - In case SelectionKey.OP_WRITE, "read" should be "write"
+
+- I suggest to simplify the codes for timing as below
+{code}
+final long endtime = System.currentTimeMillis() + timeout;
+while(true) {
+  final long timeleft = endtime - System.currentTimeMillis();
+  ...
+  if (... && timeleft < 0) {
+    throw ...
+  }
+}
+{code}, Thanks Nicholas.
+
+Updated patch is attached.
+
+> In case SelectionKey.OP_WRITE, "read" should be "write"
+good catch. 
+
+> I suggest to simplify the codes for timing as below 
+I modified the loop a bit like the way you suggested, but not exactly same, since it requires two calls to currentTime() instead of one for each loop.. even in the common case of no timeouts. 
+  
+
+
+, +1 patch looks good., Updated patch fixes two findbugs warnings. 'SocketChannel' is is already a SelectableChannel, there is no need to check with instanceof., tes-patch output : {noformat}
+     [exec] -1 overall.
+
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+
+     [exec]     -1 tests included.  The patch doesn't appear to include any new or modified tests.
+     [exec]                         Please justify why no tests are needed for this patch.
+
+     [exec]     +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+     [exec]     +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+     [exec]     +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+{noformat}, I just committed this., Integrated in Hadoop-trunk #646 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/646/])
+    . Implement blocking connect so that Hadoop is not affected
+by selector problem with JDK default implementation. (Raghu Angadi)
+, The -branch-18 patch does not apply to Hadoop 0.18.3. Specifically, the following hunk fails to apply in DataNode.java:
+
+{code}
+*** 1490,1496 ****
+          InetSocketAddress proxyAddr = NetUtils.createSocketAddr(
+              proxySource.getName());
+          proxySock = newSocket();
+-         proxySock.connect(proxyAddr, socketTimeout);
+          proxySock.setSoTimeout(socketTimeout);
+
+          OutputStream baseStream = NetUtils.getOutputStream(proxySock,
+{code}
+
+The lines near 1490 do not make any reference to 'proxySock'. 
+
+The only definitions of "OutputStream baseStream" are in run(), copyBlock(), and readBlock(). Without more context, for this patch hunk, I'm not sure where this might be applied, though the line:
+
+{code}
+targetSock.connect(targetAddr, socketTimeout);
+{code}
+
+near line 1431 seems like a reasonable candidate, as it's the only example of a fooSock.Connect() call. 
+
+Raghu, am I correct here? If not, can you release a new 18-branch patch?
+, My proposed change to the patch is attached as HADOOP-4346-0.18.3.patch, but I'm not sure if it's correct., Reuploading patch that works with -p0 instead of -p1, > The lines near 1490 do not make any reference to 'proxySock'. 
+
+Right, looks like that part got reverted in 0.18 [later|http://svn.apache.org/viewvc?view=rev&revision=708637].
+
+0.18 patch I attached does not have some minor fixes that were done later.
+
+I suggest following change for your patch : changes for SocketIOWtihTimeout.java and NetUtils.java should come from trunk patch (they should just apply without any conflicts). The rest of it should be fine.
+
+We should run 'ant test-patch' with new one.. I can run that if you want., Thanks Raghu,
+
+So what's the resolution on DataNode.java? Just disregard the non-applying hunk? If so, what about the targetSock.connect() call at line 1431?
+, You resolution is correct. targetSock.connect() should be changed instead of proxySock.
+
+Essentially, DataNode should not invoke plain {{socket.connect()}} at all, they should all be replaced with {{NetUtils.connect(sock...)}}, Updated 0.18.3 patch per Raghu's suggestions, Fixed -p0 / -p1 issue in patch (again...), +1. looks correct.  
+
+When I grepped, I noticed that we don't fix connect in Balancer.java. We probably should. I will file jira on that., 
+> When I grepped, I noticed that we don't fix connect in Balancer.java. We probably should. I will file jira on that.
+
+not  an issue. Balancer does not use NIO sockets, so not affected. sorry for the confusion. ]

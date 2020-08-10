@@ -1,0 +1,345 @@
+[I write a test to produce the scenario, and here is the log:
+{noformat}
+2012-12-05 22:55:15,135 WARN  hdfs.DFSClient (DFSInputStream.java:readBuffer(596)) - Found Checksum error for BP-50712310-192.168.0.101-1354719313473:blk_-705068286766485620_1002 from 127.0.0.1:50099 at 0
+2012-12-05 22:55:15,136 INFO  DataNode.clienttrace (BlockSender.java:sendBlock(672)) - src: /127.0.0.1:50099, dest: /127.0.0.1:50105, bytes: 4128, op: HDFS_READ, cliID: DFSClient_NONMAPREDUCE_-1488457569_1, offset: 0, srvID: DS-91625336-192.168.0.101-50099-1354719314603, blockid: BP-50712310-192.168.0.101-1354719313473:blk_-705068286766485620_1002, duration: 2925000
+2012-12-05 22:55:15,136 INFO  hdfs.DFSClient (DFSInputStream.java:chooseDataNode(741)) - Could not obtain BP-50712310-192.168.0.101-1354719313473:blk_-705068286766485620_1002 from any node: java.io.IOException: No live nodes contain current block. Will get new block locations from namenode and retry...
+2012-12-05 22:55:15,136 WARN  hdfs.DFSClient (DFSInputStream.java:chooseDataNode(756)) - DFS chooseDataNode: got # 1 IOException, will wait for 274.34891931868265 msec.
+2012-12-05 22:55:15,413 INFO  DataNode.clienttrace (BlockSender.java:sendBlock(672)) - src: /127.0.0.1:50099, dest: /127.0.0.1:50106, bytes: 4128, op: HDFS_READ, cliID: DFSClient_NONMAPREDUCE_-1488457569_1, offset: 0, srvID: DS-91625336-192.168.0.101-50099-1354719314603, blockid: BP-50712310-192.168.0.101-1354719313473:blk_-705068286766485620_1002, duration: 283000
+2012-12-05 22:55:15,414 INFO  hdfs.StateChange (FSNamesystem.java:reportBadBlocks(4761)) - *DIR* reportBadBlocks
+2012-12-05 22:55:15,415 INFO  BlockStateChange (CorruptReplicasMap.java:addToCorruptReplicasMap(66)) - BLOCK NameSystem.addToCorruptReplicasMap: blk_-705068286766485620 added as corrupt on 127.0.0.1:50099 by null because client machine reported it
+2012-12-05 22:55:15,416 INFO  hdfs.TestClientReportBadBlock (TestDFSInputStream.java:testDFSInputStreamReadRetryTime(94)) - catch IOExceptionorg.apache.hadoop.fs.ChecksumException: Checksum error: /testFile at 0 exp: 809972010 got: -1374622118
+2012-12-05 22:55:15,431 INFO  hdfs.MiniDFSCluster (MiniDFSCluster.java:shutdown(1411)) - Shutting down the Mini HDFS Cluster
+{noformat}
+, You have HDFS-4271 and HDFS-4272 with similar description. Are they accidentally created?, bq. You have HDFS-4271 and HDFS-4272 with similar description. Are they accidentally created?
+Yes, bad Internet connection. I have closed the other two., And here seams have another issue:
+
+{code}
+  /**
+   * This variable tracks the number of failures since the start of the
+   * most recent user-facing operation. That is to say, it should be reset
+   * whenever the user makes a call on this stream, and if at any point
+   * during the retry logic, the failure count exceeds a threshold,
+   * the errors will be thrown back to the operation.
+   *
+   * Specifically this counts the number of times the client has gone
+   * back to the namenode to get a new list of block locations, and is
+   * capped at maxBlockAcquireFailures
+   */
+  private int failures = 0;
+......
+  public int read(long position, byte[] buffer, int offset, int length)
+    throws IOException {
+    // sanity checks
+    dfsClient.checkOpen();
+    if (closed) {
+      throw new IOException("Stream closed");
+    }
+    failures = 0;
+
+{code}
+
+every concurrent "pread" call will reset failures, so if there always have new pread calls, seems all pread will loop infinitely? 
+I am assuming int read(long position, byte[] buffer, int offset, int length) is intended for concurrent use? If so, failures should be a local variable.
+, I do not think the DFSInputstream#read will be used concurrently. Thus the failure variable reset should be correct. Also, to clear deadNodes looks reasonable especially when you have multiple replications (since at that you do not have any candidate nodes to try and some previous temporary "deaths" may already have been recovered). , bq. I do not think the DFSInputstream#read will be used concurrently.
+Yes "read(byte [] buffer, int offset, int length)" will not be used concurrently. but according the classic semantics of pread "int read(long position, byte[] buffer, int offset, int length)", and no "synchronized" implication, I thought hbase may be using pread concurrently, right?
+
+bq. Also, to clear deadNodes looks reasonable...
+I'm not against clear deadNodes and retry, on the contrary, the current logic makes it may not retry enough and quit early., I am referring read() as int readWithStrategy(ReaderStrategy strategy, int off, int len)
+and pread() as int read(long position, byte[] buffer, int offset, int length)
+
+Changes:
+1. Add new argument "dislike" to chooseDatanode() and bestNode(), so to fix seekToNewSource.
+2. Make failures to be local variable, so pread can be thread-safe
+2. In read(), make outer layer to handle BlockMissingException, bypassing seekToNewSource
+3. Remove read retries, cause there is already MaxBlockAcquireFailures to handle retry
+4. Throw ChecksumException iff we have tried enough times and there is only one replica available.
+   In original logic, the throwing of ChecksumException or BlockMissing is somehow random, depending the order of the locations of getLocatedBlocks().
+   Another alternative is change it to always throw BlockMissingException(like pread behavior), but it breaks current test cases.
+5. In pread(), modify code to follow the same retry logic as read().  
+   Notice that the exception behavior of read() and pread() is not same currently:
+   read() sometimes throw ChecksumException, pread() never throw ChecksumException. The current patch remain the same behavior.  
+6. Add sanity checks for seek and seekToNewSource
+7. Add test to check DFSInputStream tried MaxBlockAcquireFailures under error
+8. Add the same test cases to check seekToNewSource as the original test cases to check seek
+, new version, fix bug -- forget to set blockEnd to -1 in two places: seekToNewSource() and read(), {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12556369/HDFS-4273-v2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.TestEditLog
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/3613//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/3613//console
+
+This message is automatically generated., the failed test is caused by HDFS-4282, Anyone familiar this part of code, could you please give some input for this issue? I'm reviewing DFSClient code to try to evaluate the complexity of reimplementing a native HDFS client and found some issues of the code(not only this one), at least it will make hdfs more robust., HBase definitely uses the positional read API (at least since 0.92 with HFile v2, see HFileBlock.java). OTOH, since the private retries is not volatile, it might appear to be thread local in many JVMs to avoid the infinite loop by concurrent preads in this case :)
+
+The patch fix the retry logic and lgtm. Maybe "avoid" is better than "dislike"?, thanks for the review Luke! 
+Here is new version:
+change dislike to avoid
+, {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12562449/HDFS-4273.v3.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/3696//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/3696//console
+
+This message is automatically generated., Looks like the patch has gone stale..., @Luke, Sorry for the late, attaching latest version patch, Patch looks good Binglin,
+Only one small nit.
+
+duplicate closed check is done in seekToNewSource
+{code}
++    if (closed) {
++      throw new IOException("Stream is closed!");
++    }{code}
+
++1, once this is addressed. Lets wait for the jenkins +1 too., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12614872/HDFS-4273.v4.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The following test timeouts occurred in hadoop-hdfs-project/hadoop-hdfs:
+
+org.apache.hadoop.hdfs.TestShortCircuitLocalRead
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5502//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5502//console
+
+This message is automatically generated., Thanks for the review Vinay! Attach new patch addressing your comments and fix the test timeout., +1, Latest patch looks good., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12615064/HDFS-4273.v5.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5516//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5516//console
+
+This message is automatically generated., Hi, @Luke or @Vinay, Looks like the patch is OK, could you help get this committed? Thanks!, [~decster], Let me take a look, I will commit the patch for you., {code}
+     -> seekToNewSource() add currentNode to deadnode, wish to get a different datanode
+        -> blockSeekTo()
+           -> chooseDataNode()
+              -> block missing, clear deadNodes and pick the currentNode again
+        seekToNewSource() return false
+{code}
+
+i checked codebase, it shows :
+{code}
+  private synchronized boolean seekToBlockSource(long targetPos)
+                                                 throws IOException {
+    currentNode = blockSeekTo(targetPos);
+    return true;
+  }
+{code}
+It could not return false, seems the original description is stale ? , seekToNewSource, not seekToBlockSource, Oh, my stupid:), Update patch because of recent commit conflict, changes:
+Change getStorageID to getDatanodeUuid
+[~umamaheswararao] if you are reviewing please use the latest patch., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12619271/HDFS-4273.v6.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestBlocksWithNotEnoughRacks
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5756//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5756//console
+
+This message is automatically generated., The test failure TestBlocksWithNotEnoughRacks is not caused by this patch, and is tracked in HDFS-5540, Hi Binglin, I have another case.
+
+I use Hbase-0.94 and CDH-4.3.1
+When RegionServer read data from loca datanode, if local datanode is dead, the local datanode is add to deadNodes, and RegionServer read data from remote datanode. But when local datanode is become live, RegionServer still read data from remote datanode, that reduces the performance of RegionServer.  We need to one way that remove local datanode from deadNodes when the local datanode is become live., Hi LiuLei,  this is indeed an issue. 
+By my understanding, hbase mostly uses pread to read hfile data in multithread, but deadnodes is not per thread, hence a more broader issue is if we change deadnodes in one thread, it affects other threads' logic. This jira doesn't not fix this broader issue.
+I am thinking of a workaround, if a DN in deadNodes is local, we give it an expire time, after it expires, we remove it, this is not perfect but should solve the issue most of the time.
+
+, Update patch, chages:
+1. rebase to current trunk
+2. local DN in deadNodes can expire, after local DN expires, it is removed from deadNodes
+3. set static const LOCAL_DEADNODE_EXPIRE_MILLISECONDS to10 minutes, so local DN should expire in 10 minutes, then read operations will try to use this local DN is possible. Assuming fail is fast when connecting to local DN when local DN is dead, performance impact should be small for extra retry. 
+
+We can make LOCAL_DEADNODE_EXPIRE_MILLISECONDS configurable by adding it to dfsclient.conf, if someone think it necessary. , Hi, Binglin
+We can add isLocalNodeDead attribute in DFSClient object, when one DFSInputStream object find the local datanode is dead, the DFSInputStream object set isLocalNodeDead attribute to true. We need one thread that detection whether the local datanode is live, if the local datanode is live, the thread set  isLocalNodeDead attribute to false.  When DFSInputStream object choose datanode, the DFSInputStream need to judge  isLocalNodeDead attribute.  
+
+We can create another jira to discuss the question.
+, {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12621571/HDFS-4273.v7.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5827//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5827//console
+
+This message is automatically generated., bq. We can create another jira to discuss the question.
+About your proposed approach, you need to find local datanode inetaddr and a way to to detect whether the local datanode is live, it may take more effort. Sure we can create another jira., Current simple workaround (expire for local deadnode) looks good to me. [~liulei.cn], please go ahead to create a separated JIRA on discussing other approach if you have better ideas.
+Hi [~umamaheswararao], are you currently reviewing this jira? If not, I can help to review on this effort., Update patch to remove expiring local deadNodes related changes. Will create another jira addressing it., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12621932/HDFS-4273.v8.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5844//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5844//console
+
+This message is automatically generated., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12621932/HDFS-4273.v8.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / f1a152c |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/10593/console |
+
+
+This message was automatically generated., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12621932/HDFS-4273.v8.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / f1a152c |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/10630/console |
+
+
+This message was automatically generated., I'm looking into this and writing my understanding for other reviewers here:
+
+All of HDFS-4273, HDFS-5917 and HDFS-6022 addresses improvement of refreshing {{deadNodes}}. I think HDFS-6022 is the most promising. (Actually, newest v8 patch omitted the deadNodes part.)
+
+Other issues addressed here are
+# There is a case it should retry but don't
+# There is race condition around {{failures}}
+
+HDFS-5776 changed a lot of relevant code around {{chooseDataNode}} method and the v8 patch is difficult to rebase.
+
+Fixes around {{seekToNewSource}} alone may work and I'll try to update the patch.
+, I looked into tests added by .v8 patch.
+
+{{TestDFSClientRetries#testDFSInputStreamReadRetryTime}} added by .v8 patch. The test expects client to always retry up to maxBlockAcquireFailures but it is not true. Client does not retry to same node on ChecksumException. {{seekToNewSource}} returning 0 means there is no more possible datanodes and it is right to give up even if retry count (failures) does not reache to max.
+
+{{testSeekToNewSourcePastFileSize}} and {{testNegativeSeekToNewSource}} added to {{TestSeekBug}} calls {{FSDataInpuStream#seekToNewSource}} just after opening file. This causes NullPointerException because currentNode is not set in DFSInputstream. Tests passed after fixing this.
+
+I close this issue as Won't fix.
+]

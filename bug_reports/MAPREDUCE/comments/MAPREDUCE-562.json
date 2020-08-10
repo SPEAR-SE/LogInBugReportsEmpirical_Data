@@ -1,0 +1,60 @@
+[
+Here's a first stab at an algorithm to fix this:
+
+*  Let's define the "home stretch" of shuffling, from the perspective of a reducer, as the last X% of the map shards it needs to fetch. Maybe that's 3% or 4%.
+* If during the home stretch, a map task enters the penalty box and stays there for some number of seconds (let's say 30), the reducer can send a message back to the JobTracker voting that the task be marked as "failed for being too slow."
+* The JobTracker requires a quorum of still-shuffling reducers to vote this way. The quorum might be, say, 10%. This way if only two reducers are still waiting, either one of them is a quorum by itself. But if 40 reducers are shuffling, it will take the consensus of a few reducers that a mapper is indeed too slow.
+* If enough votes are given, the JobTracker blacklists a TaskTracker from the job, marks all its map task attempts as failed, and restarts all the map tasks from that node, on other nodes.
+, > ... some number of seconds (let's say 30) ...
+This probably should depend on the map running time. 30 seconds are nothing if the running time is 2 hours.
+
+I do not understand the algorithm in every detail.  Could give an example?, Sure.
+
+To clarify a bit first: when reducers put mappers in "the penalty box," they're saying that this mapper is being slow, so it should prioritize receiving from other mappers instead. But if there are no other mappers left, then this just makes the reducer spin in circles. If the only mappers left are in the penalty box, then something's probably wrong.
+
+Call the home stretch percentage 4%. There are 1,000 map tasks.  There are 20 reduce tasks. The kill quorum is 10%.
+
+A reducer retrieves 960 map task outputs -- that's 96%, so we're in the last 4%. There are 40 mapper outputs left to receive. The 20 mapper tasks from one node are all in the penalty box. The other twenty mapper outputs get retrieved. The 20 stalled outputs are still in the penalty box. The timeout is triggered, meaning that those 20 tasks just spun in the penalty box for way too long. The reducer votes to tell the JobTracker that the mapper is frozen.
+
+Another reducer experiences the same problem. It votes the same way.
+
+The JobTracker has now received 2/20 = 10% of the active shufflers saying that a particular mapper node has not been delivering its outputs. The JobTracker blacklists that TT and marks all its mapper tasks as failed. All twenty of those map tasks go to other nodes. They finish. The reducers grab their outputs, and the reduce process continues.
+, This is a very good observation and the solution seems interesting too (we observed this behavior in our PetaSort experiment too).
+
+However, I think the fundamental problem is still not tackled - where the last few mappers will block all reducers. Even if every mapper is running on a different task tracker, you would have all reducers trying to pull from those few mappers and thus would still be very slow - informing JT to spawn mappers to other TTs would not help (and may make the matter even worse 'coz you may end up not making any progress at all).
+
+To really solve the problem, we probably want to run multiple copies of the same mapper and keep them all, then balance the reducers among those replica instances. This is not an easy fix and may belong to the scope of speculative execution., Hong,
+
+This changes the semantics of speculative execution, as I understand it.
+
+Speculative execution does not strictly guarantee that all mappers will emit the same output for the same input, but it does guarantee that they are all equally "good." So map(A) might return X, but a second speculative execution of map(A) might return Y. Either X or Y will finish first and the JT will use exactly one of these.
+
+Your proposal is that some of the reducers can grab their output shard from the X results, and other reducers can grab their output shard from the Y results.
+
+If we're willing to tell developers about that new contract and make it an option, then wouldn't be universally applicable. So I still think we'd still need a fallback mechanism like I proposed here., I don't think it changes the semantics. You were saying that all reducers should either see output from map(A) or map(B), but not a mixture of both. But this is not the case even without what I am suggesting. Today, a reducer may gets map output from map(A), then the TT that hosts the output of map(A) dies, and all maps on that TT gets re-executed, and other reducers that have not yet fetched output from map(A) will fetch from map(B)., I was under the impression that if a map task died before delivering output to all of the reducers, then after the map task is re-executed elsewhere, all reducers roll back and re-pull from the newer version of the mapper. I could be mistaken though?
+
+Because if that's the case, then we just need to run another round of speculative execution during the final shufflings, even if the map tasks themselves were marked as "complete," and modify the reducers to try to pull from a list of eligible mappers instead of just a single node., AFAIK, once a reducer finishes pulling map output from a particular mapper, it will no longer pulling the same output again (from a different invocation of the same map task). If not so, then a reducer cannot quit until all other reducers finish fetching map outputs from all maps. This then lead to another implication that if your cluster has fewer reducer slots than total # of reducers, your job will never finish., Hong,
+
+Good point regarding where reducers pull from. Since multiple waves of reducers are supported, it sounds reasonable to me.
+
+So maybe the algorithm changes to this; we modify speculative execution in the following way:
+
+* If a map task is launched multiple times via spec. ex., all copies that succeed are eligible to serve reducers concurrently, not just one such copy.
+* The completion of a map task's processing does not cause speculative copies to be killed; they also run to completion.
+* Mapper TaskTrackers report back to the JT (during their heartbeat) the number of reduce shards served / available. If any set of mappers are falling "too far behind" the other mappers (e.g., most mappers have served 900/1000 shards, but a couple have only served 50/1000), then we launch additional copies of those mapper tasks on other nodes.
+* Reducers are advised of additional alternate locations to pull a particular map shard. If multiple sources are available, they randomly choose one. If that source is too slow, it tries a different copy.
+
+
+This gets rid of the need for reducers to "vote" and influence the JT's behavior directly.
+
+, I think this approach is the right one, Aaron. However, the tricky part will be determining what metrics to use for deciding that a TaskTracker is slow at serving outputs and for deciding on a reducer when you want to try a second location.
+
+For identifying slow TT's, just looking at number of shards served might not be enough. First of all, TT's might have run different numbers of tasks. Second, TT's might become slow partway through their lifetime. If all TT's have served 1000/1000 shards and one of them is at 800/1000 and then starts thrashing, you have to realize that at that point. I think there are two possible ways to go:
+1) Instead of looking at shards served, ask reducers periodically about how many shards they are in the process of fetching from each TT. If there is a TT that a lot of reducers are currently fetching from, it's probably being slow (we could even say "when there are only N tasktrackers left that we are fetching from, start considering them slow"). This might have to be weighted by number of shards that ran per node. The idea is to match the same kind of detection that a human operator may do ("hey, everyone is waiting on tasktracker X").
+2) Look at rate of data being served (in bytes/second) from each TT, as well as the demand (how many shards are being requested). Mark TT's where the rate is below some threshold and the demand is above some other threshold as slow. (These thresholds may be calculated based on how the other TT's did).
+
+For deciding when to fetch from a new shard in a reducer, the tricky part will be telling loaded TT's apart from slow TT's. The moving around between shards can't be too aggressive., Sorry for jumping in late, I somehow missed this one.
+
+I thought I'd point out that currently reduces _do_ indeed provide feedback regarding 'failed' shuffles to the JobTracker, which on receipt of sufficient number of complaints from reduces does re-execute the map elsewhere.
+, I think the problem here was a slow shuffle, not a failed one. What conditions cause a shuffle to be declared as failed?, This is still an interesting issue, but at this point, I feel the need to close this one.  The big reason being that this problem needs to be generalized for YARN and made much less MR specific.
+]

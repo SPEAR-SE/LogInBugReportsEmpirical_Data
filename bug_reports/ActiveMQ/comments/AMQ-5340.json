@@ -1,0 +1,90 @@
+[Attached JUnit test that shows the issue. On my machine it runs in 0.7ms when sending 50 messages using EXPIRE_MESSAGES_PERIOD = 200. With EXPIRE_MESSAGES_PERIOD = 10000 and otherwise the same settings it runs in 10.5s, with EXPIRE_MESSAGES_PERIOD = 30000 in 30.5s., I'm experiencing this issue as well, but my messages are not expiring. Steps to reproduce on AMQ 5.10.0, default configuration - just unzip and run:
+
+ # Send a few messages to a queue
+ # Browse it repeatedly
+ # Observe that on some browse attempts hasMoreMessages() takes a very long time (tens of seconds), This is not a problem and is working as intended.  Your issue is that you are using a transaction and you never call commit so your messages are never acknowledged by the broker.  Since your messages are never acknowledged, hasMoreElements() will always return true because the QueueBrowser is never notified that it is done browsing until the expire messages task runs and removes the messages.
+
+In your test on line 115 when you create your session, if you change {{connection.createSession(true, Session.AUTO_ACKNOWLEDGE)}} to {{connection.createSession(false, Session.AUTO_ACKNOWLEDGE}} then your test will immediately finish and not hang.
+
+ If you still want to use a transaction then you need to call commit on the session after you get each element or hasMoreElements() is never going to finish.  So you would change your loop to:
+
+{code:java}
+while (enumeration.hasMoreElements()) {
+	TextMessage m = (TextMessage) enumeration.nextElement();
+	browsed++;
+        session.commit();
+	LOG.info("B[{}]: {}", browsed, m.getText().substring(0, 100));
+}
+{code}, After talking with [~tabish121] about this issue, I'm going to take a look and see what it would take to change the QueueBrowser behavior so it doesn't participate in a transaction since it doesn't really make sense to be transacted. , [~christopher.l.shannon], following your suggestion for either properly handling transactions or not using transactions solves the issue in the example I created.
+
+What is very weird is that the issue still remains in my actual application. I am using standalone Spring (3.2.5.RELEASE, no J2EE container). I use the browseSelected method of a org.springframework.jms.core.JmsTemplate that is configured with an ActiveMQConnectionFactory. As is the default, it does not use a transaction and it uses auto acknowledge.
+
+Problem also remains when I set sessionTransacted to true on the JmsTemplate and call commit after fetching each message., [~slowstrider],
+
+That is odd because it should work fine.  I just modified your example to use a JmsTemplate and browseSelected to browse the queue and everything works as expected and finishes in less than 1 second.  I went ahead and uploaded my change so you can see what I did.   I'm using Spring version 3.2.11.RELEASE (current version in ActiveMQ's master) , Thank you for taking the time to solve this issue. Perhaps it's some specific configuration in my setup e.g. in activemq.xml or my Spring configuration which creates the queue. I will see if I can isolate the issue., I found out what I did wrong. The AMQ5340BrowsingPerformanceBug.java does not reproduce the issue and indeed contains the bug you have mentioned. It does not actually do what I am claiming in the bug description! With a small change I can reproduce the original bug I mentioned:
+
+- set a time to live of 1 second for the messages that are sent
+- set expireMessagesPeriod to 10 seconds
+- repeatedly browse the queue until it is empty, sleeping for 100ms in between
+
+One would expect this to end after at most 1200 ms or so, but it actually runs for 10 seconds! After all messages have expired enumeration.hasMoreElements() blocks instead of immediately returning false., AMQ5340BrowsingPerformanceBugCorrected actually shows the issue I'm experiencing., In summary: after there are expired messages, the queue browser's enumeration.hasMoreElements() blocks until the expired messages are removed by the background job.
+
+The blocking is unexpected. I would expect the enumeration to immediately return no messages at all, or perhaps alternatively immediately return the expired messages which the background job hasn't removed yet., Thanks for submitting your updated test case, I can see where this an issue now.
+
+[~gtully] and [~tabish121],
+
+This is another interesting issue relating to expired messages.  The problem with this test case is the messages are added to the subscription to be dispatched but when the subscription goes to dispatch them the logic detects the messages are expired so the QueueBrowser client never gets any messages.  Unfortunately, since the QueueBrowser never receives any messages it never sends back any acks and acks are what trigger the logic to send a NULL_MESSAGE signaling the browser is done.  This happens in the iterate method in Queue.
+
+So basically the QueueBrowser needs some way to know that it will never receive any messages.  The QueueBrowser already calls off to waitForMessage() in the hasMoreElements() so using the pullCommand might work here as that would trigger the NULL_MESSAGE to get sent back.  However, right now a pull command is never sent if prefetch is greater than 0., When the queue has no messages at all the browser returns immediately. This is true before sending any message as well as after the expired messages have been removed by the background job., [~christopher.l.shannon]  - it does not make sense to me that a queue browser would check expiry, it should get a snapshot of messages from its creation time.
+maybe the simplest thing is to make the expiry check from org.apache.activemq.broker.region.PrefetchSubscription#dispatchPending conditional on not being a browser:                                
+{code} if (!isBrowser()  && node!=QueueMessageReference.NULL_MESSAGE && node.isExpired()) {{code}
+, [~gtully],
+
+I agree, not checking expiry for browsers makes sense.  This almost works but it appears there is something else that would need to be changed too...The problem is when running the test case against this change, the last run breaks.  The {{enumeration.hasMoreElements()}} returns true but the only thing pending is the NULL control message so then {{enumeration.nextElement()}} returns null.  It's detecting that no new messages were added in the iterate() method in Queue and calling brwoser.decrementQueueRef() which sends the NULL control message.  I haven't looked at it yet to figure out why it's doing that., GitHub user cshannon opened a pull request:
+
+    https://github.com/apache/activemq/pull/127
+
+    https://issues.apache.org/jira/browse/AMQ-5340
+
+    A QueueBrowser no longer checks expiry on messages to prevent a
+    browser from hanging in between the hasMoreElements check and actually
+    getting a message.  This means that if messages were in the queue when
+    the browser started it will receive messages even if they are now
+    expired. Even though the browser will get the expired message, the
+    broker will still expire it to prevent future access to it.
+
+
+You can merge this pull request into a Git repository by running:
+
+    $ git pull https://github.com/cshannon/activemq AMQ-5340
+
+Alternatively you can review and apply these changes as the patch at:
+
+    https://github.com/apache/activemq/pull/127.patch
+
+To close this pull request, make a commit to your master/trunk branch
+with (at least) the following in the commit message:
+
+    This closes #127
+    
+----
+commit ebac24a95870fda9de760709ffb5533adaa5c7f7
+Author: Christopher L. Shannon <christopher.l.shannon@gmail.com>
+Date:   2015-07-06T02:11:23Z
+
+    https://issues.apache.org/jira/browse/AMQ-5340
+    
+    A QueueBrowser no longer checks expiry on messages to prevent a
+    browser from hanging in between the hasMoreElements check and actually
+    getting a message.  This means that if messages were in the queue when
+    the browser started it will receive messages even if they are now
+    expired. Even though the browser will get the expired message, the
+    broker will still expire it to prevent future access to it.
+    
+    Thanks to Henno Vermeulen for providing a test case.
+
+----
+, I finally got some time to come back to this.  I created a PR so that a queue browser now ignores expiration but the broker will still expire the message on dispatch.  This way the browser will get a snapshot when started and prevent it from hanging but any future calls (a new browser, etc) won't get the messages as they have expired on the broker end.  , Github user asfgit closed the pull request at:
+
+    https://github.com/apache/activemq/pull/127
+, Fix applied, thanks!, Thank you for solving this, I upgraded to ActiveMQ 5.12.0 and my tests now succeed while they fail in 5.10.0.]

@@ -1,0 +1,424 @@
+[Does this Jira  handles scenario mentioned in YARN-1680 for headroom calculation?, bq. Does this Jira handles scenario mentioned in YARN-1680 for headroom calculation?
+Yes, it is. It's kind of related to "New node is added/removed from the cluster" above. Making it as a sub-task., bq. It's kind of related to "New node is added/removed from the cluster" above
+In YARN-1680,  from yarn cluster perspective, number of NodeManager remain same. Applicationmaster marked 1 nodemanager as blacklisted and update to RM. Further RM does not assign any containers on blacklisted nodes. But headroom sent to applicationmaster(availableResource) is per cluster level.
+
+Say 4 NM's(NM1,NM2,NM3,NM4) in cluster with 8GB each. 
+NM1,NM2,NM3 and NM4 running task occuping 27GB of whole cluster.*5GB free in NM4*
+Now Headroom=5GB(RM calculated and sent to applicationmaster)
+After *NM4 is blacklisted* by applicationmaster,still *headroom=5GB*(RM calculates headroom including NM4). This is wrong value receiving by applicationmaster!!!., Since headroom calculation is used reducer preemption, I have seen issues with these bugs causes queue deadlock where multi-job queue is full of reducers that can't finish since the mappers can't run due to reducers having higher task priority. Preemption doesn't kill reducers since headroom falsely shows there is plenty of room in the queue for mappers to run., It seems like the related problem with these group of jiras is mostly around when the cluster is resource constrained/has a small number of large jobs using most of the resources it can get into deadlock scenarios.  In addition to fixes for the specific behaviors I think it would be worthwhile to do a min of the calculated headroom against "cluster headroom" as a sanity check, cluster headroom being the total cluster resource - utilized resources.  I've attached a partial patch for that.  This will not help with the application blacklist case (1680) but it would help with 1857 and 2008 (it doesn't correct the mistake in headroom calculation, but it should prevent it from causing a deadlock).  (That's not to say we should not also fix the individual issues, just that this might be a good "catch all" for others we aren't aware of / the problem generally).  I'm attaching an initial pass at doing this (it's just the basics to see if the direction makes sense, not a finished product). , [~vinodkv] what do you think? (can you take a peek at my at my last comment & draft patch?), bq. I think it would be worthwhile to do a min of the calculated headroom against "cluster headroom" as a sanity check, cluster headroom being the total cluster resource - utilized resources.
+
+There are a couple of min's that need to be added to the current headroom calculation to catch some unsolved deadlock scenarios (again ignoring blacklisting effects):
+
+- Need to min against the available resources in the current queue, otherwise we don't account for the resources consumed by other users in the queue.
+- Need to min against the available resources in the parent queues (all the way up to the root queue), otherwise we don't account for the resources consumed elsewhere in the cluster.
+
+The first min above solves the deadlock where two apps from different users but in the same queue completely exhaust the queue's limits but there is still available resources in the cluster for other queues.  I believe the patch for YARN-1857 is intended to correct that scenario.
+
+For the second min, a min against the cluster avail resources is equivalent if there aren't any hierarchical queues, but it fails to prevent some deadlocks if those are employed.  We could have a parent queue that's not allowed to use all of the cluster resources and two leaf queues underneath that queue whose max cap each can be the entire parent queue.  Apps competing between those two leaf queues could completely saturate the parent queue and deadlock but there are still resources available at the cluster level.  I think YARN-2008 is related there.
+
+In summary, I think we need to add in a min against the queue avail resources for all queues from the current leaf queue up to and including the root queue (i.e.: the whole cluster)., [~jlowe] Right, this isn't a replacement for the other fixes, the question is really "is this worth doing in addition to those", or is it really not likely to be helpful.  I took a pass yesterday at detail for the approach for [YARN-2008]. It sounds like what you have in mind in your comment above, but you might take a look when you have a chance., bq.  The question is really "is this worth doing in addition to those", or is it really not likely to be helpful.
+
+It would definitely be helpful, but I think we should try to do the general form of that solution.  If we walk the parents then the cluster avail check will be automatically included (as that's the root queue), so we wouldn't need to do it separately., I've just taken a look at all sub tasks of this JIRA, I'm wondering if we should define what is the "headroom" first.
+In previous YARN, including YARN-1198 the headroom is defined as "the maximum resource of an application can get".
+And in YARN-2008, the headroom is defined as "the available resource of an application can get", because we already considered used resource of sibling queues.
+
+I'm afraid if we need add a new field like "guaranteed headroom" of an application consider its absolute capacity (not maximum capacity) and user-limits, etc. We may keep both of them because,
+- The maximum resource is not always achievible because sum of maximum resource of leaf queues may excess cluster resource.
+- With preemption, resource beyond guaranteed resource will be likely preempted. It should be consider as a temporary resource.
+
+And with this, AM can,
+- Using "guaranteed headroom" to allocate resource which will not be preempted.
+- Using "maximum headroom" to try to allocate resource beyond its guaranteed headroom.
+
+And in my humble opinion, the "available resource of an application can get" doesn't make a lot of sense here, and may cause some backward-compatible problems as well. Because in a dynamic cluster, the number can change rapidly, it is possible that a cluster is fulfilled by another application just happens one second after the AM got the "available headroom".
+And also, this field can not solve the deadlock problem as well, a malicious application can ask much more resource of this, or a careless developer totally ignore this field. The only valid solution in my head is putting such logic into scheduler side, and enforce resource usage by preemption policy.
+
+Any thoughts? [~jlowe], [~cwelch]
+
+Thanks,
+Wangda, We need to worry about headroom as a report of resources that can be allocated if requested.  If the AM cannot currently allocate any containers then the headroom should be reported as zero.  I think "guaranteed headroom" is a separate JIRA and not necessary to solve the deadlock issues surrounding the current headroom reporting.
+
+bq. Because in a dynamic cluster, the number can change rapidly, it is possible that a cluster is fulfilled by another application just happens one second after the AM got the "available headroom".
+
+Sure, this can happen.  However on the next heartbeat the headroom will be reported as less than it was before, and the AM can take appropriate action.  I don't see this as a major issue at least in the short-term.  Telling an AM repeatedly that it can allocate resources that will never be allocated in practice is definitely wrong and needs to be fixed.
+
+bq. And also, this field can not solve the deadlock problem as well, a malicious application can ask much more resource of this, or a careless developer totally ignore this field.
+
+A malicious application cannot cause another application to deadlock as long as the YARN scheduler properly enforces user limits and properly reports the headroom to applications.  It seems to me the worst case is an application hurts itself, but since the entire application can be custom user code there's not much YARN can do to prevent that.
+
+bq. The only valid solution in my head is putting such logic into scheduler side, and enforce resource usage by preemption policy.
+
+The problem is that the scheduler does not, and IMHO should not, know the details of the particular application.  For example, let's say an application's headroom goes to zero but is has outstanding allocation requests.  Should the YARN scheduler automatically preempt something when this occurs?  If so which container does it preempt?  These are questions an AM can answer optimally, including an answer of preempting nothing (e.g.: task is completing imminently), while I don't see how the YARN scheduler can make good decisions without either putting application-specific logic in the YARN scheduler or having the YARN scheduler defer to the AM to make the decision.  Reporting the headroom to the AM enables the AM to make an application-optimal decision of what to do, if anything, when the available resources to the application changes., {quote}
+With preemption, resource beyond guaranteed resource will be likely preempted. It should be consider as a temporary resource.
+{quote}
+One thing needs to be clarified about preemption. I think we can resolve YARN-2008 without introducing preemption. Because if we allow preemption before define priority, it is wasting time and resource to let thousand of  AMs to compete those "temporary resources" repeatedly. 
+
+priority is the most important factor in preemption of scheduling. I think, in this JIRA, we are talking about how to efficiently and relatively accurate get headroom in capacity scheduler. Preemption is another story. Here is how preemption defined in scheduling: 
+
+"In computing, preemption is the act of temporarily interrupting a task being carried out by a computer system, without requiring its cooperation, and with the intention of resuming the task at a later time. Such a change is known as a context switch. It is normally carried out by a privileged task or part of the system known as a preemptive scheduler, which has the power to preempt, or interrupt, and later resume, other tasks in the system." refer to Preemption from wikipedia [http://en.wikipedia.org/wiki/Preemption_%28computing%29], [~wangda] I concur with [~jlowe] and [~airbots] that these headroom fixes (incl [YARN-2008]) should happen.  I don't think that this is a redefinition of headroom, "headroom" remains "the maximum resource of an application can get" - the application can't get resources which are not available because they are in use, which is what the change addresses.  I think of this change as really only being a fix for a missed case - and it will in fact return the same value as it does today except under some specific cases of higher cluster utilization, in which case the value it returns will actually be better than it's current behavior in terms of helping the AM to work accurately and preventing some known deadlock conditions.  This kind of behavior is a necessary consequence of allowing oversubscription of cluster resources vis - a - vis the "maximum" allocation which is greater than the baseline (and which in aggregate can be > 100%), and this oversubscription is a reasonable design choice to allow applications to burst above their guaranteed level when other queues are less utilized.  As I mentioned on [YARN-2008], since the aggregate maximum can be > 100% it's not possible to solve this solely with preemption - AM's will still be getting higher values than are available without this correction - and retaining the "max" behavior for the reasons above, this kind of approach is going to be the way to go., Also - this combined with preemption will be desirable behavior - as preeption rebalances, this logic will properly (accurately) raise the headroom value for an application - since the AM understands the particulars of it's own task ordering, it will need to know what resources it actually has to work with as preemption frees them in order to make optimal use of them., I agree with [~jlowe], [~airbots] and [~cwelch], used resource should be considered into headroom (which is YANR-2008). And apparently, application master can ask more than that number to get more resource possibly. 
+
+I completely agree with what Jason mentioned, ignore headroom will not cause more problem except application itself. What I originally want to say is when putting headroom and gang scheduling together, it will cause deadlock problem and should be solved in scheduler side. But it seems kind of off-topic, let's ignore it here. 
+
+Also, as Chen mentioned, we don't need consider preemption when computing headroom. And besides, when resource will be preempted from an app, the AM will receive messages about preemption requests, it should handle itself.
+
+Thanks,
+Wangda
+
+, So, I'm in the process of putting together a patch to calculate the headroom in more cases as described in this jira.  It strikes me that one of the changes called for is to change headroom to apply to the queue+user combination instead of to the application as it does today -  today, headroom is per application, as I understand the jira, the suggestion is to establish the same headroom value for a given user + queue combination and to change the headroom simultaneously for all applications for a user + queue any time the headroom would change for any of them.  This suggests that a reasonable approach might be to use the same resource instance for a given user+queue combination, instead of having it per application.  Thoughts? , I think having a per-user-per-queue headroom computation and reusing it between applications for that user in that queue makes sense.  I don't know of a case where the headroom of one app for a user in a queue should be computed differently than another app for the same user in the same queue., Patch for most items in this jira not covered in subtasks, including
+update headroom when container finishes
+headroom changes propagated to all applications for the same user+queue combo
+admin refresh of queue results in headroom update
+
+Not included:
+If a new user submits an application to the queue then all applications submitted by all users in that queue should be notified of the headroom change.
+because I believe that really should be done on [YARN-1857]
+, Submit initial go at patch..., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12661256/YARN-1198.2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager:
+
+                  org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.TestApplicationLimits
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/4604//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/4604//console
+
+This message is automatically generated., Update broken test to reflect intentional change in behavior, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12661296/YARN-1198.3.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  Trunk compilation may be broken.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/4607//console
+
+This message is automatically generated., redo-patch against current trunk, trigger rebuild b/c something went wrong with the last one, So, looking at this a bit more holistically - it appears to me that the cumulative effect of the changes in this jira and it's subtasks is that any change in utilization by any application in the queue potentially effects the headroom of all of the applications in the queue (really, any change anywhere in the cluster when you consider [YARN-2008], but putting that aside for the moment...) - the current approach (.4 patch) may do the trick, but I wonder if it wouldn't be better to tweak things a bit in the following way:
+
+given that:
+an application's headroom is effectively a user's headroom for the application's queue (the user in queue headroom)
+and
+the user in queue headroom is effectively a generic per user headroom in the queue (an identical slicing for all users based on how many are active combined with the user limit factor) minus what that user is already using across all applications (already tracked in User)
+and
+any change which impacts this does cause a headroom recalculation for an application in the queue, but may affect them all
+
+when recalculating headroom on any event we could generate one generic queue-user value and then iterate all the applications in the queue and adjust their headroom to a per user value which would simply be the generic queue-per-user headroom minus that user's used resources
+
+Which is to say, I think that any time we recalculate the headroom we want to recalculate it for all users in the queue and apply the change to all applications in the queue - and I believe the simplest and most efficient way to do that would be to generate a generic "queue headroom", apply the generic per user logic, then iterate the applications and set the application user's headroom (same for all of that user's applications - calculated once per user - the generic value minus that user's used resources), I'd like to avoid iterating all the applications in the queue, as we do too much of that already.  Wouldn't it be more efficient to have the applications reference a common headroom object if they truly share the same headroom?  Off the top of my head I'm thinking of some headroom object that applications could reference that in turn contained the immutable Resource reference representing the headroom.  If we can lookup these headroom objects per-user-per-queue and assign the same headroom object to each application in a queue for the same user then we only have to iterate the number of users in the queue rather than the number of applications in the queue.  One gotcha is we'd have to fixup the headroom object for an application that moved between queues (which is possible in the FairScheduler today and soon the CapacityScheduler).
+, {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12661339/YARN-1198.4.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/4609//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/4609//console
+
+This message is automatically generated., So, it's possible to avoid iterating the applications in the queue and even the queue users if the antecedents of the headroom calculation are shared and updated at the queue level on change (qmaxcap...) and the final calculation is done during the heartbeat request / call to scheduler application attempt.  It would just be a calculation over these resources & some user specific values, should be reasonably performant, but it would move the final activity away from where it is today., Patch with a slightly different approach - calculates final headroom on demand from intermediate values (shared across all applications in queue where possible) does not require iteration over applications or users, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12662350/YARN-1198.5.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 2 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/4649//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/4649//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/4649//console
+
+This message is automatically generated., Fix for findbug finds, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12662360/YARN-1198.6.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager:
+
+                  org.apache.hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRestart
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/4650//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/4650//console
+
+This message is automatically generated., Can't repro test failure - uploading (better formatted) patch to trigger new build, {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12662403/YARN-1198.7.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/4655//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/4655//console
+
+This message is automatically generated., Thank you for the update, [~cwelch]., Hi [~cwelch],
+Thanks for updating, I went through your patch just now.
+
+I think the current approach makes more sense to me comparing to patch#4, it avoids iterating all apps when computing headroom. But currently, CapacityHeadroomProvider#getHeadroom will recompute headroom for each application heartbeat. Assume we have #application >> #user in a queue (the most possible case), it's still a little costly.
+
+I agree with the method which mentioned by Jason more: Specifically, we can create a map of <user, headroom> for each queue, when we need update headroom, we can update the all headroom in the map. And each SchedulerApplicationAttempt will hold a reference to headroom. The "headroom" in the map maybe as same as the {{HeadroomProvider}} in your patch. I would suggest to rename the {{HeadroomProvider}} to {{HeadroomReference}}, because we don't need do any computation in it anymore.
+
+Another benefit is, we don't need write HeadroomProvider for each scheduler. A simple HeadroomReference with getter/setter should be enough.
+
+Two more things we should take care with previous method:
+1) As mentioned by Jason, currently, fair/capacity scheduler all support moving app between queues, we should recompute and change the reference after finished moving app. 
+2) In LeafQueue#assignContainers, we don't need call 
+{code}
+  Resource userLimit = 
+      computeUserLimitAndSetHeadroom(application, clusterResource, 
+          required);
+{code}
+For each application, and in LeafQueue#updateClusterResource iterate and update the map of <user, headroom> should be enough
+
+Wangda
+, I initially considered an approach like this one, but did not go in that direction for a couple of reasons.  One is that, to avoid introducing a calculation during the heartbeat, you do end up iterating all the users in the queue with every headroom calculation.  While this may generally be less than iterating all of the applications in a queue it may still be fairly significant in some usage patterns, and in a worst case (different user for each application) it is exactly equivalent to what we are trying to avoid.  The other is the "Resource required" which is application specific and included in the userlimit calculation - the comments indicate this  
+
+ensures that jobs in queues
+//   with miniscule capacity (< 1 slot) make progress
+
+- I notice that updateClusterResource just provides the ".none" for this value - so it is not being honored in all cases, but I'm concerned about breaking the case it is meant to handle by detaching it generally from the headroom calculation.  Handling this value as we do today requires an application specific calculation - hence placing it in the application path and handling it as I do in the .7 patch during heartbeat/using an application specific value.  If we move to calculating it at the user level then we would have to choose one value for the "required" from one of the user's applications to avoid iterating them otherwise we are back to iterating all applications at each go.  In a practical sense that might be fine, unless different applications for the same user are passing significantly different values for "required" - I suppose we could use a "max" for that value, but then an unusually large value for "required" could be carried forward indefinitely (for as long as a user has active applications) - or we could just use the last one provided for that user and understand that it changes the results a bit, possibly in an undesired way.
+
+Couple of other points:
+
+-re "we don't need write HeadroomProvider for each scheduler" - we already don't need one - the base implementation I've provided maintains the current behavior for other schedulers, and it appears that other schedulers may not require the same treatment as they do not necessarily vary their headroom as dynamically/in the interrelated way that the capacity scheduler does - in any case, the pattern I'm introducing here can be reused by them - but they would, in any case, require their own logic to effect this kind of update if they require it.
+
+-re "As mentioned by Jason, currently, fair/capacity scheduler all support moving app between queues, we should recompute and change the reference after finished moving app" 
+I take this to properly be a task to take on when providing support for moving between queues - not having the location in code at present where this will happen prevents me from really addressing it, it's not part of the current effort, and in any case this change is not making that any more difficult (it may be making it easier... hard to be sure until we're ready to do it... but I am sure it is not making it more difficult - The first time an application calls computUserLimit... after it is moved it will automatically update to the proper configuration to provide headroom from then onward, with no other changes so far as I can see.  We could also effect this by simply setting the headroom provider during the move.)
+
+Provider vs Reference - I went with a more general term as I'm not sure that in all cases it will be simple reference/will have no logic of it's own - Provider is a superset/more generic term :-)
+
+-re the cost of the calculation - if you look through the code, it's factored such that everything is referring to local members of a relatively small object graph - basically, it's just "doing a few member lookups and a little math (I know, you could say that about anything - but in this case, it really isn't very much)" - no significant data structures have to be accessed and while it's hidden behind calls to Resources it really is just a bit of calculation...
+
+That said, I can see benefits to avoiding some of the work being done in the heartbeat - the one hard limit is the impact to how the "Resource required" value is handled, possibly not a significant tradeoff.  I also had some concurrency concerns - by moving this out to the heartbeat we are accessing some shared Resource values concurrently which are not at present, and I ran into some concurrency issues with LeafQueue when making the change (all resolved, but caused some alarm/required some workaround) - there could be other latent concurrency issues there which will be corner cases, where if we have all calculation happening in the calculate... call in leaf queue we will be back to the earlier model/can be pretty assured there are no new concurrency issues in play.  When looking at this user-centric approach my intention was to attach the headroom value(s) to the User instance which is already present in a user(String)->User map in the LeafQueue - it's not necessary to introduce a new map, we already have something which is holding User level resource information which could be used consistently forward for the headroom calculation.  I'll post a patch with that approach, we can have a look at it in comparison to .7 and .4 and decide on a direction, Patch based on my last comment which iterates/calculates headroom at the user level - which is (I believe) favored by [~jlowe] and [~wangda] (I'm comfortable with it, too...), {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12664285/YARN-1198.8.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/4726//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/4726//console
+
+This message is automatically generated., Craig, thanks for working on the issue. Took a look at the patch. 
+Does it make sense to decouple  headRoom calculation from user limit calculation? specifically, we may calculate the headRoom when the AM actually calls getHeadRoom. This should make sure that the headRoom is always up-to-date when AM gets the headRoom. Also, we may not need to loop all the users in assignContainers if doing this. , [~jianhe], have a look at patch 7, it takes that sort of approach.  , Hi [~cwelch],
+Sorry for this late response, I've just looked your ver.8 patch and comments,
+My reply,
+bq. -re "we don't need write HeadroomProvider for each scheduler" 
+And 
+bq. Provider vs Reference
+I agree with this, I think we need write different Headroom Provider and it's better to keep Provider since its more general.
+
+bq. -re "As mentioned by Jason, currently ...
+Agree, this can be done in a separated JIRA
+
+bq. -re the cost of the calculation
+Agree, it's just a small computation effort.
+
+In the past, I suggest do as I mentioned https://issues.apache.org/jira/browse/YARN-1198?focusedCommentId=14108991&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14108991 because I think that will make code more clean.
+But according to your ver.8 patch, I realized that may not doable. In LeafQueue#computeUserLimit, it uses required to get user limit. In your patch, you save the lastRequired to user class. However, we need different required for different app under a same user. We can only do the calculate when app heartbeats (We can also loop and set all app's headroom, but that's a way we abandoned before). 
+
+So basically, IMHO, I think your ver.7 is a more correct way to go. Which keeps complexity/efficiency balanced. 
+Any thoughts? [~jianhe], [~cwelch].
+
+Wangda, I tried to merge in YARN-1857.3.patch and then merge in YARN-1198.7.patch since people favor this patch over the .8 patch. Seems the change in the following method cancels the update in YARN-1857.
+
+  private Resource getHeadroom(User user, Resource queueMaxCap,
+      Resource clusterResource, Resource userLimit) {
+     Resource headroom =
+        Resources.subtract(
+            Resources.min(resourceCalculator, clusterResource, 
+                userLimit, queueMaxCap), 
+            user.getConsumedResources());
+    return headroom;
+  }
+
+Shouldn't it be the following one if I merge both YARN-1857 and YARN-1198?
+
+  private Resource getHeadroom(User user, Resource queueMaxCap,
+      Resource clusterResource, Resource userLimit) {
+    Resource headroom =
+        Resources.min(resourceCalculator, clusterResource,
+            Resources.subtract(
+                Resources.min(resourceCalculator, clusterResource,
+                    userLimit, queueMaxCap),
+                user.getConsumedResources()),
+            Resources.subtract(queueMaxCap, usedResources));
+    return headroom;
+  }
+
+, That's not intentional - I think it's just a side effect of where the changes are taking place, and it will require some manual fixup to keep both changes together.  I expected that [YARN-1857] would be committed first, and then I would fixup this patch to reflect the change., [~leftnoteasy] [~john.jian.fang] it sounds like the .7 approach is the way to go.  Jian had a tweak to this approach which he suggested here: [https://issues.apache.org/jira/browse/YARN-1198?focusedCommentId=14122078&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14122078] - on the whole the same thing happens, but it might be a cleaner way to do it.  I was hoping to give a go at it so that we could compare with .7 before closing this up.  Thoughts?, Sorry, the above was off - the conversation happened offline, here was the tweak to .7 that Jian suggested:
+
+Hi Craig, I looked at your patch again. It's similar to what I thought. One thing is that now that headRoom is not application specific, it doesn't belong to application any more. We may make a member of LeafQueue#User. From CapacityScheduler#allocate, directly call LeafQueue #getAndCalculateHeadRoom , not going through SchedulerApplicationAttempt route to get the HeadRoom. I think this is simpler. do you think this will work?
+
+> We may make a member of LeafQueue#User. To clarify: make the headRoom a variable of LeafQueue#User, and remove that from SchedulerAttempt
+
+we might, in this approach, do what we are doing in .7 but without the HeadroomProvider at all... I'm going to give a go at this..., Updated version of .7 patch to current trunk (as .7 now fails to fully apply), {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12672445/YARN-1198.9.patch
+  against trunk revision 52bbe0f.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/5217//console
+
+This message is automatically generated., And again, this time, with the additional files, .10 (nee .9, .7), {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12672450/YARN-1198.10.patch
+  against trunk revision 8dfe54f.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/5219//console
+
+This message is automatically generated., [~john.jian.fang] I look a look at implementing the change with the tweaked .7 approach per your suggestion above and it seemed to just be trading some complexities for others, so I set it aside and I think the current .7 approach is as good as any.  I uploaded a .10 patch which is the .7 fixed to apply cleanly to current trunk (.7 no longer quite does for me).  I took a look at incorporating [YARN-1857] into this change but chose not to, as I think they should be committed independently.  The .10 (.7) patch factors the change for [YARN-1857] up into a different method, getHeadroom(), if you replace it with the below:
+
+
+{code} 
+private Resource getHeadroom(User user, Resource queueMaxCap,
+      Resource clusterResource, Resource userLimit) {
+    Resource headroom = 
+      Resources.min(resourceCalculator, clusterResource,
+        Resources.subtract(
+            Resources.min(resourceCalculator, clusterResource, 
+                userLimit, queueMaxCap), 
+            user.getConsumedResources()),
+        Resources.subtract(queueMaxCap, usedResources));
+    return headroom;
+  }
+{code}
+  
+then you should have the combined logic.  Note, the LeafQueue tests will then not all pass, I believe because results changed when that patch was applied - I've not before tried the two in combination, assuming we would apply one at a time, and then address the impact on the other., The Jenkins failures do not actually seem to have anything to do with the patch, the output is complaining about being behind trunk..., Attaching patch .11, this is based on .10 (nee .7), the preferred approach, with the a factoring change to decrease the impact - the HeadroomProvider is now limited to just the CapacityScheduler area / FiCaSchedulerApp.  It's actually possible to remove the HeadroomProvider altogether in favor of adding more members to the scheduler app, but I think it actually looks better factored this way (the functional result would be the same)., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12672614/YARN-1198.11.patch
+  against trunk revision a56f3ec.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/5240//console
+
+This message is automatically generated., And, again, I think something is up with Jenkins, the patch application issue doesn't look to have anything to do with the patch, and all the builds are red..., Patch combining the last .11 with the latest 1857 patch, to make it easy to check them out together.  Tests changed/added for both issues are present and pass (unchanged), {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12672649/YARN-1198.11-with-1857.patch
+  against trunk revision f679ca3.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/5243//console
+
+This message is automatically generated., FYI, it's not possible to call the getAndCalculateHeadroom because nothing can synchronize on the queue during the allocation call without deadlocking - this is why it's necessary to break out the headroom they way it is here and store some items (such as the LeafQueue.User, which comes from the usermanager and syncs on the queu) to avoid any synchronization on the queue itself during the final headroom calculation in the allocate/getHeadroom step.  It's not a bad thing to do anyway, to reduce the number of operations (somewhat) in that final headroom calculation - but it is also why we can't just call the getAndCalculateHeadroom as such (unchanged) in allocate(), Craig, thanks for your effort. I have already merged in your YARN-1857 and YARN-1198 patches.
+
+For blacklisting, I think there are both props and cons on whether different applications should share the blacklisting information or not. There are valid cases in both cases. For example, if multiple nodes have difficulties to access one node, it probably is better to share this information among all nodes because usually it takes a quite long time to cause sock timeout and exhaust the retry logic from my own experiences. In this way, the hadoop system can react faster to a problematic node. Certainly, there are other use cases that the blacklisting only applies to one application.  I am fine with the current design, but expect Hadoop becomes smarter to handle different scenarios, or at least provide options for users to customize. 
+
+When a node is removed from the cluster because of unhealthy, decommission, or lost, the blacklisted resources should be updated accordingly. Otherwise, new issues will come out., An updated version of the 11-with-1857 patch, the only difference is commenting of the headroom calculations throughout the TestLeafQueue.testComputeUserLimitAndSetHeadroom, which can be confusing without all of the details, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12672853/YARN-1198.12-with-1857.patch
+  against trunk revision 7f6ed7f.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/5255//console
+
+This message is automatically generated., Hi [~cwelch], I reviewed 1198.11.patch, looks good, few comments
+- maybe we can just new a queueHeadroomInfo object each time and pass it into CapacityHeadroomProvider, instead of synchronizing the single object? 
+{code}
+    synchronized (queueHeadroomInfo) {
+      queueHeadroomInfo.setQueueMaxCap(queueMaxCap);
+      queueHeadroomInfo.setClusterResource(clusterResource);
+    }
+    CapacityHeadroomProvider headroomProvider = new CapacityHeadroomProvider(
+      queueUser, this, application, required, queueHeadroomInfo
+      ); // minor code format, move the bracket  to the above line ?
+{code}
+- some places exceed 80 column limit, like 
+{code}
+    Resource headroom = queue.getHeadroom(user, queueMaxCap, clusterResource, application, required);
+{code}
+
+Could you also open a sub jira specifically for the issue of reflecting headroom to all apps of a single user  and upload a patch there? thx, Opened [YARN-2644]  Will fix the long lines.  The QueueHeadroomInfo is being handled this way because it is actually changed by any app in the queue where the headroom call occurs and it is shared by all of the application headroom provider instances - intentionally, so that they always pickup the lastest values during their final calculation during allocate/getHeadroom in the application - so it can't be created anew, it needs to be maintained at a queue-level and shared.  The queue itself cannot be synchronized on in the allocate() call (the application getHeadroom), but we do need to assure the values are coherent, so the queueinfo is. 
+
+I'll fix the formatting and upload on [YARN-2644], ah, I missed that, thanks for your explanation !, The patches are now all on subjiras, [YARN-2644] now homes the patch which was previously here, While working on YARN-3265, I found there're several issues with existing headroom computation, so I filed sub JIRAs for them:
+
+1) YARN-3277, Queue's current-max-limit should be updated before allocate reserved container.
+2) YARN-3278, Queue's current-max-limit should be updated when container allocated/released in another queue.
+3) YARN-3279, AvailableResource of QueueMetrics should consider queue's current-max-limit.]

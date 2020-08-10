@@ -1,0 +1,144 @@
+[These issues were pointed out here http://mail-archives.apache.org/mod_mbox/storm-dev/201702.mbox/%3C3E125946-CB8B-4FA9-8943-CB5AF367F92B%40coviam.com%3E, [~Srdo] For a tuple to be retried, it needs to be emitted again which can only happen if kafka consumer poll is called. Even with this fix I feel it is possible for the spout to get stuck if a specific tuple fails repeatedly and a lot of subsequent ones succeed, get acked but are blocked on commit inside OffsetManager.
+
+My suggestion is that as long as there is a tuple ready to be retried (retryService.readyMessageCount() > 0), poll should proceed independent of the numUncommittedOffsets. This will allow for the possibility that that tuple is successfully processed and the topology is not stalled. 
+
+We can optionally add logic in the emitTupleIfNotEmitted(ConsumerRecord<K, V> record) method to restrict fresh tuples from being emitted if the numUncommittedOffsets threshold has been breached while still allowing kafka consumer poll to happen as long as retryService.readyMessageCount() is non-zero., [~ranganp] You are right. I missed some cases.
+
+Just to illustrate:
+Say maxUncommittedOffsets is 10, maxPollRecords is 5, and the committedOffset is 0.
+The spout will initially emit up to offset 10, because it is allowed to poll until numNonRetriableTuples is >= maxUncommittedOffsets
+The spout will be allowed to emit another 5 tuples if offset 10 fails, so if that happens, offsets 10-14 will get emitted. If offset 1 fails and 2-14 get acked, the spout gets stuck because it will count the "extra tuples" 11-14 in numNonRetriableTuples.
+
+An similar case is the one where maxPollRecords doesn't divide maxUncommittedOffsets evenly. If it were 3 in the example above, the spout might just immediately emit offsets 1-12. If 2-12 get acked, offset 1 cannot be reemitted.
+
+Your suggestion would solve this, but also means that we can't meaningfully cap numUncommittedOffsets. If we allow a poll whenever there's a failed tuple, the spout might emit an arbitrary number of tuples if tuples fail in an unlucky order.
+
+For example, take the case where maxUncommittedOffsets is 10, maxPollRecords is 5, and the committedOffset is 0, and 10 tuples have been emitted.
+If offset 10 fails and is retried, 10-14 may be emitted. If 14 fails, 14-19 get emitted. This can be repeated as many times as needed. The issue is more likely to happen when multiple partitions are involved, because then you might have a failed tuple on partition 0 cause the spout to emit fresh tuples on partition 1, regardless of how far past the limit partition 1 already is.
+
+I'm torn on whether this kind of limit violation is really serious enough to matter. It's possible that we run a lot past maxUncommittedOffsets, but it doesn't seem likely that the bad tuple failure pattern keeps repeating. It's just a gut feeling though, which is why I made an attempt to put a real cap on maxUncommittedOffsets in the linked PRs.
+
+If it is serious enough that we want to fix it I think there are two decent approaches. 
+
+One is to do what you mention and filter out the fresh tuples we happen to also receive when we poll for failed tuples. The downside is that in order to avoid losing tuples, we have to seek the consumer back to the first tuple we filtered out for each partition, or we have to be able to emit only the retriable tuples while keeping the rest in memory for later. 
+
+The other option would be to always allow retries (per partition) only for those tuples that are within maxUncommittedOffsets tuples of committedOffsets. For example, if the maxUncommittedOffsets is 10, maxPollRecords is 5, and the committedOffset is 0, and 14 tuples have been emitted, we only allow retries for the partition if the earliest retriable tuple is one of the first 10. The point would be that we never fail to retry tuples within maxUncommittedOffsets of the committed offset, but we don't retry tuples that are beyond that boundary until the committed offset moves, so we can cap numUncommittedOffsets. The downsides to this are we have to do this evaluation per partition, and we might have to pause nonretriable partitions when we're beyond maxUncommittedOffsets to ensure that we actually emit the retriable tuples and not just some new ones on unrelated partitions.
+
+I don't really have a particular preference here. What do you think?, [~Srdo] I need some time to properly digest your input and reply. Will do so. Meanwhile, I was thinking about this issue and have the following to add to what I stated earlier:
+
+One issue that I see currently is that the spout emits greater than maxUncommittedOffsets tuples into the topology. This happens because we check for numUncommittedOffsets in poll() but once it succeeds and a kafka broker call is made, we go ahead and emit ALL the tuples received from the broker. This effectively means that there can be an undefined number of tuples over and beyond the maxUncommittedOffsets being processed by the topology.
+
+Now, if we capped the total number of tuples under process (including those ready or waiting for retry) then the logic we have for poll() would always ensure that failed tuples are fetched from the brokers. Does this make sense? Or am I missing any edge case here?, [~Srdo] Need a basic clarification on the following: Offsets are TopicPartition specific but numUncommittedOffsets is global across all the partitions that belong to the spout instance / executor in question, right?
+
+, That isn't quite true. There is a limit to how far past maxUncommittedOffsets we can emit, because the KafkaConsumer has a limit to how many messages a call to poll will return (max.poll.records)
+
+I agree that the problem is that we either need to not emit all the tuples we receive in order to respect maxUncommittedOffsets, or we need to do something else to ensure that we won't poll if we're sufficiently far past the maxUncommittedOffsets limit. I don't think we're treating maxUncommittedOffsets as a strict cap (because it is hard to enforce if we want to emit all the tuples we receive in poll), but we'd like to at least be able to say we won't go farther than x tuples past it.
+
+I think you're missing the case where the poll returns messages from an unexpected partition. e.g. if you have retriable tuples on partition 1 and are at the cap of how many tuples you're willing to process, you would want to allow poll so you can retry the tuples. Unless you pause the partitions that don't have retriable tuples, the consumer might decide to poll from those instead. So you might be trying to get retries for partition 1, but the poll might get tuples for partition 2., Yes, offsets are specific to the TopicPartition, and numUncommittedOffsets is a global limit currently. If we want to interpret it as a per partition limit, that's fine too IMO, as long as there's a limit., The illustrative example is very useful in thinking through the issue. Thanks for the same. Generally speaking, my preference is for a simple solution with minimal overhead in the Spout. 
+
+There is another critical issue that we need to consider though. Created the JIRA just now: STORM-2546
+
+I am trying to come up with a solution that would address both these issues comprehensively. We are essentially dealing with the challenge of ensuring failing tuples are properly accounted for and the at least once processing guarantee is enforced properly., [~ranganp] I spent a while thinking about this, but it seems to me to be something where there's a lot of corner cases to consider. Here's my best effort.
+Regarding fixing STORM-2546:
+The only way to know that a tuple has been deleted from Kafka is to try polling for it. We can know for sure that a failed tuple has been deleted if we seek to the failed tuple's offset (or earlier) on the relevant partition and poll, and we then encounter a tuple that has a higher offset than the failed tuple on that partition earlier in the result set.
+
+For instance:
+Offset 0...5 have failed and also been compacted away. Offset 6 has failed and is present, offset 7 has failed and is not present.
+We seek to offset 0 for the partition.
+If we then see that the first message in the poll result is offset 6, we can be sure that offset 0...5 are deleted, because otherwise they would have been returned in the poll. Offset 7 cannot be removed from the spout because we can't be sure that it was deleted, the consumer may just have received too few messages.
+
+I believe we can also conclude that offsets have been removed if we seek to their offsets, poll and receive an empty result. I'm not entirely sure about this, but I don't think the consumer will return empty polls if there are more messages to consume.
+
+I think we can use this method to remove failed, deleted tuples from the offset manager. When we do a poll, we examine the retriable tuples for each partition. For each partition where we received tuples, we compare the earliest received tuple to the retriable tuples for that partition. If the offset of a given retriable tuple is lower than the offset of the earliest received tuple, then the retriable tuple must have been deleted. 
+
+About this issue:
+The fact that failed tuples can be removed from Kafka before they can be retried is something I overlooked in what I wrote earlier. I think either solution can deal with it though.
+
+One correction to what I wrote earlier regarding emitTupleIfNotEmitted filtering btw: We'll should also pause partitions in this solution IMO. Otherwise it is possible (even likely if there are few retriable partitions) to allow poll due to retriable tuples, and get no retriable tuples from the poll, in which case we'll discard all the messages and try again later. I think it would make that solution unacceptably wasteful (we'd risk multiple useless polls for unrelated partitions every time we have to retry a tuple while at the maxUncommittedOffsets limit), so we should pause nonretriable partitions.
+
+The solutions I see to this issue right now are:
+
+* Don't enforce maxUncommittedOffsets if there are retriable tuples at all. This is simple to implement, but I don't really have a good feeling for what the likelihood is that maxUncommittedOffsets will be exceeded by "too much".
+
+Example of this functionality:
+MaxUncommittedOffsets is 100
+MaxPollRecords is 10
+Committed offset for partition 0 and 1 is 0.
+Partition 0 has emitted 0
+Partition 1 has emitted 0...95, 97, 99, 101, 103 (some offsets compacted away)
+Partition 1, message 97 is retriable
+The spout seeks to message 97 and polls
+It gets back offsets 99, 101, 103 and potentially 7 new tuples. Say the new tuples are in the range 104-110.
+If any of 104-110 become retriable, the spout may emit another set of 9 (maxPollRecords - 1) tuples.
+This can repeat for each newly emitted set. The likelihood of this happening in real life is unclear to me.
+----
+* Enforce maxUncommittedOffsets globally by always allowing poll if there are retriable tuples, pause any non-retriable partitions if the spout has passed the maxUncommittedOffsets limit, and filter out fresh tuples from the poll result. This should work to enforce maxUncommittedOffsets. In order to avoid dropping messages, the consumer has to seek back to the earliest offset on each partition that was filtered out by this new check. As far as I can tell we won't be increasing the number of discarded tuples by an unreasonable number as long as we pause non-retriable partitions. This is because the spout will currently discard any acked or already emitted offset it receives in a poll. This solution will additionally discard those that are entirely new, which means they have to have a higher offset than the newest currently emitted tuple on the retried partition. It seems (assuming tuple failures are evenly distributed in the emitte set) more likely to me that most retries will happen somewhere "in the middle" of the currently emitted tuples. 
+
+Example of this functionality:
+MaxUncommittedOffsets is 100
+MaxPollRecords is 10
+Committed offset for partition 0 and 1 is 0.
+Partition 0 has emitted 0
+Partition 1 has emitted 0...95, 97, 99, 101, 103 (some offsets compacted away)
+Partition 1, message 99 is retriable
+We pause partition 0, seek to offset 99 on partition 1 and poll.
+We get back offsets 99, 101, 103 and potentially 7 new tuples. Say the lowest of these is at offset 104.
+We prefilter the offset list to remove acked, emitted and new tuples, leaving 99. The 7 new tuples are filtered out.
+The consumer seeks to offset 104 to pick up there on next poll.
+The spout emits offset 99.
+
+I'd like to highlight that the filtering solution only discards tuples when it gets new tuples back in a poll, so if the retriable tuple in the example had been e.g. 50, it would not have been unnecessarily discarding anything. 
+----
+* Enforce maxUncommittedOffsets on a per partition basis (i.e. actual limit will be multiplied by the number of partitions) by always allowing poll for retriable tuples that are within maxUncommittedOffsets tuples of the committed offset. Pause any non-retriable partitions if the spout has passed the maxUncommittedOffsets limit. There is some additional bookkeeping in this solution, because we have to know for each partition whether the maxUncommittedOffsets limit has been reached, and if so what the offset of the tuple at the limit is (e.g. if the limit is 10, we want to know the offset of the 10th tuple emitted after the current committed offset). I believe we should be able to get that information out of the acked and emitted sets in OffsetManager. 
+
+Example of this functionality:
+MaxUncommittedOffsets is 100
+MaxPollRecords is 10
+Committed offset for partition 0 and 1 is 0.
+Partition 0 has emitted 0
+Partition 1 has emitted 0...95, 97, 99, 101, 103 (some offsets compacted away)
+Partition 1, message 99 is retriable
+We check that message 99 is within 100 emitted tuples of offset 0 (it is the 97th tuple after offset 0, so it is)
+We pause partition 0, seek to offset 99 on partition 1 and poll
+We get back offset 99, 101, 103 and potentially 7 new tuples. Say the lowest of these is at offset 104.
+The spout emits offset 99, filters out 101 and 103 because they were already emitted, and emits the 7 new tuples.
+If offset 104 (or later) become retriable, they are not retried until the committed offset moves. This is because offset 104 is the 101st tuple emitted after offset 0, so it isn't allowed to retry until the committed offset moves.
+
+I think either solution of the last two solutions should work, and we should be able to implement the fix for STORM-2546 on top of either. I can't offhand say whether one solution is better than the other. I think it depends on the cost of discarding a few extra messages, vs. doing the extra bookkeeping for the other solution. 
+
+I'd be happy if you would consider whether either of these solutions seem workable to you :), Thanks a ton for the awesome writeup of the issue and potential solutions. My thoughts so far around potential solutions are mostly in-line with yours. I wanted but did not get around to confirming the behaviour of Kafka Broker / Group Coordinator when the client node that paused a partition crashes OR leaves group OR suffers network partition before calling resume() for that partition. We need to confirm the behaviour in this scenario and handle it accordingly in the spout.
+
+About Solution #3:
+I am assuming we need NOT pause partition 0 in solution #3 for the scenario described. This solution, to me, is basically extending the current logic around maxUncommittedOffsets to every partition in the spout. If a spout handles only one partition then we would never really pause it. We simply stop calling poll if a partition reaches maxUncommittedOffsets without any failed tuples. Otherwise the partition should continue to be polled. The logic should then simply take care of seeking to the appropriate offset depending on whether retriable tuples are present.
+
+Agree completely that the choice is between #2 and #3. Am leaning toward #3 for the following reasons:
+- Partition is a fundamental building block / concept in Kafka and this solution fits neatly into it and extends it
+- For Storm spout, Kafka Partitions enable scaling and isolation among other things. It is not acceptable for a 'healthy' partition to be blocked by an 'unhealthy' one
+- We do a fair bit of partition-specific bookkeeping in OffsetManager already. More bookkeeping is a fair price to pay given the reward on offer.. :-), {quote}
+We need to confirm the behaviour in this scenario and handle it accordingly in the spout.
+{quote}
+As far as I know pausing/resuming is a purely local operation for the KafkaConsumer. It just causes it to not fetch records for the paused partitions. The paused state is not preserved if the client crashes (because the local state is then lost), or if the consumers rebalance (see https://github.com/apache/kafka/blob/2af4dd8653dd6717cca1630a57b2835a2698a1bc/clients/src/main/java/org/apache/kafka/clients/consumer/internals/SubscriptionState.java#L49). I don't think we need to worry about this. Also I'm pushing for us dropping support for Kafka-managed subscriptions here https://github.com/apache/storm/pull/2151 so I'm hoping this ends up being irrelevant.
+
+{quote}
+I am assuming we need NOT pause partition 0 in solution #3 for the scenario described
+{quote}
+The reason we want to pause is that when the spout is at (or past) the maxUncommittedOffsets limit, it should only emit retries or a very limited number of new tuples. In the example I gave above, if we don't pause partition 0, then the poll triggered to fetch offset 99 on partition 1 might just return a full batch of messages from partition 0. There is no guarantee that the poll will even contain the retriable tuple, so we might do this multiple times. If there were 10 additional partitions we might get full polls for any of those as well before we get the retriable tuple.
+
+If we don't pause we can't really enforce maxUncommittedOffsets as far as I can tell. 
+
+I agree that if there's only one partition it should never be paused. The rest of your outline seems right to me as well.
+
+{quote}
+For Storm spout, Kafka Partitions enable scaling and isolation among other things. It is not acceptable for a 'healthy' partition to be blocked by an 'unhealthy' one
+{quote}
+I don't think the healthy partitions will be blocked for very long. Each poll where we pause will reemit (or discard pending the fix for STORM-2546) some retriable tuples. The only way the spout should be completely blocked due to retries is if the user hasn't configured a retry limit and the tuples fail consistently.
+
+I agree that it isn't ideal, but I don't see a way to have a limit like maxUncommittedOffsets be properly enforced without pausing (and thus blocking) the healthy partitions when we get in this state where maxUncommittedOffsets is violated., Wait, I think this is fixable. Instead of pausing nonretriable partitions, we could instead keep track of numUncommittedOffsets per partition, so we can pause only those partitions that have no retriable tuples and are at the maxUncommittedOffsets limit. That way unhealthy partitions can't block healthy partitions, and we avoid the case described above where a failed tuple on one partition causes new (limit breaking) tuples to be emitted on a different partition., {quote}
+Instead of pausing nonretriable partitions, we could instead keep track of numUncommittedOffsets per partition, so we can pause only those partitions that have no retriable tuples and are at the maxUncommittedOffsets limit. That way unhealthy partitions can't block healthy partitions, and we avoid the case described above where a failed tuple on one partition causes new (limit breaking) tuples to be emitted on a different partition.
+{quote}
+
+Yes, this is what we should do. Pause partitions only in the above scenario. In the special case of a spout handling only one partition, we can simply skip poll() instead of pausing even when this condition is met.
+
+Noted your update on kafka consumer pause being locally managed. Makes sense.
+
+STORM-2542 is interesting. Will comment on that in that JIRA once I catch up on it., I'll take a look at implementing this fix soon. , [~ranganp] Put up a PR for the proposed fix here https://github.com/apache/storm/pull/2156, Awesome. Will take a look.]

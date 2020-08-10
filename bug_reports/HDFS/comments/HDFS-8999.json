@@ -1,0 +1,1876 @@
+[I'd be interested in your thoughts on:  if we are going to trust the client, do we even need IBRs?  How do the failure modes change?, bq. if we are going to trust the client, do we even need IBRs?
+
+Yeah, I have the same question here. [~szetszwo] once mentioned the IBR actually could fix some data inconsistency. If we still need IBRs, can we change its sending mechanism from block-triggering to periodical?
+
+Also currently we trust the client on the length of the file/block. In HDFS-8498 [~daryn] you mentioned you had seen this caused data corruption. Could you please provide more details about the corruption so that we can understand if we can really trust the client?, The current logic as I remember it when it was designed way back:
+- Only the client can be trusted about the length of the block, because it knows how many bytes it pushed to the DNs.
+- DataNodes do not determine the length of the block, only the length of the replica in its possession. Because DNs do not sync replica data to disk, and because irresponsible users, or untrusted scripts, or bugs in local fs can damage replica files.
+- When the client allocates a new block or closes the file, it also confirms the length of the last written block. That block goes into COMMITTED state, but can still remain under-construction until minimal number of replicas are reported by DNs.
+- IBRs (via blockReceivedAndDeleted()) confirm that replicas actually exist on DNs and have the expected length.
+- The block needs to be COMMITTED and reported by the minimal number of DNs in order to go into COMPLETE state.
+
+[The append design document|https://issues.apache.org/jira/secure/attachment/12445209/appendDesign3.pdf] is somewhat outdated by now, but still gives a good idea how it was intended. Need to think more about this optimization proposal.
+In general I'd leave the data pipeline alone (as a rather delicate subject) unless there is a clear bug., Thanks for the comments, [~shv]. So one of the motivations for this simplification is to decrease the total number of messages sent from DNs to NN. Recently we saw in a real cluster because a large amount of writing was happening, the IBR from DNs finally overwhelmed NN and caused congestion of the RPC queue. Of course the main cause of the issue is that these writing generated a lot of small blocks and files. But towards improving HDFS's scalability and capability for handling small files, it may be worth exploring this optimization., My rhetorical question to provoke thought was misunderstood.  I was not implying we should eliminate IBRs.  They do fix data inconsistency and ensure the NN stays in sync with the DNs state.  I would never rely on the client as an authoritative source of what's on a DN.
+
+bq. So one of the motivations for this simplification is to decrease the total number of messages sent from DNs to NN. Recently we saw in a real cluster because a large amount of writing was happening, the IBR from DNs finally overwhelmed NN and caused congestion of the RPC queue.
+
+Happens all the time.  Ironically I've been testing a patch to aggregate IBRs.  No pipeline or DN changes necessary.
+
+, Spent some time browsing jira. This issue was discussed earlier in HDFS-1172 (linking).
+# NN cannot rely on locations reported by the client (or a primary DN) because it leads to a race condition between the client report and block reports from the DN, that contains the replica. The block report may not contain the replica that was reported by the client. As noted in [Hairong's comment|https://issues.apache.org/jira/browse/HDFS-1172?focusedCommentId=12874030&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-12874030]
+# [~hairong] proposed a solution, which makes NN place replicas that were not yet reported by DNs into {{pendingReplication}} queue instead of {{neededRepication}}. This is absolutely logical, because NN knows that missing replicas were in the succeeded pipeline and can assume they will be reported soon.
+
+I don't know why HDFS-1172 was never committed. May be it is time to revisit it now., Well, HDFS-1172 is in.  If NN has an ability to correctly fix the locations based on IBRs and eventually using FBRs, it will be okay to not wait for IBRs before completing the block.
+
+As for availability, a datanode can crash right after finalizing a block but before sending the IBR. But it could also crash right after sending the IBR. Timing-wise, the two are not very different. I don't think waiting for the IBR adds much value in this regard.
+
+For correctness, we need to think about the new "race" between addBlock()/complete() from clients and IBRs from datanodes. E.g. there are places that ignore inconsistency while a block is under construction. It could create other issues especially when recovery is involved.  NN might incorrectly mark a replica as corrupt or have more locations than committed and do not know which are valid (this sometimes happens today).
+
+Conceptually, namenode knows exactly where the replicas of an under-construction blocks are. If any of them changes, the client is supposed to call updatePipeline().  So, closing without waiting for IBRs seems reasonable.  However, the difficulty arises because the locations can change quickly by replication and balancing. I.e. namenode cannot reliably reject bogus locations. It has to record all reported locations whether it thinks they are corrupt or not.  When recoverClose() is involved, it can be even more confusing, as multiple IBRs with a different gen stamp comes from the datanode.  Namenode currently doesn't deal with this very well. It needs to be properly addressed before or with this JIRA., Kihwal, I did not understand exactly what you propose. But it seems that the following two of your statements contradict each other.
+- ??NN might incorrectly mark a replica as corrupt or have more locations than committed and do not know which are valid??
+- ??Conceptually, namenode knows exactly where the replicas of an under-construction blocks are.??
+
+I think the first is correct as NameNode knows only where the replicas should be, but never knows where they actually are at any given moment. And the same is with clients.
+
+I was talking about the following race condition. Suppose we let NN complete the block based on client locations, and it does. Then FBR comes from DN. The FBR could have been formed before the the replica was received by DN, and therefore will NOT contain the new replica. Because the block is complete, NN will _incorrectly_ remove the valid replica.
+
+I think HDFS-1172 fixed the problem with closing. The replications are not starting immediately, so DN's have a chance to IBR remaining replicas. If they don't, these replicas will eventually be moved from pendingReplication into neededReplication, and then replicated.
+
+Don't see any problems and don't think anything needs to be done here?, [~shv], the goal of this jira is to allow closing the files without waiting for IBRs from DN. This will also reduce the pressure on DNs to quickly send {{blockReceived}} messages, and allow sending IBRs at longer intervals to reduce the number of RPCs to NN. As mentioned by [~jingzhao] in an earlier comment, it has been observed in real clusters where IBRs overwhelmed the NN and clients failed to close the files., To allow the client to close the file without waiting for IBR, and to fix the race condition mentioned by [~shv], we may have to add some extra information on NN to identify replicas that have only been reported by the client but have been confirmed by the DataNodes. These replicas can be treated the same as the current expected replicas of a committed block., >  the goal of this jira is to allow closing the files without waiting for IBRs from DN.
+
+Why? Here are some arguments against doing it:
+
+# _NN only waits for one replica_, then it can close the file. Before HDFS-1172 the problem was, that NN would immediately start replicating the block without waiting for remaining IBRs. This overwhelmed NN even more. HDFS-1172 solved it by placing replicas are in pendingReplication, so DNs have more time to IBR.
+# If 1 is too much, _one can cause immediate close of a file by setting minimum replication to 0_ instead of default 1. It is a configuration change, no need for code changes.
+# _Client can only be trusted to report replica length, but not its locations._ NN and clients know only where replicas should be, but not where they are. NN trusting clients about locations is an induced knowledge, more like in gossip protocols.
+# _Race condition between client and FBR reporting._ Why should one deal with this and potentially other races, which we haven't thought about yet, if it works as is.
+# _Delaying IBRs, will not solve the NN overwhelming problem._ People will just add more DNs, and the problem comes back.
+NN limits HDFS scalability, everybody knows it, just keep your scale right.,  The clients do know the data pipeline and so does the NN. Therefore, at the instant pipeline closes, client and NN know the location of the blocks. The blocks can move anywhere afterwards, but that is no worse than a DN sending an IBR, but loosing the block immediately afterwards.
+
+  Every system has certain scalability limits, but if a design choice can push the limit a bit higher, its not a bad idea to explore. The problems will come back with more writers and more DNs, but at least at a higher level of scale.
+
+ Agreed, we need a solution to the race condition, the direction that [~jingzhao] mentioned in his last comment, seems promising., > 4. Race condition between client and FBR reporting. ...
+
+If the block is kept in the COMMIT state, then there is no race condition (since there is no change compared with the current implementation.)
+
+In this JIRA, we may change the code to allow closing a file even if the last block is in COMMIT state.  When a reader try to read the last block of the file, NN responses all the stored locations.  Do you see any problem in this scheme?, > ... we may change the code to allow closing a file even if the last block is in COMMIT state. ...
+
+In order to avoid data loss of closed files, we are better to allow it only when the number of replicas is greater than 1., Before commenting on suggested solutions let me ask the following questions:
+# Has anybody tried to run the same workload on the same size cluster with a version of HDFS that has HDFS-1172 in it?
+Again, HDFS-1172 reduced the replication load on NN in extreme case (1-block files) by a factor of at least 2. Did it help?
+# Has anybody tried to set minimum replication to 0 on the same size cluster? Did it help?
+Asking this, because it is easy to change configuration, while the performance will be the same as with the discussed proposal.
+So if the config change doesn't help the proposed change won't help either.
+# Does anybody have material estimates on scalability gains with this fix?, Hi [~shv], we did see a huge number of block receipts which eventually slowed down NN in some clusters.  Therefore, we would like to reduce the block receipt RPCs.
+
+I suggest that we change the code to allow closing a file even if the last block is in COMMITTED state in this JIRA and then change DN to send IBRs in batches in another JIRA., h8999_20151228.patch: allow file to be closed if the last block is COMMITTED.
+
+The patch is not ready yet.  Just want to run tests on it., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 8m 54s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 47s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 47s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 59s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 15s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 53s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 5s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 46s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 44s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 35s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 38s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 38s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 15s {color} | {color:red} Patch generated 2 new checkstyle issues in hadoop-hdfs-project/hadoop-hdfs (total was 498, now 496). {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 48s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 11s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 1 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 59s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 2s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 41s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 61m 28s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 61m 5s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 21s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 150m 7s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.hdfs.TestBlocksScheduledCounter |
+|   | hadoop.hdfs.TestMissingBlocksAlert |
+|   | hadoop.hdfs.TestFileAppend2 |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure160 |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure110 |
+|   | hadoop.hdfs.TestAppendDifferentChecksum |
+| JDK v1.7.0_91 Failed junit tests | hadoop.hdfs.TestDFSClientExcludedNodes |
+|   | hadoop.hdfs.TestRollingUpgrade |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithMultipleNameNodes |
+|   | hadoop.hdfs.TestAppendDifferentChecksum |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12779645/h8999_20151228.patch |
+| JIRA Issue | HDFS-8999 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux a45508b99c22 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / a0249da |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/14000/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/14000/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14000/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14000/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/14000/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/14000/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/14000/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Max memory used | 75MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14000/console |
+
+
+This message was automatically generated.
+
+, What is "the block receipt RPC"? Which RPC is that?, It is the blockReceivedAndDeleted RPC, aka IBR., Thought so. But
+# The IBR problem is solved by HDFS-1172. That is why I am asking if anybody tried it to confirm.
+# Here you are optimizing completeBlock(), not IBR, which I don't know how substantial it is, if at all.
+
+Is my reasoning understood?, bq. Here you are optimizing completeBlock(), not IBR, which I don't know how substantial it is, if at all.
+
+bq. I suggest that we change the code to allow closing a file even if the last block is in COMMITTED state in this JIRA and then change DN to send IBRs in batches in another JIRA.
+
+I think Nicholas's comment has summarized our final goal: to decrease the total number of IBR. Currently writing a block with 3 replicas can easily generate >6 RPCs, which greatly limits the scalability of HDFS handling small files. We should explore if we can batch IBR and let DN send them periodically. The first step will be breaking the dependency between {{completeFile}} and IBR., > 1. The IBR problem is solved by HDFS-1172. That is why I am asking if anybody tried it to confirm.
+
+It did not reduce the number of IBR RPCs which is the problem we are trying to solve here today., Suppose client writes 3 files sequentially (files are related and must be write in order):
+f0b0, f0b1, f0b2, f0b3, f1b0, f2b0
+Then
+adding f0b2 will wait f0b0 completed,
+adding f0b3 will wait f0b1 completed,
+adding f1b0 won't wait f0b3
+adding f2b0 won't wait f1b0
+
+Is it strange? If we gonna do this, does it mean {{addBlock(..)}} can apply the same change?
+If block size is small or client writes lots of small files, we have lots of committed blocks. And, what's the meaning of "minRepl"? Why we need "committed" and "completed"? The whole point is to let client know the data is safe so it can continue.
+I don't worry about safety since acked empty_last_packet means block files are flushed/closed and is safe in DNs, it's just not reported.
+Agreed race condition mentioned by Konstantin Shvachko is possible., > Is it strange? If we gonna do this, does it mean addBlock(..) can apply the same change?
+
+[~walter.k.su], your example is interesting.  As you mentioned, addBlock(..) waits for the second-last block.  close() still waits for the second-last block.  Two methods are the same in this sense.
+
+Indeed, we may change addBlock(..) to wait for the third-last block.  However, we don't see a need for the moment.
+
+> If block size is small or client writes lots of small files, we have lots of committed blocks. ...
+
+Within a short period of time, it is correct that we have a lot of committed blocks.  This is the problem we try to solve here -- datanode send an accumulated block receipt instead of a block receipt for each block within a short period of time in order to reduce the number of RPCs to NN.
+
+> ... And, what's the meaning of "minRepl"? Why we need "committed" and "completed"? ...
+
+Historically, the notion of minRepl existed before we introduced the notions of COMMITTED and COMPLETE blocks for append.  These two states are still useful for append after the change., h8999_20160106.patch:
+- When closing a file with the last block COMMITTED, make sure getNumExpectedLocations() > 1.
+- When appending to a file with the last block COMMITTED, throw LastBlockNotYetCompleteException (a new exception).  Client will retry for a few seconds., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 48s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 2m 1s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 36s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 28s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 25s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 26s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 3m 41s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 26s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 11s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 16s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 25s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 25s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 35s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 35s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 28s {color} | {color:red} Patch generated 4 new checkstyle issues in hadoop-hdfs-project (total was 633, now 632). {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 22s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 21s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 2 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 13s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 18s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 12s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 1s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 68m 46s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 56s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 66m 36s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 22s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 175m 57s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.hdfs.TestBlockStoragePolicy |
+|   | hadoop.hdfs.security.TestDelegationTokenForProxyUser |
+|   | hadoop.hdfs.server.namenode.TestINodeAttributeProvider |
+|   | hadoop.hdfs.server.namenode.TestFSImageWithSnapshot |
+| JDK v1.7.0_91 Failed junit tests | hadoop.hdfs.server.datanode.TestDiskError |
+|   | hadoop.hdfs.server.balancer.TestBalancer |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshot |
+|   | hadoop.hdfs.server.namenode.ha.TestFailureToReadEdits |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure110 |
+|   | hadoop.hdfs.TestFileStatus |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12780573/h8999_20160106.patch |
+| JIRA Issue | HDFS-8999 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux fd589ee144b6 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 96d8f1d |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/14029/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/14029/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14029/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14029/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/14029/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/14029/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/14029/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-client U: hadoop-hdfs-project |
+| Max memory used | 76MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14029/console |
+
+
+This message was automatically generated.
+
+, Thanks for the patch, [~szetszwo]! The patch looks good to me. Comments and question:
+# AccessControlException is for security, thus instead of extending it, it's better to let LastBlockNotYetCompleteException extend IOException, or even RetriableException if we want to enable retry for client?
+# Should we be more aggressive and allow all the blocks to be in committed state? Otherwise we will still have issue when IBRs are sent periodically., Another question is whether we should update the new logic from HDFS-1172 and HDFS-9535. In HDFS-1172, we add the replica to the pending queue only when there are already >=1 live replicas. Now since the client can close the file without waiting for the IBR, we will add the block into the UnderReplicated queue with {{QUEUE_WITH_CORRUPT_BLOCKS}} priority. I think maybe we should still put the block into the pending queue in this scenario., > 2. Should we be more aggressive and allow all the blocks to be in committed state? Otherwise we will still have issue when IBRs are sent periodically.
+
+Let's test with the last block to see if it already solves the problem.  I hesitates to be so aggressive.
+
+For addBlock, I think it is okay since it waits for the second-last block (not the last block).  The client has to take time to write a full block so that there should be enough time for the block receipts to come., h8999_20160106b.patch: addresses Jing's comment., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 54s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 35s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 38s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 31s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 29s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 26s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 3m 52s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 28s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 13s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 19s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 36s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 38s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 38s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 29s {color} | {color:red} Patch generated 4 new checkstyle issues in hadoop-hdfs-project (total was 633, now 632). {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 24s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 22s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 3 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 5s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 25s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 10s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 50s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 55m 44s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 54s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 55m 4s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red} 0m 19s {color} | {color:red} Patch generated 1 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 151m 15s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.hdfs.TestModTime |
+|   | hadoop.hdfs.server.namenode.TestFSEditLogLoader |
+|   | hadoop.hdfs.server.namenode.TestFileContextAcl |
+|   | hadoop.hdfs.TestErasureCodingPolicies |
+|   | hadoop.hdfs.TestPread |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractOpen |
+|   | hadoop.hdfs.TestFileStatus |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractAppend |
+|   | hadoop.hdfs.server.namenode.ha.TestBootstrapStandby |
+|   | hadoop.hdfs.server.datanode.TestBlockReplacement |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotBlocksMap |
+|   | hadoop.hdfs.server.blockmanagement.TestNodeCount |
+|   | hadoop.hdfs.server.datanode.TestHSync |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractSeek |
+|   | hadoop.hdfs.server.namenode.TestFSImageWithXAttr |
+|   | hadoop.hdfs.server.namenode.TestFSImageWithAcl |
+|   | hadoop.hdfs.server.namenode.ha.TestRetryCacheWithHA |
+|   | hadoop.hdfs.server.namenode.snapshot.TestAclWithSnapshot |
+|   | hadoop.hdfs.server.namenode.TestNameNodeMXBean |
+|   | hadoop.hdfs.TestDFSOutputStream |
+|   | hadoop.hdfs.TestDFSPermission |
+|   | hadoop.hdfs.TestEncryptionZonesWithKMS |
+|   | hadoop.hdfs.server.namenode.TestINodeFile |
+|   | hadoop.hdfs.TestSetTimes |
+|   | hadoop.hdfs.server.namenode.TestNamenodeRetryCache |
+|   | hadoop.hdfs.TestHDFSFileSystemContract |
+|   | hadoop.hdfs.TestEncryptionZones |
+|   | hadoop.hdfs.TestAppendDifferentChecksum |
+|   | hadoop.hdfs.TestFileAppend2 |
+|   | hadoop.hdfs.TestAppendSnapshotTruncate |
+|   | hadoop.hdfs.server.namenode.TestEditLog |
+|   | hadoop.hdfs.TestFileStatusWithECPolicy |
+|   | hadoop.hdfs.TestWriteReadStripedFile |
+|   | hadoop.hdfs.TestQuota |
+|   | hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer |
+|   | hadoop.hdfs.TestDFSStripedOutputStream |
+|   | hadoop.hdfs.server.namenode.ha.TestStandbyIsHot |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractConcat |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractRootDirectory |
+|   | hadoop.hdfs.TestHFlush |
+|   | hadoop.hdfs.TestBlockStoragePolicy |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotFileLength |
+|   | hadoop.hdfs.TestFileCreation |
+|   | hadoop.hdfs.server.namenode.ha.TestXAttrsWithHA |
+|   | hadoop.hdfs.server.namenode.TestFSImageWithSnapshot |
+|   | hadoop.hdfs.TestDFSShell |
+|   | hadoop.fs.TestHDFSFileContextMainOperations |
+|   | hadoop.fs.TestGlobPaths |
+|   | hadoop.hdfs.server.namenode.ha.TestHarFileSystemWithHA |
+|   | hadoop.hdfs.TestDistributedFileSystem |
+|   | hadoop.hdfs.server.namenode.TestNameNodeAcl |
+|   | hadoop.cli.TestHDFSCLI |
+|   | hadoop.hdfs.TestReplaceDatanodeOnFailure |
+|   | hadoop.hdfs.server.namenode.TestFavoredNodesEndToEnd |
+|   | hadoop.hdfs.server.namenode.TestFSImage |
+| JDK v1.8.0_66 Timed out junit tests | org.apache.hadoop.hdfs.server.namenode.TestNNThroughputBenchmark |
+| JDK v1.7.0_91 Failed junit tests | hadoop.hdfs.TestModTime |
+|   | hadoop.hdfs.server.namenode.TestFSEditLogLoader |
+|   | hadoop.hdfs.server.namenode.TestFileContextAcl |
+|   | hadoop.hdfs.TestErasureCodingPolicies |
+|   | hadoop.hdfs.TestPread |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractOpen |
+|   | hadoop.hdfs.TestFileStatus |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractAppend |
+|   | hadoop.hdfs.server.namenode.ha.TestBootstrapStandby |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotBlocksMap |
+|   | hadoop.hdfs.server.blockmanagement.TestNodeCount |
+|   | hadoop.hdfs.server.datanode.TestHSync |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractSeek |
+|   | hadoop.hdfs.server.namenode.TestFSImageWithXAttr |
+|   | hadoop.hdfs.server.namenode.TestFSImageWithAcl |
+|   | hadoop.hdfs.server.namenode.ha.TestRetryCacheWithHA |
+|   | hadoop.hdfs.server.namenode.snapshot.TestAclWithSnapshot |
+|   | hadoop.hdfs.server.namenode.TestNameNodeMXBean |
+|   | hadoop.hdfs.TestDFSOutputStream |
+|   | hadoop.hdfs.TestDFSPermission |
+|   | hadoop.hdfs.TestEncryptionZonesWithKMS |
+|   | hadoop.hdfs.TestCrcCorruption |
+|   | hadoop.hdfs.server.namenode.TestINodeFile |
+|   | hadoop.hdfs.TestSetTimes |
+|   | hadoop.hdfs.server.namenode.TestNamenodeRetryCache |
+|   | hadoop.hdfs.TestHDFSFileSystemContract |
+|   | hadoop.hdfs.TestEncryptionZones |
+|   | hadoop.hdfs.TestAppendDifferentChecksum |
+|   | hadoop.hdfs.TestFileAppend2 |
+|   | hadoop.hdfs.TestAppendSnapshotTruncate |
+|   | hadoop.hdfs.server.namenode.TestEditLog |
+|   | hadoop.hdfs.TestFileStatusWithECPolicy |
+|   | hadoop.hdfs.TestWriteReadStripedFile |
+|   | hadoop.hdfs.TestQuota |
+|   | hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer |
+|   | hadoop.hdfs.TestDFSStripedOutputStream |
+|   | hadoop.hdfs.server.namenode.ha.TestStandbyIsHot |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractConcat |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractRootDirectory |
+|   | hadoop.hdfs.TestHFlush |
+|   | hadoop.hdfs.TestBlockStoragePolicy |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotFileLength |
+|   | hadoop.hdfs.TestFileCreation |
+|   | hadoop.hdfs.server.namenode.ha.TestXAttrsWithHA |
+|   | hadoop.hdfs.server.namenode.TestFSImageWithSnapshot |
+|   | hadoop.hdfs.TestDFSShell |
+|   | hadoop.fs.TestHDFSFileContextMainOperations |
+|   | hadoop.fs.TestGlobPaths |
+|   | hadoop.hdfs.server.namenode.ha.TestHarFileSystemWithHA |
+|   | hadoop.hdfs.TestDistributedFileSystem |
+|   | hadoop.hdfs.server.namenode.TestNameNodeAcl |
+|   | hadoop.cli.TestHDFSCLI |
+|   | hadoop.hdfs.TestReplaceDatanodeOnFailure |
+|   | hadoop.hdfs.server.namenode.TestFavoredNodesEndToEnd |
+|   | hadoop.hdfs.server.namenode.TestFSImage |
+| JDK v1.7.0_91 Timed out junit tests | org.apache.hadoop.hdfs.server.namenode.TestNNThroughputBenchmark |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12780722/h8999_20160106b.patch |
+| JIRA Issue | HDFS-8999 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 434db39bf81c 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 2d16f40 |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/14041/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/14041/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14041/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14041/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/14041/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/14041/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/14041/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/14041/artifact/patchprocess/patch-asflicense-problems.txt |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-client U: hadoop-hdfs-project |
+| Max memory used | 75MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14041/console |
+
+
+This message was automatically generated.
+
+, h8999_20160106c.patch: fixes a NPE., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 28s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 28s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 34s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 29s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 24s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 27s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 3m 46s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 27s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 20s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 24s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 34s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 34s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 37s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 37s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 30s {color} | {color:red} Patch generated 4 new checkstyle issues in hadoop-hdfs-project (total was 633, now 632). {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 24s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 21s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 3 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 10s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 20s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 6s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 51s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 68m 33s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 55s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 66m 16s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 21s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 174m 43s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.hdfs.server.namenode.TestNameNodeMetadataConsistency |
+|   | hadoop.hdfs.server.blockmanagement.TestBlockManager |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotFileLength |
+|   | hadoop.hdfs.TestAclsEndToEnd |
+|   | hadoop.hdfs.server.namenode.TestNamenodeCapacityReport |
+|   | hadoop.hdfs.server.namenode.ha.TestStandbyIsHot |
+|   | hadoop.fs.viewfs.TestViewFileSystemHdfs |
+| JDK v1.7.0_91 Failed junit tests | hadoop.hdfs.TestBlockStoragePolicy |
+|   | hadoop.hdfs.server.namenode.ha.TestStandbyIsHot |
+|   | hadoop.hdfs.server.blockmanagement.TestNodeCount |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12780748/h8999_20160106c.patch |
+| JIRA Issue | HDFS-8999 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux d8068254a3c9 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 2d16f40 |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/14043/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/14043/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14043/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14043/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/14043/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/14043/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/14043/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-client U: hadoop-hdfs-project |
+| Max memory used | 76MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14043/console |
+
+
+This message was automatically generated.
+
+, # How about making BlockNotYetCompleteException simply an IOException and then in {{appendFile}} wrapping it inside of a {{RetriableException}} (like the current {{checkNameNodeSafeMode}})? In this way we can depend on the existing retry logic fo {{RetriableException}} and do not need to have explicit retry in {{callAppend}}.
+# We may need a unit test for the append retry in a block-not-yet-complete scenario.
+# In {{commitOrCompleteLastBlock}} and {{addStoredBlock}}, looks like we do not need the {{hasMinStorage}} check when adding the replicas to the pending queue? Otherwise the block may be later put into the under-replicated queue with {{QUEUE_WITH_CORRUPT_BLOCKS}} priority. If this change makes sense to you, we may also need another unit test here.
+{code}
+    if (hasMinStorage(lastBlock)) {
+      if (b) {
+        addExpectedReplicasToPending(lastBlock, bc);
+      }
+{code}, COMPLETE state used to mean that the number of reported replicas is {{>= minReplication}}, not {{> 1}}. Would make sense to me to retain this logic., > Let's test with the last block to see if it already solves the problem. I hesitates to be so aggressive.
+
+Did you test without this patch? How? May be the problem is already solved just with HDFS-1172, as I argued above., This isn't a review but just want to understand the work. Some minor comments or questions by the way. Thanks for clarifying.
+Regarding the following codes:
+{code}
+-      if (lastBlock != null && lastBlock.isComplete()
++      if (lastBlock != null) {
++        if (lastBlock.getBlockUCState() == BlockUCState.COMMITTED) {
++          throw new BlockNotYetCompleteException("append: lastBlock="
++              + lastBlock + " of src=" + path
++              + " is COMMITTED but not yet COMPLETE.");
++        } else if (lastBlock.isComplete()
+           && !blockManager.isSufficientlyReplicated(lastBlock)) {
+-        throw new IOException("append: lastBlock=" + lastBlock + " of src="
+-            + path + " is not sufficiently replicated yet.");
++          throw new IOException("append: lastBlock=" + lastBlock + " of src="
++              + path + " is not sufficiently replicated yet.");
++        }
+{code}
+* {{lastBlock.isComplete}} means the block has minimal replicas. From the header comment of {{isSufficientlyReplicated}}, it also means the block has minimal replicas. Actually it does check if the block has minimal live or available replicas. So suggest refine the method comment and the IOException message to avoid confusion here.
+* Would we have a method like {{isCommitted}} similar to {{isComplete}}?
+* In comments for {{BlockUCState.COMPLETE}}, it says when a block is in this state then it's not going to be modified. Is this out of sync since a complete block can append?, h8999_20160111.patch:
+- The new behavior is configurable.  The default is disabled.
+- Allow closing a file with multiple COMMITTED blocks.
+- Use minReplication instead of 1., Will add some tests for the new behavior., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 8m 8s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 35s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 38s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 35s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 27s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 5s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 34s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 21s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 23s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 34s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 34s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 36s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 36s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 35s {color} | {color:red} Patch generated 7 new checkstyle issues in hadoop-hdfs-project (total was 1045, now 1046). {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 27s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 23s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 3 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 19s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 29s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 14s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 56s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 64m 37s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 6s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 0m 30s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red} 0m 25s {color} | {color:red} Patch generated 2 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 107m 36s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.hdfs.TestHDFSFileSystemContract |
+|   | hadoop.hdfs.TestEncryptedTransfer |
+|   | hadoop.hdfs.TestClientProtocolForPipelineRecovery |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure160 |
+|   | hadoop.hdfs.TestDecommission |
+|   | hadoop.hdfs.TestFileAppend4 |
+|   | hadoop.hdfs.TestDFSShell |
+|   | hadoop.hdfs.TestBlockReaderLocalLegacy |
+|   | hadoop.fs.TestWebHdfsFileContextMainOperations |
+|   | hadoop.hdfs.server.mover.TestStorageMover |
+|   | hadoop.hdfs.server.datanode.TestDataNodeMetrics |
+|   | hadoop.hdfs.TestPersistBlocks |
+|   | hadoop.hdfs.server.datanode.TestBlockScanner |
+|   | hadoop.hdfs.TestLeaseRecovery2 |
+|   | hadoop.hdfs.TestLeaseRecovery |
+|   | hadoop.hdfs.TestReplaceDatanodeOnFailure |
+|   | hadoop.hdfs.TestReadStripedFileWithDecoding |
+|   | hadoop.fs.TestSymlinkHdfsFileSystem |
+|   | hadoop.fs.TestSWebHdfsFileContextMainOperations |
+|   | hadoop.hdfs.TestDataTransferProtocol |
+|   | hadoop.hdfs.TestQuota |
+|   | hadoop.hdfs.web.TestWebHdfsFileSystemContract |
+|   | hadoop.hdfs.TestEncryptionZones |
+|   | hadoop.hdfs.TestGetFileChecksum |
+|   | hadoop.hdfs.TestFileAppend |
+|   | hadoop.hdfs.server.balancer.TestBalancer |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithNodeGroup |
+|   | hadoop.hdfs.server.namenode.TestAddOverReplicatedStripedBlocks |
+|   | hadoop.hdfs.TestEncryptionZonesWithKMS |
+|   | hadoop.fs.TestSymlinkHdfsFileContext |
+|   | hadoop.hdfs.security.TestDelegationTokenForProxyUser |
+|   | hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer |
+|   | hadoop.hdfs.TestFileAppendRestart |
+|   | hadoop.cli.TestHDFSCLI |
+|   | hadoop.fs.TestHDFSFileContextMainOperations |
+|   | hadoop.hdfs.TestReadWhileWriting |
+|   | hadoop.hdfs.TestFileAppend3 |
+|   | hadoop.hdfs.server.namenode.TestNNThroughputBenchmark |
+|   | hadoop.hdfs.TestDFSUpgradeFromImage |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractAppend |
+|   | hadoop.hdfs.web.TestWebHdfsWithMultipleNameNodes |
+|   | hadoop.fs.permission.TestStickyBit |
+| JDK v1.8.0_66 Timed out junit tests | org.apache.hadoop.hdfs.server.balancer.TestBalancerWithSaslDataTransfer |
+|   | org.apache.hadoop.hdfs.server.mover.TestMover |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12781596/h8999_20160111.patch |
+| JIRA Issue | HDFS-8999 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux f941efa8b529 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 8c1adea |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/14087/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/14087/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14087/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14087/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/14087/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/14087/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/14087/artifact/patchprocess/patch-asflicense-problems.txt |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-client U: hadoop-hdfs-project |
+| Max memory used | 75MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14087/console |
+
+
+This message was automatically generated.
+
+, > COMPLETE state used to mean that the number of reported replicas is >= minReplication, not > 1. ...
+
+The previous patch did not change any logic of block COMPLETE state.  It checked if #locations > 1 before allowing close a file with COMMITTED blocks.
+
+It makes sense to change it to > minReplication.  Note that it is > but not >= since we don't want to allow closing file if #locations == minReplication., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 39s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 25s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 34s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 34s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 29s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 27s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 3m 47s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 28s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 11s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 17s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 23s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 23s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 30s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 30s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 32s {color} | {color:red} Patch generated 7 new checkstyle issues in hadoop-hdfs-project (total was 1043, now 1044). {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 20s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 22s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 3 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 13s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 22s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 7s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 49s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 65m 35s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 56s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 64m 41s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 21s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 169m 52s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.hdfs.server.datanode.TestFsDatasetCache |
+|   | hadoop.hdfs.server.namenode.TestDecommissioningStatus |
+| JDK v1.7.0_91 Failed junit tests | hadoop.hdfs.server.namenode.snapshot.TestSnapshotFileLength |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12781596/h8999_20160111.patch |
+| JIRA Issue | HDFS-8999 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux e06d69e7c815 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 1715864 |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/14098/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/14098/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14098/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14098/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/14098/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/14098/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/14098/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-client U: hadoop-hdfs-project |
+| Max memory used | 75MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14098/console |
+
+
+This message was automatically generated.
+
+, > 1.   How about making BlockNotYetCompleteException simply an IOException ...
+
+Sure
+
+> 2.   We may need a unit test for the append retry in a block-not-yet-complete scenario.
+
+TestAppendDifferentChecksum#testAlgoSwitchRandomized has a similar scenario.  I am also going to add a new test.
+
+> 3.    In commitOrCompleteLastBlock and addStoredBlock, looks like we do not need the hasMinStorage check when adding the replicas to the pending queue? ...
+
+I like to keep the hasMinStorage check since commitOrCompleteLastBlock and addStoredBlock check whether a block is updated from COMMITTED to COMPLETE.  If yes, added it to pendingReplications.
+
+In this patch, we allow file close for COMMITTED blocks.  I think we should add the COMMITTED blocks to pendingReplications when the file is being closed.  The existing logic (add a block to pendingReplications if it changes from COMMITTED to COMPLETE) should not be changed.  How does it sound to you?, h8999_20160113.patch: adds a test and fixes some bugs.
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 26s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 56s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 2m 5s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 49s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 34s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 29s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 27s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 18s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 50s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 14s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 16s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 27s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 27s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 36s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 36s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 33s {color} | {color:red} Patch generated 7 new checkstyle issues in hadoop-hdfs-project (total was 1043, now 1044). {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 25s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 23s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 4 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 2s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 23s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 7s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 51s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 169m 26s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 57s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 168m 56s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red} 0m 30s {color} | {color:red} Patch generated 1 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 381m 34s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.hdfs.TestParallelShortCircuitRead |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure150 |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractMkdir |
+|   | hadoop.hdfs.TestBlockStoragePolicy |
+|   | hadoop.hdfs.TestEncryptedTransfer |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotMetrics |
+|   | hadoop.hdfs.TestDFSInotifyEventInputStream |
+|   | hadoop.hdfs.TestFileLengthOnClusterRestart |
+|   | hadoop.hdfs.TestAppendSnapshotTruncate |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshottableDirListing |
+|   | hadoop.hdfs.TestRead |
+|   | hadoop.hdfs.TestBlocksScheduledCounter |
+|   | hadoop.hdfs.server.namenode.TestDiskspaceQuotaUpdate |
+|   | hadoop.hdfs.TestDFSPermission |
+|   | hadoop.hdfs.server.namenode.TestCheckpoint |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure200 |
+|   | hadoop.hdfs.TestReplaceDatanodeOnFailure |
+|   | hadoop.hdfs.TestRemoteBlockReader2 |
+|   | hadoop.hdfs.server.namenode.TestStartup |
+|   | hadoop.hdfs.TestDFSStorageStateRecovery |
+|   | hadoop.hdfs.TestRemoteBlockReader |
+|   | hadoop.hdfs.TestMultiThreadedHflush |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractRename |
+|   | hadoop.hdfs.TestDFSClientFailover |
+|   | hadoop.hdfs.TestBlockReaderLocal |
+|   | hadoop.hdfs.server.mover.TestMover |
+|   | hadoop.hdfs.server.blockmanagement.TestOverReplicatedBlocks |
+|   | hadoop.hdfs.server.namenode.web.resources.TestWebHdfsDataLocality |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure |
+|   | hadoop.hdfs.TestLeaseRecovery2 |
+|   | hadoop.fs.loadGenerator.TestLoadGenerator |
+|   | hadoop.hdfs.server.namenode.TestLargeDirectoryDelete |
+|   | hadoop.hdfs.TestWriteConfigurationToDFS |
+|   | hadoop.fs.TestFcHdfsSetUMask |
+|   | hadoop.hdfs.TestPread |
+|   | hadoop.hdfs.server.namenode.TestFSEditLogLoader |
+|   | hadoop.hdfs.server.datanode.TestFsDatasetCacheRevocation |
+|   | hadoop.hdfs.server.namenode.ha.TestQuotasWithHA |
+|   | hadoop.hdfs.crypto.TestHdfsCryptoStreams |
+|   | hadoop.fs.viewfs.TestViewFsFileStatusHdfs |
+|   | hadoop.hdfs.server.datanode.TestReadOnlySharedStorage |
+|   | hadoop.hdfs.tools.offlineImageViewer.TestOfflineImageViewerForAcl |
+|   | hadoop.hdfs.web.TestHttpsFileSystem |
+|   | hadoop.tracing.TestTracingShortCircuitLocalRead |
+|   | hadoop.hdfs.server.namenode.TestFSDirectory |
+|   | hadoop.hdfs.server.datanode.TestBlockScanner |
+|   | hadoop.hdfs.server.namenode.TestNameNodeMetadataConsistency |
+|   | hadoop.tracing.TestTracing |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestInterDatanodeProtocol |
+|   | hadoop.hdfs.server.namenode.snapshot.TestNestedSnapshots |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyPersistFiles |
+|   | hadoop.hdfs.TestParallelRead |
+|   | hadoop.hdfs.TestDFSStripedInputStream |
+|   | hadoop.hdfs.TestRestartDFS |
+|   | hadoop.fs.TestWebHdfsFileContextMainOperations |
+|   | hadoop.hdfs.TestParallelShortCircuitReadNoChecksum |
+|   | hadoop.hdfs.server.blockmanagement.TestSequentialBlockId |
+|   | hadoop.hdfs.server.blockmanagement.TestNameNodePrunesMissingStorages |
+|   | hadoop.hdfs.TestSetTimes |
+|   | hadoop.hdfs.TestParallelShortCircuitLegacyRead |
+|   | hadoop.hdfs.server.blockmanagement.TestPendingInvalidateBlock |
+|   | hadoop.hdfs.server.blockmanagement.TestBlockTokenWithDFS |
+|   | hadoop.hdfs.TestReadStripedFileWithMissingBlocks |
+|   | hadoop.hdfs.TestDatanodeDeath |
+|   | hadoop.hdfs.server.namenode.ha.TestPipelinesFailover |
+|   | hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer |
+|   | hadoop.fs.TestFcHdfsCreateMkdir |
+|   | hadoop.hdfs.TestHFlush |
+|   | hadoop.hdfs.server.namenode.ha.TestFailoverWithBlockTokensEnabled |
+|   | hadoop.hdfs.server.namenode.ha.TestDNFencingWithReplication |
+|   | hadoop.hdfs.server.namenode.ha.TestDNFencing |
+|   | hadoop.hdfs.TestDFSRollback |
+|   | hadoop.hdfs.TestDFSUpgrade |
+|   | hadoop.fs.TestFcHdfsPermission |
+|   | hadoop.hdfs.TestClientBlockVerification |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotBlocksMap |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureToleration |
+|   | hadoop.hdfs.tools.offlineImageViewer.TestOfflineImageViewerWithStripedBlocks |
+|   | hadoop.hdfs.server.namenode.TestNamenodeRetryCache |
+|   | hadoop.hdfs.server.datanode.TestFsDatasetCache |
+|   | hadoop.hdfs.server.datanode.TestBlockHasMultipleReplicasOnSameDN |
+|   | hadoop.hdfs.TestMissingBlocksAlert |
+|   | hadoop.hdfs.server.namenode.TestNNThroughputBenchmark |
+|   | hadoop.hdfs.server.namenode.ha.TestHAMetrics |
+|   | hadoop.hdfs.TestQuota |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithEncryptedTransfer |
+|   | hadoop.hdfs.server.namenode.snapshot.TestFileContextSnapshot |
+|   | hadoop.hdfs.server.namenode.TestQuotaByStorageType |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotDeletion |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure060 |
+|   | hadoop.hdfs.server.namenode.TestParallelImageWrite |
+|   | hadoop.hdfs.tools.TestDebugAdmin |
+|   | hadoop.hdfs.server.datanode.TestDiskError |
+|   | hadoop.hdfs.server.namenode.snapshot.TestRenameWithSnapshots |
+|   | hadoop.hdfs.server.namenode.TestNameEditsConfigs |
+|   | hadoop.hdfs.server.namenode.TestSnapshotPathINodes |
+|   | hadoop.hdfs.server.namenode.TestFavoredNodesEndToEnd |
+|   | hadoop.hdfs.tools.offlineImageViewer.TestOfflineImageViewer |
+|   | hadoop.hdfs.shortcircuit.TestShortCircuitCache |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithNodeGroup |
+|   | hadoop.hdfs.server.datanode.TestDnRespectsBlockReportSplitThreshold |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotNameWithInvalidCharacters |
+|   | hadoop.hdfs.TestModTime |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure120 |
+|   | hadoop.hdfs.server.blockmanagement.TestBlockManager |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure180 |
+|   | hadoop.hdfs.TestSetrepIncreasing |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure040 |
+|   | hadoop.hdfs.TestGetBlocks |
+|   | hadoop.hdfs.TestDFSStartupVersions |
+|   | hadoop.hdfs.TestReadWhileWriting |
+|   | hadoop.hdfs.TestRenameWhileOpen |
+|   | hadoop.tools.TestJMXGet |
+|   | hadoop.hdfs.shortcircuit.TestShortCircuitLocalRead |
+|   | hadoop.hdfs.TestHDFSFileSystemContract |
+|   | hadoop.hdfs.TestFileAppend4 |
+|   | hadoop.hdfs.TestRecoverStripedFile |
+|   | hadoop.hdfs.server.namenode.TestAddBlock |
+|   | hadoop.hdfs.TestDataTransferKeepalive |
+|   | hadoop.hdfs.server.datanode.TestDataNodeMetrics |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithHANameNodes |
+|   | hadoop.security.TestPermissionSymlinks |
+|   | hadoop.hdfs.server.namenode.ha.TestRetryCacheWithHA |
+|   | hadoop.hdfs.server.namenode.TestINodeFile |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithSaslDataTransfer |
+|   | hadoop.hdfs.TestFileAppend2 |
+|   | hadoop.hdfs.TestErasureCodeBenchmarkThroughput |
+|   | hadoop.hdfs.TestSetrepDecreasing |
+|   | hadoop.hdfs.server.namenode.TestProcessCorruptBlocks |
+|   | hadoop.hdfs.security.TestDelegationTokenForProxyUser |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure140 |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure100 |
+|   | hadoop.hdfs.server.namenode.TestAuditLogs |
+|   | hadoop.fs.TestSWebHdfsFileContextMainOperations |
+|   | hadoop.hdfs.TestInjectionForSimulatedStorage |
+|   | hadoop.hdfs.server.namenode.TestFsck |
+|   | hadoop.hdfs.TestErasureCodingPolicyWithSnapshot |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractDelete |
+|   | hadoop.hdfs.TestLocalDFS |
+|   | hadoop.hdfs.server.namenode.TestListCorruptFileBlocks |
+|   | hadoop.hdfs.TestCrcCorruption |
+|   | hadoop.hdfs.TestListFilesInFileContext |
+|   | hadoop.hdfs.TestDataTransferProtocol |
+|   | hadoop.hdfs.TestConnCache |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure170 |
+|   | hadoop.hdfs.server.namenode.TestStripedINodeFile |
+|   | hadoop.hdfs.TestGetFileChecksum |
+|   | hadoop.hdfs.server.blockmanagement.TestBlocksWithNotEnoughRacks |
+|   | hadoop.hdfs.TestFileAppend |
+|   | hadoop.hdfs.TestReservedRawPaths |
+|   | hadoop.hdfs.TestReadStripedFileWithDecoding |
+|   | hadoop.hdfs.server.datanode.TestDataNodeRollingUpgrade |
+|   | hadoop.hdfs.TestDisableConnCache |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyPersistReplicaPlacement |
+|   | hadoop.hdfs.server.datanode.TestIncrementalBrVariations |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure160 |
+|   | hadoop.hdfs.TestParallelShortCircuitReadUnCached |
+|   | hadoop.hdfs.TestDecommission |
+|   | hadoop.fs.TestUrlStreamHandler |
+|   | hadoop.hdfs.TestSeekBug |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailure |
+|   | hadoop.hdfs.security.token.block.TestBlockToken |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSetQuotaWithSnapshot |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure020 |
+|   | hadoop.fs.TestEnhancedByteBufferAccess |
+|   | hadoop.hdfs.TestDFSFinalize |
+|   | hadoop.hdfs.TestDFSMkdirs |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotRename |
+|   | hadoop.hdfs.TestDFSClientExcludedNodes |
+|   | hadoop.hdfs.TestRollingUpgrade |
+|   | hadoop.hdfs.server.namenode.TestFSImage |
+|   | hadoop.hdfs.server.balancer.TestBalancer |
+|   | hadoop.hdfs.server.datanode.TestNNHandlesBlockReportPerStorage |
+|   | hadoop.hdfs.TestSafeModeWithStripedFile |
+|   | hadoop.fs.TestHDFSFileContextMainOperations |
+|   | hadoop.hdfs.TestSafeMode |
+|   | hadoop.hdfs.server.namenode.TestBackupNode |
+|   | hadoop.hdfs.server.namenode.ha.TestStandbyCheckpoints |
+|   | hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+|   | hadoop.hdfs.server.namenode.ha.TestStandbyBlockManagement |
+|   | hadoop.hdfs.TestWriteRead |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotFileLength |
+|   | hadoop.hdfs.TestWriteReadStripedFile |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotDiffReport |
+|   | hadoop.hdfs.TestExternalBlockReader |
+|   | hadoop.hdfs.server.namenode.TestMetaSave |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractAppend |
+|   | hadoop.hdfs.TestDFSStripedOutputStream |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractOpen |
+|   | hadoop.hdfs.server.namenode.TestAddStripedBlocks |
+|   | hadoop.hdfs.TestFileCreation |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshot |
+|   | hadoop.hdfs.server.mover.TestStorageMover |
+|   | hadoop.hdfs.TestClientReportBadBlock |
+|   | hadoop.hdfs.server.namenode.TestAddBlockRetry |
+|   | hadoop.hdfs.TestDistributedFileSystem |
+|   | hadoop.hdfs.TestFileCorruption |
+|   | hadoop.hdfs.server.namenode.TestHDFSConcat |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestSpaceReservation |
+|   | hadoop.hdfs.web.TestWebHdfsFileSystemContract |
+|   | hadoop.hdfs.server.datanode.TestBlockReplacement |
+|   | hadoop.hdfs.TestClose |
+|   | hadoop.hdfs.server.namenode.metrics.TestNameNodeMetrics |
+|   | hadoop.hdfs.TestAbandonBlock |
+|   | hadoop.hdfs.TestDFSShell |
+|   | hadoop.hdfs.TestDFSInputStream |
+|   | hadoop.hdfs.TestLeaseRecovery |
+|   | hadoop.hdfs.server.namenode.ha.TestSeveralNameNodes |
+|   | hadoop.hdfs.server.datanode.TestTriggerBlockReport |
+|   | hadoop.hdfs.TestWriteBlockGetsBlockLengthHint |
+|   | hadoop.hdfs.server.blockmanagement.TestRBWBlockInvalidation |
+|   | hadoop.hdfs.server.namenode.ha.TestPendingCorruptDnMessages |
+|   | hadoop.fs.viewfs.TestViewFsHdfs |
+|   | hadoop.hdfs.TestFSInputChecker |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractConcat |
+|   | hadoop.hdfs.server.namenode.TestFileLimit |
+|   | hadoop.fs.viewfs.TestViewFileSystemAtHdfsRoot |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithMultipleNameNodes |
+|   | hadoop.hdfs.TestHDFSTrash |
+|   | hadoop.hdfs.server.datanode.TestCachingStrategy |
+|   | hadoop.hdfs.TestSmallBlock |
+|   | hadoop.hdfs.TestReplication |
+|   | hadoop.hdfs.server.namenode.ha.TestHAAppend |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestScrLazyPersistFiles |
+|   | hadoop.cli.TestAclCLI |
+|   | hadoop.fs.TestSymlinkHdfsFileContext |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure050 |
+|   | hadoop.hdfs.server.namenode.snapshot.TestINodeFileUnderConstructionWithSnapshot |
+|   | hadoop.hdfs.TestFileAppendRestart |
+|   | hadoop.fs.TestSymlinkHdfsFileSystem |
+|   | hadoop.hdfs.TestFileAppend3 |
+|   | hadoop.hdfs.server.namenode.TestFileContextXAttr |
+|   | hadoop.hdfs.server.blockmanagement.TestBlockStatsMXBean |
+|   | hadoop.fs.TestUnbuffer |
+|   | hadoop.hdfs.TestPipelines |
+|   | hadoop.hdfs.server.namenode.TestDecommissioningStatus |
+|   | hadoop.hdfs.server.namenode.ha.TestHASafeMode |
+|   | hadoop.hdfs.web.TestWebHdfsWithMultipleNameNodes |
+|   | hadoop.hdfs.server.namenode.metrics.TestNNMetricFilesInGetListingOps |
+|   | hadoop.hdfs.TestBlockReaderFactory |
+|   | hadoop.hdfs.server.namenode.TestNamenodeCapacityReport |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotReplication |
+|   | hadoop.hdfs.server.namenode.ha.TestStandbyIsHot |
+|   | hadoop.hdfs.server.namenode.TestFileTruncate |
+|   | hadoop.hdfs.TestFSOutputSummer |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure070 |
+|   | hadoop.hdfs.server.blockmanagement.TestSequentialBlockGroupId |
+|   | hadoop.hdfs.TestBlockReaderLocalLegacy |
+|   | hadoop.hdfs.server.namenode.TestFSImageWithSnapshot |
+|   | hadoop.hdfs.TestFsShellPermission |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyWriter |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+|   | hadoop.hdfs.server.blockmanagement.TestPendingReplication |
+|   | hadoop.hdfs.server.namenode.ha.TestHAStateTransitions |
+|   | hadoop.hdfs.TestEncryptionZones |
+|   | hadoop.hdfs.server.namenode.TestCommitBlockWithInvalidGenStamp |
+|   | hadoop.hdfs.server.blockmanagement.TestUnderReplicatedBlocks |
+|   | hadoop.hdfs.TestFileConcurrentReader |
+|   | hadoop.hdfs.server.blockmanagement.TestNodeCount |
+|   | hadoop.fs.viewfs.TestViewFsDefaultValue |
+|   | hadoop.hdfs.TestAppendDifferentChecksum |
+|   | hadoop.hdfs.TestEncryptionZonesWithHA |
+|   | hadoop.hdfs.server.namenode.TestCacheDirectives |
+|   | hadoop.hdfs.server.namenode.ha.TestHarFileSystemWithHA |
+|   | hadoop.hdfs.server.namenode.TestQuotaWithStripedBlocks |
+|   | hadoop.hdfs.tools.offlineImageViewer.TestOfflineImageViewerForContentSummary |
+|   | hadoop.hdfs.TestFileStatus |
+|   | hadoop.hdfs.web.TestWebHDFSXAttr |
+|   | hadoop.hdfs.server.namenode.TestNameNodeXAttr |
+|   | hadoop.hdfs.server.datanode.TestHSync |
+|   | hadoop.hdfs.protocol.datatransfer.sasl.TestSaslDataTransfer |
+|   | hadoop.fs.viewfs.TestViewFileSystemHdfs |
+|   | hadoop.hdfs.server.namenode.TestRecoverStripedBlocks |
+|   | hadoop.hdfs.TestParallelUnixDomainRead |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure030 |
+|   | hadoop.hdfs.tools.TestStoragePolicyCommands |
+|   | hadoop.hdfs.TestDFSRemove |
+|   | hadoop.fs.viewfs.TestViewFsAtHdfsRoot |
+|   | hadoop.hdfs.server.datanode.TestNNHandlesCombinedBlockReport |
+|   | hadoop.hdfs.server.datanode.TestDeleteBlockPool |
+|   | hadoop.hdfs.TestDFSClientRetries |
+|   | hadoop.hdfs.server.blockmanagement.TestComputeInvalidateWork |
+|   | hadoop.hdfs.TestListFilesInDFS |
+|   | hadoop.hdfs.server.namenode.TestAddOverReplicatedStripedBlocks |
+|   | hadoop.hdfs.server.namenode.TestHostsFiles |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractCreate |
+|   | hadoop.fs.permission.TestStickyBit |
+|   | hadoop.hdfs.web.TestFSMainOperationsWebHdfs |
+|   | hadoop.hdfs.TestEncryptionZonesWithKMS |
+|   | hadoop.fs.TestSymlinkHdfsDisable |
+|   | hadoop.hdfs.server.namenode.snapshot.TestOpenFilesWithSnapshot |
+|   | hadoop.hdfs.TestDFSRename |
+|   | hadoop.hdfs.server.namenode.TestDeleteRace |
+|   | hadoop.hdfs.TestLease |
+|   | hadoop.hdfs.TestLargeBlock |
+|   | hadoop.hdfs.server.namenode.TestFsckWithMultipleNameNodes |
+|   | hadoop.hdfs.security.TestDelegationToken |
+|   | hadoop.hdfs.TestClientProtocolForPipelineRecovery |
+|   | hadoop.security.TestPermission |
+|   | hadoop.hdfs.server.datanode.TestDirectoryScanner |
+|   | hadoop.hdfs.web.TestWebHDFS |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractSeek |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestDatanodeRestart |
+|   | hadoop.fs.shell.TestHdfsTextCommand |
+|   | hadoop.hdfs.server.namenode.snapshot.TestGetContentSummaryWithSnapshot |
+|   | hadoop.hdfs.TestBlockMissingException |
+| JDK v1.8.0_66 Timed out junit tests | org.apache.hadoop.hdfs.server.blockmanagement.TestBlockTokenWithDFSStriped |
+|   | org.apache.hadoop.hdfs.server.namenode.TestBlockUnderConstruction |
+|   | org.apache.hadoop.hdfs.TestPersistBlocks |
+|   | org.apache.hadoop.cli.TestHDFSCLI |
+| JDK v1.7.0_91 Failed junit tests | hadoop.hdfs.TestParallelShortCircuitRead |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractMkdir |
+|   | hadoop.hdfs.TestBlockStoragePolicy |
+|   | hadoop.hdfs.TestEncryptedTransfer |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotMetrics |
+|   | hadoop.hdfs.TestDFSInotifyEventInputStream |
+|   | hadoop.hdfs.TestFileLengthOnClusterRestart |
+|   | hadoop.hdfs.TestAppendSnapshotTruncate |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshottableDirListing |
+|   | hadoop.hdfs.TestRead |
+|   | hadoop.hdfs.TestBlocksScheduledCounter |
+|   | hadoop.hdfs.server.namenode.TestDiskspaceQuotaUpdate |
+|   | hadoop.hdfs.TestDFSPermission |
+|   | hadoop.hdfs.server.namenode.TestCheckpoint |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure200 |
+|   | hadoop.hdfs.TestReplaceDatanodeOnFailure |
+|   | hadoop.hdfs.TestRemoteBlockReader2 |
+|   | hadoop.hdfs.server.namenode.TestStartup |
+|   | hadoop.hdfs.TestDFSStorageStateRecovery |
+|   | hadoop.hdfs.TestRemoteBlockReader |
+|   | hadoop.hdfs.TestMultiThreadedHflush |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractRename |
+|   | hadoop.hdfs.TestDFSClientFailover |
+|   | hadoop.hdfs.TestBlockReaderLocal |
+|   | hadoop.hdfs.server.mover.TestMover |
+|   | hadoop.hdfs.server.blockmanagement.TestOverReplicatedBlocks |
+|   | hadoop.hdfs.server.namenode.web.resources.TestWebHdfsDataLocality |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure |
+|   | hadoop.hdfs.TestLeaseRecovery2 |
+|   | hadoop.fs.loadGenerator.TestLoadGenerator |
+|   | hadoop.hdfs.server.namenode.TestLargeDirectoryDelete |
+|   | hadoop.hdfs.TestWriteConfigurationToDFS |
+|   | hadoop.fs.TestFcHdfsSetUMask |
+|   | hadoop.hdfs.TestPread |
+|   | hadoop.hdfs.server.namenode.TestFSEditLogLoader |
+|   | hadoop.hdfs.server.datanode.TestFsDatasetCacheRevocation |
+|   | hadoop.hdfs.server.namenode.ha.TestQuotasWithHA |
+|   | hadoop.hdfs.crypto.TestHdfsCryptoStreams |
+|   | hadoop.fs.viewfs.TestViewFsFileStatusHdfs |
+|   | hadoop.hdfs.server.datanode.TestReadOnlySharedStorage |
+|   | hadoop.hdfs.tools.offlineImageViewer.TestOfflineImageViewerForAcl |
+|   | hadoop.hdfs.web.TestHttpsFileSystem |
+|   | hadoop.tracing.TestTracingShortCircuitLocalRead |
+|   | hadoop.hdfs.server.namenode.TestFSDirectory |
+|   | hadoop.hdfs.server.datanode.TestBlockScanner |
+|   | hadoop.hdfs.server.namenode.TestNameNodeMetadataConsistency |
+|   | hadoop.tracing.TestTracing |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestInterDatanodeProtocol |
+|   | hadoop.hdfs.server.namenode.snapshot.TestNestedSnapshots |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyPersistFiles |
+|   | hadoop.hdfs.TestParallelRead |
+|   | hadoop.hdfs.TestDFSStripedInputStream |
+|   | hadoop.hdfs.TestRestartDFS |
+|   | hadoop.fs.TestWebHdfsFileContextMainOperations |
+|   | hadoop.hdfs.TestParallelShortCircuitReadNoChecksum |
+|   | hadoop.hdfs.server.blockmanagement.TestSequentialBlockId |
+|   | hadoop.hdfs.server.blockmanagement.TestNameNodePrunesMissingStorages |
+|   | hadoop.hdfs.TestSetTimes |
+|   | hadoop.hdfs.TestParallelShortCircuitLegacyRead |
+|   | hadoop.hdfs.server.blockmanagement.TestPendingInvalidateBlock |
+|   | hadoop.hdfs.server.blockmanagement.TestBlockTokenWithDFS |
+|   | hadoop.hdfs.TestReadStripedFileWithMissingBlocks |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure210 |
+|   | hadoop.hdfs.TestDatanodeDeath |
+|   | hadoop.hdfs.server.namenode.ha.TestPipelinesFailover |
+|   | hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer |
+|   | hadoop.fs.TestFcHdfsCreateMkdir |
+|   | hadoop.hdfs.TestHFlush |
+|   | hadoop.hdfs.server.namenode.ha.TestFailoverWithBlockTokensEnabled |
+|   | hadoop.hdfs.server.namenode.ha.TestDNFencingWithReplication |
+|   | hadoop.hdfs.server.namenode.ha.TestDNFencing |
+|   | hadoop.hdfs.TestDFSRollback |
+|   | hadoop.hdfs.TestDFSUpgrade |
+|   | hadoop.fs.TestFcHdfsPermission |
+|   | hadoop.hdfs.TestClientBlockVerification |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotBlocksMap |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureToleration |
+|   | hadoop.hdfs.tools.offlineImageViewer.TestOfflineImageViewerWithStripedBlocks |
+|   | hadoop.hdfs.server.namenode.TestNamenodeRetryCache |
+|   | hadoop.hdfs.server.datanode.TestFsDatasetCache |
+|   | hadoop.hdfs.server.datanode.TestBlockHasMultipleReplicasOnSameDN |
+|   | hadoop.hdfs.TestMissingBlocksAlert |
+|   | hadoop.hdfs.server.namenode.TestNNThroughputBenchmark |
+|   | hadoop.hdfs.server.namenode.ha.TestHAMetrics |
+|   | hadoop.hdfs.TestQuota |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithEncryptedTransfer |
+|   | hadoop.hdfs.server.namenode.snapshot.TestFileContextSnapshot |
+|   | hadoop.hdfs.server.namenode.TestQuotaByStorageType |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotDeletion |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure060 |
+|   | hadoop.hdfs.server.namenode.TestParallelImageWrite |
+|   | hadoop.hdfs.tools.TestDebugAdmin |
+|   | hadoop.hdfs.server.datanode.TestDiskError |
+|   | hadoop.hdfs.server.namenode.snapshot.TestRenameWithSnapshots |
+|   | hadoop.hdfs.server.namenode.TestNameEditsConfigs |
+|   | hadoop.hdfs.server.namenode.TestSnapshotPathINodes |
+|   | hadoop.hdfs.server.namenode.TestFavoredNodesEndToEnd |
+|   | hadoop.hdfs.tools.offlineImageViewer.TestOfflineImageViewer |
+|   | hadoop.hdfs.shortcircuit.TestShortCircuitCache |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithNodeGroup |
+|   | hadoop.hdfs.server.datanode.TestDnRespectsBlockReportSplitThreshold |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotNameWithInvalidCharacters |
+|   | hadoop.hdfs.TestModTime |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure120 |
+|   | hadoop.hdfs.server.blockmanagement.TestBlockManager |
+|   | hadoop.hdfs.TestSetrepIncreasing |
+|   | hadoop.hdfs.TestGetBlocks |
+|   | hadoop.hdfs.TestDFSStartupVersions |
+|   | hadoop.hdfs.TestReadWhileWriting |
+|   | hadoop.hdfs.TestRenameWhileOpen |
+|   | hadoop.tools.TestJMXGet |
+|   | hadoop.hdfs.shortcircuit.TestShortCircuitLocalRead |
+|   | hadoop.hdfs.TestHDFSFileSystemContract |
+|   | hadoop.hdfs.TestFileAppend4 |
+|   | hadoop.hdfs.TestRecoverStripedFile |
+|   | hadoop.hdfs.server.namenode.TestAddBlock |
+|   | hadoop.hdfs.TestDataTransferKeepalive |
+|   | hadoop.hdfs.server.datanode.TestDataNodeMetrics |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithHANameNodes |
+|   | hadoop.security.TestPermissionSymlinks |
+|   | hadoop.hdfs.server.namenode.ha.TestRetryCacheWithHA |
+|   | hadoop.hdfs.server.namenode.TestINodeFile |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithSaslDataTransfer |
+|   | hadoop.hdfs.TestFileAppend2 |
+|   | hadoop.hdfs.TestErasureCodeBenchmarkThroughput |
+|   | hadoop.hdfs.TestSetrepDecreasing |
+|   | hadoop.hdfs.server.namenode.TestProcessCorruptBlocks |
+|   | hadoop.hdfs.security.TestDelegationTokenForProxyUser |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure140 |
+|   | hadoop.hdfs.server.namenode.TestAuditLogs |
+|   | hadoop.fs.TestSWebHdfsFileContextMainOperations |
+|   | hadoop.hdfs.TestInjectionForSimulatedStorage |
+|   | hadoop.hdfs.server.namenode.TestFsck |
+|   | hadoop.hdfs.TestErasureCodingPolicyWithSnapshot |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractDelete |
+|   | hadoop.hdfs.TestLocalDFS |
+|   | hadoop.hdfs.server.namenode.TestListCorruptFileBlocks |
+|   | hadoop.hdfs.TestCrcCorruption |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure090 |
+|   | hadoop.hdfs.TestListFilesInFileContext |
+|   | hadoop.hdfs.TestDataTransferProtocol |
+|   | hadoop.hdfs.TestConnCache |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure170 |
+|   | hadoop.hdfs.server.namenode.TestStripedINodeFile |
+|   | hadoop.hdfs.TestGetFileChecksum |
+|   | hadoop.hdfs.server.blockmanagement.TestBlocksWithNotEnoughRacks |
+|   | hadoop.hdfs.TestFileAppend |
+|   | hadoop.hdfs.TestReservedRawPaths |
+|   | hadoop.hdfs.TestReadStripedFileWithDecoding |
+|   | hadoop.hdfs.server.datanode.TestDataNodeRollingUpgrade |
+|   | hadoop.hdfs.TestDisableConnCache |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyPersistReplicaPlacement |
+|   | hadoop.hdfs.server.datanode.TestIncrementalBrVariations |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure160 |
+|   | hadoop.hdfs.TestParallelShortCircuitReadUnCached |
+|   | hadoop.hdfs.TestDecommission |
+|   | hadoop.fs.TestUrlStreamHandler |
+|   | hadoop.hdfs.TestSeekBug |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailure |
+|   | hadoop.hdfs.security.token.block.TestBlockToken |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSetQuotaWithSnapshot |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure020 |
+|   | hadoop.fs.TestEnhancedByteBufferAccess |
+|   | hadoop.hdfs.TestDFSFinalize |
+|   | hadoop.hdfs.TestDFSMkdirs |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotRename |
+|   | hadoop.hdfs.TestDFSClientExcludedNodes |
+|   | hadoop.hdfs.TestRollingUpgrade |
+|   | hadoop.hdfs.server.namenode.TestFSImage |
+|   | hadoop.hdfs.server.balancer.TestBalancer |
+|   | hadoop.hdfs.server.datanode.TestNNHandlesBlockReportPerStorage |
+|   | hadoop.hdfs.TestSafeModeWithStripedFile |
+|   | hadoop.fs.TestHDFSFileContextMainOperations |
+|   | hadoop.hdfs.TestSafeMode |
+|   | hadoop.hdfs.server.namenode.TestBackupNode |
+|   | hadoop.hdfs.server.namenode.ha.TestStandbyCheckpoints |
+|   | hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+|   | hadoop.hdfs.server.namenode.ha.TestStandbyBlockManagement |
+|   | hadoop.hdfs.TestWriteRead |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotFileLength |
+|   | hadoop.hdfs.TestWriteReadStripedFile |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotDiffReport |
+|   | hadoop.hdfs.TestExternalBlockReader |
+|   | hadoop.hdfs.server.namenode.TestMetaSave |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractAppend |
+|   | hadoop.hdfs.TestDFSStripedOutputStream |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractOpen |
+|   | hadoop.hdfs.server.namenode.TestAddStripedBlocks |
+|   | hadoop.hdfs.TestFileCreation |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshot |
+|   | hadoop.hdfs.server.mover.TestStorageMover |
+|   | hadoop.hdfs.TestClientReportBadBlock |
+|   | hadoop.hdfs.server.namenode.TestAddBlockRetry |
+|   | hadoop.hdfs.TestDistributedFileSystem |
+|   | hadoop.hdfs.TestFileCorruption |
+|   | hadoop.hdfs.server.namenode.TestHDFSConcat |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestSpaceReservation |
+|   | hadoop.hdfs.web.TestWebHdfsFileSystemContract |
+|   | hadoop.hdfs.server.datanode.TestBlockReplacement |
+|   | hadoop.hdfs.TestClose |
+|   | hadoop.hdfs.server.namenode.metrics.TestNameNodeMetrics |
+|   | hadoop.hdfs.TestAbandonBlock |
+|   | hadoop.hdfs.TestDFSShell |
+|   | hadoop.hdfs.TestDFSInputStream |
+|   | hadoop.hdfs.TestLeaseRecovery |
+|   | hadoop.hdfs.server.namenode.ha.TestSeveralNameNodes |
+|   | hadoop.hdfs.server.datanode.TestTriggerBlockReport |
+|   | hadoop.hdfs.TestWriteBlockGetsBlockLengthHint |
+|   | hadoop.hdfs.server.blockmanagement.TestRBWBlockInvalidation |
+|   | hadoop.hdfs.server.namenode.ha.TestPendingCorruptDnMessages |
+|   | hadoop.fs.viewfs.TestViewFsHdfs |
+|   | hadoop.hdfs.TestFSInputChecker |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractConcat |
+|   | hadoop.hdfs.server.namenode.TestFileLimit |
+|   | hadoop.fs.viewfs.TestViewFileSystemAtHdfsRoot |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithMultipleNameNodes |
+|   | hadoop.hdfs.TestHDFSTrash |
+|   | hadoop.hdfs.server.datanode.TestCachingStrategy |
+|   | hadoop.hdfs.TestSmallBlock |
+|   | hadoop.hdfs.TestReplication |
+|   | hadoop.hdfs.server.namenode.ha.TestHAAppend |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestScrLazyPersistFiles |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure110 |
+|   | hadoop.cli.TestAclCLI |
+|   | hadoop.fs.TestSymlinkHdfsFileContext |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure130 |
+|   | hadoop.hdfs.server.namenode.snapshot.TestINodeFileUnderConstructionWithSnapshot |
+|   | hadoop.hdfs.TestFileAppendRestart |
+|   | hadoop.fs.TestSymlinkHdfsFileSystem |
+|   | hadoop.hdfs.TestFileAppend3 |
+|   | hadoop.hdfs.server.namenode.TestFileContextXAttr |
+|   | hadoop.hdfs.server.blockmanagement.TestBlockStatsMXBean |
+|   | hadoop.fs.TestUnbuffer |
+|   | hadoop.hdfs.TestPipelines |
+|   | hadoop.hdfs.server.namenode.TestDecommissioningStatus |
+|   | hadoop.hdfs.server.namenode.ha.TestHASafeMode |
+|   | hadoop.hdfs.web.TestWebHdfsWithMultipleNameNodes |
+|   | hadoop.hdfs.server.namenode.metrics.TestNNMetricFilesInGetListingOps |
+|   | hadoop.hdfs.TestBlockReaderFactory |
+|   | hadoop.hdfs.server.namenode.TestNamenodeCapacityReport |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotReplication |
+|   | hadoop.hdfs.server.namenode.ha.TestStandbyIsHot |
+|   | hadoop.hdfs.server.namenode.TestFileTruncate |
+|   | hadoop.hdfs.TestFSOutputSummer |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure070 |
+|   | hadoop.hdfs.server.blockmanagement.TestSequentialBlockGroupId |
+|   | hadoop.hdfs.TestBlockReaderLocalLegacy |
+|   | hadoop.hdfs.server.namenode.TestFSImageWithSnapshot |
+|   | hadoop.hdfs.TestFsShellPermission |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyWriter |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+|   | hadoop.hdfs.server.blockmanagement.TestPendingReplication |
+|   | hadoop.hdfs.server.namenode.ha.TestHAStateTransitions |
+|   | hadoop.hdfs.TestEncryptionZones |
+|   | hadoop.hdfs.server.namenode.TestCommitBlockWithInvalidGenStamp |
+|   | hadoop.hdfs.server.blockmanagement.TestUnderReplicatedBlocks |
+|   | hadoop.hdfs.TestFileConcurrentReader |
+|   | hadoop.hdfs.server.blockmanagement.TestNodeCount |
+|   | hadoop.fs.viewfs.TestViewFsDefaultValue |
+|   | hadoop.hdfs.TestAppendDifferentChecksum |
+|   | hadoop.hdfs.TestEncryptionZonesWithHA |
+|   | hadoop.hdfs.server.namenode.TestCacheDirectives |
+|   | hadoop.hdfs.server.namenode.ha.TestHarFileSystemWithHA |
+|   | hadoop.hdfs.server.namenode.TestQuotaWithStripedBlocks |
+|   | hadoop.hdfs.tools.offlineImageViewer.TestOfflineImageViewerForContentSummary |
+|   | hadoop.hdfs.TestFileStatus |
+|   | hadoop.hdfs.web.TestWebHDFSXAttr |
+|   | hadoop.hdfs.server.namenode.TestNameNodeXAttr |
+|   | hadoop.hdfs.server.datanode.TestHSync |
+|   | hadoop.hdfs.protocol.datatransfer.sasl.TestSaslDataTransfer |
+|   | hadoop.fs.viewfs.TestViewFileSystemHdfs |
+|   | hadoop.hdfs.server.namenode.TestRecoverStripedBlocks |
+|   | hadoop.hdfs.TestParallelUnixDomainRead |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure030 |
+|   | hadoop.hdfs.tools.TestStoragePolicyCommands |
+|   | hadoop.hdfs.TestDFSRemove |
+|   | hadoop.fs.viewfs.TestViewFsAtHdfsRoot |
+|   | hadoop.hdfs.server.datanode.TestNNHandlesCombinedBlockReport |
+|   | hadoop.hdfs.server.datanode.TestDeleteBlockPool |
+|   | hadoop.hdfs.TestDFSClientRetries |
+|   | hadoop.hdfs.server.blockmanagement.TestComputeInvalidateWork |
+|   | hadoop.hdfs.TestListFilesInDFS |
+|   | hadoop.hdfs.server.namenode.TestAddOverReplicatedStripedBlocks |
+|   | hadoop.hdfs.server.namenode.TestHostsFiles |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractCreate |
+|   | hadoop.fs.permission.TestStickyBit |
+|   | hadoop.hdfs.web.TestFSMainOperationsWebHdfs |
+|   | hadoop.hdfs.TestEncryptionZonesWithKMS |
+|   | hadoop.fs.TestSymlinkHdfsDisable |
+|   | hadoop.hdfs.server.namenode.snapshot.TestOpenFilesWithSnapshot |
+|   | hadoop.hdfs.TestDFSRename |
+|   | hadoop.hdfs.server.namenode.TestDeleteRace |
+|   | hadoop.hdfs.TestLease |
+|   | hadoop.hdfs.TestLargeBlock |
+|   | hadoop.hdfs.server.namenode.TestFsckWithMultipleNameNodes |
+|   | hadoop.hdfs.security.TestDelegationToken |
+|   | hadoop.hdfs.TestClientProtocolForPipelineRecovery |
+|   | hadoop.security.TestPermission |
+|   | hadoop.hdfs.server.datanode.TestDirectoryScanner |
+|   | hadoop.hdfs.web.TestWebHDFS |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractSeek |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestDatanodeRestart |
+|   | hadoop.fs.shell.TestHdfsTextCommand |
+|   | hadoop.hdfs.server.namenode.snapshot.TestGetContentSummaryWithSnapshot |
+|   | hadoop.hdfs.TestBlockMissingException |
+| JDK v1.7.0_91 Timed out junit tests | org.apache.hadoop.hdfs.server.blockmanagement.TestBlockTokenWithDFSStriped |
+|   | org.apache.hadoop.hdfs.server.namenode.TestBlockUnderConstruction |
+|   | org.apache.hadoop.hdfs.TestPersistBlocks |
+|   | org.apache.hadoop.cli.TestHDFSCLI |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12782093/h8999_20160113.patch |
+| JIRA Issue | HDFS-8999 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 49ac6fcf836c 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / c722b62 |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/14113/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/14113/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14113/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14113/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/14113/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/14113/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/14113/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/14113/artifact/patchprocess/patch-asflicense-problems.txt |
+| modules | C:  hadoop-hdfs-project/hadoop-hdfs-client   hadoop-hdfs-project/hadoop-hdfs  U: hadoop-hdfs-project |
+| Max memory used | 76MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14113/console |
+
+
+This message was automatically generated.
+
+, Oops, the index calculated was incorrect in the last patch.
+
+h8999_20160114.patch: fixes the bug., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 30s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 9m 21s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 2m 4s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 2m 2s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 39s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 41s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 52s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 52s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 38s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 20s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 53s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 53s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 48s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 48s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 40s {color} | {color:red} Patch generated 7 new checkstyle issues in hadoop-hdfs-project (total was 1043, now 1044). {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 22s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 3m 58s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 27s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 9s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 50s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 67m 16s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 55s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 66m 18s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 21s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 180m 40s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.hdfs.server.namenode.TestStartup |
+|   | hadoop.hdfs.server.datanode.TestBlockScanner |
+|   | hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+| JDK v1.7.0_91 Failed junit tests | hadoop.hdfs.server.namenode.ha.TestBootstrapStandbyWithQJM |
+|   | hadoop.hdfs.server.namenode.TestStartup |
+|   | hadoop.hdfs.TestRollingUpgrade |
+|   | hadoop.hdfs.web.TestWebHDFS |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12782183/h8999_20160114.patch |
+| JIRA Issue | HDFS-8999 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 1c82269e3867 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 8315582 |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/14117/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14117/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14117/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/14117/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/14117/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/14117/testReport/ |
+| modules | C:  hadoop-hdfs-project/hadoop-hdfs-client   hadoop-hdfs-project/hadoop-hdfs  U: hadoop-hdfs-project |
+| Max memory used | 76MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14117/console |
+
+
+This message was automatically generated.
+
+, Thanks for updating the patch, Nicholas! The current patch looks good to me. Some minors:
+# Will the current default retry policy retry the append RPC for RetriableException? In that case we do not need to retry explicitly in {{callAppend}}?
+# We can always use {{getMinStorageNum}} instead of adding {{BlockManager#getMinReplication}} since we already check if the block/file is striped.
+# In FSEditLogLoader, when applying OP_ClOSE, all the blocks are forced to close. Thus looks like we can blindly complete the file without bringing in the committed block logic.
+{code}
+-        fsNamesys.leaseManager.removeLeases(Lists.newArrayList(file.getId()));
+-        file.toCompleteFile(file.getModificationTime());
++        fsNamesys.removeLeaseAndCompleteFile(file);
+{code}
+# We now have two places in {{completeFileInternal}} to add committed blocks into the pending queue: one is in {{commitOrCompleteLastBlock}}, and the other is {{addCommittedBlocksToPending}}. Do we still need the first one? Looks like we can now remove the changes from HDFS-1172 and HDFS-9535.
+{code}
+    // commit the last block and complete it if it has minimum replicas
+    fsn.commitOrCompleteLastBlock(pendingFile, iip, last);
+
+    if (!fsn.checkFileProgress(src, pendingFile, true)) {
+      return false;
+    }
+
+    fsn.addCommittedBlocksToPending(pendingFile);
+{code}, > 1. Will the current default retry policy retry the append RPC for RetriableException? In that case we do not need to retry explicitly in callAppend?
+
+No, it does not work for non-HA setup.  The test will fail if we do not retry explicitly in callAppend.
+
+Will address your comment in the next patch.  Thanks a lot!, > We can always use getMinStorageNum instead of adding BlockManager#getMinReplication ...
+
+There is a problem: getMinStorageNum requires a BlockInfo as parameter but there is no BlockInfo in finalizeINodeFileUnderConstruction and removeLeaseAndCompleteFile, where getMinReplication is invoked.
+
+We may pass the BlockManager object to INodeFile.toCompleteFile, then assertAllBlocksComplete and then checkBlockComplete which has BlockInfo objects available.  However, it does not good to pass the BlockManager object down the road., > We now have two places in completeFileInternal to add committed blocks into the pending queue: one is in commitOrCompleteLastBlock, and the other is addCommittedBlocksToPending. Do we still need the first one? Looks like we can now remove the changes from HDFS-1172 and HDFS-9535. 
+
+I think we still need the changes from HDFS-1172 and HDFS-9535 since they add newly COMPLETE blocks to pending replication.  The current patch adds COMMITTED blocks to pending replication.  If we remove the changes, the newly COMPLETE blocks won't be added to pending replication., h8999_20160121.patch: keeps original FSEditLogLoader behavior., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 31s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 13m 0s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 4m 23s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 2m 17s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 54s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 2m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 49s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 6m 44s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 3m 31s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 3m 34s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 18s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 48s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 2m 25s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 2m 25s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 57s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 57s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 43s {color} | {color:red} hadoop-hdfs-project: patch generated 4 new + 1029 unchanged - 3 fixed = 1033 total (was 1032) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 51s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 26s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 5m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 9s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 3m 1s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 16s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 114m 17s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 37s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 120m 38s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 40s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 301m 9s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.hdfs.server.datanode.TestBlockScanner |
+|   | hadoop.hdfs.server.namenode.TestNameNodeMetadataConsistency |
+|   | hadoop.hdfs.server.namenode.TestNNThroughputBenchmark |
+|   | hadoop.hdfs.server.namenode.ha.TestEditLogTailer |
+|   | hadoop.hdfs.TestPersistBlocks |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure120 |
+|   | hadoop.hdfs.server.datanode.TestDataNodeMultipleRegistrations |
+|   | hadoop.hdfs.TestDataTransferKeepalive |
+|   | hadoop.hdfs.security.TestDelegationTokenForProxyUser |
+|   | hadoop.hdfs.TestFileAppend |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailure |
+|   | hadoop.hdfs.server.datanode.TestBlockReplacement |
+|   | hadoop.hdfs.server.namenode.TestDecommissioningStatus |
+|   | hadoop.hdfs.TestEncryptionZones |
+|   | hadoop.hdfs.server.datanode.TestDirectoryScanner |
+| JDK v1.7.0_91 Failed junit tests | hadoop.hdfs.server.datanode.TestBlockScanner |
+|   | hadoop.tracing.TestTracing |
+|   | hadoop.hdfs.server.namenode.ha.TestEditLogTailer |
+|   | hadoop.hdfs.security.TestDelegationTokenForProxyUser |
+|   | hadoop.hdfs.TestLocalDFS |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailure |
+|   | hadoop.hdfs.server.namenode.ha.TestStandbyCheckpoints |
+|   | hadoop.hdfs.server.datanode.TestBlockReplacement |
+|   | hadoop.hdfs.server.namenode.ha.TestHAAppend |
+|   | hadoop.hdfs.server.namenode.TestDecommissioningStatus |
+|   | hadoop.hdfs.qjournal.TestSecureNNWithQJM |
+|   | hadoop.hdfs.server.namenode.TestNamenodeCapacityReport |
+|   | hadoop.hdfs.TestEncryptionZones |
+|   | hadoop.hdfs.server.namenode.snapshot.TestOpenFilesWithSnapshot |
+|   | hadoop.hdfs.server.datanode.TestDirectoryScanner |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12783589/h8999_20160121.patch |
+| JIRA Issue | HDFS-8999 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 71160514af20 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / b7372b7 |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/14185/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14185/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14185/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/14185/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/14185/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/14185/testReport/ |
+| modules | C:  hadoop-hdfs-project/hadoop-hdfs-client   hadoop-hdfs-project/hadoop-hdfs  U: hadoop-hdfs-project |
+| Max memory used | 77MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14185/console |
+
+
+This message was automatically generated.
+
+, Thanks for updating the patch, Nicholas!
+
+bq. No, it does not work for non-HA setup.
+
+Yeah, for non-HA setup the retry is disabled by default. Then we need the retry in callAppend.
+
+bq. I think we still need the changes from HDFS-1172 and HDFS-9535
+
+My original thought is maybe we can combine all the "putting blocks into the pending queue" logic together into your new method. But the current approach looks also fine to me.
+
+Some of the test failures look suspicious. I just started another Jenkins run., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | {color:red} patch {color} | {color:red} 0m 5s {color} | {color:red} HDFS-8999 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12783589/h8999_20160121.patch |
+| JIRA Issue | HDFS-8999 |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14192/console |
+
+
+This message was automatically generated.
+
+, rebase the patch., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 20s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 8m 5s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 42s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 26s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 34s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 27s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 25s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 3m 48s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 31s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 17s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 15s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 36s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 21s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 21s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 31s {color} | {color:red} hadoop-hdfs-project: patch generated 4 new + 1028 unchanged - 3 fixed = 1032 total (was 1031) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 23s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 20s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 13s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 29s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 14s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 55s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 63m 4s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 56s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 56m 44s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 22s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 161m 0s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.hdfs.server.namenode.TestNNThroughputBenchmark |
+|   | hadoop.hdfs.TestFileAppend |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure |
+|   | hadoop.hdfs.server.datanode.TestBlockScanner |
+| JDK v1.7.0_91 Failed junit tests | hadoop.hdfs.server.datanode.fsdataset.impl.TestScrLazyPersistFiles |
+|   | hadoop.hdfs.server.namenode.TestNNThroughputBenchmark |
+|   | hadoop.hdfs.TestDFSClientRetries |
+|   | hadoop.hdfs.TestEncryptionZonesWithKMS |
+|   | hadoop.hdfs.server.datanode.TestBlockScanner |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12783701/h8999_20160121b.patch |
+| JIRA Issue | HDFS-8999 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 4a6f3eb55fe1 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / f3427d3 |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/14193/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14193/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14193/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/14193/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/14193/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/14193/testReport/ |
+| modules | C:  hadoop-hdfs-project/hadoop-hdfs-client   hadoop-hdfs-project/hadoop-hdfs  U: hadoop-hdfs-project |
+| Max memory used | 77MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14193/console |
+
+
+This message was automatically generated.
+
+, In the failed test ({{TestDFSClientRetries}} e.g.) I saw the following stack trace:
+{code}
+org.apache.hadoop.hdfs.server.namenode.NotReplicatedYetException: Not replicated yet: /testIdempotentAllocateBlock
+	at org.apache.hadoop.hdfs.server.namenode.FSDirWriteFileOp.validateAddBlock(FSDirWriteFileOp.java:190)
+	at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.getAdditionalBlock(FSNamesystem.java:2395)
+	at org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer.addBlock(NameNodeRpcServer.java:797)
+	at org.apache.hadoop.hdfs.DFSOutputStream.addBlock(DFSOutputStream.java:917)
+	at org.apache.hadoop.hdfs.DataStreamer.locateFollowingBlock(DataStreamer.java:1684)
+	at org.apache.hadoop.hdfs.DataStreamer.nextBlockOutputStream(DataStreamer.java:1494)
+	at org.apache.hadoop.hdfs.DataStreamer.run(DataStreamer.java:594)
+{code}
+
+Could you please check if this is caused by the patch, [~szetszwo]?, The failure of TestDFSClientRetries is not related to the patch.  I can reproduce the failure without the patch in my machine.  It also failed in some other builds such as below.
+- https://builds.apache.org/job/PreCommit-HDFS-Build/14201/testReport/org.apache.hadoop.hdfs/TestDFSClientRetries/testIdempotentAllocateBlockAndClose/
+- https://builds.apache.org/job/PreCommit-HDFS-Build/14202/testReport/org.apache.hadoop.hdfs/TestDFSClientRetries/testIdempotentAllocateBlockAndClose/, Filed HDFS-9690 for the TestDFSClientRetries bug., Thanks for verifying the test failures, Nicholas! +1 committing the latest patch to trunk. Please see if you plan to commit it to branch-2 as well. , Thanks Jing for reviewing the patch!
+
+h8999_20160121c.patch: rebases the patch for fixing import conflicts.
+
+Since the new patch only fixes imports, I will commit it without waiting for another Jenkins build., > Please see if you plan to commit it to branch-2 as well.
+
+Since the new behavior is configurable and the default is disabled, we should merge this to branch-2., h8999_20160121c_branch-2.patch: for branch-2., FAILURE: Integrated in Hadoop-trunk-Commit #9185 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/9185/])
+HDFS-8999. Allow a file to be closed with COMMITTED but not yet COMPLETE (szetszwo: rev bd909ed9f2d853f614f04a50e2230a7932732776)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestLeaseManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirWriteFileOp.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFileAppend.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFile.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSEditLogLoader.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestINodeFile.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirAppendOp.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSImage.java
+* hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DataStreamer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | {color:red} patch {color} | {color:red} 0m 5s {color} | {color:red} HDFS-8999 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12784330/h8999_20160121c_branch-2.patch |
+| JIRA Issue | HDFS-8999 |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14240/console |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 20s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 50s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 42s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 27s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 28s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 25s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 22s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 46s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 38s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 21s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 37s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 2m 5s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 2m 5s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 46s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 46s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 44s {color} | {color:red} hadoop-hdfs-project: patch generated 4 new + 1027 unchanged - 3 fixed = 1031 total (was 1030) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 43s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 22s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 1s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 58s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 52s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 48s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 11s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 79m 19s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 13s {color} | {color:green} hadoop-hdfs-client in the patch passed with JDK v1.7.0_91. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 103m 46s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 44s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 230m 38s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.hdfs.server.datanode.TestDirectoryScanner |
+|   | hadoop.hdfs.server.namenode.ha.TestHAAppend |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyPersistReplicaRecovery |
+|   | hadoop.hdfs.security.TestDelegationTokenForProxyUser |
+|   | hadoop.hdfs.TestFileAppend |
+|   | hadoop.hdfs.server.namenode.ha.TestDFSUpgradeWithHA |
+|   | hadoop.hdfs.TestDFSUpgradeFromImage |
+|   | hadoop.hdfs.server.datanode.TestBlockScanner |
+| JDK v1.8.0_66 Timed out junit tests | org.apache.hadoop.hdfs.TestLeaseRecovery2 |
+|   | org.apache.hadoop.hdfs.TestDFSStripedOutputStreamWithFailure190 |
+|   | org.apache.hadoop.hdfs.TestClientProtocolForPipelineRecovery |
+|   | org.apache.hadoop.hdfs.TestDFSRename |
+| JDK v1.7.0_91 Failed junit tests | hadoop.hdfs.server.datanode.TestDirectoryScanner |
+|   | hadoop.hdfs.TestEncryptionZones |
+|   | hadoop.hdfs.server.namenode.TestNameNodeMetadataConsistency |
+|   | hadoop.hdfs.server.namenode.ha.TestHAAppend |
+|   | hadoop.hdfs.server.namenode.TestDecommissioningStatus |
+|   | hadoop.hdfs.qjournal.TestSecureNNWithQJM |
+|   | hadoop.hdfs.TestMissingBlocksAlert |
+|   | hadoop.hdfs.server.namenode.ha.TestRequestHedgingProxyProvider |
+|   | hadoop.hdfs.server.datanode.TestBlockScanner |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailure |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12784314/h8999_20160121c.patch |
+| JIRA Issue | HDFS-8999 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux b6c7d7085b81 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 2085e60 |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/14239/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14239/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14239/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/14239/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/14239/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_91.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/14239/testReport/ |
+| modules | C:  hadoop-hdfs-project/hadoop-hdfs-client   hadoop-hdfs-project/hadoop-hdfs  U: hadoop-hdfs-project |
+| Max memory used | 77MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14239/console |
+
+
+This message was automatically generated.
+
+, I have committed this to trunk.  Will leave this open for committing to branch-2., > ... then change DN to send IBRs in batches in another JIRA.
+
+Filed HDFS-9710., Thanks for posting the branch-2 patch, Nicholas! The branch-2 patch looks good to me. +1. 
+
+Some changes on imports can be removed. You can do it while committing the patch., Thanks Jing for reviewing the branch-2 patch!
+
+h8999_20160121c_branch-2.patch: reverts some import changes.
+
+, I have committed this.  Thanks everyone who has contributed on this., Updated the title to be same as CHANGES.txt entry.
+Also pushed to branch-2.8, which was missed, but CHANGES.txt entry and fix versions were set to 2.8.0]

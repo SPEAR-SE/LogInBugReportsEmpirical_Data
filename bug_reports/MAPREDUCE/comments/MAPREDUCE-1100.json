@@ -1,0 +1,109 @@
+[The available features in the framework which can be used at all for limiting user logs are
+ - User-log's limit via mapreduce.task.userlog.limit.kb
+ - Log cleanup via mapred.task.userlog.retain.hours
+
+mapreduce.task.userlog.limit.kb is not usable in the current format because of its limitations:
+ - If this is used, showing the userlogs is not possible until tasks finish or fail. This is not acceptable.
+ - The stdout/stderr files are controlled by using 'tail -c' on the stdout/stderr of the task-jvm. This tail command uses some of the precious memory allocated to the users, which is not accounted or controlled anywhere.
+ - syslog files are written to by tasks but the files themselves can be arbitrarily written to by the jvm and its child processes without respecting any of these limits.
+
+mapred.task.userlog.retain.hours cannot completely solve the issue because
+ - it only takes into the account the amount of time the logs have to be retained *and not* the disk usage
+ - because of MAPREDUCE-927, the cleanup mechanism itself is not guaranteed even in terms of time.
+
+We should have a concrete mechanism to limit the amount of disk logs., This problem is similar to the issues with excessive memory usage by tasks - HADOOP-3581 - in many ways. And the typical disaster scenario is task logs of particular job *all* wreck havoc and at once, a bunch of nodes become unusable in the cluster.
+
+A simple short roster of requirements I can think of:
+ (1) Excessive logging by one user's tasks should not affect/fail other user's tasks or other processes running on the same node.
+ (2) The user whose task is writing massive logs should be warned/informed about the damage he /she is doing. This will help in avoiding the same issue to happen again.
+ (3) Overall usage of logs by tasks over time on a single node shouldn't affect/fail new tasks arriving on this node.
+ (4) Clean up of a particular task's user logs should be deterministic - users should have an idea of how long they can see their logs., Offline discussions with Koji/Hemanth/Amareshwari/Jothi yielded a few possible approaches to the problem in general.
+
+The problem can be spilt into two -
+
+h4. Shielding against a single task writing excessive logs
+This can be done in various ways
+ - Each task's log file entitled to a limit similar to mapred.userlog.limit.kb and the corresponding task will be killed when the size of a log file goes over the limit.
+    -- Requirements (1) and (2) are met.
+    -- A bit aggressive.
+ - Let the tasks run as they are now, but only keep the last mapred.userlog.limit.kb of each log file's data when tasks finish.
+    -- (2) can be met.
+    -- (1) is not met. It can still fill up disks in the interim.
+    -- Not aggressive.
+ - Monitor the total usage of all logs and make sure that the total usage is limited. When ever the limit can be potentially overflown, cleaning up logs by picking up tasks - say the largest log files or the least recently ones written to.
+  -- This may also remove logs of running tasks and so (2) will not be met sometimes - removing task log files of running tasks will fail them.
+  -- If running tasks' logs are not to be removed, (1) will not be met.
+
+The first solution seems the best of the lot. Thoughts?
+
+h4. Addressing tasks filling up disks with logs over time though each task writes only a limited amount
+This involves two different steps.
+ - There should be a configurable upper limit on total disk space usable by task logs. Whenever this limit is breached, the logs of picked up tasks should be purged.
+    -- Requirement (4) will not be met, but we can hardly help.
+    -- Tasks  picked up can be based on some criterion:
+      --- the least recently written to
+      --- logs occupying largest disk space
+ - A thread running periodically should use _mapred.task.userlog.retain.hours_ to purge logs of a particular task to avoid the total usage filling up disks., One point to remember is how we deal with jvm-reuse. In case of jvm reuse, all tasks running in a jvm will write to single file and so, limit on the size of the file should be increased n times, where n is the number of tasks running in a single JVM.
+
+To be more fool-proof, we may also remove writable permissions on the log files once the task finishes(and once the jvm finishes in jvm reuse case)., Attaching a first patch.
+
+Introducing the following configuration items:
+ - Job Configuration:
+    -- {{JobContext.MAP_USERLOG_LIMIT}} : Per task limit on how much each log file can grow to. Used by {{killRunningTasksOverLimit()}} for killing tasks that write excessive logging.
+    -- {{JobContext.REDUCE_USERLOG_LIMIT}} : Same as above for reduces.
+    -- {{JobContext.MAP_USERLOG_RETAIN_SIZE}} : Per task configuration of how much tail of the each log file has to be retained. Each task-log file is truncated to this amount after the task finishes. Used by {{truncateLogsOfFinishedTasks()}}
+    -- {{JobContext.REDUCE_USERLOG_RETAIN_SIZE}} : Same as above for reduces.
+
+ - TT configuration
+    -- {{TTConfig.TT_USERLOG_RETAIN_HOURS}} : TT configuraton of how long logs of each finished task has to be retained on this TT. Used by {{retireOldLogs()}} to cleanup very old logs.
+    -- {{TTConfig.TT_USERLOG_CUMULATIVE_LIMIT}} : TT configuration limiting the total usage of log files across all tasks. If the total usage grows beyond this limit, {{removeOldFilesToControlCumulativeUsage()}} removes old log files irrespective of their age w.r.t {{TTConfig.TT_USERLOG_RETAIN_HOURS}}.
+
+Moved clean-up of task-logs from child into TaskLogsMonitor which does the following:
+{code}
+while(true) {
+
+  retireOldLogs(); // remove very old logs
+
+  truncateLogsOfFinishedTasks(); // truncate finished tasks' logs. Also set no-writable permissions.
+
+  killRunningTasksOverLimit(); // kill tasks going over per-task per-file limit
+
+  removeOldFilesToControlCumulativeUsage(); // remove very old logs if total usage is alarming irrespective of retain.hours
+}  
+{code}, Works still in progress:
+ - Handle special cases in Jvm-reuse.
+ - Deal with the old configuration related to limiting user-logs., Whether each of the above configuration is job-specific or TT-specific is somewhat debatable. Need to resolve that issue too., Attaching a patch that handles cases with JVM-reuse., I would like to point one fine point with the above implementation:
+bq. removeOldFilesToControlCumulativeUsage(); // remove very old logs if total usage is alarming irrespective of retain.hours
+With the above, retain.hours is no longer a proper contract for tasks, logs can get cleaned-up at arbitrary times. So the 4th requirement is broken - 
+bq. (4) Clean up of a particular task's user logs should be deterministic - users should have an idea of how long they can see their logs.
+The only way I think of in which this can be addressed is by taking care of the cumulative disk-usage of TaskTracker while scheduling a new task. Should this be done too?, Debug script is run after the task is finished and by that time the task may be removed from monitoring(!). (TODO) Need to make sure that this patch controls the size of debugout files properly.
+
+(TODO) Same with profile files., Attaching Vinod's yhadoop20 patch on his behalf., The patch MAPREDUCE-1100-20091216.2.txt above that tried to solve log truncation for yahoo distribution has a bug w.r.t updating index files correctly. Attached patch fixes that bug. The patch is not for commit to any of apache branches., class JvmEnv missed logSize argument in its constructor, so 'tail -c' seems never works.
+
+{code:title=JvmManager.java|borderStyle=solid}
+    public JvmEnv(List<String> setup, Vector<String> vargs, File stdout,
+        File stderr, long logSize, File workDir, Map<String,String> env,
+        JobConf conf) {
+      this.setup = setup;
+      this.vargs = vargs;
+      this.stdout = stdout;
+      this.stderr = stderr;
+      this.workDir = workDir;
+      this.env = env;
+      this.conf = conf;
+    }
+{code}
+, logSize not set in JvmEnv's constructor is tracked in MAPREDUCE-1057. See my comment(on 22/Oct/09 10:52 AM) at MAPREDUCE-1057 about the issue of "tail -c" is being done after writing of log.index file is finished. So the issue of making mapred.userlog.limit.kb work is still open for investigation even with my patch available at MAPREDUCE-1057., OK, so what do you want here? I could +1 MAPREDUCE-1057 and if hudson is happy, push out to 0.21/0.22 branches. MAPREDUCE-1100  would be the patch that goes into trunk.
+
+The other fix would be documentation. I've added something on logging to [http://wiki.apache.org/hadoop/DiskSetup] but it could be improved. More subtly, any production cluster that doesn't have a limit on log size is doomed. Some preflight checks could note this and perhaps warn., The patch existing now at MAPREDUCE-1057 doesn't solve the whole problem. Currently, "tail -c" is done after task process has finished execution but log.index file is created(and written to) by task itself. So log.index cannot have correct index details of task logs(i.e. startingOffset and length of stdout, stderr and syslog).
+
+One way to solve this is to make TT write the index details to log.index file once a task is done.
+
+Thoughts ?, Looks like the task-logs truncation functionality through "tail -c" is broken since 0.19 itself when jvm-reuse feature went in via HADOOP-249.
+
+I see this issue as the final way of truncating user logs because of the limitations we have with "tail -c". So instead of fixing "tail -c", I propose we throw it away as part of this issue itself in favour of the truncation code being put in here, thoughts?, Issue [MAPREDUCE-1648|https://issues.apache.org/jira/browse/MAPREDUCE-1648] is created for "tail -c" problem, I will attach patch files for this issue later., I opened MAPREDUCE-1716 to implement the second part of the algorithm I made [here|https://issues.apache.org/jira/browse/MAPREDUCE-1100?focusedCommentId=12772468&page=com.atlassian.jira.plugin.system.issuetabpanels%3Acomment-tabpanel#action_12772468] in this same JIRA issue. The first part related to retiring old logs is already handled by MAPREDUCE-927., Is this ready for a commit to trunk?, bq. Is this ready for a commit to trunk? 
+Unfortunately no, Allen. The ydist patch doesn't work for trunk as there is a reversal of commits as MAPREDUCE-927 went in before this into apache svn while the order was the opposite on ydist.
+
+I will try finding some cycles for updating this patch ASAP., Before this is committed to trunk, it will also need to be updated to use SecureIOUtils to open the logs for truncation (see the 0.20 patch for MAPREDUCE-2096), This is a pretty serious bug, let's make it a blocker for 22., The YDH patch for this issue also includes these changes to the logging level in ReduceTask, Don't see any activity from Vinod. Any volunteers to port this to 0.22?, I took a look at this and other jira's to make it work with Hadoop 0.22. I think that based on the multiple dependencies, this will require a lot of changes to be pulled in from the 0.20.2xx branch, and is not worth the risk. I know of at least a handful of production deployments that have circumvented this with a simple cron job looking at log dirs and doing cleanups outside of the framework, and do not this this to be a blocker.
+
+Konstantin, it's your call now., I agree. Unblocking this. Target for 0.22.1, Konstantin/Milind - I'd strongly urge you to consider this 0.22. Without this patch, and with a simple cron job, debugging user jobs becomes very hard and leads to lots of angst.]

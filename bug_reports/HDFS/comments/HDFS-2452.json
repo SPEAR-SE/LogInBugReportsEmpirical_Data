@@ -1,0 +1,491 @@
+[I carried out a high-load test on a cluster running Hadoop 0.22. Because of the high load several DataNodes ran out of memory and died. The reason is that OutOfMemoryError occurred when DataXceiverServer.run() was starting a new DataXceiver, which is treated as a fatal error by current implementation.
+{code}
+2011-10-11 17:56:07,228 ERROR org.apache.hadoop.hdfs.server.datanode.DataNode: DatanodeRegistration( ... ):
+DataXceiveServer: Exiting due to:java.lang.OutOfMemoryError: unable to create new native thread
+        at java.lang.Thread.start0(Native Method)
+        at java.lang.Thread.start(Thread.java:640)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiverServer.run(DataXceiverServer.java:137)
+        at java.lang.Thread.run(Thread.java:662)
+{code}
+In order to reproduce it one can write a unit test, which mocks {{DataXceiver.start()}} method to throw OutOfMemoryError.
+I think DataXceiverServer should have a special catch statement for OutOfMemoryError, where it goes to a sleep for say 60 seconds and then go back to the main loop.
+A word of caution here, as {{DataXceiver()}} constructor puts the socket into {{childSockets}}, and if the error happens in start() there will be nobody to remove it. It think it is better to move line {{dataXceiverServer.childSockets.put(s, s);}} from the {{DataXceiver()}} constructor into the {{DataXceiver.run()}} method., I believe the same error exists in trunk., Yes , currently we are handling only SocketTimeOutException and IOExceptions
+
+{code}
+} catch (SocketTimeoutException ignored) {
+        // wake up to see if should continue to run
+      } catch (IOException ie) {
+        LOG.warn(datanode.dnRegistration + ":DataXceiveServer: " 
+                                + StringUtils.stringifyException(ie));
+      } catch (Throwable te) {
+        LOG.error(datanode.dnRegistration + ":DataXceiveServer: Exiting due to:" 
+                                 + StringUtils.stringifyException(te));
+        datanode.shouldRun = false;
+      }
+{code}
+
+thanks
+Uma, I just verified trunk code and security barnch code. There we handled one more case for AsynchronousCloseException.
+
+{code}
+} catch (SocketTimeoutException ignored) {
+        // wake up to see if should continue to run
+      } catch (AsynchronousCloseException ace) {
+        // another thread closed our listener socket - that's expected during shutdown,
+        // but not in other circumstances
+        if (datanode.shouldRun) {
+          LOG.warn(datanode.getMachineName() + ":DataXceiverServer: ", ace);
+        }
+      } catch (IOException ie) {
+        LOG.warn(datanode.getMachineName() + ":DataXceiverServer: ", ie);
+      } catch (Throwable te) {
+        LOG.error(datanode.getMachineName()
+            + ":DataXceiverServer: Exiting due to: ", te);
+        datanode.shouldRun = false;
+      }
+{code}
+
+
+This particular AsynchronousCloseException is missed in 22 branch. Is it intentional for 22?
+
+In security branch, handling is different 
+{code}
+catch (AsynchronousCloseException ace) {
+          LOG.warn(datanode.dnRegistration + ":DataXceiveServer:"
+                  + StringUtils.stringifyException(ace));
+          datanode.shouldRun = false;
+      } 
+{code}
+ here setting datanode.shouldRun = false. So, here it is just for logging?
+
+I am confusing about this exception handling here. why it is different for branch by branch?
+
+
+thanks
+Uma
+, I think the main reason for different handling is how patches are being committed to active branches ;(, Thanks Cos for taking a look.
+Ok then, shall we make the changes same as trunk?
+
+@ Konstantin Shvachko: Before going, one more question is , we made the maxXeivercount check after starting the thread.
+{code}
+// Make sure the xceiver count is not exceeded
+        int curXceiverCount = datanode.getXceiverCount();
+        if (curXceiverCount > dataXceiverServer.maxXceiverCount) {
+          throw new IOException("xceiverCount " + curXceiverCount
+                                + " exceeds the limit of concurrent xcievers "
+                                + dataXceiverServer.maxXceiverCount);
+        }
+{code}
+  in your case, whether system is not able to handle configured thread count itself?
+
+And also, can we move this check before starting the new thread?
+
+Thanks
+Uma
+ , I think the check has to be done before starting the thread. Also in DataNode.java, the method getXceiverCount() is using ThreadGroup.activeCount() which only returns the estimate of number of threads running in a thread-group. This information has to be used for only informational purpose (look at the java docs), but we are using for controlling the state of the Data-Node. 
+
+My suggestion would be to use a variable to track the number of active threads or better a thread pool. Even better if we are able to dynamically control the value of this variable, so that we get max throughput from the data-node.
+
+Thanks,
+Praveen Kumar K J V S, Let's fix one thing at a time.
+# AsynchronousCloseException handling was introduced to 0.23 in HDFS-2286. We can apply this patch to 0.22, but it is mostly a nuisance rather than a bug.
+# It could be better to check XceiverCount before starting the thread, but it should work fine as it is now, because the check is done before actually executing the command. Please file a separate jira on this if not filed already.
+# Dynamic control of DataNode resources is a good idea. Probably worth a separate jira too., Updated the patch (22branch) for Review!
+
+Patch contains: 
+  1) handled the OutOfMemoryError 
+  2) closed the sockets on IOExceptions
+  3) Handled AsynchronousCloseException , as trunk changes.
+  4) moved the childsockets.put to run method.
+
+Once it is approved, i will upload for trunk!
+
+@Praveen
+Yes, I too think that check should be before starting the new thread. I think we can handle it as part of other JIRA. 
+
+Thanks
+Uma, {quote}
+AsynchronousCloseException handling was introduced to 0.23 in HDFS-2286. We can apply this patch to 0.22, but it is mostly a nuisance rather than a bug.
+{quote}
+ Konstantin, sorry, I did not see your comment above. I included AsynchronousCloseException  also in this patch. You want me to remove? (or) it is ok for this now?
+ , - Uma, yes let's split it into 2 patches: one for HDFS-2286. I'll commit it first, then this one. Otherwise things will get messy.
+- The fix looks good. A suggestion for better logging and commenting. In the comment you can say something like "// DataNode can run out of memory if there is too many transfers. Log the event, sleep for 30 seconds, other transfers may complete be then."
+In log message you can say something like LOG.warn("DataNode is out of memory. Will retry in 30 seconds.", e);
+- For the test. You actually need to mock Daemon.start() method if possible. In your patch OutOfMemoryError comes from DataXceiver() constructor. In the exception I posted it is thrown in Thread.start()., +1 on the splitting it.
+I would also suggest to pay attention to the formatting of the patch e.g. spaces before '{', etc., Thanks a lot for the review!
+
+I have updated the patch for HDFS-2286. Can you please take a look. So, that i can rebase this patch again., {quote}The fix looks good. A suggestion for better logging and commenting. In the comment you can say something like "// DataNode can run out of memory if there is too many transfers. Log the event, sleep for 30 seconds, other transfers may complete be then."
+{quote}
+fixed
+{quote}
+In log message you can say something like LOG.warn("DataNode is out of memory. Will retry in 30 seconds.", e);
+{quote}
+Done
+{quote}
+For the test. You actually need to mock Daemon.start() method if possible. In your patch OutOfMemoryError comes from DataXceiver() constructor. In the exception I posted it is thrown in Thread.start().
+{quote}
+I tried to mock start. But i could not do it because the thread is just local referance. So i couldnot inject mock obj here. So, to replicate the scenario, i throwed the OoutOfMemoryError from getConf.
+
+Thanks
+Uma, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12499440/HDFS-2452-22branch.1.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1371//console
+
+This message is automatically generated., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12499440/HDFS-2452-22branch.1.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1375//console
+
+This message is automatically generated., Can you mock datanode.getXceiverCount() to throw OutOfMemoryError on the second call. That way the error will come from DataXceiver.run(). Also forgot to mention last time you do not need to sleep(30sec) in the test. Checking alive once should be fine.
+A javaDoc for the test description would be good to have.
+Please don't do Patch Available for 0.22 pathces. This only triggers Jenkins build failures. We will have to run test and test-patch locally anyway before committing., bq. Also forgot to mention last time you do not need to sleep(30sec) in the test. Checking alive once should be fine.
+Which makes the test to be compatible with unit test defs (e.g. running under 10 seconds), Thanks a lot for taking a look.
+Ok fine...I thought to test exact case even after one round retry.
+I will not remove complete wait there, because Test may complete before exactly spawning the new thread. So, i am planning to put wait of 100ms.
+
+{quote}
+Can you mock datanode.getXceiverCount() to throw OutOfMemoryError on the second call. That way the error will come from DataXceiver.run()
+{quote}
+ Here the problem is, DataXceiver thread already handled the Throwable there. So, the exception will be handled silently and log the error. So, it will not reach to our exception block.
+
+{code}
+ catch (Throwable t) {
+      LOG.error(datanode.dnRegistration + ":DataXceiver, at " +
+        s.toString(), t);
+    }
+{code}
+
+Thanks
+Uma, Sleeping an arbitrary # of seconds is not a good solution, as it makes tests flaky, passing on some nodes and failing on other because of different environments. If you need to wait, then wait for a specific event (thread started in the case) rather than relying on passing time.
+
+> DataXceiver thread already handled the Throwable there.
+
+You are right, mocking getXceiverCount() doesn't work. May be Cos can help with that., We aren't running auto-validation of .22 patches anyway., With respect to the case I think getting rid of Mockito.doThrow and spying on {{DataXceiverServer}} should do the trick.
+So, something along the lines 
+
+{code}
+...
+    DataNode dn = Mockito.mock(DataNode.class);
+    DataXceiverServer server = new DataXceiverServer(sock, new Configuration(),
+        dn);
+    DataXceiverServer spyServer = spy(server);
+    doThrow(new OutOfMemoryError("Faulting...")).when(spyServer).run();
+    dn.shouldRun = true;
+...
+{code}
+would work, I believe. Fixed patch version is attached., Hi Konstantin,
+Thanks a lot for the review!
+
+{quote}
+Sleeping an arbitrary # of seconds is not a good solution, as it makes tests flaky, passing on some nodes and failing on other because of different environments. If you need to wait, then wait for a specific event (thread started in the case) rather than relying on passing time.
+{quote}
+We can set max time for test is 30secs (@Test(timeout=30000)). 
+In testcase, I will close the sockets immediately when we get the OutOfMemoryError. Here i will use the CounDownLatch(1) in my stubbed Socket close method to latch.countDown(). So, main thread (test) will do latch.await(). After this i can assert for thread alive or not.
+If you like this approach, i will go ahead with it.
+
+{quote}
+You are right, mocking getXceiverCount() doesn't work. May be Cos can help with that.
+{quote}
+Cos, do you have any other suggestion here?
+
+Thanks
+Uma
+, Did you see [my comment| https://issues.apache.org/jira/browse/HDFS-2452?focusedCommentId=13130311&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-13130311] and the new patch?, Hey Cos,
+ I just reviewed the patch. The problem is not for mocking the DataXciverServer#run method.
+{code}
+ DataXceiverServer spyServer = spy(server);
+    doThrow(new OutOfMemoryError("Faulting...")).when(spyServer).run();
+{code}
+
+ We need to mock DataXceiver#run method.
+Modified TestCase doesn't test the expected functionality. 
+The problem to mock DataXceiver is , we can not get the reference of DataXceiver out. 
+In real case we are getting the OutOfMemoryError from thread#start() native method before reaching run method itself.
+That is the reason i trowed the exception from DataXceiver  constructor ( from dn.getConf()). Because we could not mock the start method of thread.
+
+Test may pass because, main thread(test main) can complete before exactly completing the run method of DataXceiverServer#run. For solving this, i suggested one approach in my above comment.
+
+
+Thanks
+Uma, Right, I agree - there's no way in the current implementation to mock this internal instance of DataXceiver.
+I see how it can be done using fault injection with ease, but I am not sure if you guys want to consider such approach., > Here i will use the CounDownLatch(1) in my stubbed Socket
+
+Uma, this sounds like a good plan.
+
+> I see how it can be done using fault injection with ease
+
+Cos, good idea, why not., Are the 2 paths above mutually exclusive?, Here's fault inject test (with aspects and whatnot) which guarantees that OOM will happen first thing when DataXceiver#run() is executed.
+
+Uma, please do whatever you need with latches to achieve desired result in the test.
+Running fault injection tests is easy. Something like
+{{ant -Dtestcase=TestFiDataXceiverServer run-test-hdfs-fault-inject -Dtest.output=true}} should help., a tiny oops in the patch., Here is a patch with CountDownLatch.
+
+Other changes in previous patch is:
+ 
+1) fixed one null pointer, which is caused because of not mocking the getConf on DN.
+ Added the mock in test. 
+ 
+2) DataXceiverAspects file apache header was not a header comment
+    {code}
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
+{code}
+updated it.
+
+3) System.setProperty("fi.enabledOOM", null); also changed to System.setProperty("fi.enabledOOM", "false");
+   because can not set null in props.
+   Also changed the check in aspectj file to check with true.
+
+
+To be frank, i am not familiar with aspectJ programs. 
+So, requesting Cos to review once with my changes. One more thing is when i ran the tests with your command, i don't see any aspects injected in to DataXceiver.class and not running test. Not sure my compilations has the problems with aspectj. Since this is urgent for some of the load tests running by Konstantin, i updated the patch here.
+
+Konstantin, can you check the patch and give the test run once.
+
+
+Thanks,
+Uma, Thanks for fixing aspect code Uma - I was doing it in a hassle last night and did a suboptimal job apparently.
+Aspects should be injected in 'injectfaults' target which is called by the test target. You don't need to have anything else to make it happen: all components of AOP framework are in place by default. 
+
+I have applied your patch and ran the test and I see that injected code is working as expected. I see many OOM errors thrown from a huge number of the DataXceiver threads like this
+{noformat}
+    [junit] Exception in thread "org.apache.hadoop.hdfs.server.datanode.DataXceiver@7e3feb83" java.lang.OutOfMemoryError: Pretend there's no more memory
+    [junit]     at org.apache.hadoop.hdfs.server.datanode.DataXceiverAspects.ajc$before$org_apache_hadoop_hdfs_server_datanode_DataXceiverAspects$1$1a38ea(DataXceiverAspects.aj:36)    [junit]     at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:120)    [junit]     at java.lang.Thread.run(Thread.java:680)    
+    [junit] Exception in thread "org.apache.hadoop.hdfs.server.datanode.DataXceiver@29b18dc0" java.lang.OutOfMemoryError: Pretend there's no more memory
+    [junit]     at org.apache.hadoop.hdfs.server.datanode.DataXceiverAspects.ajc$before$org_apache_hadoop_hdfs_server_datanode_DataXceiverAspects$1$1a38ea(DataXceiverAspects.aj:36)    [junit]     at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:120)    [junit]     at java.lang.Thread.run(Thread.java:680)
+{noformat}, I have ran the test twice: it passed once and crashed the second time., And yes - patch looks good to me overall., I think test wont work as expected because, throwing exception from run will not get propagated to parent thread. Silently child threads will die.
+I am not sure,we can throw the exception before actually spawning the thread.
+
+I feel simple, the option would be from DataXceiver Constructor.
+
+
+Thanks
+Uma, Cos, do we have the option in aspectJ to throw the exception before invoking run. 
+Here the expectation is that, injected exception should be propagated to DataXceiverServer try-catch block.
+That will not happen with current case, t, Uma, we can throw an exception instead of calling run() method. In this case before(...): advice has to be replaced with void around(...): one (see new patch).
+
+Or, doing this before invoking run() means that it should be happening in DataXceiverServer, right? They the patch needs to be slightly different and we need to instrument DataXceiverServer instead of DataXceiver. Sorry, I am confused., I ran the test several times. It is working fine now.
+I also ran the test target, which passed.
++1 on the patch. Tanks Cos and Uma for working on this., I have committed it to branch-0.22. Thanks Uma., Integrated in Hadoop-Hdfs-22-branch #101 (See [https://builds.apache.org/job/Hadoop-Hdfs-22-branch/101/])
+    HDFS-2452. OutOfMemoryError in DataXceiverServer takes down the DataNode. Contributed by Uma Maheswara Rao.
+
+cos : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1187168
+Files : 
+* /hadoop/common/branches/branch-0.22/hdfs/CHANGES.txt
+* /hadoop/common/branches/branch-0.22/hdfs/src/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* /hadoop/common/branches/branch-0.22/hdfs/src/java/org/apache/hadoop/hdfs/server/datanode/DataXceiverServer.java
+* /hadoop/common/branches/branch-0.22/hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/DataXceiverAspects.aj
+* /hadoop/common/branches/branch-0.22/hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/TestFiDataXceiverServer.java
+, Hi Cos,
+
+ Looks that aspects not working reliably.Still it is throwing the error after spawning the DataXceiver thread. So, parent thread (DataXceiverServer) is not getting that exception.
+
+[junit]  at java.lang.Thread.run(Thread.java:662)
+    [junit] Exception in thread "org.apache.hadoop.hdfs.server.datanode.DataXceiver@6e2335" java.lang.OutOfMemoryError: Pretend there's no more memory
+    [junit]  at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run_aroundBody1$advice(DataXceiver.java:36)
+    [junit]  at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:1)
+    [junit]  at java.lang.Thread.run(Thread.java:662)
+    [junit] Exception in thread "org.apache.hadoop.hdfs.server.datanode.DataXceiver@576165" java.lang.OutOfMemoryError: Pretend there's no more memory
+    [junit]  at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run_aroundBody1$advice(DataXceiver.java:36)
+    [junit]  at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:1), Hi Uma.
+
+Aspect either work on not :) - they are just a pieces of byte code physically inserted into the target class. The reason you see {{DataXceiver.java:36}} in the stack is because there's no source code line anymore to tie with.
+An easy way to find out what's going on is to disassemble the class file. When you do it you see this:
+{code}
+59     DataNode getDataNode()
+60     {
+61         return datanode;
+62     }
+63 
+64     public void run()
+65     {
+66         run_aroundBody1$advice(this, DataXceiverAspects.aspectOf(), this, null);
+67     }
+68 
+69     protected void opReadBlock(DataInputStream in, Block block, long startOffset, long length, String clientName,
+70             Token blockToken)
+71         throws IOException
+{code}
+I'd say it should work as expected. If an unexpected behavior is seen it is likely that we instrumented it on somewhat incorrect assumptions. , We should make a patch for trunk too., Right. However, patch for trunk will depends on completion of Mavenization work. Right now fault-injection is _completely_ unsupported by trunk build system. Pity ;(, Let's commit the fix and file another jira for the test, dependent on the mavenization progress., Here's a patch for trunk. Something wrong with my ant installation or something and maven complains that it can't run the build. Thus, I can't verify it right now - will do later.
+
+The patch also contains new test and instrumentation but it won't be verified until AOP is fixed in trunk., Sorry for coming late, Thanks a lot for making the patch on trunk as well!
+
+Cos, Patch mostly looks good. But one problem is IOUtils.socketClose() repeated in the patch. Because socket close already handle in try block itself for IOEceptions. To avoid confusions i just made it sync with 22 as well.
+
+Here is a patch for trunk (only src changes). I will file separate JIRA for faultinjection test.
+
+Thanks,
+Uma, Uma, actually there's no need for a separate patch: FI test will be picked up automatically once someone (likely to be me though) get AOP fixed in maven env., Here is a patch for trunk with test.
+1. In trunk code, InputStream getting logic has been moced to DataXceiver constructor. So, we need to stub getInputStream also.Updated with this change in test.
+
+Thanks
+Uma, Coupla nits:
+- {{+        new Daemon(datanode.threadGroup, new DataXceiver(s, datanode, this)).start();}} is too long. Should be longer than 80 chars.
+- you don't need to change the name for every new patch: JIRA will make sure that the latest one is shown as 'enabled'. Custom naming is confusing, actually.
+- nice catch with IS' getter: I've missed it completely
+Looks good otherwise., Thanks for the review!
+{quote}
+# + new Daemon(datanode.threadGroup, new DataXceiver(s, datanode, this)).start(); is too long. Should be longer than 80 chars.
+# you don't need to change the name for every new patch: JIRA will make sure that the latest one is shown as 'enabled'. Custom naming is confusing, actually.
+{quote}
+wrapped it.
+I have been observing in other JIRAs with this namings;). To avoid confusions, i just named it with JIRA id.
+
+Thanks
+Uma, +1 looks good.
+As for the naming: [JIRA].patch stands for trunk patch, IMO. Any branch designations can be add as qualifiers. Thanks, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12500308/HDFS-2452.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.hdfs.server.namenode.TestBackupNode
+                  org.apache.hadoop.hdfs.TestFileAppend2
+                  org.apache.hadoop.hdfs.TestBalancerBandwidth
+                  org.apache.hadoop.hdfs.TestRestartDFS
+                  org.apache.hadoop.hdfs.TestDistributedFileSystem
+                  org.apache.hadoop.hdfs.server.datanode.TestDeleteBlockPool
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/1417//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1417//console
+
+This message is automatically generated., Test failures are not related to this patch!, Integrated in Hadoop-Hdfs-trunk-Commit #1218 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/1218/])
+    HDFS-2452. OutOfMemoryError in DataXceiverServer takes down the DataNode. Contributed by Uma Maheswara Rao.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1187965
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiverServer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/DataXceiverAspects.aj
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/TestFiDataXceiverServer.java
+, Integrated in Hadoop-Common-trunk-Commit #1140 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/1140/])
+    HDFS-2452. OutOfMemoryError in DataXceiverServer takes down the DataNode. Contributed by Uma Maheswara Rao.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1187965
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiverServer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/DataXceiverAspects.aj
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/TestFiDataXceiverServer.java
+, I just committed this to trun and branch 0.23. Thank you Uma., Integrated in Hadoop-Common-0.23-Commit #43 (See [https://builds.apache.org/job/Hadoop-Common-0.23-Commit/43/])
+    HDFS-2452. OutOfMemoryError in DataXceiverServer takes down the DataNode. Contributed by Uma Maheswara Rao.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1187969
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiverServer.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/DataXceiverAspects.aj
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/TestFiDataXceiverServer.java
+, Integrated in Hadoop-Hdfs-0.23-Commit #44 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Commit/44/])
+    HDFS-2452. OutOfMemoryError in DataXceiverServer takes down the DataNode. Contributed by Uma Maheswara Rao.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1187969
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiverServer.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/DataXceiverAspects.aj
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/TestFiDataXceiverServer.java
+, Integrated in Hadoop-Mapreduce-trunk-Commit #1155 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Commit/1155/])
+    HDFS-2452. OutOfMemoryError in DataXceiverServer takes down the DataNode. Contributed by Uma Maheswara Rao.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1187965
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiverServer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/DataXceiverAspects.aj
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/TestFiDataXceiverServer.java
+, Integrated in Hadoop-Mapreduce-0.23-Commit #43 (See [https://builds.apache.org/job/Hadoop-Mapreduce-0.23-Commit/43/])
+    HDFS-2452. OutOfMemoryError in DataXceiverServer takes down the DataNode. Contributed by Uma Maheswara Rao.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1187969
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiverServer.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/DataXceiverAspects.aj
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/TestFiDataXceiverServer.java
+, Integrated in Hadoop-Hdfs-0.23-Build #49 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/49/])
+    HDFS-2452. OutOfMemoryError in DataXceiverServer takes down the DataNode. Contributed by Uma Maheswara Rao.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1187969
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiverServer.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/DataXceiverAspects.aj
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/TestFiDataXceiverServer.java
+, Integrated in Hadoop-Mapreduce-trunk #870 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/870/])
+    HDFS-2452. OutOfMemoryError in DataXceiverServer takes down the DataNode. Contributed by Uma Maheswara Rao.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1187965
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiverServer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/DataXceiverAspects.aj
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/TestFiDataXceiverServer.java
+, Integrated in Hadoop-Mapreduce-0.23-Build #61 (See [https://builds.apache.org/job/Hadoop-Mapreduce-0.23-Build/61/])
+    HDFS-2452. OutOfMemoryError in DataXceiverServer takes down the DataNode. Contributed by Uma Maheswara Rao.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1187969
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiverServer.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/DataXceiverAspects.aj
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/TestFiDataXceiverServer.java
+, Integrated in Hadoop-Hdfs-trunk #841 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/841/])
+    HDFS-2452. OutOfMemoryError in DataXceiverServer takes down the DataNode. Contributed by Uma Maheswara Rao.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1187965
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiverServer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/DataXceiverAspects.aj
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/aop/org/apache/hadoop/hdfs/server/datanode/TestFiDataXceiverServer.java
+, As Jakob noted to me the patch that went into trunk still has the 30 sec sleep in the test, while in the patch for 0.22 branch it was eliminated. Uma, do you know what happened there?, Hi Konstantin,
+ 
+ I just compared the code with trunk and 0.22 branch. I don't see any difference, except getInputStream stub and there is no sleeps as well!.
+
+I think, i he may be pointing about source code 30sec sleep or may be about testcase timeout. That will be the failure case. If CountDownLatch does not decrement the count then, latch.await() may wait forever. So , to avaoid this, we gave 30000ms as testcase timeout. This will be the failure case.
+If that is the case, we need to correct the actual testcase problem first. Why it is not throwing the OutOfMemory Error from aspectj mocks and did he provided any trace? If you get any trace please provide, i will take a look.
+
+one more point is, some one started looking on AspectJ on trunk? if yes, can you share the options to run the aspectJ on trunk if you have idea?
+
+Thanks,
+Uma, bq. If you get any trace please provide, i will take a look.
+I don't think there will be traces - aspectj support is totally broken in trunk and it hasn't been fixed yet. Hopefully, I will have some spare time to work on it. , Sorry guys, everything is ok. I was looking in the wrong place. Juggling too many things.]

@@ -1,0 +1,176 @@
+[The following code will either result in resource leakage or invalid FileSystem object:
+
+Path path;
+ ...
+FileSystem fs1 = path.getFileSystem(conf);
+...
+FileSystem fs2 = path.getFileSystem(conf);
+// fs1 should be the same as fs2.
+...
+
+fs1.close();
+...
+FileSystem fs3 = path.getFileSystem(conf);
+// fs3 would be a newly created FileSystem object (instead of reusing fs1).
+
+Even worse, if the actual FileSystem implemnetation's close() actually invalidates the object (such as DistributedFileSystem), then fs2 would no longer usable after fs1.close().
+
+This is probably related to HADOOP-319.
+, If you do ref-count, does fs1.close() above become a no-op?, yes, Specifically, if the cache is ref-counted, fs1.close() should not close the actual file system, but it needs to decrement the ref-count in the cached entry.
+
+Also, maybe we need to make FileSystem.close() final, and add a protected abstract method called FileSystem.realClose() that is supposed to be implemented by actual file systems., If we do this, this is going to be an incompatible change., +1 for this change. , I have a better idea to fix the current problem with minimum change of the API:
+
+- Make FileSystem.CACHE ref-counted.
+- FileSystem.close() is no-op, and knows nothing about FileSystem.CACHE.
+- Add two static methods whose names clearly reflect the shared nature of the FileSystem objects:
+    - static FileSystem getFileSystem(Path, Configuration)
+    - static void returnFileSystem(FileSystem)
+- Deprecate Path.getFileSystem(Configuration), and suggest to use FileSystem.getFileSystem instead.
+
+The recommended usage pattern would be:
+- If a FileSystem object is created by new, then people should release resources by FileSystem.close().
+- If a FileSystem object is obtained by getFileSystem, then the resource should be released through returnFileSystem.
+
+, I'm not yet convinced this is a bug that needs fixing.  Yes, closing a FileSystem that's in use by other threads can break things.  But what harm is this causing in practice?
+, > I'm not yet convinced this is a bug that needs fixing.
+
+I also don't think this is a bug.  This issue is proposing a functional change, which breaks compatibility for all the client codes since FileSystem.get(..) and FileSystem.close() are used everywhere., @Doug,
+
+FileSystem implements Closeable, and if a thread obtains a FileSystem object from path.getFileSystem(conf), should it or should it not call fs.close()? Note that the thread has no knowledge whether the object is shared by other threads or not. 
+
+As a mater of fact, what I see throughout the current Hadoop code, the practice is not to call fs.close(). For instance, the SequenceFileRecordReader.close() does not actually close the file system. (And if you do put fs.close() there, you are likely fail tests using MiniMRCluster.)
+
+You may argue most applications do not access more than a couple of file systems, and not closing them is not practically harmful. Then what is the reason of making FileSystem implement Closeable in the first place? 
+
+Additionally, the bug could also affect single threaded program if individual functions create their own FileSystem objects and close them after usage. For instance,
+{code}
+  static void depthFirstSearch(Path dir, Configuration conf) throws IOException {
+    FileSystem fs = dir.getFileSystem(conf);
+    if (fs.isFile(dir)) {
+      // process file.
+      return;
+    }
+    FileStatus[] subs = fs.listStatus(dir);
+    for (FileStatus s : subs) {
+      depthFirstSearch(s.getPath(), conf);
+    }
+    fs.close();
+  }
+{code}, >'Yes, closing a FileSystem that's in use by other threads can break things. But what harm is this causing in practice?
+
+My patke is that this patch makes it easier for an application program to use the FileSystem object. RefCounting the objects make it easier for users of this API to use FileSystem object: they need not know about the existence of the cache. Maybe we can label it as a "improvement"  rather than a "bug"., > the current Hadoop code, the practice is not to call fs.close()
+
+That's correct.  So the question is whether we have a strong need to change that.
+
+> Then what is the reason of making FileSystem implement Closeable in the first place?
+
+That is the root question here.  If there's no need to explicitly close FileSystem implementations, then perhaps the change is simply to remove FileSystem#close.
+, If an application wants to release all the resources associated with an "open" filesystem, it might want to use FileSystem.close(), isn't it? This might be worthwhile for an application that opens many many different FileSystems (especially with different usernames) and then closes them appropriately to release the amount of resources tied up with each open instance., "ref-counted" here indeed means "get-counted" since it is not counting the number of references but the number of FileSystem.get(...).  It may be a nice thing have but the cost of doing this is very high.
+
+@Houng> the bug could also affect single threaded program
+I would argue that the bug is in depthFirstSearch(..) but not FileSystem cache.
+
+@dhruba> This might be worthwhile for an application that opens many many different FileSystems (especially with different usernames)
+For this kind of special applications, ref-counted (or get-counted) could be implemented there., bq. If an application wants to release all the resources associated with an "open" filesystem, it might want to use FileSystem.close(), isn't it? This might be worthwhile for an application that opens many many different FileSystems (especially with different usernames) and then closes them appropriately to release the amount of resources tied up with each open instance.
+
++1
+
+Resource leakage should be considered bugs. Even though the leakage is so slow that it causes little impact in practice does not change that fact. And as Dhruba pointed out, it does not preclude that in the future, some applications may cause much faster leakage, and thus make this a severe issue.
+, The JVM caches URLStreamHandler implementations in an ever-growing table w/o issue.  FileSystem implementations don't have much state, nor do they keep connections open, etc.  They're lightweight and small in number.  I don't yet see this warranting an incompatible change.
+
+Some ways to deal with this that would not involve incompatible changes might be:
+ - use a WeakHashMap for the cache and close FileSystem instances in a finalize() method.
+ - remove the cache, and allocate a new FileSystem instance per call to getFileSystem().
+
+The latter would be cleanest.  I wonder if it would have much performance impact?  Those few cases where it does should be easy to fix.
+
+But overall I still see this as a non-problem for now.
+, I would like to resurrect the discussion on this issue.
+
+I am in the process of integrating a distributed log aggregation service called Scribe (http://developers.facebook.com/scribe/) to be able to store directly into HDFS. The scribe server invokes HDFS APIs using libhdfs. Scribe is a multi-threaded software module, each thread should be able to independently open files from different hdfs clusters. It will be very convenient for scribe to be able to invoke hdfsConnect() just before every time a file is opened. Similarly, after closing a file, it would invoke hdfsdisConnect(). This reduces complexity in the scribe-hdfs integration to a large extent. However, with the current caching behaviour of FileSystem.get(), the above is not possible. Scribe has to maintain reference counts for each open and understand the caching behaviour of FileSystem objects.
+
+I would like to implement the second option that Doug has suggested, i.e. "remove the cache, and allocate a new FileSystem instance per call to getFileSystem()". However, this will be an incompatible change, especially because pre-existing applications might be rely on this singular behavour to elegantly open file systems. To ensure than existing implementations do not break, we can introduce a new method FileSystem.getNewFileSystem() that skips the CACHE and allocates a new FileSystem object every time it is invoked.  
+
+, Here is a small patch that introduces FileSystem.getUnique() to return a unique file system object per invocation. I will write a unit test once people are comfortable with this new API., +1.
+
+BTW, instead of getUnique(), newInstance() or create() sounds better to me. Also, clarify the semantic difference between the two in javadoc., Do we want to deprecate the method that uses the cache?  If so, we'd need to make FileSystem instantiation more lightweight.  Currently, e.g., HDFS makes a call to the namenode to check version compatibility each time a DistributedFileSystem is created.  We'd probably want to cache that and/or do it lazily., I would rather not deprecate the method that uses the CACHE because that behaviour might be optimal for some class of applications, do you agree?
+
+I will take Hong's suggestion and change the name of this new API  to FileSystem.newInstance()., In most situations cache is useful. But I don't like the fact that currently all concrete FileSystem implementations must call super.close(). From API symmetry point of view, if you get a FileSystem instance through FS.newInstance(), then you are responsible for calling fs.close(); or if you get an instance from cache as in FS.get(), you should call something like FS.return() instead of fs.close(). If this is enforced, then we can ref-count the CACHE, and FileSystem.close() should not deal with CACHE at all., Changed name of new API to FileSystem.createNewInstance(). Made corresponding changes to libhdfs to expose this API. Added unit tests.
+, > Changed name of new API to FileSystem.createNewInstance().
+
+A nit: that seems redundant.  I'd rather see this as just 'create()' or 'newInstance()', but not both.
+, +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12401565/FileSystemUnique.txt
+  against trunk revision 751463.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-minerva.apache.org/36/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-minerva.apache.org/36/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-minerva.apache.org/36/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-minerva.apache.org/36/console
+
+This message is automatically generated., Read through the java part of the patch, looks mostly good to me. Two questions:
+- What should be the semantics of FileSystem.equals()? Should two unique instances pointing to the same File System be considered equal or not?
+- There seems to be a redundant line of import of atomic.AtomicLong
+
+, Cancelling patch to incorporate review comments., Changed name to FileSystem.newInstance(). Remove redundant imports of AtomicLong., Since this patch adds new API (without changing existing APIs), it is safe to pull this into 0.20. , +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12401983/FileSystemUnique2.txt
+  against trunk revision 752682.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-minerva.apache.org/52/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-minerva.apache.org/52/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-minerva.apache.org/52/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-minerva.apache.org/52/console
+
+This message is automatically generated., > Since this patch adds new API (without changing existing APIs), it is safe to pull this into 0.20. 
+
+Except we don't add new features to branches, but only to trunk, right?
+
+Also, what's the use case for newInstanceLocal()?  I can't think of one and would prefer not to add that method., > Except we don't add new features to branches, but only to trunk, right?
+
+Sounds perfect to me. It is just that 0.20 is an "unreleased" branch.
+
+> Also, what's the use case for newInstanceLocal()? 
+
+An application that uses newInstance() method assumes that a new filesystem object is created (irrespective of the path that is being passed in). It does not matter whether it is a local path or a hdfs path. The application logic does not have to change depending on the FileSystem that it is trying to access. So, I would like to keep the newInstanceLocal() method. , > 0.20 is an "unreleased" branch.
+
+True, but the branch date is also the feature freeze-date, no?  Documentation, tests and bugfixes are added after the branch date, but not features.
+, I have committed this., Integrated in Hadoop-trunk #785 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/785/])
+    . New method FileSystem.newInstance() that always returns
+a newly allocated FileSystem object. (dhruba)
+, Editorial pass over all release notes prior to publication of 0.21.]

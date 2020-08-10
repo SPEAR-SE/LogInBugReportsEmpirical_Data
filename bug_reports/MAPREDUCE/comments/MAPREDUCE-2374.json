@@ -1,0 +1,317 @@
+[Because this part of the code is rewritten by MR-2178, I don't want to make a patch for this against trunk. Attaching a patch against secure 20.
+
+In testing this on a cluster on 20, this patch avoided the "Text file busy" issue I was seeing before., +1, We are noticing these "Text file busy" exceptions on an Hadoop 1.0.3 environment which are causing task failures with exit status 126. These exceptions are non-deterministic. They occur when shExec.execute() call is made in org.apache.hadoop.mapred.DefaultTaskController class. Return string from the call to shExec.getOutput()is empty line. We captured the details of this exception by logging the stack trace in the catch block.
+Here is what the stack trace looks like:
+org.apache.hadoop.util.Shell$ExitCodeException: bash: /local4/1_0_3/hadoop-local/ttprivate/taskTracker/root/jobcache/job_201206081243_0001/attempt_201206081243_0001_m_000024_0/taskjvm.sh: Text file busy
+
+        at org.apache.hadoop.util.Shell.runCommand(Shell.java:255)
+        at org.apache.hadoop.util.Shell.run(Shell.java:182)
+        at org.apache.hadoop.util.Shell$ShellCommandExecutor.execute(Shell.java:375)
+        at org.apache.hadoop.mapred.DefaultTaskController.launchTask(DefaultTaskController.java:131)
+        at org.apache.hadoop.mapred.JvmManager$JvmManagerForType$JvmRunner.runChild(JvmManager.java:498)
+        at org.apache.hadoop.mapred.JvmManager$JvmManagerForType$JvmRunner.run(JvmManager.java:472)
+
+Also, all the log/work files corresponding to the failed tasks get cleaned up and hence it becomes harder to debug the underlying cause.
+
+Above patch has helped reduce these failures, however, they still occur. I am not sure whether the "Text file busy" exception is a Hadoop issue or some other issue though. I just thought sharing this information here would benefit someone., Hi Shrinivas,
+
+Yes, I still see them on very rare occasion, though I don't have a good explanation as to why. And since they're rare, it's pretty hard to repro and investigate further., Hi Todd,
+
+Thanks for the info. We see these exceptions once or twice in few runs so it may be little easier for us to reproduce them. Will update this thread once we have more info. In the mean time let us know if there is any specific debug info/traces you think would help root cause this issue. BTW, we notice these on a RHEL 6.2 64-bit platform with Oracle JDK 7 update 4. We have not yet encountered these exceptions on an Ubuntu 11.04 64-bit environment though. Do you think this might be a platform specific issue?, Yea, I've noticed it more on RHEL6 than RHEL5, I think... but I haven't looked closely recently. I saw it on Java6, so it's not Java7-specific.
+
+It does seem like some kind of kernel level issue: if you close() a file, it should be immediately available to execute, but it seems on some OSes there's a slight delay before it becomes executable, or something., Hi Todd,
+
+I spent some time looking in to this. I have a query regarding this. Is there any particular reason why a call to rawFs.setPermission method (of DefaultTaskController class) is made when it is already performed by writeCommand method (of TaskController class)? 
+
+By commenting out the call to rawFs.setPermission method I have not seen these errors occurring in my testing. I am in process of additional testing. It may not be the ideal solution for this issue, however, it does seem to address it to a great extent. If you think there is value in this change then let me know, I can create the 1-line patch and run unit tests before submitting it., In OpenJDK 6 at least, FileWriter#close doesn't always close the file descriptor.
+
+Starting here:
+http://grepcode.com/file/repository.grepcode.com/java/root/jdk/openjdk/6-b14/java/io/FileWriter.java
+
+I went to OutputStreamWriter.  OutputStreamWriter#close calls StreamEncoder#close, which has:
+
+{code}
+void implClose() throws IOException {
+    flushLeftoverChar(null, true);
+    try {
+        for (;;) {
+            CoderResult cr = encoder.flush(bb);
+            if (cr.isUnderflow())
+                break;
+            if (cr.isOverflow()) {
+                assert bb.position() > 0;
+                writeBytes();
+                continue;
+            }
+            cr.throwException();
+        }
+        if (bb.position() > 0)
+            writeBytes();
+        if (ch != null)
+            ch.close();
+        else
+            out.close();
+    } catch (IOException x) {
+        encoder.reset();
+        throw x;
+    }
+}
+{code}
+
+So you can see that in the case of exceptions being thrown, the FileChannel is not closed.  The finalizer probably takes care of it, but that's cold comfort to you in this case.
+
+Maybe it would be best to use the FileChannel API directly rather than using FileWriter., Supposing that SElinux is not involved, here's some analysis under traditional UNIX semantics.  (I'll post another comment relevant to SElinux.)
+
+The ETXTBSY error code from execve(2) happens when the executable (in this case, a shell script) is still opened for write by another process.  Reading the kernel code there does not appear to be any chance for a "slight delay"; when the writer calls close() the atomic {{inode->i_readcount}} is decremented, and {{open_exec()}} correctly tests the atomic against zero.
+
+So I strongly suspect that the writer does, in fact, still have the filedescriptor open for write when the execve happens.
+
+I don't see how that's possible, though -- we clearly call {{w.close()}} in the {{finally}} clause of {{writeCommand}}, and I don't see anywhere that we leak a {{FileDescriptor}} to prevent {{FileOutputStream#close}} from triggering the underlying {{close(2)}}.
+
+But...
+
+We can avoid the {{ETXTBSY}} by avoiding the {{execve}}.  If I'm reading {{launchTask}} correctly, the script we're execing isn't even a valid shell script anyways -- it's just a sequence of shell commands, without the leading "#!/bin/sh" header.  By running it {{bash -c "/path/to/script"}} we're relying on the ancient pre-Bourne shell script convention that if execve() fails with {{ENOEXEC}}, the shell tries to interpret the file as a script.
+
+Instead, we can ask bash to directly run the script as a script by running {{bash "/path/to/script"}} leaving out the {{-c}}.  This avoids the code path that triggers the ETXTBSY failure and is slightly less reliant on random backwards compatibility kludges.  And it doesn't break if we do have the {{#!/bin/sh}} line since that's just a comment.
+
+Now, suppose the undiscovered but hypothesized race condition in {{writeCommand}} does exist, and affects the {{write}} as well as the {{close}}.  Then removing {{-c}} does not remove the race, and when we lose the race the failure will probably be more silent.  The command file might not be completely written and running the script might fail., bq. in the case of exceptions being thrown, the FileChannel is not closed.
+
+Ah, but in this case the caller doesn't catch that exception, so we wouldn't have gotten to the {{shExec.execute()}} if {{writeCommand}}'s invocation of {{w.close()}} had thrown., bq. (I'll post another comment relevant to SElinux.)
+
+There are some examples in the RHEL bugzilla of SElinux causing mysterious ETXTBSY failures.  Such failures should leave a trace in {{/var/log/audit/audit.log}} on the node which experienced the failure.
+
+Could someone who can reproduce this failure please check the audit log on the node when a failure occurs?  Even if you think that SElinux is turned off, sometimes it's on by accident...
+
+It would also potentially be helpful to compare an {{audit.log}} from a node that runs the same code and does not experience the ETXTBSY failure., I have tried collecting lsof output before and after the call to shExec.execute() and I do not see any process holding on to the handle for taskjvm.sh file. I agree with Andy, the problem here does not seem to be because of an open FD. I have tried making changes where a call to RawLocalFileSystem.sync() gets explicitly called for the underlying output data stream after the write to taskjvm.sh happens. I assume that the sync() method calls fsync sys call which will ensure that the data is committed to the underlying storage.
+
+I have noticed ENOEXEC errors for both successful as well as unsuccessful (ETXTBSY) cases of bash -c /path/to/taskjvm.sh calls through strace output. So I am not sure if this is the root cause. However, it doesn't hurts to add the #!/bin/sh construct. 
+One thing I am planning to do is to capture strace output for child processes forked from taskjvm.sh script. Also, another thing that I need to try is to call sync on the whole directory containing taskjvm.sh.
+There is probably something internal at the kernel level that is causing this issue. As I mentioned earlier, this problem is much more pronounced on RHEL 6.2 (stock kernel) compared to Ubuntu 11.04 server.
+, Attaching a patch implementing the suggestion to remove "-c" from the bash command line, thereby avoiding the only code path which can return ETXTBSY under non-SElinux semantics., Re-attaching patch with correct license grant this time; the previous "not intended" was an error., bq. We can avoid the ETXTBSY by avoiding the execve. If I'm reading launchTask correctly, the script we're execing isn't even a valid shell script anyways – it's just a sequence of shell commands, without the leading "#!/bin/sh" header. By running it bash -c "/path/to/script" we're relying on the ancient pre-Bourne shell script convention that if execve() fails with ENOEXEC, the shell tries to interpret the file as a script.
+
+bq. Instead, we can ask bash to directly run the script as a script by running bash "/path/to/script" leaving out the -c. This avoids the code path that triggers the ETXTBSY failure and is slightly less reliant on random backwards compatibility kludges. And it doesn't break if we do have the #!/bin/sh line since that's just a comment.
+
+That's a very interesting analysis, Andy.
+
+I agree that it would be simpler without the -c, but I don't see how this "avoids the code path that triggers the ETXTBSY."  We're still calling execve at some point, and if someone has that FD open for write it will squawk.  (All the other exec flavors are just wrappers around execve and return the same error codes).  Am I missing something?
+
+As you pointed out, it's possible that SELinux is doing something odd.  Shrinivas, can you confirm that seLinux is off during your testing?
+
+Just this command as root and then we will be sure:
+{code}
+/usr/sbin/setenforce 0
+{code}
+
+It will stay in effect until you reboot., SELinux is disabled on all the nodes of our cluster. Another thing I have noticed with this issue is that it is more pronounced with large number of map processes., bq. I agree that it would be simpler without the -c, but I don't see how this "avoids the code path that triggers the ETXTBSY."
+
+Currently we are invoking {{bash -c /path/to/script}}.  Bash treats the argument after -c as input to its command processor.  The string ends up being parsed as a command to execute.  Bash tries to execve the script, and either gets ENOEXEC (and then falls back to trying to read the file as a script) or ETXTBSY (and fails the command).  The execve that we sometimes see returning ETXTBSY is {{execve("/path/to/script", ...)}}.
+
+I'm suggesting we remove the -c, so we would invoke {{bash /path/to/script}}.  According to {{bash(1)}}, "If ... neither the -c nor the -s option have been supplied, the first argument is assumed to be the name of a file containing shell commands. ... Bash reads and executes commands from this file, then exits."  The intermittently failing execve is never called, per the documentation, and I verified with a standalone testcase that the workaround works correctly.  Also it's instructive to observe bash with strace.
+
+bq.  We're still calling execve at some point
+
+It's true that we're still calling {{execve("/bin/bash")}} but that is not relevant to the EXTXBSY failure.  Without -c we do not call execve on the shell script., Ah, you're absolutely right.  Without the -c, bash won't execve the file itself.  It will read the file into an already running interpreter.  So no ETXTBSY.
+
+I'm a little nervous about this proposed "fix" because it doesn't really seem to fix the problem.  Are we absolutely sure that the file is closed and not still being written to?  If it's not, we could be getting file descriptor leaks, partially written scripts, and all the usual evils.
+
+I guess Shrinivas did some testing with lsof.  Shrinivas, can you try deliberately keeping the file open for write and verifying that your lsof test detects it?  Also, it would be interesting to see if the same problem shows up when using the raw FileChannel API (as opposed to the FileWriter API).
+
+If this is a real kernel bug, I guess we need to file it upstream on the red hat bug tracker and/or kernel mailing list., bq. I have noticed ENOEXEC errors for both successful as well as unsuccessful (ETXTBSY) cases of bash -c /path/to/taskjvm.sh calls through strace output. So I am not sure if this is the root cause. However, it doesn't hurts to add the #!/bin/sh construct. 
+
+If you have strace output showing the ETXTBSY, could you upload it to the bug?  That would greatly help in isolating the problem.  Especially if it also shows the open()/write()/close() of the script file.  Specific kernel version where the problem has been seen would be great too!, I have attached 2 files containing strace output. In our analysis it did not show why ETXTBSY error was caused. This is on RHEL Server release 6.2 (2.6.32-220.el6.x86_64)., Thanks for the strace output, Shrinivas.  Unfortunately, it doesn't seem to show the place where you're opening up /local5/sj_mrv1_trunk/hadoop-local/ttprivate/taskTracker/root/jobcache/job_201207131350_0001/attempt_201207131350_0001_m_000201_0/taskjvm.sh for writing.
+
+If there is no file descriptor leak, you'd expect to see something like this:
+{code}
+open("blahblahblah.sh", {st_mode=S_IFREG|0700, ...}) = 5
+close(5) = 0
+...
+execve("blahblahblah.sh") ...
+{code}
+
+On the other hand, if there is a leak, there should be no corresponding close() call.  Things can get more complicated than that because of dup() and stuff like that, but that's the basic idea...
+
+In the absence of that, we can't really draw any conclusions either way.  It may be helpful to use strace -f to follow forks.  I realize there's a lot of output, but those are the lines we need, I think., I just thought of something.  Suppose that the JVM is holding blahblahblah.sh open for write, and meanwhile another thread forks a bash process (or something).  After the fork completes, that process will hold blahblahblah.sh open for write with O_WRONLY.  At the very least, this is a race condition that could lead to "mysterious" failures, since you don't know when the fork'ed process will next get scheduled in relation to the parent process.
+
+The O_CLOEXEC flag was introduced in Linux 2.6.23 to solve this problem, by atomically closing the FDs on a fork.  However, I didn't see it being used in the strace output you posted.  And it's certainly not around on RHEL5 and earlier.
+
+If this is true, then I guess the solution Andy posted earlier is probably the best way to go.  Just get rid of the -c and this behavior will be masked., Colin, I think you've got a great theory!  That fork-from-another-thread scenario would explain the intermittent problems.
+
+bq. It may be helpful to use strace -f to follow forks. I realize there's a lot of output, but those are the lines we need, I think.
+
+My favorite strace commandline is {{strace -tttfo /tmp/foo -p <pid>}}, with -ttt for millisecond timestamps and -f to follow forks and -o to put the output in a file., Yea, I buy that theory. Good thinking, Colin.
+
+So it seems like to fix this issue we could do one or more of the following:
+
+1) If the NativeIO library is present and we're on a system that has it defined, we could use open() with O_CLOEXEC to open the taskjvm.sh files.
+2) We could switch from "bash -c" to "bash" to run the shell script. Can anyone think of an unintended consequence of this? How does the taskjvm.sh get execced with the linux task controller at play?
+3) We could add a simple retry or two on Text File Busy.
+
+
+#1 probably sucks because O_CLOEXEC isn't present on RHEL5, and it will require native support. Between #2 and #3 I don't have a strong opinion., It's true that open(O_CLOEXEC) isn't in RHEL5, but fcntl to set FD_CLOEXEC is.  It doesn't completely close the race but it does reduce the window substantially.  (The fact that there's an unfixable race window there is why O_CLOEXEC was added.)  It would still require NativeIO.  It's orthogonal to my proposed fix, though.
+
+Colin's theory also clears up this worry:
+bq. Now, suppose the undiscovered but hypothesized race condition in writeCommand does exist, and affects the write as well as the close.
+Since there's no race condition in writeCommand, there's no chance the script will be incomplete when we run it.
+
+I'd love to see a strace -tttf showing the entire failure scenario just to be sure, but I'm confident enough that Colin nailed it that I think we should just merge my "no more -c" patch., This is really a bug in {{java.lang.ProcessBuilder}}, that it does not close open files in the forked child before execing the target command.  Where does one report such bugs?, Adds code to flush and synch outputstream for taskjvm.sh file, I have tested Andy's suggestion of not using -c switch. It does resolve the issue on our test cluster. Since we are thinking of removing the -c switch, to avoid potential data loss issues (from delayed allocation by file systems like ext4) I have made some changes so that the IO buffer contents of taskjvm.sh file are committed to the underlying storage before shell executor is called. The mapreduce-2374-branch-1.patch patch also removes the redundant set permission call. It also includes the -c switch change that Andy has suggested. If you all find these changes useful please take a look at the attached patch. In any case, it would be nice if Andy's patch can be committed. 
+
+Regarding other queries from Andy and Colin: I have been collecting the strace output files by annotating "strace -o /path/to/strace.output" strings to the same shell executor that calls "bash -c /path/to/taskjvm.sh". With this change, the frequency of Text busy errors goes down drastically to the level where it may occur once in several runs. I will post strace output as soon I see a failing case. Running strace outside of Hadoop code is difficult since it is hard to tell which of the JVM processes will have a failing task. Let me know if you have any tricks of capturing strace output. 
+
+Andy - could you please clarify about your comment on ProcessBuilder bug? You should be able to file a bug on bugs.sun.com., bq. Since we are thinking of removing the -c switch, to avoid potential data loss issues (from delayed allocation by file systems like ext4) I have made some changes so that the IO buffer contents of taskjvm.sh file are committed to the underlying storage before shell executor is 
+
+That shouldn't be necessary -- the exec code is perfectly OK to read out of the OS buffer cache. Adding an fsync here will just hurt the latency of task launch. Though I agree that a flush() is necessary to make sure it is pushed out of any Java-side buffers., bq. I have tested Andy's suggestion of not using -c switch. It does resolve the issue on our test cluster.
+Thanks for testing!  This is great news.
+
+bq. to avoid potential data loss issues (from delayed allocation by file systems like ext4) I have made some changes so that the IO buffer contents of taskjvm.sh file are committed to the underlying storage before shell executor is called.
+
+I'm a bit confused why you're concerned about crash consistency here.  AFAIK, ext4 delayed allocation is *completely* invisible to application code, unless the machine crashes and you're recovering afterwards.
+
+(OK, that's not quite true since you could use {{filefrag}} to find out where the allocations are, or maybe you could use hires timers to notice seek-induced IO timing discontinuities, but those are not relevant to this discussion.)
+
+Since the taskjvm.sh script is just used immediately and not reused across a kernel crash, why do you care that the IO buffer is synced to the stable storage?
+
+Looking at mapreduce-2374-branch-1.patch, I see that you've made two related changes, one getting rid of the {{BufferedOutputStream}} from {{RawLocalFileSystem#create}} and another adding calls to {{FSDataOutputStream#flush}} and {{#sync}}.  I don't see how either of those changes can make much of a difference given that we call {{w.close}} 8 lines down in the finally block.
+
+bq. with strace the frequency of Text busy errors goes down drastically
+Not too surprising; to get ETXTBSY we have to get to the relevant {{execve}} before the forked process that's holding the fd exits.  Adding a strace before that slows down the shell and adds another child process into the scheduling mix, making the race harder to win., bq. Andy - could you please clarify about your comment on ProcessBuilder bug? You should be able to file a bug on bugs.sun.com.
+
+I am suggesting that {{ProcessBuilder}} should ensure that there are no filedescriptors unintentionally left open in the child, before execing the target executable.  There are some systems where {{system(3)}} does this by simply {{close(2)}}ing every filedescriptor from 3 up to the maxfiles ulimit.  Turns out glibc's {{system(3)}} doesn't, (anymore?) though -- if you have a open fd and call {{system("ls /proc/self/fd")}} you can see that {{ls}} still has a copy of the open fd.
+
+So that's evidence that maybe it's not considered part of the interface contract., Last I looked, I think ProcessBuilder did do that.. no?, No luck with strace output yet. I will try to collect a failing case using short running jobs such as piEstimator. 
+
+While I was initially debugging this issues, since I was not able to see any process in lsof output of taskjvm.sh file, I was wondering whether ext4 delayed allocation had to do something with the text file busy error. I thought that this would be more of an issue with the -c bash switch change if the whole file doesn't gets committed to the disk by the time executor thread is scheduled. This theory could be wrong though as indicated by Todd and Andy. 
+
+I had to remove the BufferedOutputStream wrapper so that fdos.sync call would succeed as LocalFSFileOutputStream implements Syncable interface whereas BufferedOutputStream  doesnt. I thought PrintWriter close wouldn't affect the flush and sync of LocalFSFileOutputStream. May be I am missing something?, You've got the layering mixed up there -- execve is perfectly happy to read out of buffer cache regardless of whether the underlying file is on persistent media or not. So, you don't need to sync anything.
+
+The java close() API does forward the 'close' through to the underlying writers, and that also triggers a flush of any buffered streams.
+
+So I think Andy's patch is sufficient to fix this issue.
+
+Andy: would you mind updating the patch with a comment above your change indicating that it's important to run "bash foo.sh" instead of just chmod 755 and execing "foo.sh" or running "bash -c foo.sh", due to this race condition? It's subtle and I can imagine it regressing if someone later redoes this code at all.
+
+Also, please double-check that the LinuxTaskExecutor code path doesn't have the same problem, if you can. We'll also need to look at the equivalent code in trunk (MR2), since it probably has the same issue.
+
+Nice work, everyone, tracking down this long-standing bug., Todd, thanks for clarifying my concerns with sync. With my comment about PrintWriter close not affecting flush/sync I meant that calling flush and FD level sync on underlying LocalFSFileOutputStream object before calling PrintWriter close would still sync the file.
+, Updated description and summary given the original description didn't turn out to be the true underlying issue., Updated patch including comment warning the intrepid refactorer., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12537923/mapreduce-2374-2.txt
+  against trunk revision .
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2662//console
+
+This message is automatically generated., branch-1 patch looks good. What's the verdict on whether this affects any of the trunk code paths and the secure launchers?, bq. What's the verdict on whether this affects any of the trunk code paths and the secure launchers?
+
+I reviewed trunk's {{LinuxContainerExecutor.java}} and v1's {{LinuxTaskController.java}}.  Neither of them has the pattern "write to a script and then execute the script".  So they're not open to this particular problem.  (Both appear on first inspection to have various shell quoting bugs, but the Java -> bash mapping is sufficiently baroque that I'm not going to try to reify those bugs right now.), (I meant branch-1 where I said v1, sorry.), I looked at trunk and it does have this bug. See ./hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/DefaultContainerExecutor.java, bq. I looked at trunk and it does have this bug
+
+Thanks for double checking me.  Yes, {{launchContainer()}} uses {{lfs.util().copy()}} to write the {{CONTAINER_SCRIPT}}, and {{FileContext.Util#copy}} does open the output file directly, and both {{launchContainer}} and {{writeLocalWrapperScript}} use {{bash -c}} to run scripts.
+
+So, yes, this bug is also present on trunk.
+
+I'll prepare a separate patch for trunk.
+
+Is there anything stopping us from checking in the branch-1 patch?, Attaching patch for trunk removing -c from DefaultContainerExecutor., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12542059/mapreduce-2374.txt
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2762//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2762//console
+
+This message is automatically generated., +1, I've just committed Andy's latest patches to to branch-1, branch-2, and trunk. Thanks a lot for the contribution, Andy, and thanks a lot to everyone for the discussion to get to the bottom of this issue., Thanks Andy, Todd, and everyone else for figuring out this difficult bug.  I merged it into branch-0.23., Integrated in Hadoop-Common-trunk-Commit #2629 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/2629/])
+    MAPREDUCE-2374. "Text File Busy" errors launching MR tasks. Contributed by Andy Isaacson. (Revision 1376632)
+
+     Result = SUCCESS
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1376632
+Files : 
+* /hadoop/common/trunk/hadoop-yarn-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/DefaultContainerExecutor.java
+, Integrated in Hadoop-Hdfs-trunk-Commit #2693 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/2693/])
+    MAPREDUCE-2374. "Text File Busy" errors launching MR tasks. Contributed by Andy Isaacson. (Revision 1376632)
+
+     Result = SUCCESS
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1376632
+Files : 
+* /hadoop/common/trunk/hadoop-yarn-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/DefaultContainerExecutor.java
+, Integrated in Hadoop-Mapreduce-trunk-Commit #2657 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Commit/2657/])
+    MAPREDUCE-2374. "Text File Busy" errors launching MR tasks. Contributed by Andy Isaacson. (Revision 1376632)
+
+     Result = FAILURE
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1376632
+Files : 
+* /hadoop/common/trunk/hadoop-yarn-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/DefaultContainerExecutor.java
+, Integrated in Hadoop-Hdfs-0.23-Build #353 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/353/])
+    svn merge -c 1376632 FIXES: MAPREDUCE-2374. "Text File Busy" errors launching MR tasks. Contributed by Andy Isaacson. (Revision 1376660)
+
+     Result = UNSTABLE
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1376660
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-yarn-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/DefaultContainerExecutor.java
+, Integrated in Hadoop-Hdfs-trunk #1144 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1144/])
+    MAPREDUCE-2374. "Text File Busy" errors launching MR tasks. Contributed by Andy Isaacson. (Revision 1376632)
+
+     Result = FAILURE
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1376632
+Files : 
+* /hadoop/common/trunk/hadoop-yarn-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/DefaultContainerExecutor.java
+, Integrated in Hadoop-Mapreduce-trunk #1175 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1175/])
+    MAPREDUCE-2374. "Text File Busy" errors launching MR tasks. Contributed by Andy Isaacson. (Revision 1376632)
+
+     Result = FAILURE
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1376632
+Files : 
+* /hadoop/common/trunk/hadoop-yarn-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/DefaultContainerExecutor.java
+, ATM - In future, please open a separate YARN jira. It's very odd to have MAPREDUCE jira numbers in hadoop-yarn-project/CHANGES.txt. , Also, a simple test case to ensure we don't introduce "bash -c" in future would have been helpful., bq. ATM - In future, please open a separate YARN jira. It's very odd to have MAPREDUCE jira numbers in hadoop-yarn-project/CHANGES.txt.
+
+Sorry, Arun. I didn't quite know what to do with this since this JIRA was opened long before YARN was split off from MR. When committing, I also noticed that there is some precedent for having a MAPREDUCE JIRA entry in the YARN CHANGES.txt (MAPREDUCE-4323) and so thought it was OK. I agree that putting a MAPREDUCE jira in the YARN CHANGES.txt is odd, but opening a separate JIRA just so we have a new number for putting in CHANGES.txt also seemed odd to me. Doing so would also serve to artificially separate the issues from the branch-1 and branch-0.23 fixes, which seemed less than ideal as well. Anyway, my point is just that the right thing to do was not obvious., No problem, thanks for bringing MAPREDUCE-4323 to my attention - I moved it as YARN-58 and fixed CHANGES.txt.
+
+In future, we will have to open a pair of jiras e.g. MAPREDUCE-4575/YARN-38.
+
+For now, I'll clone this jira into YARN - maybe we can commit it with a testcase, and fix CHANGES.txt then? Makes sense? Thanks!
+
+Also, branch-0.23 has the split too, so we shouldn't have to worry about inconsistency b/w branch-2 and branch-0.23., Arun, thanks for taking a look!
+
+bq. Also, a simple test case to ensure we don't introduce "bash -c" in future would have been helpful.
+
+I'd be happy to add a testcase, but how would you suggest that we detect this?  Note that the ETXTBSY failure happens only on some systems, only under load, and only if a script is written from the daemon and then executed by the shell.
+
+There are other legitimate uses of "bash -c" where that's the only reasonable way to do it, so we can't just prohibit the construct.
+
+Thoughts?, Arun just closed this issue, but it hasn't been applied to branches 1 (or 1.1) yet. Can you consider this for inclusion in 1.0.4 as well?, Please consider backporting this to the stable branch, as I am seeing this regularly in 1.0.3/1.0.4. I believe this is the true fix for the original condition (not what was fixed, see the last few comments) of MAPREDUCE-4003. At the very least, if someone could provide a patched hadoop 1.0.3 jar with this bash fix I would try it out.
+
+, The fix has been merged to branch-1, but unfortunately not to branch-1.1, so it's not included in the 1.1.1 release which is currently being voted on., Andy,
+
+Thank you for your comment. I apologize for my lack of understanding of the hadoop release process, but does this mean the fix will be included in a future 1.0.5 release?, Marc, being in branch-1, it will be in 1.2.0 when we make that release in December.
+Andy, please go ahead and commit it to branch-1.1 also, so it will be in 1.1.2 when that patch release is made.
+Marc, you can request it be committed to branch-1.0 also, but at this time there are no plans to produce a 1.0.5 release.  Are you able to move to 1.1.1 instead?  1.1.1 passed vote yesterday, and I will have it published and announced in the next day or two., Matt,
+
+Thank you for your response. I will be able to move to 1.1.x. I was hoping to not have to move to 2.x soon. Does 1.1 move to stable when 1.2 gets released (beta?) in December?
+
+I apologize for the improper forum for these questions.
+
+Thanks,
+Marc]

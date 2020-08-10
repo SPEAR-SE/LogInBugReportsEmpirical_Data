@@ -1,0 +1,143 @@
+[bq. This leads to two AMRM tokens in the credentials and can still fail if the AMRMTokenSelector picks the wrong one.
+
+[~jlowe] Could you explain more clearly why this can happen, please ? I do not get it right now., Sorry for the confusion, I'll try to go through it step-by-step.  It's similar to the problem we saw in MAPREDUCE-6230 which is the same kind of AMRM token updating code, just in the MR-AM code rather than the AMRMClientImpl code.
+
+# The RM creates an AMRM token as part of setting up the AM's launch context.  That token is created with an empty service name, see AMRMSecretManager.createAndGetAMRMToken.
+# The RM then pokes this token into the launch context credentials, using the token's service name as the key.  See AMLauncher.setupTokens and Credentials.addToken.  We now have an AMRM token in the credentials mapped under an empty service name as the key.
+# When the AMRMClient receives an updated AMRM token it updates the service name of the token _before_ it pokes it into the credentials.  See AMRMClientImpl.updateAMRMToken.  Therefore we are adding the token using a non-empty service name as the key in the credentials token map.
+# After updating the credentials we now have _two_ AMRM tokens in the credentials map, one with an empty service name key (but a non-empty service name on the token itself) and one where the service name key equals the token's service name.  In other words, we failed to replace the existing AMRM token in the credentials
+
+Also for a secure setup, we're updating the wrong UGI.  IIUC the ClientRMProxy will use the UGI obtained from the current user when performing the connection to the RM, so updating the login user rather than the current user can update the wrong UGI if we're currently running in a doAs context where the UGI isn't the login UGI., In general it seems very hazardous to assume nobody else will ever try to put a token into a credentials map associated with an empty service name.  It's just begging for two unrelated tokens to accidentally clobber each other.  IMHO the RM should add the AMRM token to the credentials using a well-known identifier that the client can also use when updating it.  For example, rather than the RM poking the token in with an empty service name, it could do something like this instead:
+
+{code}
+    // Add AMRMToken
+    Token<AMRMTokenIdentifier> amrmToken = createAndSetAMRMToken();
+    if (amrmToken != null) {
+      credentials.addToken(AMRMTokenIdentifier.KIND_NAME, amrmToken.getService(), amrmToken);
+    }
+{code}
+
+And clients could expect to associate any updated AMRM token from the RM in a similar fashion, poking it into the credentials using the KIND_NAME alias rather than relying on the implicit service name mapping done with UserGroupInformation.addToken(Token) form.   That way we're helping to isolate the token from other tokens.  The client would be free to update the service name of the token and know that when it pokes it back into the credentials it will be replacing the existing token., thanks for reporting this issue, Jason !
+IIUC, the root cause is that {{ClientRMProxy#setAMRMTokenService}} updates the service name of the token, but doesn't update the service key which is empty.  (quick fix might be to fix this first.)
+bq. RM should add the AMRM token to the credentials using a well-known identifier that the client can also use when updating it. 
+Is it a valid future use-case that one AM talking with two RMs from separate clusters? If so, one AM may need to hold two AMRM tokens.
+, bq. IIUC, the root cause is that ClientRMProxy#setAMRMTokenService updates the service name of the token, but doesn't update the service key which is empty.
+
+The key in question is not part of the token but rather part of the Credentials object (i.e.: the key in the map associated with the token value).  Not sure ClientRMProxy can even update the key/alias associated with the token in the Credentials since UserGroupInformation either returns copies of the Credentials or an unmodifiable collection of the tokens.
+
+bq. Is it a valid future use-case that one AM talking with two RMs from separate clusters? If so, one AM may need to hold two AMRM tokens.
+
+Yes, that's the tricky part.  AFAIK there's no way to know what key/alias a given token is associated with in the credentials, which makes it particularly tricky to make sure we're updating the right one.  At least using a non-empty string will help us avoid colliding with other, non-AMRM tokens accidentally.  The only way I know to fix this the "right" way is if the RM knew, at the time of the AM launch context creation, what service name the AM would use to locate the RM.  It could then set the token service name properly before putting it in the credentials (and not require fixing up the service name by the client).   But currently I do not believe there is any way for the RM to determine that., bq.  Not sure ClientRMProxy can even update the key/alias associated with the token in the Credentials
+I see. looks like Credentials doesn't have a removeToken method. If so, we may remove the old token with the empty service name. And insert the new token with the correct service name as the key.
+
+bq. if the RM knew, at the time of the AM launch context creation, what service name the AM would use to locate the RM.
+Maybe use the cluster ID as the key ? active and standby RMs will share the same cluster ID. RMs from different cluster use different cluster IDs. , bq. I see. looks like Credentials doesn't have a removeToken method. If so, we may remove the old token with the empty service name.
+
+I'm missing how we're going to remove the old token with teh empty service name if Credentials doesn't let you remove tokens?
+
+bq. Maybe use the cluster ID as the key ? active and standby RMs will share the same cluster ID. RMs from different cluster use different cluster IDs. 
+
+This would be a good idea if we know with certainty that the client also knows the cluster ID.  It would need it to update the token with the appropriate service name to make sure it's clobbering the appropriate token.  Unfortunately I don't think it's guaranteed, since the client doesn't seem to need it to function properly., bq. I'm missing how we're going to remove the old token with teh empty service name if Credentials doesn't let you remove tokens?
+We may need to expose UserGroupInformation#getCredentialsInternal to be public and add a Credentials#removeToken method which can remove the token from the Credentials#tokenMap, ClientRMProxy call {{UserGroupInformation#getCurrentUser()#getCredentialsInternal#removeToken(serviceName)}},  though this doesn't look good..
+bq. Unfortunately I don't think it's guaranteed, since the client doesn't seem to need it to function properly.
+right. today cluster ID is defined in yarn-site.xml. It's not guaranteed each AM has the right cluster ID defined in its yarn-site.xml; , On second thought, maybe the client doesn't need to know the service name the RM used.  The RM is already sending an updated token _that the RM generated_ to the AM.  If the AM blindly stuffs it into the credentials _before_ it tries to fixup the token then it will use whatever service name the RM left on the token.  As long as that service name matches the one the RM put in originally (and ideally it's not going to collide with any other token) then we know it will clobber the old AMRM token as intended.  Then the client can fixup the token service name _after_ it's been stored in the credentials, just like it does during AM startup.
+
+So we just need the AM to generate something that will not collide with non-AMRM tokens and also not collide with tokens from other cluster RMs.  Cluster ID is tempting, but if the AM is talking to two, non-HA clusters then I'm not sure we know the user bothered to configure the cluster ID.  However I think we _have_ to use the cluster ID otherwise two RMs in the same HA-enabled cluster could generate different service names which breaks things.  So I think the cluster ID is our best bet, with the caveat that if an AM needs to wield multiple AMRM tokens then all clusters involved need to have unique cluster IDs configured.  Thoughts?, bq. Then the client can fixup the token service name after it's been stored in the credentials,  just like it does during AM startup.
+Good point.  or we can loop the existing tokens in UGI and select out the AMRMToken based on token kind and set the token service name.
+Or another way is to fix AM startup to inject the correct AMRMToken service name instead of empty string. Each way looks fine to me. 
+
+Currently, AMRMToken service name is reset on AM side with a concatenated string of multiple RM addresses; If we do above, then we don't need the cluster ID?, bq.  we can loop the existing tokens in UGI and select out the AMRMToken based on token kind and set the token service name.
+
+That will be problematic with multiple AMRM tokens, since we won't know which token is which.  Also, we have the token in-hand from the AllocateResponse call, no need to go hunting for it -- or are you thinking of a different scenario?
+
+bq. Or another way is to fix AM startup to inject the correct AMRMToken service name instead of empty string.
+
+AM startup already fixes the service name of the token, but it does not (and cannot) change the key/alias associated with the token in the credentials.  Without changing UserGroupInformation to return a modifiable credentials and modifying Credentials to let us remove tokens, I don't see how we can update the key/alias associated with a token in the Credentials.
+
+bq. Currently, AMRMToken service name is reset on AM side with a concatenated string of multiple RM addresses; If we do above, then we don't need the cluster ID?
+
+The key/alias associated with the AMRM token is determined by the RM since it stuffs the token into the AM's credentials as part of the AM launch process.  If we can't change the key/alias once established then this is something only the RM can do., Attaching a patch that fixes which UGI is being updated along with updating the test to properly emulate what the RM is doing when setting up the UGI originally for the AM.  Without the fix the test now fails by detecting there are multiple AMRM tokens in the UGI during the AMRM token update test.
+
+Note that this patch does not address the issue of what the RM should use for a service name when setting up the AMRM token.  It just preserves whatever string the RM sent when adding the token to the UGI then updates it afterwards.  We can address the empty service name issue in a followup JIRA., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12695065/YARN-3103.001.patch
+  against trunk revision 9850e15.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:red}-1 eclipse:eclipse{color}.  The patch failed to build with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6440//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6440//console
+
+This message is automatically generated., patch looks good to me.
+
+bq. In addition the AMRMClientImpl grabs the login user rather than the current user when security is enabled
+[~xgong], do you recall why this change is made? maybe it didn't work on secure cluster when using the current ugi?  Jason, does the patch work on secure cluster too? 
+
+bq. That will be problematic with multiple AMRM tokens, since we won't know which token is which. Also, we have the token in-hand from the AllocateResponse call, no need to go hunting for it – or are you thinking of a different scenario?
+make sense, I missed the part that we already got a handle from AllocateResponse. {{ClientRMProxy#setAMRMTokenService}} now loops the existing tokens and set the token service name. If we support multiple AMRM tokens, this code will break too. Anyway, this can be addressed later.
+
+bq. AM startup already fixes the service name of the token, but it does not (and cannot) change the key/alias associated with the token in the credentials.
+In MRAppMaster#initAndStartAppMaster, will it work if we insert the correct key/alias when adding credentials into appMasterUgi ?
+
+bq. If we do above, then we don't need the cluster ID?
+I meant given we already have a way to uniquely identify the AMRMToken on AM side based on the concatenated RM addresses. we may not need an extra cluster ID to uniquely identify the token., bq.  Jason, does the patch work on secure cluster too? 
+
+I didn't test this particular patch on a secure cluster, however I did test the same kind of change in MAPREDUCE-6230 on a secure cluster.  That patch did not work if I let it update the login user instead of the current user.  The current user is what the RPC layer is going to use (indeed, most of the purpose doAs exists is to specify which UGI the RPC layer will use), so I have no idea why we would try to circumvent that and update some other UGI.
+
+bq. In MRAppMaster#initAndStartAppMaster, will it work if we insert the correct key/alias when adding credentials into appMasterUgi ?
+
+Yes, I suppose there is one way to change what key/alias is associated with a token in Credentials and that's to create a complete copy of the credentials and specify the new alias when adding the token to the copy.  Since innitAndStartAppMaster is doing that, it could explicitly specify the key/alias by manually copying the credentials and special-casing the AMRM token.  Seems simpler to just re-use the alias set by the RM if that can work.  Or just add a UGI/Credentials API to update the service name of a token that also updates its key/alias in the credentials map so subsequent token stores will overwrite that token.  Or maybe a bit cleaner to have an API that explicitly says to replace one token with another, since the client can hunt down the old AMRM token using its updated service name., bq. That patch did not work if I let it update the login user instead of the current user. 
+I see. The previous version patch in YARN-3103 actually use the current user, and then changed to use login user in secure mode for some reason. 
++1 to the patch.  [~xgong], do you have any comments ?, bq. The previous version patch in YARN-3103 
+sorry, I meant YARN-2212, I do not have any other comments. +1 for the patch.
+
+bq. The previous version patch in YARN-3103 actually use the current user, and then changed to use login user in secure mode for some reason. 
+I do not remember why I made this change in YARN-2212. , Committed to trunk and branch-2 ,  thanks Jason !, FAILURE: Integrated in Hadoop-trunk-Commit #6953 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/6953/])
+YARN-3103. AMRMClientImpl does not update AMRM token properly. Contributed by Jason Lowe (jianhe: rev 6d2bdbd7dab179dfb4f19bb41809e97f1db88c6b)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/AMRMClientImpl.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestAMRMClient.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #88 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/88/])
+YARN-3103. AMRMClientImpl does not update AMRM token properly. Contributed by Jason Lowe (jianhe: rev 6d2bdbd7dab179dfb4f19bb41809e97f1db88c6b)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/AMRMClientImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestAMRMClient.java
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Yarn-trunk #822 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/822/])
+YARN-3103. AMRMClientImpl does not update AMRM token properly. Contributed by Jason Lowe (jianhe: rev 6d2bdbd7dab179dfb4f19bb41809e97f1db88c6b)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/AMRMClientImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestAMRMClient.java
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #89 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/89/])
+YARN-3103. AMRMClientImpl does not update AMRM token properly. Contributed by Jason Lowe (jianhe: rev 6d2bdbd7dab179dfb4f19bb41809e97f1db88c6b)
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/AMRMClientImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestAMRMClient.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #85 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/85/])
+YARN-3103. AMRMClientImpl does not update AMRM token properly. Contributed by Jason Lowe (jianhe: rev 6d2bdbd7dab179dfb4f19bb41809e97f1db88c6b)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/AMRMClientImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestAMRMClient.java
+* hadoop-yarn-project/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #2020 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2020/])
+YARN-3103. AMRMClientImpl does not update AMRM token properly. Contributed by Jason Lowe (jianhe: rev 6d2bdbd7dab179dfb4f19bb41809e97f1db88c6b)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestAMRMClient.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/AMRMClientImpl.java
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2039 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2039/])
+YARN-3103. AMRMClientImpl does not update AMRM token properly. Contributed by Jason Lowe (jianhe: rev 6d2bdbd7dab179dfb4f19bb41809e97f1db88c6b)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestAMRMClient.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/AMRMClientImpl.java
+* hadoop-yarn-project/CHANGES.txt
+, Pulled this into 2.6.1. Ran compilation and TestAMRMClient before the push. Patch applied cleanly.]

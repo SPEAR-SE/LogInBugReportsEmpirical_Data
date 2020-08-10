@@ -1,0 +1,90 @@
+[bin-incompat would be good to do in 4.0
+
+bin-compat is "good enough" for now imo given this should happen relatively infrequently (granted it can happen)., We fixed this by use 31-bit only. , As I said，it may core or hang after about ten days on one of our internal services., I have multiple cases of this causing cores on long-running clients. See [ZOOKEEPER-2318|https://issues.apache.org/jira/browse/ZOOKEEPER-2318] for an example of what this looks like.
+
+I'm not convinced that the bin-compat option above would solve the issue, at least for the C client as it's currently implemented. The client uses a static variable to track the XID, so expiring the session doesn't seem like it would reset it, and the client would keep trying negative XIDs.
+
+Simply wrapping the XID to 0 after it hits INT32_MAX seems like it would fix the issue, since as far as I can tell, the client XID is only used for equality comparisons to match server responses to pending completions., I think that [~makuchta] is right on this one as well. If he's right, and the only purpose of the C client xid is to to track equality of operations submitted to the server and the responses that come back, then it seems like the simplest, and most correct thing to do here is the following:
+
+1. In get_xid(), we should initialize xid to 0 rather than time(0). Starting at zero instead of the time since the epoch ensures we have as much runway as possible before we wrap.
+
+2. As Martin suggests, Inside get_xid, if we overflow INT32_MAX, then simply set it back to 0. I don't think there's any risk of collisions here since that gives us as the maximum amount of digits before wrapping. The odds of an existing in-flight operation that happened 2147483647 operations ago still lingering around or causing any confusion seems beyond unlikely IMO.
+
+The nice thing about this is we don't have to make any changes to the server or worry about compatibility.
+
+[~phunt] what do you think?, [~fanster.z], [~fpj] or [~michim] - any of you have any thoughts on this?, [~marshall] The reasoning sounds right to me, resetting to 0 when overflowing should not cause a problem. The Java client also only checks if the expected and received xid values are the different in {{ClientCnxn.readResponse}}. 
+
+This discussion actually made me think of ZOOKEEPER-22, which we should really finish up some day. In that jira, we want to avoid a duplicate execution of, e.g., when creating sequential znodes. I believe we will need to use the xid there as well to find the response for the request. The one problem I see is that a client that takes a really long time to reconnect might end up seeing a different response for its request if multiple requests can have the same xid. This is highly unlikely given that in practice it should take some time to wraparound and we might be able to play with zxids and such. I'd need to think again about that jira, though.
+
+I'm also thinking that closing the session might be a better alternative to avoid the wraparound issue altogether. I'm not sure why the observation about the xid being a static variable stops us from doing it.  , [~fpj] - I agree we should fix ZOOKEEPER-22. Does it make sense to fix this case first and then come back to ZOOKEEPER-22? It seems like we should handle overflow safely either way and in that regard I think ZOOKEEPER-22 would be good follow-on work to do after this one. 
+
+I think the issue that [~makuchta] brought up with regard to closing the session is not understanding how the client reacts to having the session closed., We can fix this issue first, but I'd like us to keep ZOOKEEPER-22 in mind when fix this here., [~fpj], thanks for providing your thoughts.
+
+To clarify a bit on the issue I had with just expiring the session:
+
+In the C client, the only time the xid variable is initialized is when the client process starts. Expiring the session would force the client to reconnect, but I can't see how that would reset the xid since its lifetime is tied to the process. In the Java client, the xid is a field in ClientCnxn, which is a final field in the ZooKeeper class. Does session expiration force you to construct a new ZooKeeper object? My understanding of this is probably incomplete, but that's the angle I was looking at it from. 
+
+That's not to say that expiring the session is wrong if the client sends a request with an invalid XID, but I still think the client itself needs to handle overflow in some way., > Does session expiration force you to construct a new ZooKeeper object
+
+I wouldn't say "force". What happens is that once the client ZooKeeper object learns that it's session is expired it will go into the closed state - it's no longer usable at that point. The client would be forced to create a new session (new ZK object) in order to communicate with the service. This is the same as if the client is partitioned from the service for a period of time, when it comes back, if sufficient time has passed (> session timeout) then the session will be expired and the same logic would be executed by the client., That makes sense. I probably should have brushed up on my knowledge of the Java client and ZooKeeper states in general before asking, but thanks for the clarification.
+
+With that information, I think having the server expire a client's session when it receives a negative XID would fix the issue in the Java client. The issue would remain in the C client because XID initialization is still tied to the start of the process and not the ZooKeeper handle initialization. I can see two potential fixes for the overall problem.
+
+a) Expire the session upon receiving a negative XID. Modify the C client to make the XID a member of the zhandle struct to more closely mirror the Java client. Initialize the new XID struct member in zookeeper_init_internal.
+
+b) Modify both clients to wrap the XID around as described above.
+
+These aren't mutually exclusive either, but I think only one should be needed. Option (a) would ensure XID uniqueness for all requests made by a single connection (not currently done because XIDs will be reused when they wrap all the way around to the starting value). Option (b) is a simpler (and probably lower risk) fix, being a small value check in the client code only., Assigning this to [~makuchta] as he's been working this issue for us., I am uploading a patch that takes the approach of wrapping the XID around when the max value is reached. The Java client and both multi- and single-threaded C implementations have been modified. They also now all initialize the XID to 1 to match the Java client's behavior (the C implementations used epoch time before), though I don't think it matters.
+
+We're likely going to deploy this fix internally, since we're hitting the overflow issue somewhat frequently given the number of ZooKeeper deployments we have and the volume of requests they're processing. It sounds like [~fanster.z] fixed the issue in a similar way.
+
+We can discuss whether mainline ZooKeeper should take a different approach toward fixing this based on the points made above., Should we add a test case about this if there is no existing tests? We could add a "test only" method like set_xid if it is hard to simulate the overflow condition in a test. 
+
+I am also wondering what is the performance implication by changing get_xid from using a compiler intrinsic / atomic operation to use explicit locks. I think it is possible to implement the same 'wrap if overflow' operation using CAS. Generally lock free atomic operation provides better performance comparing to locks, but it of course depends on the use cases such as the level of contention / number of threads, so without benchmark in a specific context it might hard to tell. Not saying we should over optimize, just want to bring this up see if this is a real concern or not.
+
+, I was thinking about the value of a test case around the overflow condition here. Like you said, we would need to add a set_xid function and move the xid variable outside the get_xid function to let both functions access it. I didn't see an existing pattern to add test-only code either. Do you have any suggestions?
+
+As for the performance issue, that's also a valid point. I was a bit hesitant to replace the atomic operation at first, but I'm not sure it's actually an issue. The locking happens once per client request, the lock is held for a very short period of time, and each request already performs other locking on the ZK handle (enter_critical(), lock_buffer_list()). The one difference here might be that this is a global lock not tied to a particular zhandle, which could cause performance issues with multiple threads making requests with different zhandles.
+
+I don't think you can correctly implement this using a plain CAS and atomic add. Any way you combine those operations, I think there's a chance the CAS won't trigger on the value you're checking against. Did you have a specific implementation in mind? I might be approaching it from the wrong angle when trying to reason about possible implementations., bq. I didn't see an existing pattern to add test-only code either. Do you have any suggestions?
+I think zoo_get_current_server could be one existing example of a 'largely for testing purposes' code. 
+
+bq. which could cause performance issues with multiple threads making requests with different zhandles.
+Yeah this was what I thought about. Might not be an issue if the number of threads is capped. 
+
+bq. Did you have a specific implementation in mind?
+How about this (in C++, could be updated to use gcc intrinsics as well in C):
+{code}
+#include <atomic>
+#include <limits>
+
+std::atomic<uint32_t> count;
+
+uint32_t get_count() {
+    uint32_t new_count;
+    uint32_t cur_count;
+    do {
+        uint32_t cur_count = count;
+        if (cur_count == std::numeric_limits<uint32_t>::max()) {
+            new_count = 1;
+        } else {
+            new_count = cur_count + 1;
+        }
+    } while(!std::atomic_compare_exchange_weak(&count, &cur_count, new_count));
+    return new_count;
+}
+{code}, I'm not entirely convinced that this is the right way to address this issue. I was having another look at ZOOKEEPER-22, which is something I'd really like to see implemented eventually and I'm concerned that this approach of allowing the same xid to appear twice in a session could create problems. Not repeating xid values for a given session sounds like a cleaner abstraction compared to wrapping around like this.
+
+What if we fix by not making the xid static in the C client and getting a new handle?
+
+Also, it is important that we added test cases specially when there is a change of behavior. Even if the change is trivial, we want to be able to test that future changes won't break it., bq. I'm concerned that this approach of allowing the same xid to appear twice in a session could create problems.
+Another potential problem I am thinking is if we allow repeatable xids then we would not easily figure out the system state (as we don't record how many times the id has been wrapped so far) from server logs which I am not sure is a real problem but a little bit concerning to me. I think the design of not allowing repeatable xid is better from the perspective of making the system behavior explicit and easier to understand.
+
+bq. What if we fix by not making the xid static in the C client and getting a new handle?
+I think this should work - I don't see a reason why xid can't be made as a member of zk handle in C as in Java client. So whenever overflow happens, we simply close the session on server side. Client has to then handle the session close, more work on client but sounds reasonable as client has to deal with session close event anyway.
+
+Alternatively, we could add another counter in client code that records how many times a wrap happen. This effectively make the real xid (xid + INT_MAX * counter) not repeatable on client side. The counter could be sneaked into the OpCode field (as we don't use all the bits so far) of the request header so the times to wrap has a paper trail on server side as well.
+
+, bq. Alternatively, we could add another counter in client code that records how many times a wrap happen. This effectively make the real xid (xid + INT_MAX * counter) not repeatable on client side. The counter could be sneaked into the OpCode field (as we don't use all the bits so far) of the request header so the times to wrap has a paper trail on server side as well.
+
+If we are to do this, then perhaps we should just make the zxid a 64-bit integer and deal with the backward compatibility problem., Yeah, this 'alternative' approach is to satisfy the constraint of maintaining compatibility with existing protocol. It sounds a hacky solution to me.]

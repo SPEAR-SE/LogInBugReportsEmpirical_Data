@@ -1,0 +1,232 @@
+[[~cyfdecyf] Can you reproduce this issue and capture the stack of RM
+ # jstack -F pid
+ # top -H -p pid 
+
+then attach those info in this Jira so that we can figure out the cause of infinite loop here., [~cyfdecyf], I couldn't find the error message on the latest codebase. Not sure if this still a problem in latest release (3.1.0). We have many fixes in the last several months for CapacityScheduler scheduling after YARN-5139, I believe many of them are not backported to 2.9.1. Could u check if the problem still exists in 3.1.0 if possible?, [~yuanbo] I'll capture those info when I encounter this problem again next time. Currently I don't know the exact trigger condition for the problem, so have to wait for some time., [~leftnoteasy] Thanks for your suggestions. I'll deploy a test environment with 3.1.0 and test it with some of our production workloads. This may take quite some time but I'll report my findings when I've done the test., [~yuanbo] I've uploaded jstack and top log when the problem appeared yesterday.
+
+jstack log is captured for 5 times thus 5 log files.
+
+[^top-during-lock.log] is captured when RM is not responding to requests.
+
+[^top-when-normal.log] is captured today and RM is running normally., Sorry for the late response. Quite busy this week. I will go through the dump files today, We also met this problem in 2.9.1. It is caused by deadlock., We got infinite loops two times recently with 2.9.1, restarting ResourceManager fixed the issue again.
+
+ 
+
+As the cause of the problem is still not clear, we have upgraded to Hadoop 3.1.0. I'll give further updates in case we encounter this issue again., [~leftnoteasy] We encounter the same problem twice today with Hadoop 3.1.0. ResourceManager log messages are the same as before, flushing out 20k lines every seconds during deadlock.
+
+Our current setup enables ResourceManager and NameNode HA, killing the active ResourceManager with SIGKILL will turn other standby RM to active state, and the new active RM can work properly.
+
+ApplicationMaster running on our cluster is a slightly modified version of distributedshell (modified from Hadoop 2.7.1). When updating to Hadoop 3.1.0, we fixed all deprecated APIs and didn't make other modifications. During the RM deadlock, I killed the AM (having very low CPU usage) which is being reported in the log message, but RM still flushes the same log messages. If the problem is caused by our AM, killing the problematic AM may turn RM to a normal state. But seems like it's the internal deadlock in RM causing the problem., [~cyfdecyf], 
+
+Could u upload logs/jstacks for 3.1.0 deployment? We can help to take a look at it. It will be better if you can enable DEBUG log of {{org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity}} for a short while.
+
+cc: [~sunil.govind@gmail.com], [~cheersyang]. , [~leftnoteasy] Thanks for your help. I'll enable capacity scheduler DEBUG log and upload logs/jstacks when the problem occurs again., New jstack/top and RM logs are uploaded and prefixed with yarn3. We upgraded to Hadoop 3.1.1 yesterday and encounter this problem several times.
+
+The problem seems reproducible when one queue is near fully utilized. Killing current active RM can not solve the problem. We have to kill some jobs in the fully utilized queue in order to submit new jobs.
+
+Debug log shows that CapacityScheduler repeatedly trying to schedule on a specific node, but as queue resource has exceeded resource limit, allocation proposal won't be accepted. top command shows only one thread with near 100% CPU usage, strace shows this thread is the one trying to do the allocation and flushing out logs.
+
+I've tried to dig into source code, but can't find out why RM repeatedly trying to schedule on a specific node.
+
+Some notes about our setup:
+
+* 3 partitions: default, sim, gpu
+* 4 queues: dev & mkt (10% capacity, max 90%), dev-daily & mkt-daily (40% capacity, max 100%)
+* preemption disabled, Hi [~cyfdecyf]
+
+From the RM log you uploaded, in 1 sec, there are 70 times of
+{code:java}
+ Trying to schedule on node: rndcl58.rt.com, available: <memory:120769, vCores:28>
+{code}
+From jstack files, they both have
+{code:java}
+Thread 328918: (state = IN_JAVA)
+...
+org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler.allocateContainersToNode(org.apache.hadoop.yarn.server.resourcemanager.scheduler.placement.CandidateNodeSet, boolean) @bci=50, line=1647 (Compiled frame) - org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler.allocateContainersToNode(org.apache.hadoop.yarn.api.records.NodeId, boolean) @bci=102, line=1417 (Compiled frame) - org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler.nodeUpdate(org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode) @bci=110, line=1258 (Compiled frame)
+{code}
+so they are triggered by nodeUpdate (HB). Looks like the RM dispatcher is flooded with NM HBs? I think we need more info, what's the size of your cluster and what is the time interval of the NM HB?
+
+Thanks, [~cheersyang] Thanks for looking into this issue.
+
+The log message file is truncated (because mosts are repeated), the whole log size in a second is 60MB and contains about 5300 lines of "Trying to schedule on node".
+
+Cluster size:
+
+* default partition: 79 NM
+* sim: 45 NM
+* gpu: 0 NM (we still have Hadoop 2.9.1 running and some nodes haven't join the new version of Hadoop)
+
+NM HB interval is not changed and is the default values 1000ms.
+
+I looked at some NMs CPU usage when the infinite loop happens, but didn't see high CPU usage of NM process., Thanks for the info [~cyfdecyf]. To work more efficiently on this issue, lets collaborate on Slack. I created a channel {{yarn-8513}} and please use [this link|https://join.slack.com/t/yarn-group/shared_invite/enQtNDE5NTA0ODk2NTE3LTljNWE2MzdjMWU5NGUyYTJkYjI0YmJhNzc4NDg5MTMwMWRiZDI1OGE2YWI4ZTE1MzQ2MjBkYWRjNDk0MjJhMTY] to join., Discussed with [~cyfdecyf] in the slack channel, it looks like this issue was caused by the greedy container assignments per HB mechanism, for some reason, it never stop trying assign new containers for this particular node in a while loop. I suggested to add following config to work-around
+{noformat}
+“yarn.scheduler.capacity.per-node-heartbeat.multiple-assignments-enable”=“true”
+“yarn.scheduler.capacity.per-node-heartbeat.maximum-container-assignments”=“10”
+{noformat}
+At the mean time, [~cyfdecyf] is trying to apply this config changes to their cluster to see if that helps, and I am trying to reproduce this issue locally., Interesting, [~cheersyang], 
+
+I can only think about reservation allocation causes the issue, but given we already have logic below, it should not happen:
+
+{code} 
+    // And it should not be a reserved container
+    if (assignment.getAssignmentInformation().getNumReservations() > 0) {
+      return false;
+    }
+{code} 
+
+We should be able to see what kind of allocation causes the issue, or is it possible that CSAssignment indicate allocation happens but actually it doesn't.
+
+What is the {{maximum-container-assignments}} settings now?, [~leftnoteasy] My original config did not have the two config options specified so should be using the default values.
+
+Currently I have applied the configuration suggested by [~cheersyang], so maximum-container-assignments is 10 now., I also check the logic for printing out of the error "Failed to accept allocation proposal".
+
+allocateContainersToNode
+	-- if canAllocateMore // (decided by yarn.scheduler.capacity.per-node-heartbeat.maximum-container-assignments)
+		-- allocateContainersToNode
+		 -- allocateContainerOnSingleNode
+		  -- allocateOrReserveNewContainers
+		   -- submitResourceCommitRequest
+		     -- tryCommit
+		       -- LOG.info("Failed to accept allocation proposal");
+
+
+
+It seems this error is indeed caused by infinit number of of container requests., [~hustnn], what is the cause of "Failed to accept allocation proposal"? You should be able to get this from DEBUG log. Once we understand why allocation proposal got rejected, we can understand why such loop happens., OK. I will try., [~leftnoteasy] Can reproduce as follow:
+
+1.Specify 2 queues:
+    - queue1:
+        - capacity: 68
+        - maximum-capacity: 100
+    - queue2:
+        - capacity: 32
+        - maximum-capacity: 60
+2. Submit a big spark job, make sure this job use resource higher than queue's capacity(68%), like 90% of the cluster's resource.
+    pyspark --num-executor=100 --executor-memory=20g --queue=queue1
+3. Submit another big spark job. 
+    pyspark --num-executor=100 --executor-memory=20g --queue=queue2
+4.Then the resource manager log will show the "Failed to accept allocation proposal".
+
+And if I change the maximum-capacity of queue2 to 100 or -1, the log stops flushing., Thanks. I will try it tomorrow. , Interesting, it must be caused by CS allocation doesn't fully consider queue maximum resource in some cases. Tried to look at related code, hasn't figured out root case yet. 
+
+CS allocation phase relies on the logic of ResourceLimits passed by upper level component (Parent of queues, queue of apps, etc.). Under some corner cases, the ResourceLimits passed in could be larger than accurate. 
+
+[~Card], could u enable DEBUG log of org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity, and rerun the test? (or you can click "dump DEBUG log" in CS web UI) It gonna be helpful if you can get a few seconds DEBUG log for our troubleshooting when the infinite loop happens., And btw, I found a comment in LeafQueue:
+{code:java}
+private void updateCurrentResourceLimits(
+    ResourceLimits currentResourceLimits, Resource clusterResource) {
+  // TODO: need consider non-empty node labels when resource limits supports
+  // node labels
+  // Even if ParentQueue will set limits respect child's max queue capacity,
+  // but when allocating reserved container, CapacityScheduler doesn't do
+  // this. So need cap limits by queue's max capacity here.
+  this.cachedResourceLimitsForHeadroom =
+      new ResourceLimits(currentResourceLimits.getLimit());
+  Resource queueMaxResource = getEffectiveMaxCapacityDown(
+      RMNodeLabelsManager.NO_LABEL, minimumAllocation);
+  this.cachedResourceLimitsForHeadroom.setLimit(Resources.min(
+      resourceCalculator, clusterResource, queueMaxResource,
+      currentResourceLimits.getLimit()));
+}{code}
+I can remember a little bit when I wrote the code: YARN-3243 fixed an issue which ParentQueue's max capacity could be violated. I didn't consider node label max capacity because at that time per-queue per-label capacities support has some issues. I believe the issue should be fixed in later patches, but it is worth to check if we need any other fixes. 
+
+[~Card], does this happen when node label is being used or not? , I also tested. This happens when node label is not used. Is it caused by the resource request which is already rejected but still recovered? So it never ends., Debug dump:
+{code:java}
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeImpl: Processing xxx-test-cluster04:45454 of type STATUS_UPDATE
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.event.AsyncDispatcher: Dispatching the event org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeUpdateSchedulerEvent.EventType: NODE_UPDATE
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler: nodeUpdate: xxx-test-cluster04:45454 cluster capacity: <memory:1351680, vCores:240>
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler: Node being looked for scheduling xxx-test-cluster04:45454 availableResource: <memory:82944, vCores:77>
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler: Trying to schedule on node: xxx-test-cluster04, available: <memory:82944, vCores:77>
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue: Trying to assign containers to child-queue of root
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.AbstractCSQueue: Check assign to queue: root nodePartition: , usedResources: <memory:1095680, vCores:8>, clusterResources: <memory:1351680, vCores:240>, currentUsedCapacity: 0.81060606, max-capacity: 1.0
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue: printChildQueues - queue: root child-queues: root.dwusedCapacity=(1.1842697),  label=(*)root.devusedCapacity=(0.016571993),  label=(*)
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue: Trying to assign to queue: root.dev stats: dev: capacity=0.32, absoluteCapacity=0.32, usedResources=<memory:7168, vCores:1>, usedCapacity=0.016571993, absoluteUsedCapacity=0.0053030304, numApps=1, numContainers=1
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.LeafQueue: assignContainers: partition= #applications=1
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.AbstractCSQueue: Check assign to queue: dev nodePartition: , usedResources: <memory:7168, vCores:1>, clusterResources: <memory:1351680, vCores:240>, currentUsedCapacity: 0.0053030304, max-capacity: 0.6
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.UsersManager: userLimit is fetched. userLimit=<memory:432640, vCores:77>, userSpecificUserLimit=<memory:432640, vCores:77>, schedulingMode=RESPECT_PARTITION_EXCLUSIVITY, partition=
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.LeafQueue: Headroom calculation for user work:  userLimit=<memory:432640, vCores:77> queueMaxAvailRes=<memory:811008, vCores:144> consumed=<memory:7168, vCores:1> partition=
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.fica.FiCaSchedulerApp: pre-assignContainers for application application_1535930391687_0019
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.UsersManager: userLimit is fetched. userLimit=<memory:432640, vCores:77>, userSpecificUserLimit=<memory:432640, vCores:77>, schedulingMode=RESPECT_PARTITION_EXCLUSIVITY, partition=
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt: showRequests: application=application_1535930391687_0019 headRoom=<memory:425472, vCores:76> currentConsumption=7168
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.placement.LocalitySchedulingPlacementSet:         Request={AllocationRequestId: 0, Priority: 1, Capability: <memory:360448, vCores:2>, # Containers: 3, Location: *, Relax Locality: true, Execution Type Request: null, Node Label Expression: }
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.allocator.RegularContainerAllocator: assignContainers: node=xxx-test-cluster04 application=application_1535930391687_0019 priority=1 pendingAsk=<per-allocation-resource=<memory:360448, vCores:2>,repeat=3> type=OFF_SWITCH
+2018-09-03 11:44:11,175 INFO org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.allocator.AbstractContainerAllocator: Reserved container  application=application_1535930391687_0019 resource=<memory:360448, vCores:2> queue=org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.allocator.RegularContainerAllocator@65ed660 cluster=<memory:1351680, vCores:240>
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.LeafQueue: post-assignContainers for application application_1535930391687_0019
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.UsersManager: userLimit is fetched. userLimit=<memory:432640, vCores:77>, userSpecificUserLimit=<memory:432640, vCores:77>, schedulingMode=RESPECT_PARTITION_EXCLUSIVITY, partition=
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt: showRequests: application=application_1535930391687_0019 headRoom=<memory:425472, vCores:76> currentConsumption=7168
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.placement.LocalitySchedulingPlacementSet:         Request={AllocationRequestId: 0, Priority: 1, Capability: <memory:360448, vCores:2>, # Containers: 3, Location: *, Relax Locality: true, Execution Type Request: null, Node Label Expression: }
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue: Assigned to queue: root.dev stats: dev: capacity=0.32, absoluteCapacity=0.32, usedResources=<memory:7168, vCores:1>, usedCapacity=0.016571993, absoluteUsedCapacity=0.0053030304, numApps=1, numContainers=1 --> <memory:360448, vCores:2>, OFF_SWITCH
+2018-09-03 11:44:11,175 INFO org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue: assignedContainer queue=root usedCapacity=0.81060606 absoluteUsedCapacity=0.81060606 used=<memory:1095680, vCores:8> cluster=<memory:1351680, vCores:240>
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue: ParentQ=root assignedSoFarInThisIteration=<memory:360448, vCores:2> usedCapacity=0.81060606 absoluteUsedCapacity=0.81060606
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler: Try to commit allocation proposal=New org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.ResourceCommitRequest:
+         RESERVED=[(Application=appattempt_1535930391687_0019_000001; Node=xxx-test-cluster04:45454; Resource=<memory:360448, vCores:2>)]
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.UsersManager: userLimit is fetched. userLimit=<memory:432640, vCores:77>, userSpecificUserLimit=<memory:432640, vCores:77>, schedulingMode=RESPECT_PARTITION_EXCLUSIVITY, partition=
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.LeafQueue: Headroom calculation for user work:  userLimit=<memory:432640, vCores:77> queueMaxAvailRes=<memory:811008, vCores:144> consumed=<memory:7168, vCores:1> partition=
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.AbstractCSQueue: Used resource=<memory:1095680, vCores:8> exceeded maxResourceLimit of the queue =<memory:1351680, vCores:240>
+2018-09-03 11:44:11,175 INFO org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler: Failed to accept allocation proposal
+2018-09-03 11:44:11,175 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler: Assigned maximum number of off-switch containers: 1, assignments so far: resource:<memory:360448, vCores:2>; type:OFF_SWITCH; excessReservation:null; applicationid:null; skipped:NONE; fulfilled reservation:false; allocations(count/resource):0/<memory:0, vCores:0>; reservations(count/resource):1/<memory:360448, vCores:2>
+2018-09-03 11:44:11,287 DEBUG org.apache.hadoop.ipc.Server:  got #68890
+2018-09-03 11:44:11,287 DEBUG org.apache.hadoop.ipc.Server: IPC Server handler 30 on 8031: Call#68890 Retry#0 org.apache.hadoop.yarn.server.api.ResourceTrackerPB.nodeHeartbeat from 10.65.205.151:60900 for RpcKind RPC_PROTOCOL_BUFFER
+2018-09-03 11:44:11,287 DEBUG org.apache.hadoop.security.UserGroupInformation: PrivilegedAction as:work (auth:SIMPLE) from:org.apache.hadoop.ipc.Server$Handler.run(Server.java:2606)
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.ipc.Server: Served: nodeHeartbeat, queueTime= 1 procesingTime= 0
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.event.AsyncDispatcher: Dispatching the event org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeStatusEvent.EventType: STATUS_UPDATE
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeImpl: Processing xxx-test-cluster03:45454 of type STATUS_UPDATE
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.ipc.Server: IPC Server handler 30 on 8031: responding to Call#68890 Retry#0 org.apache.hadoop.yarn.server.api.ResourceTrackerPB.nodeHeartbeat from 10.65.205.151:60900
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.event.AsyncDispatcher: Dispatching the event org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeUpdateSchedulerEvent.EventType: NODE_UPDATE
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.ipc.Server: IPC Server handler 30 on 8031: responding to Call#68890 Retry#0 org.apache.hadoop.yarn.server.api.ResourceTrackerPB.nodeHeartbeat from 10.65.205.151:60900 Wrote 42 bytes.
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler: nodeUpdate: xxx-test-cluster03:45454 cluster capacity: <memory:1351680, vCores:240>
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler: Node being looked for scheduling xxx-test-cluster03:45454 availableResource: <memory:90112, vCores:78>
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler: Trying to schedule on node: xxx-test-cluster03, available: <memory:90112, vCores:78>
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue: Trying to assign containers to child-queue of root
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.AbstractCSQueue: Check assign to queue: root nodePartition: , usedResources: <memory:1095680, vCores:8>, clusterResources: <memory:1351680, vCores:240>, currentUsedCapacity: 0.81060606, max-capacity: 1.0
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue: printChildQueues - queue: root child-queues: root.dwusedCapacity=(1.1842697),  label=(*)root.devusedCapacity=(0.016571993),  label=(*)
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue: Trying to assign to queue: root.dev stats: dev: capacity=0.32, absoluteCapacity=0.32, usedResources=<memory:7168, vCores:1>, usedCapacity=0.016571993, absoluteUsedCapacity=0.0053030304, numApps=1, numContainers=1
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.LeafQueue: assignContainers: partition= #applications=1
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.AbstractCSQueue: Check assign to queue: dev nodePartition: , usedResources: <memory:7168, vCores:1>, clusterResources: <memory:1351680, vCores:240>, currentUsedCapacity: 0.0053030304, max-capacity: 0.6
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.UsersManager: userLimit is fetched. userLimit=<memory:432640, vCores:77>, userSpecificUserLimit=<memory:432640, vCores:77>, schedulingMode=RESPECT_PARTITION_EXCLUSIVITY, partition=
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.LeafQueue: Headroom calculation for user work:  userLimit=<memory:432640, vCores:77> queueMaxAvailRes=<memory:811008, vCores:144> consumed=<memory:7168, vCores:1> partition=
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.fica.FiCaSchedulerApp: pre-assignContainers for application application_1535930391687_0019
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.UsersManager: userLimit is fetched. userLimit=<memory:432640, vCores:77>, userSpecificUserLimit=<memory:432640, vCores:77>, schedulingMode=RESPECT_PARTITION_EXCLUSIVITY, partition=
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt: showRequests: application=application_1535930391687_0019 headRoom=<memory:425472, vCores:76> currentConsumption=7168
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.placement.LocalitySchedulingPlacementSet:         Request={AllocationRequestId: 0, Priority: 1, Capability: <memory:360448, vCores:2>, # Containers: 3, Location: *, Relax Locality: true, Execution Type Request: null, Node Label Expression: }
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.allocator.RegularContainerAllocator: assignContainers: node=xxx-test-cluster03 application=application_1535930391687_0019 priority=1 pendingAsk=<per-allocation-resource=<memory:360448, vCores:2>,repeat=3> type=OFF_SWITCH
+2018-09-03 11:44:11,288 INFO org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.allocator.AbstractContainerAllocator: Reserved container  application=application_1535930391687_0019 resource=<memory:360448, vCores:2> queue=org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.allocator.RegularContainerAllocator@65ed660 cluster=<memory:1351680, vCores:240>
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.LeafQueue: post-assignContainers for application application_1535930391687_0019
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.UsersManager: userLimit is fetched. userLimit=<memory:432640, vCores:77>, userSpecificUserLimit=<memory:432640, vCores:77>, schedulingMode=RESPECT_PARTITION_EXCLUSIVITY, partition=
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt: showRequests: application=application_1535930391687_0019 headRoom=<memory:425472, vCores:76> currentConsumption=7168
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.placement.LocalitySchedulingPlacementSet:         Request={AllocationRequestId: 0, Priority: 1, Capability: <memory:360448, vCores:2>, # Containers: 3, Location: *, Relax Locality: true, Execution Type Request: null, Node Label Expression: }
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue: Assigned to queue: root.dev stats: dev: capacity=0.32, absoluteCapacity=0.32, usedResources=<memory:7168, vCores:1>, usedCapacity=0.016571993, absoluteUsedCapacity=0.0053030304, numApps=1, numContainers=1 --> <memory:360448, vCores:2>, OFF_SWITCH
+2018-09-03 11:44:11,288 INFO org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue: assignedContainer queue=root usedCapacity=0.81060606 absoluteUsedCapacity=0.81060606 used=<memory:1095680, vCores:8> cluster=<memory:1351680, vCores:240>
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.ParentQueue: ParentQ=root assignedSoFarInThisIteration=<memory:360448, vCores:2> usedCapacity=0.81060606 absoluteUsedCapacity=0.81060606
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler: Try to commit allocation proposal=New org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.ResourceCommitRequest:
+         RESERVED=[(Application=appattempt_1535930391687_0019_000001; Node=xxx-test-cluster03:45454; Resource=<memory:360448, vCores:2>)]
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.UsersManager: userLimit is fetched. userLimit=<memory:432640, vCores:77>, userSpecificUserLimit=<memory:432640, vCores:77>, schedulingMode=RESPECT_PARTITION_EXCLUSIVITY, partition=
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.LeafQueue: Headroom calculation for user work:  userLimit=<memory:432640, vCores:77> queueMaxAvailRes=<memory:811008, vCores:144> consumed=<memory:7168, vCores:1> partition=
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.AbstractCSQueue: Used resource=<memory:1095680, vCores:8> exceeded maxResourceLimit of the queue =<memory:1351680, vCores:240>
+2018-09-03 11:44:11,288 INFO org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler: Failed to accept allocation proposal
+2018-09-03 11:44:11,288 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler: Assigned maximum number of off-switch containers: 1, assignments so far: resource:<memory:360448, vCores:2>; type:OFF_SWITCH; excessReservation:null; applicationid:null; skipped:NONE; fulfilled reservation:false; allocations(count/resource):0/<memory:0, vCores:0>; reservations(count/resource):1/<memory:360448, vCores:2>
+2018-09-03 11:44:11,700 DEBUG org.apache.hadoop.ipc.Server:  got #440
+2018-09-03 11:44:11,700 DEBUG org.apache.hadoop.ipc.Server: IPC Server handler 2 on 8032: Call#440 Retry#0 org.apache.hadoop.yarn.api.ApplicationClientProtocolPB.getApplicationReport from 10.65.205.148:48970 for RpcKind RPC_PROTOCOL_BUFFER
+2018-09-03 11:44:11,700 DEBUG org.apache.hadoop.security.UserGroupInformation: PrivilegedAction as:work (auth:SIMPLE) from:org.apache.hadoop.ipc.Server$Handler.run(Server.java:2606)
+2018-09-03 11:44:11,700 DEBUG org.apache.hadoop.yarn.server.security.ApplicationACLsManager: Verifying access-type VIEW_APP for work (auth:SIMPLE) on application application_1535930391687_0019 owned by work
+2018-09-03 11:44:11,701 DEBUG org.apache.hadoop.ipc.Server: Served: getApplicationReport, queueTime= 0 procesingTime= 1
+2018-09-03 11:44:11,701 DEBUG org.apache.hadoop.ipc.Server: IPC Server handler 2 on 8032: responding to Call#440 Retry#0 org.apache.hadoop.yarn.api.ApplicationClientProtocolPB.getApplicationReport from 10.65.205.148:48970
+2018-09-03 11:44:11,701 DEBUG org.apache.hadoop.ipc.Server: IPC Server handler 2 on 8032: responding to Call#440 Retry#0 org.apache.hadoop.yarn.api.ApplicationClientProtocolPB.getApplicationReport from 10.65.205.148:48970 Wrote 358 bytes.
+2018-09-03 11:44:11,989 DEBUG org.apache.hadoop.ipc.Server:  got #3118
+2018-09-03 11:44:11,990 DEBUG org.apache.hadoop.ipc.Server: IPC Server handler 27 on 8032: Call#3118 Retry#0 org.apache.hadoop.yarn.api.ApplicationClientProtocolPB.getApplicationReport from 10.65.205.148:48370 for RpcKind RPC_PROTOCOL_BUFFER
+2018-09-03 11:44:11,990 DEBUG org.apache.hadoop.security.UserGroupInformation: PrivilegedAction as:work (auth:SIMPLE) from:org.apache.hadoop.ipc.Server$Handler.run(Server.java:2606)
+2018-09-03 11:44:11,990 DEBUG org.apache.hadoop.yarn.server.security.ApplicationACLsManager: Verifying access-type VIEW_APP for work (auth:SIMPLE) on application application_1535930391687_0012 owned by work
+2018-09-03 11:44:11,990 DEBUG org.apache.hadoop.ipc.Server: Served: getApplicationReport, queueTime= 1 procesingTime= 0
+2018-09-03 11:44:11,990 DEBUG org.apache.hadoop.ipc.Server: IPC Server handler 27 on 8032: responding to Call#3118 Retry#0 org.apache.hadoop.yarn.api.ApplicationClientProtocolPB.getApplicationReport from 10.65.205.148:48370
+2018-09-03 11:44:11,990 DEBUG org.apache.hadoop.ipc.Server: IPC Server handler 27 on 8032: responding to Call#3118 Retry#0 org.apache.hadoop.yarn.api.ApplicationClientProtocolPB.getApplicationReport from 10.65.205.148:48370 Wrote 361 bytes.
+2018-09-03 11:44:12,005 DEBUG org.apache.hadoop.ipc.Server:  got #502725
+2018-09-03 11:44:12,005 DEBUG org.apache.hadoop.ipc.Server: IPC Server handler 31 on 8031: Call#502725 Retry#0 org.apache.hadoop.yarn.server.api.ResourceTrackerPB.nodeHeartbeat from 10.65.205.150:38836 for RpcKind RPC_PROTOCOL_BUFFER
+2018-09-03 11:44:12,005 DEBUG org.apache.hadoop.security.UserGroupInformation: PrivilegedAction as:work (auth:SIMPLE) from:org.apache.hadoop.ipc.Server$Handler.run(Server.java:2606)
+2018-09-03 11:44:12,006 DEBUG org.apache.hadoop.ipc.Server: Served: nodeHeartbeat, queueTime= 1 procesingTime= 0
+2018-09-03 11:44:12,006 DEBUG org.apache.hadoop.ipc.Server: IPC Server handler 31 on 8031: responding to Call#502725 Retry#0 org.apache.hadoop.yarn.server.api.ResourceTrackerPB.nodeHeartbeat from 10.65.205.150:38836
+2018-09-03 11:44:12,006 DEBUG org.apache.hadoop.yarn.event.AsyncDispatcher: Dispatching the event org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeStatusEvent.EventType: STATUS_UPDATE
+2018-09-03 11:44:12,006 DEBUG org.apache.hadoop.ipc.Server: IPC Server handler 31 on 8031: responding to Call#502725 Retry#0 org.apache.hadoop.yarn.server.api.ResourceTrackerPB.nodeHeartbeat from 10.65.205.150:38836 Wrote 42 bytes.
+2018-09-03 11:44:12,006 DEBUG org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeImpl: Processing xxx-test-cluster02:45454 of type STATUS_UPDATE
+2018-09-03 11:44:12,006 DEBUG org.apache.hadoop.yarn.event.AsyncDispatcher: Dispatching the event org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.NodeUpdateSchedulerEvent.EventType: NODE_UPDATE
+2018-09-03 11:44:12,006 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler: nodeUpdate: xxx-test-cluster02:45454 cluster capacity: <memory:1351680, vCores:240>
+2018-09-03 11:44:12,006 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler: Node being looked for scheduling xxx-test-cluster02:45454 availableResource: <memory:82944, vCores:77>
+2018-09-03 11:44:12,006 DEBUG org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler: Trying to schedule on node: xxx-test-cluster02, available: <memory:82944, vCores:77>{code}]

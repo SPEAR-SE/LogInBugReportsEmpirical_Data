@@ -1,0 +1,178 @@
+[From the backtrace, {{getCompressedData}} got bogus len then used it to allocate memory.
+{code:java}
+  protected int getCompressedData() throws IOException {
+    checkStream();
+
+    // Get the size of the compressed chunk (always non-negative)
+    int len = rawReadInt();          <<<<<<<<<<<<<< got huge bogus value !
+
+    // Read len bytes from underlying stream 
+    if (len > buffer.length) {
+      buffer = new byte[len];          <<<<<   OutOfMemory exception
+    }
+{code}, I don't think our Lz4Codec implementation actually uses the FRAME specification (http://cyan4973.github.io/lz4/lz4_Frame_format.html) when creating text based files. It seems it was added in as a codec for use inside block compression formats such as SequenceFiles/HFiles/etc., but wasn't oriented towards Text files from the looks of it, or was introduced at a time when there was no FRAME specification of LZ4.
+
+The lz4 utility uses the frame specification:
+
+{code}
+# cat actual-file.txt
+hadoop,foo,hadoop,foo,hadoop,foo,hadoop,foo
+# lz4 actual-file.txt
+# lz4cat actual-file.txt.lz4
+hadoop,foo,hadoop,foo,hadoop,foo,hadoop,foo
+# cat actual-file.txt.lz4 | od -X
+0000000 184d2204 15a74064 bf000000 6f646168
+0000020 662c706f 0b2c6f6f 2c500900 0a6f6f66
+0000040 00000000 cf718d62
+0000050
+{code}
+
+Note the header magic bytes that match the FRAME specification: {{184d2204}}, as per http://cyan4973.github.io/lz4/lz4_Frame_format.html
+
+Whereas in Hadoop, we produce just the actual block compression form:
+
+{code}
+# cat StreamCompressor.java 
+import org.apache.hadoop.util.*;
+import org.apache.hadoop.io.*;
+import org.apache.hadoop.io.compress.*;
+import org.apache.hadoop.conf.*;
+
+public class StreamCompressor {
+
+  public static void main(String[] args) throws Exception {
+    String codecClassname = args[0];
+    Class<?> codecClass = Class.forName(codecClassname);
+    Configuration conf = new Configuration();
+    CompressionCodec codec = (CompressionCodec)
+      ReflectionUtils.newInstance(codecClass, conf);
+    
+    CompressionOutputStream out = codec.createOutputStream(System.out);
+    IOUtils.copyBytes(System.in, out, 4096, false);
+    out.finish();
+  }
+}
+# javac -cp $(hadoop classpath) StreamCompressor.java
+# java -cp $PWD StreamCompressor < actual-file.txt > hadoop-file.txt.lz4
+# # cat hadoop-file.lz4 | od -X
+0000000 2c000000 15000000 646168bf 2c706f6f
+0000020 2c6f6f66 5009000b 6f6f662c 0000000a
+0000035
+{code}
+
+Note that we are not writing any of the FRAME required elements (magic header, etc.), but are only writing the compressed block directly.
+
+Therefore, fundamentally, we are not interoperable with the {{lz4}} utility. The difference is very similar to the GPLExtras' {{LzoCodec}} vs. {{LzopCodec}}, the former is just the data compressing algorithm, but the latter is an actual framed format interoperable with {{lzop}} CLI utility.
+
+To make ourselves interoperable, we'll need to introduce a new frame wrapping codec such as {{LZ4FrameCodec}}, and users could use that when they want to decompress or compress text data produced/readable by {{lz4/lz4cat}} CLI utilities., Is this actually expected to work?  Hadoop logic puts some framing around raw LZ4 so that the data is a sequence of length-prefixed compressed chunks.  I don't know the internals of the Linux lz4 tool, but unless it matches that framing strategy exactly (which I wouldn't expect it to), then I don't expect this would work.
+
+I know this is true of Snappy.  There are various Snappy CLIs out there, and they don't work well with our Snappy codec, because they don't implement the same framing.
+
+Of course, it would be nice if there was a more graceful failure mode than trying to do a huge allocation and hitting {{OutOfMemoryError}}., Thanks [~qwertymaniac].  Our comments crossed paths.  Yours has a lot of great additional details.  :-), Should we support this use case?, There does not also seem to be any benefit of using LZ4 Frame format with Hadoop based on the below point from its current documentation: http://cyan4973.github.io/lz4/lz4_Frame_format.html:
+
+bq. The data format defined by this specification does not attempt to allow random access to compressed data.
+
+It does appear to however have an ability to concatenate frames, in sequential order, so one could technically index it to then make splits out of it (but only for concatenated files).
+
+Doesn't sound like a lot of good would come out for the amount of work needed to support the frame format; LZ4 seems best to use in existing container formats we already have (SequenceFiles, HFiles, any file format that accepts a codec or extensions of those), vs. direct data compression (such as text files)., Summary of the difference between Hadoop lz4 compression and OS lz4 tool:
+* lz4 tool uses [frame format|http://cyan4973.github.io/lz4/lz4_Frame_format.html]: header + len (little endian) + content + trailer
+* Hadoop uses this block-based format: orignalBlockSize + len (big endian) + content
+* Please note the different endianness for the len field, Able to hack my way to make OS lz4 tool (r114) work with Hadoop (r123 lib):
+{code}
+$ lz4 -h 2>&1 | head -1
+*** LZ4 Compression CLI 64-bits r114, by Yann Collet (Apr 14 2014) ***
+
+$ lz4 10rows.txt 10rows.txt.r114.lz4
+Compressed 310 bytes into 105 bytes ==> 33.87%
+
+$ od -t x1 10rows.txt.r114.lz4
+0000000 04 22 4d 18 64 70 b9 56 00 00 00 ff 13 30 30 31
+0000020 7c 63 31 7c 63 32 7c 63 33 7c 63 34 7c 63 35 7c
+0000040 63 36 7c 63 37 7c 63 38 7c 63 39 0a 30 30 32 1f
+0000060 00 0b 1f 33 1f 00 0b 1f 34 1f 00 0b 1f 35 1f 00
+0000100 0b 1f 36 1f 00 0b 1f 37 1f 00 0b 1f 38 1f 00 0b
+0000120 1f 39 1f 00 0a 2f 31 30 1f 00 04 50 38 7c 63 39
+0000140 0a 00 00 00 00 eb 01 45 d5
+0000151
+
+### Skip 7-byte header and 4-byte len ("56 00 00 00" is 86)
+$ dd if=10rows.txt.r114.lz4 of=s11c86.r114.lz4 skip=11 bs=1 count=86
+86+0 records in
+86+0 records out
+86 bytes (86 B) copied, 0.000288006 s, 299 kB/s
+
+### Choose a block size > uncompressed content size
+$ echo -ne '\x00\x01\x00\x00' > originalBlockSize
+
+### Prepare the len in the endian Hadoop prefers
+$ echo -ne '\x00\x00\x00\x56' > len
+
+### orginalBlockSize + len + compressed_bytes
+$ cat originalBlockSize len s11c86.r114.lz4 >a2.r114.lz4
+
+$ hdfs dfs -put a2.r114.lz4 /tmp
+$ hdfs dfs -text /tmp/a2.r114.lz4
+16/04/02 23:34:52 INFO compress.CodecPool: Got brand-new decompressor [.lz4]
+001|c1|c2|c3|c4|c5|c6|c7|c8|c9
+002|c1|c2|c3|c4|c5|c6|c7|c8|c9
+003|c1|c2|c3|c4|c5|c6|c7|c8|c9
+004|c1|c2|c3|c4|c5|c6|c7|c8|c9
+005|c1|c2|c3|c4|c5|c6|c7|c8|c9
+006|c1|c2|c3|c4|c5|c6|c7|c8|c9
+007|c1|c2|c3|c4|c5|c6|c7|c8|c9
+008|c1|c2|c3|c4|c5|c6|c7|c8|c9
+009|c1|c2|c3|c4|c5|c6|c7|c8|c9
+010|c1|c2|c3|c4|c5|c6|c7|c8|c9
+{code}, We have a lot of large json files we keep around as sort of a master archive.   Our internal analysis on compression shows that lz4 completely dominates gzip/bzip2/snappy/lzo in size and compression/decompression thruput.   In fact for a lot of our data (even other than json) lz4 shreds the competition to the point now I tell most folks not to even bother with gzip or bzip2 and just use lz4.
+
+However this causes problems if we ingest things into hdfs or s3 (Databricks) since the lz4 command line tool is incompatible with the hadoop-lz4 implementation.   In order to keep compatibility with existing files, would it be possible to update hadoop-lz4 to check if the signature is for the lz4 frame and then use the newer implementation, but if not then to use the existing legacy hadoop-lz4 format?
+
+Our really experienced java guy that had previously done some apache mode just left or I would have assigned him to produce a patch for this.   I think implementing this would be a big benefit to folks in mixed environments...
+, [~cavanaug], lz4 command line and hadoop-lz4 use the same lz4 codec library. The difference is only the framing, see my comment and hack on 4/3.
+
+Questions for your use case:
+* Do your JSON files contain a single JSON object or many JSON records?
+* After ingesting into HDFS, how do you plan to use the data?
+* Have considered these splittable container file formats with compression: SequenceFile, RCFile, ORC, Avro, Parquet? In the container, they can choose any Hadoop codec, including LZ4.
+, I agree with [~qwertymaniac] that the right way to fix this is to add a separate codec intended to be compatible with the LZ4 CLI tools.  I don't think it would be too hard to accomplish.  We'd need to avoid using BlockCompressorStream/BlockDecompressorStream since those are doing the big-endian lengths that will totally confuse the CLI tools.  Instead we need to do the same little-endian block-length logic done by the CLI tool along with the 4-byte of zeros for the end marker.  Seems to simply be a 4-byte little-endian length per block, but sometimes the high bit can be set?  Haven't looked at the lz4 CLI code to see what the exact logic is.
+
+Bonus points for including the xxhash code so Hadoop can generate and validate checksums.
+, Hi, all - we've just run into this. Is there any chance that this has been resolved along the way? 
+
+Any further advice on resolving this if I were to take it on?, Not that I am aware of.
+
+Go for it!  Past comments are good source of info., After having worked on the ZStandard codec in HADOOP-13578, I have a fresher perspective on this.  One main problem with creating a separate codec for LZ4 compatibility is that the existing Hadoop LZ4 codec has claimed the standard '.lz4' extension.  That means when users upload files into HDFS that have been compressed with the standard LZ4 CLI tool, it will try to use the existing, broken LZ4 codec rather than any new one.  They'd have to rename the files to use some non-standard LZ4 extension to select the new codec.  That's not ideal.
+
+In hindsight, the Hadoop LZ4 codec really should have used the streaming APIs for LZ4 rather than the one-shot or single-step APIs.  Then it wouldn't need the extra framing bytes that broke compatibility with the existing LZ4 CLI, and it wouldn't lead to weird failures where the decoder can't decode anything that was encoded with a larger buffer size.  The streaming API solves all those problems, being able to decode with an arbitrary user-supplied buffer size and without the extra block header hints that Hadoop added.
+
+The cleanest solution from an end-user standpoint would be to have the existing LZ4 codec automatically detect the format when decoding so that we just have one codec and it works both with the old (IMHO broken) format and the standard LZ4 format.  I'm hoping there are some key signature bytes that LZ4 always places at the beginning of the compressed data stream so that we can automatically detect which one it is.  If that is possible then that would be my preference on how to tackle the issue.  If we can't then the end-user story is much less compelling -- two codecs with significant confusion on which one to use.
+
+However there is one gotcha even if we can pull off this approach.  Files generated on clusters with the updated LZ4 codec would not be able to be decoded on clusters that only have the old codec.  If that case has to be supported then we have no choice but to develop a new codec and make users live with the non-standard LZ4 file extensions used by the new codec.  .lz4 files uploaded to Hadoop would continue to fail as they do today until renamed to the non-standard extension.
+, [~jzhuge] My proposed approach is to create a new file based loosely on hadoop/io/compress/Lz4Codec.java reproducing the byte structure analagous to your 4/3 hack. Does that seem reasonable?  
+
+If my goal is ultimately to use this in something like Spark, if the version of Hadoop we're using is patched with the appropriate class, where would I add additional logic to switch between the two codecs (Lz4Codec vs. Lz4FrameCodec)?  
+
+, bq. My proposed approach is to create a new file based loosely on hadoop/io/compress/Lz4Codec.java reproducing the byte structure analagous to your 4/3 hack. Does that seem reasonable? 
+
+The problem with that approach is the existing codec is using one-shot decode.  If the amount of data to decode exceeds the buffer size being used by the decoder it just blows up.  So it's not as simple as tacking on a header and passing it through to the existing code.  That will work with small amounts of data but not once it exceeds the decoder buffer size.
+
+To handle arbitrary files generated by the LZ4 CLI tool it really needs to use the streaming API so the buffer sizes used by the encoder and decoder are decoupled, and the decoder can handle arbitrarily large amounts of input without needing to chunk it into one-shot blocks as the current one does.
+, Is there a streaming version of the decoder for Lz4? 
+
+[~jlowe] If I understood correctly, were you saying that I should be updating the Lz4Decompressor which is used within the Stream API?, bq. Is there a streaming version of the decoder for Lz4? 
+
+There is a streaming version of the lz4 compressor and decompressor.  See https://github.com/lz4/lz4/blob/dev/lib/lz4.h#L228 and https://github.com/lz4/lz4/blob/dev/lib/lz4.h#L273.  I'm not an expert on LZ4, but I'm assuming that these require the frame format rather than the block format.
+
+bq. If I understood correctly, were you saying that I should be updating the Lz4Decompressor which is used within the Stream API?
+
+It would be updating both the compressor and decompressor to use the streaming API provided by lz4 as documented in lz4.h.
+
+As I mentioned earlier, the big decision is whether we should try to fix the existing Lz4Codec (i.e.: the one that claims the standard '.lz4' file extension) to be compatible with the existing, Hadoop-proprietary format and also with files using the .lz4 extension or we should create a completely separate codec that of course cannot use the '.lz4' extension.  I'd prefer the former, but there will be some cross-cluster incompatibilities if a 'new' Lz4Codec generates a compressed file and someone tries to decode it with the 'old' Lz4Codec.
+, [~jlowe] Who can weigh in on which path to go down? My personal vote is also for the former given that adding an additional codec with a different extension will complicate using Hadoop with any other tool. 
+
+I'm currently delving into how the Decompressor is using the underlying C code via JNI since it seems that logic will need to be updated alongside the Java classes.
+, My apologies for the delay, somehow I missed getting notified on your latest comment.
+
+If this is really going to work as end-users expect then it needs to use the '.lz4' extension.  That means going with the approach of a unified Lz4Codec that can read both the legacy Lz4Codec and write the CLI-compatible one.  There would need to be a release note explaining the incompatibility for data written by the newer codec for clusters still running the older codec.  There are some other caveats, since this could cause issues for a rolling downgrade (i.e.: data written by the new codec before the downgrade can't be decoded after the downgrade).  We can mitigate this by making the output format of the new codec configurable and setting the default to be the legacy format, but then of course it doesn't work "out of the box" with the lz4 CLI tool which will be surprising to some.
+
+Anyway the first step is to see if the first proposal is even feasible -- can the codec reliably auto-detect which format is being used and properly decode both the legacy and CLI-compatible formats.  If that possibility exists then we can work through the logistics of whether the new codec emits the CLI-compatible format by default and how to handle the compatibility scenarios.]

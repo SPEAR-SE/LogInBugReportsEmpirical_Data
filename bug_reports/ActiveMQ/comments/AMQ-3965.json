@@ -1,0 +1,130 @@
+[A possible fix for this may be to no hold back acks for expired messages (as currently done by calling ackLater()) but to ack any expired messages
+straight away.
+This however will cause more acks to be written back to the broker, but only in case of expired messages.
+
+Perhaps there is a better solution that has less of an overhead? , Attaching testcase as mvn project. 
+The testclasss can also be copied into activemq-core/src/test/java/org/apache/activemq/bugs , Updated the test so that the async case is more stable on fast hardware, was a bit flaky on my fast Linux box.  Added a sync test case to show that both paths suffer the same problem and also to verify the async case was suffering timing issues. , it looks like at the very least we need to check the pendingAcks when we go into the optimize ack case as it doesn't use the deliveredCounter like the rest of the code that uses ackLater so unlike ackLater it doesn't see the pending count of expired messages., We thought that the following fix could do the job 
+{code:title=ActiveMQMessageConsumer.java} 
+private void afterMessageIsConsumed(MessageDispatch md, boolean messageExpired) throws JMSException {
+[...]
+        if (messageExpired) {
+            synchronized (deliveredMessages) {
+                deliveredMessages.remove(md);
+            }
+            stats.getExpiredMessageCount().increment();
+            ackLater(md, MessageAck.DELIVERED_ACK_TYPE);
+        } else {
+            stats.onMessage();
+            if (session.getTransacted()) {
+                // Do nothing.
+            } else if (isAutoAcknowledgeEach()) {
+                if (deliveryingAcknowledgements.compareAndSet(false, true)) {
+                    synchronized (deliveredMessages) {
+                        if (!deliveredMessages.isEmpty()) {
+                            if (optimizeAcknowledge) {
+                            	ackCounter++;
+                            	
+                            	// AMQ-3965 - this alone does not fix it.
+                                float threshold = (float) info.getPrefetchSize() * (float) 0.65;
+                            	if (pendingAck != null && (ackCounter + deliveredCounter) >= (threshold)) {
+                                    session.sendAck(pendingAck);
+                                    pendingAck = null;
+                                    deliveredCounter = 0;
+                            	}
+                                if (ackCounter >= (threshold) || (optimizeAcknowledgeTimeOut > 0 && System.currentTimeMillis() >= (optimizeAckTimestamp + optimizeAcknowledgeTimeOut))) {
+                                    MessageAck ack = makeAckForAllDeliveredMessages(MessageAck.STANDARD_ACK_TYPE);
+                                    if (ack != null) {
+                                        deliveredMessages.clear();
+                                        ackCounter = 0;
+                                        session.sendAck(ack);
+                                        optimizeAckTimestamp = System.currentTimeMillis();
+                                    }
+                                }
+{code} 
+
+but that extra code 
+{code} 
+// AMQ-3965 - this alone does not fix it.
+float threshold = (float) info.getPrefetchSize() * (float) 0.65;
+if (optimizeAcknowledge && pendingAck != null && (ackCounter + deliveredCounter) >= (threshold)) {
+  session.sendAck(pendingAck);
+  pendingAck = null;
+  deliveredCounter = 0;
+} 
+
+{code} alone is not enough. Let me explain why: 
+
+Suppose a prefetch of 100. Consumer receives 56 normal msgs. So ackCounter is at 56, no ack sent back to broker yet. It then receives 44 msgs that expire on consumer before dispatch. So deliveredCounter=44 and ackCounter=56. In afterMessageIsConsumed() it does not go into the proposed code for the expired msgs, only for normal msgs. So for the last 44 expired msgs there is no trigger fired to sent an ack to the broker. The result is a hanging consumer that does not receive any more msgs. Problem not fixed. , So far I haven't hit on any more elagant solution than to also check use the ackCounter in ackLater like so:
+
+{code}
+        // NOTE: I bumped this to 0.65, its currently 0.5 for some reason.
+        float threshold = 0.65f * info.getPrefetchSize();
+        if (threshold <= ((ackCounter + deliveredCounter) - additionalWindowSize)) {
+            session.sendAck(pendingAck);
+            pendingAck=null;
+            deliveredCounter = 0;
+            additionalWindowSize = 0;
+        }
+{code}
+
+This of course can lead to the scenario where you start acking every single expired message that arrives if the numbers are right, but without a lot of code changes I haven't seen another way to deal with this.  Eventually when some non-expired messages come in and the ackCounter gets high enough to send ack for the consumed messages things would settle down again., Proposing the following fix: 
+
+{code:title=ActiveMQMessageConsumer.java}
+private void ackLater(MessageDispatch md, byte ackType) throws JMSException {
+[...]
+    if ((0.5 * info.getPrefetchSize()) <= (deliveredCounter + ackCounter - additionalWindowSize)) {
+      session.sendAck(pendingAck);
+      pendingAck=null;
+      deliveredCounter = 0;
+      additionalWindowSize = 0;
+    }
+
+[...]
+
+private void afterMessageIsConsumed(MessageDispatch md, boolean messageExpired) throws JMSException {
+[...]
+synchronized (deliveredMessages) {
+                        if (!deliveredMessages.isEmpty()) {
+                            if (optimizeAcknowledge) {
+                                ackCounter++;
+                                
+                                // AMQ-3956 evaluate both expired and normal msgs as 
+                                // otherwise consumer may get stalled
+                                if (ackCounter + deliveredCounter >= (info.getPrefetchSize() * .65) || (optimizeAcknowledgeTimeOut > 0 && System.currentTimeMillis() >= (optimizeAckTimestamp + optimizeAcknowledgeTimeOut))) {
+                                    MessageAck ack = makeAckForAllDeliveredMessages(MessageAck.STANDARD_ACK_TYPE);
+                                	if (ack != null) {
+                                        deliveredMessages.clear();
+                                        ackCounter = 0;
+                                        session.sendAck(ack);
+                                        optimizeAckTimestamp = System.currentTimeMillis();
+                                    }
+                                	// AMQ-3956 - as further optimization send 
+                                    // ack for expired msgs when there are any.
+                                    // This resets the deliveredCounter to 0 so that
+                                	// we won't sent standard acks with every msg just
+                                	// because the deliveredCounter just below 
+                                	// 0.5 * prefetch as used in ackLater()
+                                	if (pendingAck != null && deliveredCounter > 0) {
+                                    	session.sendAck(pendingAck);
+                                        pendingAck = null;
+                                        deliveredCounter = 0;
+                                    }
+                                }
+                            }
+{code}
+
+Essentially, both methods ackLater() and afterMessageIsConsumed() now evaluate ackCounter + deliveredCounter. 
+This will avoid getting a stalled consumer and fixes the bug.
+
+However an additional optimization is necessary for the following case:
+Suppose a prefetch=100. 
+Consumer receives 49 msgs that expire before being dispatched. So deliveredCounter=49, ackCounter=0. No ack is sent as threshold is below 50. 
+Next, consumer only processes non-expired msgs. As deliveredCounter=49, it will dispatch 17 msg and then send a standard ack. Because after
+the 17th msg, deliveredCounter=49, ackCounter=17, so that exceeds 0.65*prefetch and hence a standard ack is sent. The ack resets the ackCounter but not the deliveredCounter, which remains at 49. 
+So we would process only another 17 non-expired msgs before we would send the next standard ack to the broker. The problem is that the deliveredCounter does not change unless we receive another expired msg. If we only receive non-expired msgs going further, then deliveredCounter never gets reset to 0 and we ack after every 17 msgs instead of after 0.65*prefetch=65 msg.
+To avoid this situation, I propose to send a deliveredAck right after the standard Ack. This would reset the deliveredCounter to 0 and we can process the next 65 non-expired msgs without having to send back an ack (as opposed to processing only 17 msg before sending an ack).
+If there is no expired msgs to be acked, then no deliveredAck is being sent. So this should only trigger in the case where some expired msgs have accumulated but have not being acked yet. 
+, Attaching possible patch plus JUnit test. 
+Would ask for review and if accepted I can commit the code to trunk. , @Torsten that patch[1] looks good to me.
+[1]https://issues.apache.org/jira/secure/attachment/12540464/AMQ-3956.patch
+, Looks good, think you should go ahead and apply it. , Resolved by this [commit|https://fisheye6.atlassian.com/changelog/activemq?cs=1371722].]

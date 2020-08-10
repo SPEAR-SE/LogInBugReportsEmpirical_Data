@@ -1,0 +1,89 @@
+[This is interesting. Have you checked your data for skew? In theory, hash partitioner does a pretty good job for evenly distributing the keys. Unless the keys are skewed, each partition is expected to process about the same number of rows.
+
+It's possible to provide a custom partitioner here, but I'm not entirely sure if that's worthwhile., [~xuefuz]: thanks for comment, yes the keys maybe skewed, so in this situation , how to deal with this kind of case in a custom partitioner?, Skew join can mitigate the issue, on condition that skewed data only exists in one table., [~lirui]: thanks for your suggestion, will try to use skewed join configuration to solve the problem later., [~lirui] and [~xuefuz]:  attached is the screenshot of TPC-DS/query17.sql on 3TB. 
+TPC-DS/query17.sql
+{code}
+select  i_item_id
+       ,i_item_desc
+       ,s_state
+       ,count(ss_quantity) as store_sales_quantitycount
+       ,avg(ss_quantity) as store_sales_quantityave
+       ,stddev_samp(ss_quantity) as store_sales_quantitystdev
+       ,stddev_samp(ss_quantity)/avg(ss_quantity) as store_sales_quantitycov
+       ,count(sr_return_quantity) as_store_returns_quantitycount
+       ,avg(sr_return_quantity) as_store_returns_quantityave
+       ,stddev_samp(sr_return_quantity) as_store_returns_quantitystdev
+       ,stddev_samp(sr_return_quantity)/avg(sr_return_quantity) as store_returns_quantitycov
+       ,count(cs_quantity) as catalog_sales_quantitycount ,avg(cs_quantity) as catalog_sales_quantityave
+       ,stddev_samp(cs_quantity)/avg(cs_quantity) as catalog_sales_quantitystdev
+       ,stddev_samp(cs_quantity)/avg(cs_quantity) as catalog_sales_quantitycov
+ from store_sales
+     ,store_returns
+     ,catalog_sales
+     ,date_dim d1
+     ,date_dim d2
+     ,date_dim d3
+     ,store
+     ,item
+ where d1.d_quarter_name = '2000Q1'
+   and d1.d_date_sk = store_sales.ss_sold_date_sk
+   and item.i_item_sk = store_sales.ss_item_sk
+   and store.s_store_sk = store_sales.ss_store_sk
+   and store_sales.ss_customer_sk = store_returns.sr_customer_sk
+   and store_sales.ss_item_sk = store_returns.sr_item_sk
+   and store_sales.ss_ticket_number = store_returns.sr_ticket_number
+   and store_returns.sr_returned_date_sk = d2.d_date_sk
+   and d2.d_quarter_name in ('2000Q1','2000Q2','2000Q3')
+   and store_returns.sr_customer_sk = catalog_sales.cs_bill_customer_sk
+   and store_returns.sr_item_sk = catalog_sales.cs_item_sk
+   and catalog_sales.cs_sold_date_sk = d3.d_date_sk
+   and d3.d_quarter_name in ('2000Q1','2000Q2','2000Q3')
+ group by i_item_id
+         ,i_item_desc
+         ,s_state
+ order by i_item_id
+         ,i_item_desc
+         ,s_state
+limit 100;
+{code}
+explain is also attached. 
+Let's explain the explain
+   store， item, d2，d3, d1 is small table.
+   store_sales, store_returns, ctalog_sales are big table.
+   there are 7 stages in the job
+   Stage-0:  d2 union d3 union store union item  ( all these small table will be converted to map join. Here first strange thing is d1 is also small ,why d1 is in the first stage-0)
+   Stage-1
+        Reducer 2 <- Map 1 (store_sales), Map 7 (store_returns)
+        Reducer 3 <- Map 8 (catalog_sales), Reducer 2 
+        Reducer 4 <- Map 9 (d1), Reducer 3 
+        Reducer 5 <- Reducer 4 (GROUP)
+        Reducer 6 <- Reducer 5 (SORT)
+the screenshot is about  Stage :Reducer 3 <- Map 8 (catalog_sales), Reducer 2 " . In the history server, it shows 2178 tasks finished, Median of duration time is 4s. 75 percentile of duration is 20 min. Max of duration time 32min.  About Shuffle Read size/Records, Median of it is 0.0B/0. 75 percentile of it is 274.9MB/8695090. Max of it  is 275.3MB/8709548.  I don't understand these metrics very much but it seems that the difference between tasks are too big especially some tasks need a lot of shuffle read while others are not.  Can you help to see where is wrong?
+
+
+   , Hi [~kellyzly], in the attached query plan, there's only 1 reducer for Reducer3:
+{noformat}
+Reducer 3 <- Map 8 (PARTITION-LEVEL SORT, 1), Reducer 2 (PARTITION-LEVEL SORT, 1)
+{noformat}
+Do you know why we only use 1 reducer to do the join in Reducer3? Can you try forcing Hive to use more reducers in this stage? An easy way to do it is to manually set {{mapreduce.job.reduces}}., [~lirui]: the reason why we only use 1 reducer is because there is a bug in SetSparkReducerParallelism#process in 3TB scale. We use [numberOfByteshttps://github.com/apache/hive/blob/master/ql/src/java/org/apache/hadoop/hive/ql/optimizer/spark/SetSparkReducerParallelism.java#L129] to collect the numberOfBytes of sibling of specified RS. We use Long type and it happens overflow when the data is too big. After happening this situation, the parallelism is decided by [sparkMemoryAndCores.getSecond()|https://github.com/apache/hive/blob/master/ql/src/java/org/apache/hadoop/hive/ql/optimizer/spark/SetSparkReducerParallelism.java#L184] if spark.dynamic.allocation.enabled is true, sparkMemoryAndCores.getSecond is a dymamic value which is decided by spark runtime. For example, the value of sparkMemoryAndCores.getSecond is 5 or 15 randomly. There is possibility that the value may be 1. The may problem here is the overflow of addition of Long type.  You can reproduce the overflow problem by following code
+{code}
+    public static void main(String[] args) {
+      long a1= 9223372036854775807L;
+      long a2=1022672;
+
+      long res = a1+a2;
+      System.out.println(res);  //-9223372036853753137
+
+      BigInteger b1= BigInteger.valueOf(a1);
+      BigInteger b2 = BigInteger.valueOf(a2);
+
+      BigInteger bigRes = b1.add(b2);
+
+      System.out.println(bigRes); //9223372036855798479
+
+    }
+{code}, have filed HIVE-17010 to trace the overflow problem, but give me more time to ensure there is no problem of not divided records evenly after several join in HOS. In my view, HiveKey is generated by ReduceSinkOperator#computeHashCode. Is there any possibility the key became skewed after several joins？ For example, select * from C, (select * from A join B where key="1"), the key in the result are always 1 which may be skewed.  [~lirui], do you recommend to set hive.optimize.skewjoin as true to convert a join to skewed join at runtime?, [~kellyzly], nice catch of the Long overflow!
+As to data skew, it's usually due to some skewed keys in your data. E.g. when you join A and B on A.key = B.key, and most of keys in A are 1. Since same keys have to go to the same reducer, then you'll have one reducer handling most data from A. {{hive.optimize.skewjoin}} determines skew at runtime, and joins the skewed data with a map join. It can mitigate the problem, but skewed data still has to be shuffled to the one reducer.
+I don't think hash code can lead to skew (possible in some extreme case though, like HIVE-14797).
+
+For your case, my suggestion is to force more reducers and verify if skew really exists. If so, enable {{hive.optimize.skewjoin}} and see if it helps.]

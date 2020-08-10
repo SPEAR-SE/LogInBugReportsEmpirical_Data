@@ -1,0 +1,209 @@
+[MAPREDUCE-2702 introduced a job level commit. Task commit from competing AMs should not overstep each other.
+
+Job level commit should ensure only the first one succeeds. Are you observing this in the cluster ?, MAPREDUCE-2702 is focused on FileOutputCommitter, but doesn't address the issue when that is not the committer being used., One way to fix this is to leverage the RM as a central authority in detecting a split brain situation.  The RM will already tell AMs to die, via AMResponse.getReboot(), if they are not a valid app attempt.  We could use a concept of a "commit window" indicating a relatively short amount of time.  This window should be large enough to encompass how long the AM will take to respond to a heartbeat and turn around and start committing.  This should be at least as long as the AM heartbeat interval but not a lot longer (e.g.: 10 seconds).  Here's a walkthrough of how it would work for a task (job commit is similar):
+
+# Task requests to commit, AM tells it to hold off for now
+# AM writes a task-starting-commit event to job history file and ensures it is flushed to disk before progressing to next step
+# Next time task asks to commit, AM checks the last time it received a valid heartbeat response from the RM
+#* If last heartbeat was within the commit window then the AM responds that the task can start committing
+#* If last heartbeat was outside the commit window then the AM responds that the task must hold off for now while it waits to receive a valid heartbeat from the RM to verify it is still a valid app attempt
+
+And here's how subsequent attempts would handle recovery:
+
+# AM waits for the duration of the commit window before reading the previous attempt's history file to allow any potential lingering task-starting-commit messages to be written to the job history file
+# If the history file shows a task started committing but did not complete then we treat this as if the task commit failed, i.e.: we fail the task
+# If the history file shows the job started committing but did not complete then we treat this as if the job commit failed, i.e.: we fail the job
+
+The initial wait during recovery could be reduced if the RM told the attempt when the last time it heard a valid heartbeat from a prior attempt.  Then the subsequent attempt could subtract this amount of time from the commit window (which in many cases would eliminate the need to wait at all).
+
+There's some performance concerns around sync'ing task-starting-commmit events, although we could play tradeoff games where we delay sync'ing a bit in hopes other tasks will want to commit as well so we can batch them together and amortize the sync cost.  However I do think that we need to ensure a task-is-committing-so-do-not-repeat-it marker needs to be persisted somewhere before progressing otherwise we could double-commit.  Only way we might be able to avoid that is if the committer interface allowed the AM to determine that it commits in such a way where double-commits are not a concern.  The task-starting-commit events could be skipped in that case, but that's a committer API change., Linking to MAPREDUCE-4831 and MAPREDUCE-4819 since they all discuss the issue of potential double-commits at the task or job level., Patch that implements the "commit window" concept outlined above.  The AM will not allow task commits or job commit to proceed unless it has heard back from the RM within the configured amount of time (10 seconds by default)., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12562975/MAPREDUCE-4832.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 7 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3185//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3185//console
+
+This message is automatically generated., Was talking to Hitesh offline about this patch. Is this needed at the moment ? Seems like it's possible to avoid multiple AMs by tuning the AM_LIVENESS_INTERVAL (10 minutes by default) and MR_AM_TO_RM_WAIT_INTERVAL_MS (6 minutes by default). A new AM should only be started after the existing AM is done.
+ 
+That said, this is definitely an interesting approach to fix the problem.
+- Could add a check to ensure the window interval is greater than the AM-RM heartbeat.
+- Does getClock() need to be part of the RMHeartbeatHandler. Looks like the AppContext can provide this - I think a couple of places use the AppContext, others use th RMHeartbeatHandler.
+
+Recovery and restart are still WIP. I believe the  MR_AM_TO_RM_WAIT_INTERVAL_MS will need to be looked at again in context of recovery. This patch, or a sync via hdfs seems more useful at that point ?, Independent of this change, this looks like a problem that needs to be solved in the platform than in the AM. Something like making sure the NM maintains an expire time on its containers and terminates them when the expire time is reached. The expire time is extended whenever the NM heartbeats with the RM. So if the NM loses contact with the RM or if the RM thinks the AM should not be running anymore on that NM,then the expire time will not be extended. RM starts retries after the expire time has elapsed. The logic is similar but self contained within the platform. AM's could do similar stuff to their containers. Thus providing an automatic garbage collection when an AM crashes., bq. Seems like it's possible to avoid multiple AMs by tuning the AM_LIVENESS_INTERVAL (10 minutes by default) and MR_AM_TO_RM_WAIT_INTERVAL_MS (6 minutes by default). A new AM should only be started after the existing AM is done.
+
+That *almost* solves the problem, but there are some corner cases left unsolved.  For example:
+
+1) AM is running on a node whose NM suddenly declares itself UNHEALTHY via health-check script
+2) RM removes node from active nodes and kills all containers running on that node
+3) Network cut occurs.  NM did not receive notification to kill the containers and/or NM crashes.  AM is unable to communicate to RM.
+4) RM now thinks all containers are dead on that node, proceeds to relaunch a new AM attempt
+5) Now for the next 6 minutes (or whatever the expiry interval is for the AM to RM) we have two app attempts running simultaneously.  If the old AM attempt is able to reach HDFS or whatever it needs to commit, we could end up committing twice.
+
+bq. Could add a check to ensure the window interval is greater than the AM-RM heartbeat.
+
+Actually that's not strictly necessary.  The code can function correctly even if the commit window is smaller than the heartbeat interval.  For example, job commit is woken up when a fresh heartbeat arrives, and task commit polls periodically for whether the heartbeat has occurred recently.  It's not mandatory that the interval between heartbeats is smaller than the commit window for a commit to proceed, but it is more likely a commit operation will be stalled waiting for a fresh heartbeat if configured that way.
+
+bq. Does getClock() need to be part of the RMHeartbeatHandler. Looks like the AppContext can provide this
+
+I put it in the interface so the caller can access the same clock used to timestamp the heartbeat in case it could be different from the AppContext clock or if the caller didn't have access to the AppContext.  But that's probably never going to be a real concern, so I'll take it out.
+
+And to address Bikas' comment:
+bq. Independent of this change, this looks like a problem that needs to be solved in the platform than in the AM.
+
+We might be able to close all the corner cases in the framework.  For example, the above scenario could be solved if the RM were to wait for confirmation from the NM of the containers actually expiring before proceeding to launch another attempt.  If the NM is unreachable before the confirmation is received, it could wait for the AM expiry interval before launching a new attempt.  It could mean that we wait a lot longer than necessary, but at least we'd know with confidence that two attempts aren't running simultaneously.
+, Updated patch to remove getClock() from RMHeartbeatHandler interface., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12563197/MAPREDUCE-4832.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 7 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3192//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3192//console
+
+This message is automatically generated., bq. AM is running on a node whose NM suddenly declares itself UNHEALTHY via health-check script
+Right, there's multiple ways in which an AM may time out - and this specific case can lead to multiple AMs, so a fix is required.
+I'm +1 for the updated patch., Thanks for the review, Sidd.  I committed this to trunk, branch-2, and branch-0.23., Integrated in Hadoop-trunk-Commit #3177 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/3177/])
+    MAPREDUCE-4832. MR AM can get in a split brain situation. Contributed by Jason Lowe (Revision 1429040)
+
+     Result = SUCCESS
+jlowe : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1429040
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/commit/CommitterEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMHeartbeatHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestFail.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRMContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestStagingCleanup.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/commit
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/commit/TestCommitterEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestJobImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+, Integrated in Hadoop-Yarn-trunk #87 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/87/])
+    MAPREDUCE-4832. MR AM can get in a split brain situation. Contributed by Jason Lowe (Revision 1429040)
+
+     Result = FAILURE
+jlowe : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1429040
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/commit/CommitterEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMHeartbeatHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestFail.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRMContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestStagingCleanup.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/commit
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/commit/TestCommitterEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestJobImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+, Integrated in Hadoop-Hdfs-0.23-Build #485 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/485/])
+    svn merge -c 1429040 FIXES: MAPREDUCE-4832. MR AM can get in a split brain situation. Contributed by Jason Lowe (Revision 1429049)
+
+     Result = FAILURE
+jlowe : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1429049
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/commit/CommitterEventHandler.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMHeartbeatHandler.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestFail.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRMContainerAllocator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestStagingCleanup.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/commit
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/commit/TestCommitterEventHandler.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestJobImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+, Integrated in Hadoop-Hdfs-trunk #1276 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1276/])
+    MAPREDUCE-4832. MR AM can get in a split brain situation. Contributed by Jason Lowe (Revision 1429040)
+
+     Result = FAILURE
+jlowe : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1429040
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/commit/CommitterEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMHeartbeatHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestFail.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRMContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestStagingCleanup.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/commit
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/commit/TestCommitterEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestJobImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+, Integrated in Hadoop-Mapreduce-trunk #1306 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1306/])
+    MAPREDUCE-4832. MR AM can get in a split brain situation. Contributed by Jason Lowe (Revision 1429040)
+
+     Result = FAILURE
+jlowe : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1429040
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/commit/CommitterEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMHeartbeatHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestFail.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestRMContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestStagingCleanup.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/commit
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/commit/TestCommitterEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TestJobImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+]

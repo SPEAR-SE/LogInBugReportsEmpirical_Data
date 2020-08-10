@@ -1,0 +1,111 @@
+[The race is the following:
+
+||Thread A||Thread B||
+|mkdirs() | - |
+| take FSN lock | - |
+| ..logEdit() | - |
+| drop FSN lock | - |
+| - | enterSafeMode() |
+| - | saveNamespace() |
+| - | ..logSyncAll() |
+| - | ..editLog.close() |
+| logSync() | - |
+
+In this case, because Thread A's transaction has already been synced in logSyncAll, it doesn't actually have any work to sync - i.e it got batched. Accordingly, it's fine that the edit log is closed. But, the assertion comes before the check that the sync was already batched, so it fires.
+
+This causes occasional failures of TestEditLog on one of our hudson builds now that assertions are enabled., Here's a little hack I did that makes the test fail reliably with this error:
+
+Caused by: java.lang.AssertionError: no editlog streams
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLog.logSync(FSEditLog.java:485)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.mkdirs(FSNamesystem.java:2071)
+        at org.apache.hadoop.hdfs.server.namenode.TestEditLogRace$Transactions.run(TestEditLogRace.java:115)
+        at java.lang.Thread.run(Thread.java:662)
+
+(obviously not for commit, just to trigger the race), Actually in trunk there's a second bug that affects this area of the code. As of HDFS-119 {{syntxid}} is set in the {{finally}} block, even if the sync was batched. So, in this case if there are two threads acting like "Thread A" in my example, then the second one will actually fall past the batching check and trigger the assertion later as well (or even lose edits!)
+, bq. As of HDFS-119 syntxid is set in the finally block, even if the sync was batched
+
+Sorry, didn't say that very clearly. If the sync is batched, it will set {{synctxid}} to *0* in the {{finally}} block! So the next thread comes along, doesn't think it has been batched (though it has) and do yet another sync., Updated description to reflect the other problem as well, Here's a patch containing a fix and also two new unit tests that verify the edit-batching behavior., Bumping to blocker priority. This bug also causes a >3x performance regression in NNThroughputBenchmark due to lost opportunities to batch syncs, The patch needs to be updated.
+I don't see where {{saveNamespace()}} calls {{logSyncAll()}}. {{logSyncAll()}} is called only by {{enterSafeMode()}}.
+
+The main problem seems to be that {{logSync()}} does not hold writer lock. So in the race with {{saveNamespace()}} it can kick in at any time. The only way to prevent inconsistencies is to make sure all threads waiting to {{logSync()}} have everything synced already.
+In other words all transactions that started before {{saveNamespace()}} grabbed the write lock should complete, and no new transactions should be allowed to start while {{saveNamespace()}} is in progress.
+So {{saveNamespace()}} must call {{logSyncAll()}} before doing anything with the image or edits.
+
+Therefore, moving the assert down is absolutely correct, imo. If a thread sees that it's transaction is synced, it should not touch edit streams., Updated patch against trunk (just some conflict on imports), Hi Konst. You're right, {{logSyncAll}} is called by {{enterSafeMode}} not {{saveNamespace}}, my bad.
+
+But I think since we have the policy that {{saveNamespace}} always runs while in safe mode, and we never will write edits when in safe mode, we should be safe. Another way of saying this is that between {{enterSafeMode}} and {{leaveSafeMode}} we won't have any pending edits. This might depend on completing HDFS-955, but it's a separate issue from this JIRA.
+
+As for the performance issue, it's because of the other bug mentioned in this JIRA - if a thread's transaction is batched, it will reset {{synctxid}} to 0 on its way out of {{logSync}}. This can cause other thread's transactions to *not* get batched where they normally would have. In a test run of NNThroughputBenchmark this caused a 3x degredation because so many sync-batching opportunities were lost., bq. This might depend on completing HDFS-955, but it's a separate issue from this JIRA.
+
+Sorry, I think I actually mean HDFS-988. We partially addressed this issue but I think there are still a few places in trunk where we can cause transactions even though the NN is in safemode., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12470513/hdfs-1597.txt
+  against trunk revision 1068044.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    -1 release audit.  The applied patch generated 2 release audit warnings (more than the trunk's current 0 warnings).
+
+    -1 core tests.  The patch failed these core unit tests:
+                  org.apache.hadoop.hdfs.server.namenode.TestStorageRestore
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+    +1 system test framework.  The patch passed system test framework compile.
+
+Test results: https://hudson.apache.org/hudson/job/PreCommit-HDFS-Build/152//testReport/
+Release audit warnings: https://hudson.apache.org/hudson/job/PreCommit-HDFS-Build/152//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Findbugs warnings: https://hudson.apache.org/hudson/job/PreCommit-HDFS-Build/152//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://hudson.apache.org/hudson/job/PreCommit-HDFS-Build/152//console
+
+This message is automatically generated., Good point Todd, 
+- entering safemode cleans the queue of currents transaction, and
+- then safemode acts as a lock for savenamespace preventing initiation of new transactions.
+
+This probably becomes the reason why HDFS-1508 wont work.
+
+I see a warning in TestEditLog: 
+{{fsimage.getStorage().getStorageFile(it.next(), NameNodeFile.EDITS)}} should be replaced with
+{{NNStorage.getStorageFile(it.next(), NameNodeFile.EDITS)}}
+
+I agree setting {{synctxid = syncStart}} should happen only if the sync occurred, otherwise 
+{{synctxid}} will be set to 0 and unnecessary sync again.
+
++1 modular warning., Good catch on that warning. New patch addresses that - will wait for test-patch to run and then commit, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12470638/hdfs-1597.txt
+  against trunk revision 1068619.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    -1 release audit.  The applied patch generated 2 release audit warnings (more than the trunk's current 0 warnings).
+
+    +1 core tests.  The patch passed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+    +1 system test framework.  The patch passed system test framework compile.
+
+Test results: https://hudson.apache.org/hudson/job/PreCommit-HDFS-Build/154//testReport/
+Release audit warnings: https://hudson.apache.org/hudson/job/PreCommit-HDFS-Build/154//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Findbugs warnings: https://hudson.apache.org/hudson/job/PreCommit-HDFS-Build/154//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://hudson.apache.org/hudson/job/PreCommit-HDFS-Build/154//console
+
+This message is automatically generated., Committed to branch and trunk, thanks for reviewing, Konstantin., Integrated in Hadoop-Hdfs-trunk-Commit #539 (See [https://hudson.apache.org/hudson/job/Hadoop-Hdfs-trunk-Commit/539/])
+    , Integrated in Hadoop-Hdfs-trunk #643 (See [https://builds.apache.org/hudson/job/Hadoop-Hdfs-trunk/643/])
+    , Integrated in Hadoop-Hdfs-22-branch #35 (See [https://builds.apache.org/hudson/job/Hadoop-Hdfs-22-branch/35/])
+    ]

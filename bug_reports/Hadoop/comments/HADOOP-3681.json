@@ -1,0 +1,129 @@
+[Stack trace of the close.
+DataStreamer thread doesn't show up on jstack.
+
+{noformat}
+"main" prio=10 tid=0x0805a800 nid=0x17a1 waiting on condition [0xf7e6c000..0xf7e6d1f8]
+   java.lang.Thread.State: TIMED_WAITING (sleeping)
+        at java.lang.Thread.sleep(Native Method)
+        at org.apache.hadoop.dfs.DFSClient$DFSOutputStream.closeInternal(DFSClient.java:2658)
+        - locked <0xd524fc08> (a org.apache.hadoop.dfs.DFSClient$DFSOutputStream)
+        at org.apache.hadoop.dfs.DFSClient$DFSOutputStream.close(DFSClient.java:2576)
+        at org.apache.hadoop.fs.FSDataOutputStream$PositionCache.close(FSDataOutputStream.java:59)
+        at org.apache.hadoop.fs.FSDataOutputStream.close(FSDataOutputStream.java:79)
+        at org.apache.hadoop.mapred.TextOutputFormat$LineRecordWriter.close(TextOutputFormat.java:94)
+        - locked <0xd524fce0> (a org.apache.hadoop.mapred.TextOutputFormat$LineRecordWriter)
+        at org.apache.hadoop.mapred.ReduceTask.run(ReduceTask.java:398)
+        at org.apache.hadoop.mapred.TaskTracker$Child.main(TaskTracker.java:2124)
+{noformat}, fsck -files -locations -blocks /_temporary/_task_200806262325_4136_r_000408_0/part-00408  
+
+showing 
+{noformat}
+/_temporary/_task_200806262325_4136_r_000408_0/part-00408
+0 bytes, 1 block(s):  Replica placement policy is violated for blk_4878955496501003583. Block should be additionally
+replicated on 2 more rack(s).
+ MISSING 1 blocks of total size 0 B
+0. blk_4878955496501003583 len=0 MISSING!
+
+Status: CORRUPT
+{noformat}, Attaching jstack of the dfsclient., Since the length of blk_4878955496501003583 is 0, could we let Fsck delete the block?  Then, namenode.complete(...) will return normally.
+
+Although this does not fix the bug, it provides an option for system recovery.
+, Trying to reproduce.
+
+1) Intentionally fail DataStreamer by throwing IOException right AFTER
+{noformat}
+2219         lb = locateFollowingBlock(startTime);
+{noformat}
+
+2) Add Thread.sleep(1000) at the top of DataStreamer thread run() 
+so that DataStreamer would fail after  flushInternal() line 
+{noformat}
+2524           isClosed();
+{noformat}
+
+
+This will reproduce the hang state.
+
+Also, if datastreamer throws the IOException BEFORE that line, dfs -put would return '0' but ends up with empty file., Thanks koji. I was also able to reproduce this by throwing exception after locateFollowingBlock. Looks like this is what happened
+- DFSClient timed out getting a new block from namenode, while namenode was busy. But in this case, namenode did allocate a block on behalf of the client.
+- This raised an exception and locateFollowingBlock returned exception eventually closing streamer
+- now closeInternal went pass isClosed() and was trying to complete the file. 
+- namenode had a connection to client and so, did not expire the lease. 
+
+Suggested fix is to call isClosed() while trying to complete the file. I tested this manually and it throws the exception stored in lastException and terminates the client. , Hi Lohit, +1 on your patch., Thanks Lohit! 
+
+In the DataStreamer thread, can we catch Throwable instead of IOException? 
+If OutOfMemoryError is thrown, it'll still hang., Thanks Koji, Dhruba.
+Another try with this new patch. Here, we catch Throwable and isComplete() is called only after we try to complete file for 10 times. I think we should allow complete file to retry few times before checking for isClosed(). , Need patches for both 17 and 18, if different., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12385226/HADOOP-3681-2.patch
+  against trunk revision 673517.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no tests are needed for this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2793/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2793/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2793/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2793/console
+
+This message is automatically generated., Looks like hudson is not running core tests. I see same failure on another patch as well. , Lohit, with your second patch,  if DataStreamer thread throws an exception before  locateFollowingBlock(startTime), hadoop dfs -put can incorrectly succeed ending up with empty dfs file. 
+
+I don't know the detail of the dfs enough, but maybe we need to check for the error after queue is emptied?  
+Can we call isClosed() at the bottom of flushInternal ?, Yes, there could be an exception thrown before locateFollowingBlock. So, we have to check lastException before setting close to true by calling isClosed(). As you said after flush is the right place. This updated patch also changes one testcase which used to dump the exception on stdout. , Same patch for 0.19 version., Same patch for 0.17, +1 Tested manually (throwing IOException in the middle).
+
+With second patch
+{noformat}
+bash-3.00$ ls -l testfile
+-rw-r--r--  1 knoguchi users 75396 Jul  4 01:46 testfile
+bash-3.00$ $HADOOP_HOME/bin/hadoop dfs -put testfile  /user/knoguchi
+08/07/04 02:13:43 WARN dfs.DFSClient: DataStreamer Exception: java.io.IOException: testing
+08/07/04 02:13:43 WARN dfs.DFSClient: Error Recovery for block null bad datanode[0]
+bash-3.00$ echo $?
+0
+bash-3.00$ $HADOOP_HOME/bin/hadoop dfs -ls /user/knoguchi
+Found 1 items
+/user/knoguchi/testfile <r 1>   0       2008-07-04 02:13        rw-r--r--       knoguchi        supergroup
+{noformat}
+
+With third patch, 
+{noformat}
+bash-3.00$ $HADOOP_HOME/bin/hadoop dfs -put testfile  /user/knoguchi
+08/07/04 02:15:03 WARN dfs.DFSClient: DataStreamer Exception: java.io.IOException: testing
+08/07/04 02:15:03 WARN dfs.DFSClient: Error Recovery for block null bad datanode[0]
+put: Could not get block locations. Aborting...
+Exception closing file /user/knoguchi/testfile
+java.io.IOException: Could not get block locations. Aborting...
+        at org.apache.hadoop.dfs.DFSClient$DFSOutputStream.processDatanodeError(DFSClient.java:2084)
+        at org.apache.hadoop.dfs.DFSClient$DFSOutputStream.access$1300(DFSClient.java:1702)
+        at org.apache.hadoop.dfs.DFSClient$DFSOutputStream$DataStreamer.run(DFSClient.java:1822)
+bash-3.00$ echo $?
+255
+{noformat}
+, The third patch looks good. +1., Should have been promotedearlier., I ran tests locally against trunk and branch-0.18 on my local machine. Both runs passed all tests. , -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12385262/HADOOP-3681-3-17.patch
+  against trunk revision 674834.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no tests are needed for this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2812/console
+
+This message is automatically generated., Looks like the patch build picked up latest file even if it was not marked for inclusion. It tried to apply 0.17 patch on trunk. Reattaching 0.19 patch and retrying hudson. , I just committed this. Thanks Lohit!, Integrated in Hadoop-trunk #581 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/581/])]

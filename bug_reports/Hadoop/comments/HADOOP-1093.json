@@ -1,0 +1,159 @@
+[Note, that when HADOOP-928 was committed, the number of these exceptions in my namenode logs went from 0 to more than 1 million., I have two questions regarding two snippets of code in method readBuffer() in ChecksumFilesystem.java.
+
+1.  There is a loop of the following form:
+
+        boolean endOfFile=false;
+        while (read < len && !endOfFile) {
+          int count = datas.read(b, off + read, len - read);
+          if (count < 0)
+            endOfFile = true;
+          else
+            read += count;
+        }
+
+Now, is there a possibility that datas.read() returns 0? If so, then the above might loop indefinitely.
+
+2. Another portion of code:
+
+            if (seekToNewSource(oldPos)) {
+              throw ce;
+            } else {
+              retry = true;
+            }
+
+Isn't it true that seekTonewSource returns true if there is another possible source for this block. In that case, should not the above check be reversed? if my observation is correct, the above code might result in an infinite loop.
+
+
+   
+, Nigel, I might be wrong. I feel that this issue is more likely caused by HADOOP-923. It would be nice if pendingTransfer could be done sooner when the name node is not busy. 
+, Ok, after I talked with Dhruba, I got some background information on this issue.
+
+The first piece of code is not a problem.
+
+The second piece of the code is a bug. The check should be reversed. But I do not think this will cause an infinite loop because the max # of retries is 3.
+, I agree with Hairong that the second piece of code is a bug but it migth not be contribuing to the NotYetReplicatedException problem that we are currently investigating.
+
+I think I have found another bug in DFSClient that can cause an infinite loop.
+
+3. If you look at nextBlockOutputStream: if the socket connection throws an IOException, we catch it and continue to retry indefinitely. This is not a good thing.
+
+, So Nigel and I were poking around the Namenode logs, trying to trace all the events in the lifetime of a block. We have a theory that seems to fit all the symptoms.
+
+If you look through the life story of blk_3903667269962316732, the following events appear:
+
+2007-03-16 01:21:05,248 DEBUG org.apache.hadoop.dfs.StateChange: *BLOCK* NameNode.reportWrittenBlock: blk_391490390916935261 is written to 1 locations
+2007-03-16 01:21:05,248 DEBUG org.apache.hadoop.dfs.StateChange: *BLOCK* NameNode.blockReport: from 72.30.52.207:50010 2627 blocks
+2007-03-16 01:21:05,250 DEBUG org.apache.hadoop.dfs.StateChange: BLOCK* NameSystem.blockReceived: blk_391490390916935261 is received from 72.30.52.207:50010
+2007-03-16 01:21:05,250 DEBUG org.apache.hadoop.dfs.StateChange: BLOCK* NameSystem.addStoredBlock: blockMap updated: 72.30.52.207:50010 is added to blk_391490390916935261
+2007-03-16 01:21:05,254 DEBUG org.apache.hadoop.dfs.StateChange: BLOCK* NameSystem.processReport: from 72.30.52.207:50010 2627 blocks
+2007-03-16 01:21:05,255 DEBUG org.apache.hadoop.dfs.StateChange: BLOCK* NameSystem.removeStoredBlock: blk_391490390916935261 from 72.30.52.207:50010
+
+What seems to be happening is a race between a client reporting a block and a block report from a Datanode:
+
+- the client reports a written block
+- immediately after this the NameNode receives a block report from the DataNode which *doesn't* contain this block because the block report was generated while the block was in flight
+- the NameNode trusts the block report and blithely removes the block from block map
+- the next attempt by the client to allocate a block causes a NotReplicatedYetException
+
+Other tells for this condition:
+- The NRYE happens mostly in the Namenode benchmark, which generates lots and lots and lots of blocks with exactly 1 replica. With 'n > 1' replicas, 'n' block reports have to coincide with the client report in order for this to happen.
+
+- The NRYE shows up 1 hour into the benchmark and 1 hour is of course the block report interval. We validated this by setting the block report interval to 5 minutes and sure enough NRYEs showed up in 5 minutes.
+
+We think the checksum patch caused this because it enforced a 1-byte blocksize on .crc files in NNbench. Earlier, setting the block size on a file had no effect on .crc files. This certainly needs fixing, but doesn't appear to be a blocker for 0.12.1.
+
+
+
+
+
+
+, This is great! I think the theory looks right. But why the checksum patch triggered this remains to be mysterious to me. Earlier the block size on a file DID have effect on .crc file. The checksum patch did not make any change on this., Not a 0.12.1 blocker, One proposal to fix this issue:
+
+1. Make the dfsclient *not* invoke reportWrittenBlock(). Instead, the dfsclient will instruct each datanode in the pipeline to send blockReceived confirmation to the namenode.
+
+2. The datanode already accumulates all pending blockReceived() calls and does them through the offerService thread. So, no change is needed to datanode.
+
+3. The getAdditionalBlock() method on the namenode currently checks that all previously allocated blocks of this file has reached their minimum replication factor. I plan on removing this check altogether. This is not really required but is a performance optimization.
+
+4. The close() method on the DFSClient waits for the minimum number of replicas of each block to be created. This code remains unchanged.
+, First draft of code. Please review. 
+
+I also made the following optimization:
+In the earlier code, the datanode was first writing the data to its local file before forwarding it to the next datanode in the pipeline. This patch changes this behaviour. A datanode first writes the data to the next datanode and then writes it to the local block. This should improve performance., This patch does the following:
+
+1. The client does not send block confirmations to the namenode. Instead, each datanode sends block confirmations to the namenode.
+
+2. The namenode does not verify that all previous blocks have achieved the minimum replication factor before allocating the next block for the file. The check is done when the file is closed. A successful file close guarantees that the minimum replication factor for all blocks has been achieved.
+
+3. The dfsclient uses an exponential backoff scheme when it has to retry RPC's to the namenode. This helps the namenode to not get overwhelmed.
+
+4. The datanode first forwards the data to the next datanode in the pipeline before it writes the data to its local block file.
+
+5. The default number of namenode server threads have increased from 10 to 30. This helps in the case when there are 2000 datanodes. The call queue length per thread is 100; with this setting we have a overall call queue length of 3000. There is also configuration setting to change the number of handler threads.
+, For the change 2, I think it would be nice to check if the previous block has reached the minimum # of replicas or not but not for all the previous blocks. In this way we are able to slow down client writing when dfs is not able to handle the amount of data in time., I am not too inclined to check if the last block has achieved its minimum replication factor before allocating the next block. The datanodes directly send block confirmation to the namenode and a slow datanode for even one block of the file is going to adversely impact write performance.
+
+But I agree with you that we need to slow down the client if the namenode is overloaded? If the addBlock() RPC times out, maybe the client should retry?, The check is only to see if the # of replicas has reached the minimun number, which by default is set to be 1. So if one datanode gets slow, it won't  cause the check to fail. But if the check does not get passed, it really means the whole dfs (namenode or datanodes) is overloaded, so the client should slow down. If the check is done only at close, there is a risk that a block might get lost., 0. This patch does not apply since it has
+Index: src/test/org/apache/hadoop/dfs/NNBench.java
+instead of
+Index: src/java/org/apache/hadoop/dfs/DFSClient.java
+So all changes intended for the client are considered to be for NNBench.
+Has it been manually compiled or something?
+
+1. I like that data-nodes confirm written blocks rather than the client.
+I am not sure we are fixing the problem completely here.
+If blockReport() happens before blockReceived() the received block will be removed, wont it?
+
+2. I think we should retain verification of the minimal block replication on the name-node as it was before.
+Suppose we are writing to a file for a long time and in the end get a message the first block was not written properly.
+I think the client should rather fail on allocating the second block in the case and retry.
+In order to accelerate data-node reporting of received blocks we should move it before the blockReport().
+
+3. Exponential backoff seems a little aggressive. You start with 400 msec sleep and on the last (out of 5)
+retry of allocating the next block the client will sleep for 32 seconds.
+If the name-node is not busy then this will substantially slow down the process, if the name-node is busy
+then the timeouts should take care of the overwhelming. I think we should have more experimental data on
+this issue before we apply that approach. This seems like a change of the general strategy which we should
+consider for all communications rather than just for one case, and it should belong to a separate issue.
+In this particular case the slowdown is not justified since when the data-node returns to the client everything
+is successfully replicated, written and confirmed.
+
+4. Local disk is faster than network, so if the disk is full or RO there is no reason to send data over the wire,
+since it will be redistributed again anyway. This again looks like an attempt to optimize, but has little to do
+with solving the problem.
+
+5. The default should be optimal for the most common usage scenario, and should be tested well.
+10 handlers handled the traffic well so far. Why changing the default?
+
+I don't see enough motivation for changes 2 through 5 yet. They should be discussed in separate issues.
+-1 on including 2-5.
+
+I ran 1, it works on my small cluster. But it needs
+a) to move blockReceived() before blockReport(), may be even before sendHeartbeat()
+b) to be verified and confirmed with a successful NNBench run., I removed the expenential backoff for retries. Also, at every new block allocation, we check that the penultimate block was achieved the minimum replication factor. I did not change the default number of server threads., It needs minor comment correction
+<DataNode>
+// we writing to local disk in parallel.
+^^^^^
+
+<FSNamesystem>
+     * each block, otherwise check only last block.
+
+Unused method
+      public Block getLastBlock() {
+
+On my comment #4. I think it worth doing what Dhruba proposed, namely to
+first send data over the network, and then to write it to local disk. That way
+local writes will happen almost simultaneously on all data-nodes to which the
+block was transferred.
+, Incorporated Konstantin's code review comments., A change in a comment as pointed out by Konstantin., +1 
+It looks good to me.
+, +1
+
+http://issues.apache.org/jira/secure/attachment/12355285/nyr4.patch applied and successfully tested against trunk revision r527417.
+
+Results are at http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/25/console, It looks like reportWrittenBlock is no longer called.  Should this method be removed from the protocol?, Removed reportWrittenBlock() RPC from ClientProtocol. Bumped up the ClientProtocol from 10 to 11. (described in  http://issues.apache.org/jira/browse/HADOOP-1243), I just committed this.  Thanks, Dhruba!, Integrated in Hadoop-Nightly #56 (See http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Nightly/56/), -1, could not apply patch.
+
+The patch command could not apply the latest attachment http://issues.apache.org/jira/secure/attachment/12355372/nyr5.patch as a patch to trunk revision r548794.
+
+Console output: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/309/console
+
+Please note that this message is automatically generated and may represent a problem with the automation system and not the patch., Integrated in Hadoop-Nightly #131 (See [http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Nightly/131/])]

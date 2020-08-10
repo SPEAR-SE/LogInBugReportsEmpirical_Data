@@ -1,0 +1,153 @@
+[Nice find! Thanks! I can see how that will be problematic in the inner loop. Just glancing at it:
+
+- the only place where we use operator-hooks seems to be the home-grown profiler. Neat to have, but not a good reason to slow down performance.
+- this seems to add the following overhead to the inner loop:
+  - allocation of context per row
+  - iteration through empty list of hooks (utils always sets empty list)
+  - two additional virtual calls
+
+Is anyone really using/planning on using this? The easiest fix would be to just remove it, which seems the right thing to do. It doesn't seem useful to have a feature that adds a lot of overhead in the inner loop. There are ways to cut down on the overhead for when there are no hooks, but I'd like to know if there's opposition to removing it first.
+
+, I agree with Gunther's analysis and suggestion to remove them altogether. If only reason to introduce operator level hook was to measure performance that we have failed in that objective by actually making system slower not faster. Profiling should be done using jvm toolkits like yourkit, jvisualvm etc., not by modifying code., I agree with Gunther's conclusion - moving this out would be the immediate fix for performance reasons.
+
+But a built-in profiler is an advantage in many ways, considering how something like yourkit takes ~45 mins to run through a 2 min query & requires a license key to inspect the output.
+
+There is definitely middle ground to be found here.
+
+The operator base-class hooks need to be removed for sure since it pollutes the common code-path and allocates objects in the inner loop. 
+
+But the feature is a good idea & should be set aside for an implementation revisit later., Till we find a middle ground for this, we need to remove this to avoid loosing performance. , The operator level hooks were introduced to allow a user to profile their query and see which operator was taking the most time in order to determine whether or not there are query improvements to be made, not for measuring the performance of the overall system. , The preProcessCounter and postProcessCounter weren't added for operator hooks, they were preexisting, and it doesn't look like they were modified by the diff either.
+http://svn.apache.org/viewvc/hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/Operator.java?r1=1404933&r2=1438825
+
+Could you try your experiment again just removing those two method calls and not enterOperatorHooks and exitOperatorHooks.  Those two methods look really cheap if there are not operator hooks (they just check if the list is null and return).
+
+I just want to make sure if anything is removed, we're not removing too much., It looks like the performance cost of those methods was recognized shortly after they were added
+https://issues.apache.org/jira/browse/HIVE-768
+
+It's possible the config hive.task.progress isn't as effective at countering it as expected.
+
+Can you make sure it is set to false in your run., [~kevinwilfong]: Good point, I didn't see that the counters were removed as well in the original run. I'll get more numbers.
+
+However in general, I think the process method is a bad place to put hooks into (or anything other than processing rows really). If the profiler is the only thing that uses it (and there seems to be agreement that it's useful), we should still remove it for now and re-write that in a way that has no effect on production systems.
+
+, [~kevinwilfong]: Here are the additional numbers. 
+
+Summary: You were right about counters having a significant effect despite the flag, but OperatorHooks are definitely expensive too.
+
+All tests were run on EC2, single node setup. I used ~3m rows, single table, stored in rc file. Query was count\(*\) with a simple not very selective where clause. I've ran each different build 5 times and averaged the last 3 runs. There was little difference between the runs. Hive.task.progress was off in all runs, no actual operator hooks were installed.
+
+I've also tested both removing counters and a fixed version of counters. The fixed version places the check for the flag at the right place to avoid unnecessary calls to System.currentTimeMillis(), as well as unnecessary counting of the rows, etc.
+
+Numbers:
+
+{noformat}
+Current trunk: 44.5 seconds
+Fix for counters, unchanged operator hooks: 33.5 seconds (Kevin, that's the run you asked for)
+Fix for counters, removal of operator hooks: 29.3 seconds
+Removal of both operator hooks and counters completely: 27.9 seconds
+{noformat}
+
+Proposal:
+
+- Remove operator hooks and backport to 0.11 branch. That's a regression that was introduced between 0.10 and 0.11, I believe.
+- Remove profiler for now and backport to 0.11 branch. Profiler doesn't work without operator hooks right now. I'll open a jira to re-introduce profiler in a way that doesn't add any code to the inner loop (maybe hidden behind static final var that is false, so compiler removes it).
+- Counters: Change this patch to include my fix for counters and backport to 0.11. This gives us a significant boost, but isn't a regression from the last version. I'll open a jira to dig deeper and see if we can get even closer to the result with the counters completely removed.
+
+How does that sound?, Thanks for running these separately :) I just looked in OperatorHookUtils.java which is where the opHooks list is being initialized - it looks like the opHooks list is always being initialized even if there are no OperatorHooks installed. My suspicion is that if we returned null instead of an empty list, the numbers would be different since a null check should be much cheaper. Would you mind modifying OperatorHookUtils.getOperatorHooks to return null instead of an empty list and then rerun the MBM with the code for the OperatorHooks left in and also commented out to see what the difference is?, [~pamelavagata]: I saw that too and I am sure it would make the numbers slightly better. There's also the issue with allocating a new object for each invocation which is probably even worse than the empty list. My point though is this: Even if we get it down to where I fixed counters too, you would still pay a price for the feature. No counters v fixed counters is still faster (see above). 
+
+From this thread it seems that the profiler is a valuable feature for keeping taps on performance in the dev cycle, operator hooks on the other hand are not that useful. Anything you add there has a tremendously bad effect on performance.
+
+From that I concluded that we should change the profiler not to rely on operator hooks and also not to contribute to run time in production. The best way to me is to remove it temporarily and handle it in a new jira (where we can discuss the how in more detail).
+
+Does that make sense?
+, Here's the patch that goes with the proposal, It's not clear to me that we can't cut down the cost added by operator hooks when there are no operator hooks present to the point where it does not significantly affect performance.
+
+Pam, could you provide Gunther a patch which sets the list of operator hooks to null rather than the empty list, and initializes the OperatorHookContext in the calls to enterOperatorHooks and exitOperatorHooks after the check if the list is null.  This should limit the impact of operator hooks, to two method calls and two null checks.  We could even put the check if this.operatorHooks==null around the method calls themselves, in case the Java compiler isn't inlining it for some reason.
+
+If after that, they still introduce a substantial amount of overhead, there's not much more we can do, and I'd be ok with removing operator hooks. , Will do, I'll be able to get a patch out soon, What I was trying to say is that you'll end up in the exact same place that you are with "removing counters" v "fixing counters". Two method calls, two null checks. And from my testing there *is* still overhead (29.3 v 27.9). If you think that's not a valid conclusion, I'll rerun the stuff, but otherwise we should just skip that step.
+
+Am I missing something?, I'm just really surprised that a couple of null checks increase the amount of time by ~5% especially given that we do maybe 4 null checks in the FileSinkOperator's process method alone.
+
+Of course, I can't argue with facts, so if you could try such a patch once it's available and post your results I'd really appreciate it., I agree - I've just posted the patch, it would be great if you could post some results with this one too :), I've repeated the experiments with [~pamelavagata]'s patch. Summary: Sorry, but I am *still* consistently measuring a difference.
+
+I've re-setup the experiment (didn't have the EC2 instance from last week anymore). I've setup the same data, same query, same codebase etc, but I wasn't running on the same machine, so we should be careful with comparisons between these runs and the previous ones. I did use the same method as above to get the numbers.
+
+First I created two builds: One by applying Pamela's patch ("fixed hooks") and one where I additionally commented out the operator hooks ("no hooks"). The results I got were:
+
+no hooks: 44.4 seconds
+fixed hooks: 46.2 seconds
+
+Then I created two more builds: One by applying Pamela's patch and commenting out the counters ("fixed hooks no counters") and one by commenting out both the operator hoos and the counters ("no hooks no counters"). The result I got was:
+
+no hooks no counters: 29.6 seconds
+fixed hooks no counters: 32.3 seconds, [~kevinwilfong]/[~pamelavagata]: Given the latest run, are you ok with the proposal, or do you have another suggestion?, Gunther, thanks for taking the time to run the patch: given the results - I'm ok with the proposal., Thanks. I've rebased the patch and split it into two. HIVE-4378 has the changes for the counters, this one is about operator hooks/profiler. This way I am hoping it's easier to start the work on re-introducing the profiler, because only relevant changes are captured in this patch., +1 will commit if tests pass., Committed to trunk. Thanks, Gunther!, Integrated in Hive-trunk-hadoop2 #167 (See [https://builds.apache.org/job/Hive-trunk-hadoop2/167/])
+    HIVE-4318 : OperatorHooks hit performance even when not used (Gunther Hagleitner via Ashutosh Chauhan) (Revision 1470101)
+
+     Result = FAILURE
+hashutosh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1470101
+Files : 
+* /hive/trunk/build-common.xml
+* /hive/trunk/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+* /hive/trunk/conf/hive-default.xml.template
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/ExecMapper.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/ExecReducer.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/Operator.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/OperatorHook.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/OperatorHookContext.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/OperatorHookUtils.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilePublisher.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilePublisherInfo.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfiler.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilerAggregateStat.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilerConnectionInfo.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilerStats.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilerStatsAggregator.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilerUtils.java
+* /hive/trunk/ql/src/test/org/apache/hadoop/hive/ql/exec/TstOperatorHook.java
+* /hive/trunk/ql/src/test/org/apache/hadoop/hive/ql/exec/TstOperatorHookUtils.java
+* /hive/trunk/ql/src/test/org/apache/hadoop/hive/ql/hooks/HiveProfilerResultsHook.java
+* /hive/trunk/ql/src/test/org/apache/hadoop/hive/ql/hooks/PostTestOperatorHook.java
+* /hive/trunk/ql/src/test/queries/clientpositive/hiveprofiler0.q
+* /hive/trunk/ql/src/test/queries/clientpositive/hiveprofiler_script0.q
+* /hive/trunk/ql/src/test/queries/clientpositive/hiveprofiler_union0.q
+* /hive/trunk/ql/src/test/queries/clientpositive/operatorhook.q
+* /hive/trunk/ql/src/test/results/clientpositive/hiveprofiler0.q.out
+* /hive/trunk/ql/src/test/results/clientpositive/hiveprofiler_script0.q.out
+* /hive/trunk/ql/src/test/results/clientpositive/hiveprofiler_union0.q.out
+* /hive/trunk/ql/src/test/results/clientpositive/operatorhook.q.out
+, Integrated in Hive-trunk-h0.21 #2072 (See [https://builds.apache.org/job/Hive-trunk-h0.21/2072/])
+    HIVE-4318 : OperatorHooks hit performance even when not used (Gunther Hagleitner via Ashutosh Chauhan) (Revision 1470101)
+
+     Result = ABORTED
+hashutosh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1470101
+Files : 
+* /hive/trunk/build-common.xml
+* /hive/trunk/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+* /hive/trunk/conf/hive-default.xml.template
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/ExecMapper.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/ExecReducer.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/Operator.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/OperatorHook.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/OperatorHookContext.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/exec/OperatorHookUtils.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilePublisher.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilePublisherInfo.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfiler.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilerAggregateStat.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilerConnectionInfo.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilerStats.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilerStatsAggregator.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/profiler/HiveProfilerUtils.java
+* /hive/trunk/ql/src/test/org/apache/hadoop/hive/ql/exec/TstOperatorHook.java
+* /hive/trunk/ql/src/test/org/apache/hadoop/hive/ql/exec/TstOperatorHookUtils.java
+* /hive/trunk/ql/src/test/org/apache/hadoop/hive/ql/hooks/HiveProfilerResultsHook.java
+* /hive/trunk/ql/src/test/org/apache/hadoop/hive/ql/hooks/PostTestOperatorHook.java
+* /hive/trunk/ql/src/test/queries/clientpositive/hiveprofiler0.q
+* /hive/trunk/ql/src/test/queries/clientpositive/hiveprofiler_script0.q
+* /hive/trunk/ql/src/test/queries/clientpositive/hiveprofiler_union0.q
+* /hive/trunk/ql/src/test/queries/clientpositive/operatorhook.q
+* /hive/trunk/ql/src/test/results/clientpositive/hiveprofiler0.q.out
+* /hive/trunk/ql/src/test/results/clientpositive/hiveprofiler_script0.q.out
+* /hive/trunk/ql/src/test/results/clientpositive/hiveprofiler_union0.q.out
+* /hive/trunk/ql/src/test/results/clientpositive/operatorhook.q.out
+]

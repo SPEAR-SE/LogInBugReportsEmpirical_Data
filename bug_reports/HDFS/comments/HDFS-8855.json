@@ -1,0 +1,899 @@
+[Reproducer script:
+
+{code}
+#!/bin/bash
+
+# Check that the hadoop command is available
+hadoop fs -help > /dev/null 2> /dev/null
+if [ $? != 0 ]; then
+	echo "The hadoop command must be in your path"
+	exit 1
+fi
+
+# segment, op=OPEN and offset are added to url_base                   
+file_size=${file_size:-$[ 1024 * 1024 * 1024 ]}
+count=${count:-1000000}
+reads_per_pass=${reads_per_pass:-1000}
+webhdfs_namenode=${webhdfs_namenode:-"localhost:50070"}
+read_size=${read_size:-64000}
+concurrent_reads=${concurrent_reads:-50}
+
+url_base="http://"$webhdfs_namenode"/webhdfs/v1/tmp/bigfile_$$"
+passes=$[ $count / $reads_per_pass ]
+url_list_file=/tmp/file_list_$$.txt
+namenode=${namenode:-`echo $url_base | grep -Po "(?<=http://)[^:/]*"`}
+
+echo "Environment settings:"
+echo "  file_size=$file_size"
+echo "  count=$count"
+echo "  reads_per_pass=$reads_per_pass"
+echo "  webhdfs_namenode=$webhdfs_namenode"
+echo "  read_size=$read_size"
+echo "  concurrent_reads=$concurrent_reads"
+echo "Outputs in /tmp/curl_[out|err]_$$"
+echo "Computed values:"
+echo "  url_base=$url_base"
+echo "  passes=$passes"
+echo "  url_list_file=$url_list_file"
+echo "  namenode=$namenode"
+echo
+echo "Copying temp data..."
+blocks_to_copy=$[ ( $file_size + 1023 ) / 1024 ]
+dd count=$blocks_to_copy bs=1024 if=/dev/zero | tr "\0" "+" | hadoop fs -copyFromLocal - /tmp/bigfile_$$
+
+echo "Generating URL list..."
+# Generate the load profile
+rm -f $url_list_file
+for j in `seq 1 $reads_per_pass`; do
+  rand=$(od -N 4 -t uL -An /dev/urandom | tr -d " ")
+  offset=$[ ( $rand % (file_size / read_size) * read_size )]
+  url=$url_base?op=OPEN\&user.name=$USER\&offset=$offset\&length=$read_size
+  echo url = \"$url\" >> $url_list_file
+done
+
+# Open $concurrent_reads files and do $reads_per_pass random reads of $read_size 
+for i in `seq 1 $passes` ; do
+  # Kick off concurrent random reads
+  for k in `seq 1 $concurrent_reads`; do
+	curl -v -L -K $url_list_file > /tmp/curl_out_$$-$k.txt 2>/tmp/curl_err_$$-$k.txt &
+  done
+  
+  # Wait for all curl jobs to finish
+  while [ `jobs | grep "Running.*curl" | wc -l` != 0 ]; do
+    sleep 1s
+
+    # Every second, count the connections on the webhdfs_namenode
+	ssh $namenode "file=/tmp/netstat.out_\$\$ ; netstat -an > \$file ; echo -n 'ESTABLISHED: '; echo -n \`grep -c ESTABLISHED \$file\` ; echo -n '  TIME_WAIT: '; echo -n \`grep -c TIME_WAIT \$file\` ; echo -n '  CLOSE_WAIT: '; grep -c CLOSE_WAIT \$file; rm \$file"&
+	echo `grep "HTTP/1.1 [^23]" /tmp/curl_err_$$-* | wc -l` errors, "`grep "HTTP/1.1 200" /tmp/curl_err_$$-* | wc -l`" successes
+  done
+
+  # Display the completion time
+  echo -n "Pass $i   ";
+  date +%H:%M:%S.%N
+  echo Total: `grep "HTTP/1.1 [^23]" /tmp/curl_err_$$-* | wc -l` errors, "`grep "HTTP/1.1 200" /tmp/curl_err_$$-* | wc -l`" successes
+    
+#  sleep $delay
+done
+{code}, Note: to exacerbate the test-case set the environment to have file_size=1 and read_size=1, This has the same description as HDFS-7597, although the patch is in the UGI space, which surprises me.  It speaks of the RPC layer caching the NN connection but that cache not being re-used because the UGI is created anew for each webhdfs request., I tried running this script against an HDFS-2.6.0 patched with [~daryn]'s original HDFS-7597 patch (just to ensure that my refactoring wasn't a confounding factor), and the issue seems to persist.  It is entirely possible that I messed up my configuration and was accidentally running unpatched code, so take that with a grain of salt.
+
+Looking at the source, my inclination would be to have an LRU (much like the HDFS-7597 patch) attached to the WebHDFS session that would map ugi->HDFS client.  This would keep the client's information and connection state around for re-use, but shut it down once the HTTP session ended.  What do you think, [~xiaobingo]?, [~bobhansen] This looks good to me. Let's work on this to reduce connections unnecessarily created., Tested HDFS-7597 patch, it’s working well for HDFS-8855.  In my 3 nodes of local VMs, the ESTABLISHED connection varies from 1400 to 2200 as load generator is running.
+The code path is different in two cases. HDFS-8855 case goes to cache in org.apache.hadoop.ipc.connection. Let’s investigate on that cache., Does 2200 DN->NN connections seem a bit... excessive... for 50 concurrent reads?  If you set the concurrent_reads environment variable to 500, do you end up with 22000 connections (and start running the NN out of ports very quickly)?  If the load scales up linearly with the cluster size (a process on each node reading 50 files), will your NN run out of ports and fail?, [~bobhansen]
+I was using the sequential work load for results above.
+{noformat}
+#!/bin/bash
+# segment, op=OPEN and offset are added to url_base                   
+count=${count:-1000000}
+#echo $count
+url_base=${url_base:-"http://c6401.ambari.apache.org:50070/webhdfs/v1/tmp/bigfile"}
+#echo $url_base
+read_size=${read_size:-1}
+#echo $read_size
+file_size=${file_size:-$[ 1024 * 1024 * 1024 ]}
+#echo $file_size
+#namenode=${namenode:-`echo $url_base | grep -Po "(?<=http://)[^:/]*"`}
+namenode="c6401.ambari.apache.org"
+#echo $namenode
+
+for i in `seq 1 $count` ; do
+  rand=$(od -N 4 -t uL -An /dev/urandom | tr -d " ")
+  #echo $rand
+  offset=$[ ( $rand % (file_size / read_size) * read_size )]
+  #echo $offset
+  url=$url_base?op=OPEN\&offset=$offset\&length=$read_size
+  #echo $url
+  
+  curl -L "$url" > url.blah 2>/dev/null
+  #curl -L "$url"
+  if (( $i % 100 == 0 )) ; then
+    # Display the time
+    echo -n "$i   ";
+    date +%H:%M:%S.%N
+    
+    # Count the connections on the NameNode
+    ssh vagrant@$namenode "file=/tmp/netstat.out ; netstat -a > \$file ; echo -n 'ESTABLISHED: '; echo -n \`grep -c ESTABLISHED \$file\` ; echo -n '  TIME_WAIT: '; echo -n \`grep -c TIME_WAIT \$file\` ; echo -n '  CLOSE_WAIT: '; grep -c CLOSE_WAIT \$file"&
+  fi
+#  sleep $delay
+done
+{noformat}
+
+By running one load generator, I got up to 2200 connections, two to 3200.
+
+Also ran the concurrent workload, there's up to 7000 connections. Making file_size=1 and read_size=1 does not necessarily exacerbate it. I think it has something to do with my cluster. Three nodes being local VMs. NN/DN/SNN is equally deployed to 3 nodes.
+
+Let's first try to work on the cache of org.apache.hadoop.ipc.connection to have a test again.
+
+, Made a patch for review. Idea's been to avoid creating brand new DFSClient per webhdfs request, which will create a new NN connection., I don't think this is correct as ugi / dt should be considered when caching connections.
+
+The connections to NN are supposed to be cached as the RPC layer. That's being said, that this is the wrong place to fix. If the caching is not working then it's a serious bug. We need to dig into the DFSClient / RPC layer to understand what really happened., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  1s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12751122/HDFS-8855.1.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 71aedfa |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12029/console |
+
+
+This message was automatically generated., Jitendra and [~daryn] both hypothesized that there is a missed equality check for the UserGroupInfo in the RPC lookup. I believe the theory is that the DataNodeUGIProvider is creating a new ugi each time, and something is checking if newUgi==oldUgi rather than newUgi.equals(oldUgi).  That might be a good place to look, [~wheat9]
+
+[~xiaobingo]: rather than having a static cache of clients, perhaps we should match the client lifecycle to the http session.  We can store the client reference in ChannelHandlerContext attributes, and catch the channelInactive event in the WebHdfsHandler to close the client.  Of course, we need to check that the UGIs match and make sure that the operations don't close the client before the session ends.
+
+I have a prototype of that, but haven't been able to test it yet., This patch (which compiles, but hasn't actually been "tested" or "validated" or "run") outlines the integration points that seemed like good places to poke at.  It caches the client in the Netty context, doesn't close it for op=OPEN calls, and explicitly closes it when the session ends.
+
+It might be useful as the basis for further work, or simply as a strawman to discuss., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12751266/HDFS_8855.prototype.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 2da5aaa |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12042/console |
+
+
+This message was automatically generated., This basically shows that the RPC connection cache is not working, but again this is the wrong place to fix.
+
+We should dig into in this case why RPC connection cache is not working instead of putting a band aid in WebHDFS., Agreed that the RPC cache not working is a bug that should be fixed independently.  It can be argued that caching the whole client object is an additional optimization that has some value here.
+
+But yes, we should track down why the RPC cache is failing us., Thanks [~wheat9] and [~bobhansen] for review. Tracing down to ProtobufRpcEngine that calls Client.getConnection which fetches connection from cache(com.google.common.cache.Cache) by using ConnectionId as key. ConnectionId is different for every webhdfs request even if the url and user are same. That's why the NN connection is constantly created by DN in this case. Need to refactor ConnectionId(hashCode or equals) somehow to meet comparison invariant assumed by cache(com.google.common.cache.Cache) to make it work properly., Made patch V2. The proposed fix is to cache UGI in webhdfs to avoid creating brand new UGI for every web request.
+1. In insecure case, remote-user+proxy-user is the key for cache. 
+2. In secure case, token is the key. UGI is constructed based on token. It’s necessary to ensure different UGI instance, and thus different connection, given token is changed.
+
+Connection cache is designed to be keyed on UGI instances. Actually, the connection cache is keyed on the 'UGI#Subject' instance instead of the UGI instance, which seems to be the right choice because subject contains the security credentials of the users, and we should allow connection re-use in the same authentication context only.
+, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | pre-patch |  17m 34s | Findbugs (version 3.0.0) appears to be broken on trunk. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:red}-1{color} | tests included |   0m  0s | The patch doesn't appear to include any new or modified tests.  Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. |
+| {color:green}+1{color} | javac |   7m 58s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  10m 19s | There were no new javadoc warning messages. |
+| {color:red}-1{color} | release audit |   0m 21s | The applied patch generated 1 release audit warnings. |
+| {color:red}-1{color} | checkstyle |   1m 20s | The applied patch generated  2 new checkstyle issues (total was 417, now 418). |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 38s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 35s | The patch built with eclipse:eclipse. |
+| {color:red}-1{color} | findbugs |   2m 38s | The patch appears to introduce 3 new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | native |   3m 20s | Pre-build of native portion |
+| {color:red}-1{color} | hdfs tests | 195m 18s | Tests failed in hadoop-hdfs. |
+| | | 241m  5s | |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-hdfs |
+| Failed unit tests | hadoop.hdfs.TestHDFSTrash |
+|   | hadoop.hdfs.server.namenode.TestFileTruncate |
+|   | hadoop.hdfs.server.blockmanagement.TestComputeInvalidateWork |
+|   | hadoop.hdfs.TestLeaseRecovery2 |
+|   | hadoop.hdfs.server.blockmanagement.TestNodeCount |
+|   | hadoop.hdfs.TestRollingUpgrade |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12752882/HDFS-8855.2.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / a9c8ea7 |
+| Release Audit | https://builds.apache.org/job/PreCommit-HDFS-Build/12179/artifact/patchprocess/patchReleaseAuditProblems.txt |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/12179/artifact/patchprocess/diffcheckstylehadoop-hdfs.txt |
+| Findbugs warnings | https://builds.apache.org/job/PreCommit-HDFS-Build/12179/artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12179/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12179/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf908.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12179/console |
+
+
+This message was automatically generated., Xiaobing - is there a race condition in initializing the ugiCache?  If two threads make simultaneous requests, one of them will succeed in the CAS for ugiCacheInit, and the other will proceed ahead.  If the latter thread immediately tries to reference the ugiCache while the first is still initializing it, we will get an NPE or a partially-constructed object.
+
+See http://www.journaldev.com/1377/java-singleton-design-pattern-best-practices-with-examples for a nice little discussion of idiomatic singletons in Java; if we're supporting JRE <= 1.5, the Pugh construction is clean and works well for concurrent access., [~bobthansen] Thanks for review. Although that's called by bootstrap only, it should be thread safe. See patch V3., [~xiaobingo]  Sterling.  Is this something that you can build tests over?, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  19m 23s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:red}-1{color} | tests included |   0m  0s | The patch doesn't appear to include any new or modified tests.  Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. |
+| {color:green}+1{color} | javac |   9m  7s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  12m  3s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   1m 30s | The applied patch generated  2 new checkstyle issues (total was 418, now 420). |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 35s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 36s | The patch built with eclipse:eclipse. |
+| {color:red}-1{color} | findbugs |   3m 23s | The patch appears to introduce 1 new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | native |   3m 40s | Pre-build of native portion |
+| {color:red}-1{color} | hdfs tests |  96m 24s | Tests failed in hadoop-hdfs. |
+| | | 148m  8s | |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-hdfs |
+| Failed unit tests | hadoop.hdfs.server.namenode.TestDeleteRace |
+| Timed out tests | org.apache.hadoop.hdfs.TestBlockReaderFactory |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12753053/HDFS-8855.3.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / cbb2495 |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/12203/artifact/patchprocess/diffcheckstylehadoop-hdfs.txt |
+| Findbugs warnings | https://builds.apache.org/job/PreCommit-HDFS-Build/12203/artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12203/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12203/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf900.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12203/console |
+
+
+This message was automatically generated., Patch V4. Added some UTs. Can anyone review it? Thanks., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  17m 52s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   8m 15s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  11m 53s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 27s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   1m 29s | The applied patch generated  2 new checkstyle issues (total was 412, now 414). |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 46s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 37s | The patch built with eclipse:eclipse. |
+| {color:red}-1{color} | findbugs |   3m  0s | The patch appears to introduce 1 new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | native |   3m 47s | Pre-build of native portion |
+| {color:red}-1{color} | hdfs tests | 135m  4s | Tests failed in hadoop-hdfs. |
+| | | 184m 13s | |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-hdfs |
+| Failed unit tests | hadoop.hdfs.TestDFSInputStream |
+|   | hadoop.hdfs.server.namenode.TestNameNodeMetricsLogger |
+| Timed out tests | org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyWriter |
+|   | org.apache.hadoop.hdfs.TestLargeBlock |
+|   | org.apache.hadoop.hdfs.tools.TestDFSAdmin |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12754998/HDFS-8855.4.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 4014ce5 |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/12363/artifact/patchprocess/diffcheckstylehadoop-hdfs.txt |
+| Findbugs warnings | https://builds.apache.org/job/PreCommit-HDFS-Build/12363/artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12363/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12363/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf905.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12363/console |
+
+
+This message was automatically generated., I'm looking at the patch, but you'll need to resolve the checkstyle, findbugs, and test case failures., A few points:
+* You need to use the Token.getKind(), Token.getIdentifier(), and Token.getPassword() as the key for the cache. The patch currently uses Token.toString, which uses the identifier, kind, and service. The service is set by the client so it shouldn't be part of the match. The password on the other hand must be part of the match so that guessing the identifier doesn't allow a hacker to impersonate the user.
+* The timeout should default to 10 minutes instead of 10 seconds.
+* Please fix the checkstyle and findbugs warnings.
+* Determine what is wrong with the test case.
+
+Other than that, it looks good., Thanks [~owen.omalley] for the review!
+I made patch V5 to address the issues. There are no specific warnings in findbugs report. The flakey UT failures are irrelevant. , \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  19m 53s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 50s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  10m 23s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:green}+1{color} | checkstyle |   2m 10s | There were no new checkstyle issues. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 38s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:red}-1{color} | findbugs |   2m 17s | Post-patch findbugs hadoop-hdfs-project/hadoop-hdfs compilation is broken. |
+| {color:green}+1{color} | findbugs |   2m 17s | The patch does not introduce any new Findbugs (version ) warnings. |
+| {color:red}-1{color} | common tests |   0m 24s | Tests failed in hadoop-common. |
+| {color:red}-1{color} | hdfs tests |   0m 25s | Tests failed in hadoop-hdfs. |
+| | |  46m  2s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed build | hadoop-common |
+|   | hadoop-hdfs |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12757177/HDFS-8855.005.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 6b97fa6 |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12526/artifact/patchprocess/testrun_hadoop-common.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12526/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12526/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf909.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12526/console |
+
+
+This message was automatically generated., Build failures from V5 are due to hadoop-common changes invisible to hdfs. HADOOP-12424 is used to separate the changes. Patch V6 will be posted then., Revisiting the use case  -- how much benefits are we getting from the cache? Is making a connection from DN to NN necessary at all?
+
+There are two issues that we have experienced in production here:
+
+* DN creates too many connections to the NN when serving WebHDFS requests. It happens when doing distcp over webhdfs in a large cluster (~4,000 nodes)
+* There are a lot of TIME_WAIT connections when DN serves a large mount of concurrent, burst reads. The application sees high variances of latency when there are a lot of TIME_WAIT connections on the NN.
+
+The current workflow is the following:
+
+1. NN generates a 307 to redirect the client to the DN that is closet to the client
+2. DN receives the request from the client. It creates a new {{DFSClient}}, connects to the NN and creates a {{DFSInputStream}}
+3. It streams the {{DFSInputStream}} to the client as HTTP streams
+
+My argument argument is that steps (2) and (3) are unnecessary if the DN exposes a {{GET_BLOCK}} call that directly streams the contents of the block. The problem is eliminated at the very beginning.
+
+My proposal are:
+
+1. Expose a {{GET_BLOCK}} call in the current DN to return the content of a block on the DN.
+2. Create a {{WebBlockReader}} that reads the block from {{GET_BLOCK}}
+3. {{WebHdfsFileSystem}} can use both {{GET_BLOCK_LOCATIONS}} and the {{GET_BLOCK}} to serve the data.
+
+From an implementation prospective, there are implementation in the HDFS-7966 branch for (1) already. It is straightforward to implement (2) (it's just a HTTP GET). And (3) can be done by augmenting the responses of {{GET_BLOCK_LOCATIONS}} on whether the DN supports the {{GET_BLOCK}} call.
+
+Thoughts?, There are two separable issues; this is a performance bug in existing deployments, and your comment is a good outline for a new and improved architecture.
+
+HDFS-7966 and the rest of your proposal could be a very good solution in future versions, but doesn't obviate the performance issue with deployed systems, nor does it answer the current use case of having a bog-simple path to get hdfs data via a "curl -L http:/...." call., I agree with moving [~wheat9]'s proposal to separate ticket. It'd better to fix this performance issue first., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  19m 37s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   8m  2s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  10m  9s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 24s | The applied patch does not increase the total number of release audit warnings. |
+| {color:green}+1{color} | checkstyle |   2m 13s | There were no new checkstyle issues. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 37s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 34s | The patch built with eclipse:eclipse. |
+| {color:red}-1{color} | findbugs |   4m 32s | The patch appears to introduce 1 new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | common tests |  23m 32s | Tests passed in hadoop-common. |
+| {color:red}-1{color} | hdfs tests | 207m 39s | Tests failed in hadoop-hdfs. |
+| | | 278m 25s | |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-hdfs |
+| Failed unit tests | hadoop.hdfs.server.blockmanagement.TestBlockManager |
+|   | hadoop.hdfs.server.blockmanagement.TestUnderReplicatedBlocks |
+|   | hadoop.hdfs.TestReplaceDatanodeOnFailure |
+|   | hadoop.hdfs.TestDistributedFileSystem |
+|   | hadoop.hdfs.TestLeaseRecovery2 |
+| Timed out tests | org.apache.hadoop.hdfs.TestFileCreation |
+|   | org.apache.hadoop.hdfs.TestRemoteBlockReader |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12762178/HDFS-8855.005.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 71a81b6 |
+| Findbugs warnings | https://builds.apache.org/job/PreCommit-HDFS-Build/12662/artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12662/artifact/patchprocess/testrun_hadoop-common.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12662/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12662/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf905.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12662/console |
+
+
+This message was automatically generated., UT failures are irrelevant. All passed in local env with the patch., This is ok. +1
+
+I'm a little concerned about the runtime performance of generating the string of the identifier on every connection to the datanode, but this should be correct., Given that this is in response to an HTTP request, there's already plenty of string manipulation and network I/O going on.  It will be a long time until the string construction is our bottleneck., +1, I will commit this today., 006 patch used computed hash code as cache key. Thanks [~owen.omalley] and [~bobthansen] for review., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | pre-patch |  19m 32s | Pre-patch trunk has 2 extant Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   8m  0s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  10m  1s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:green}+1{color} | checkstyle |   2m  8s | There were no new checkstyle issues. |
+| {color:green}+1{color} | whitespace |   0m  1s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 36s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:red}-1{color} | findbugs |   4m 32s | The patch appears to introduce 2 new Findbugs (version 3.0.0) warnings. |
+| {color:red}-1{color} | common tests |   7m 37s | Tests failed in hadoop-common. |
+| {color:red}-1{color} | hdfs tests | 162m 47s | Tests failed in hadoop-hdfs. |
+| | | 217m 12s | |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-hdfs |
+| Failed unit tests | hadoop.metrics2.impl.TestGangliaMetrics |
+|   | hadoop.hdfs.TestSetrepIncreasing |
+|   | hadoop.hdfs.web.TestWebHdfsTokens |
+|   | hadoop.hdfs.server.datanode.web.webhdfs.TestDataNodeUGIProvider |
+|   | hadoop.cli.TestAclCLI |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12764121/HDFS-8855.006.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 9f53a95 |
+| Pre-patch Findbugs warnings | https://builds.apache.org/job/PreCommit-HDFS-Build/12722/artifact/patchprocess/trunkFindbugsWarningshadoop-common.html |
+| Pre-patch Findbugs warnings | https://builds.apache.org/job/PreCommit-HDFS-Build/12722/artifact/patchprocess/trunkFindbugsWarningshadoop-hdfs.html |
+| Findbugs warnings | https://builds.apache.org/job/PreCommit-HDFS-Build/12722/artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12722/artifact/patchprocess/testrun_hadoop-common.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12722/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12722/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf903.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12722/console |
+
+
+This message was automatically generated., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  19m 32s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 57s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  10m  6s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 24s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   1m 48s | The applied patch generated  1 new checkstyle issues (total was 10, now 11). |
+| {color:green}+1{color} | whitespace |   0m  1s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 34s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 35s | The patch built with eclipse:eclipse. |
+| {color:red}-1{color} | findbugs |   4m 26s | The patch appears to introduce 1 new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | common tests |   7m 53s | Tests passed in hadoop-common. |
+| {color:red}-1{color} | hdfs tests |  68m  5s | Tests failed in hadoop-hdfs. |
+| | | 122m 47s | |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-hdfs |
+| Failed unit tests | hadoop.hdfs.server.namenode.ha.TestStandbyCheckpoints |
+|   | hadoop.hdfs.TestParallelShortCircuitReadUnCached |
+|   | hadoop.hdfs.qjournal.TestNNWithQJM |
+|   | hadoop.hdfs.server.datanode.web.webhdfs.TestDataNodeUGIProvider |
+| Timed out tests | org.apache.hadoop.hdfs.server.namenode.TestFsck |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12764342/HDFS-8855.007.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 6f335e4 |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/12749/artifact/patchprocess/diffcheckstylehadoop-common.txt |
+| Findbugs warnings | https://builds.apache.org/job/PreCommit-HDFS-Build/12749/artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12749/artifact/patchprocess/testrun_hadoop-common.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12749/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12749/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf901.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12749/console |
+
+
+This message was automatically generated., Only glanced at the patch, but did you figure out why  HDFS-7597 doesn't address the problem?  It has for us and it's trivial compared to this patch., This issue is from DataNodeUGIProvider#tokenUGI
+{code}
+Token<DelegationTokenIdentifier> token = params.delegationToken();
+    ByteArrayInputStream buf =
+      new ByteArrayInputStream(token.getIdentifier());
+    DataInputStream in = new DataInputStream(buf);
+    DelegationTokenIdentifier id = new DelegationTokenIdentifier();
+    id.readFields(in);
+    UserGroupInformation ugi = id.getUser();
+    ugi.addToken(token);
+    return ugi;
+{code}
+
+for every request, a brand new UGI will be created even with HDFS-7597 patch, because DelegationTokenIdentifier is initialized per request, although HDFS-7597 returns the same UGI for the same DelegationTokenIdentifier instance., [~jnp] - did this patch ever get landed on trunk?, [~bobhansen] I couldn't commit earlier, because there was another version of the patch posted. Did you get a chance to review the latest patch? I will try to review by this weekend., There's patch 007 that uses UUID as cache key.
+{code}
+345	  public String buildCacheKey() {
+346	    return UUID.nameUUIDFromBytes(
+347	        Bytes.concat(kind.getBytes(), identifier, password)).toString();
+348	  }
+{code}
+
+Instead, 006 needs address addition overflow that leads to more potential hash collision.
+{code}
+341	  public int buildCacheKey() {
+342	    return
+343	        (kind.hashCode() +
+344	        WritableComparator.hashBytes(identifier, identifier.length) +
+345	        WritableComparator.hashBytes(password, password.length));
+346	  }
+{code}, We need unique cache key to ensure semantics of one token corresponding to one distinct UGI within a given period of time., Benchmarked the two approaches based on real token at 1 million calls scale, building cache key in Patch-007 is one time  faster than that of patch-005, namely, 2457ms vs. 4023ms as total for 1M calls. So let's stick to 007., +1 for the latest patch. I will commit today, if there are no objections., I have committed this to trunk and branch-2. Thanks to Xiaobing., FAILURE: Integrated in Hadoop-trunk-Commit #8620 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/8620/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (jitendra: rev 84cbd72afda6344e220526fac5c560f00f84e374)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #521 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/521/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (jitendra: rev 84cbd72afda6344e220526fac5c560f00f84e374)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2467 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2467/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (jitendra: rev 84cbd72afda6344e220526fac5c560f00f84e374)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #532 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/532/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (jitendra: rev 84cbd72afda6344e220526fac5c560f00f84e374)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #1257 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/1257/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (jitendra: rev 84cbd72afda6344e220526fac5c560f00f84e374)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #490 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/490/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (jitendra: rev 84cbd72afda6344e220526fac5c560f00f84e374)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #2428 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2428/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (jitendra: rev 84cbd72afda6344e220526fac5c560f00f84e374)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, The patch has introduced findbugs warnings in trunk for more than 2 weeks. The findbug warning is tracked in HDFS-9242.
+
+Please fix it as soon as possible., {{TestDataNodeUGIProvider}}, introduced in this patch, has been failing intermittently.  The root cause is reliance on hard-coded sleep times to trigger cache expiration, which is non-deterministic.  I've filed a patch on HDFS-9370 to make the test work consistently., Given the current state, maybe we should consider reverting this patch and bring it back when it's ready?
+, This patch breaks Jenkins around 2 weeks. I reverted this patch in trunk and branch-2 for now to keep Jenkins happy.
+
+[~xiaobingo], can you please consolidate the effort of all the follow up jiras and post a new patch? Thanks.
+, Thanks [~wheat9]. Waiting for HDFS-9242 and HDFS-9370 to get good reviews and will merge them to a new patch., HDFS-9370 has +1's from multiple committers and contributors now.  That one is ready., FAILURE: Integrated in Hadoop-trunk-Commit #8757 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/8757/])
+Revert "HDFS-8855. Webhdfs client leaks active NameNode connections. (wheat9: rev 88beb46cf6e6fd3e51f73a411a2750de7595e326)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+, SUCCESS: Integrated in Hadoop-Yarn-trunk-Java8 #639 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/639/])
+Revert "HDFS-8855. Webhdfs client leaks active NameNode connections. (wheat9: rev 88beb46cf6e6fd3e51f73a411a2750de7595e326)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2569 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2569/])
+Revert "HDFS-8855. Webhdfs client leaks active NameNode connections. (wheat9: rev 88beb46cf6e6fd3e51f73a411a2750de7595e326)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+, SUCCESS: Integrated in Hadoop-Yarn-trunk #1362 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/1362/])
+Revert "HDFS-8855. Webhdfs client leaks active NameNode connections. (wheat9: rev 88beb46cf6e6fd3e51f73a411a2750de7595e326)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #628 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/628/])
+Revert "HDFS-8855. Webhdfs client leaks active NameNode connections. (wheat9: rev 88beb46cf6e6fd3e51f73a411a2750de7595e326)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #572 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/572/])
+Revert "HDFS-8855. Webhdfs client leaks active NameNode connections. (wheat9: rev 88beb46cf6e6fd3e51f73a411a2750de7595e326)
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #2510 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2510/])
+Revert "HDFS-8855. Webhdfs client leaks active NameNode connections. (wheat9: rev 88beb46cf6e6fd3e51f73a411a2750de7595e326)
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+, Patch v008 to merge follow-up work, kindly review. Thanks., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 7s {color} | {color:blue} docker + precommit patch detected. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 3m 16s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 4m 44s {color} | {color:green} trunk passed with JDK v1.8.0_60 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 4m 18s {color} | {color:green} trunk passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 0s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 27s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 3m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 3s {color} | {color:green} trunk passed with JDK v1.8.0_60 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 56s {color} | {color:green} trunk passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 2m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 4m 41s {color} | {color:green} the patch passed with JDK v1.8.0_60 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 4m 41s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 4m 24s {color} | {color:green} the patch passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 4m 24s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 7s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 2 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green} 0m 0s {color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 3m 48s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 59s {color} | {color:green} the patch passed with JDK v1.8.0_60 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 47s {color} | {color:green} the patch passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 6m 34s {color} | {color:green} hadoop-common in the patch passed with JDK v1.8.0_60. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 52m 31s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_60. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 7m 16s {color} | {color:green} hadoop-common in the patch passed with JDK v1.7.0_79. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 55m 31s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_79. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red} 0m 20s {color} | {color:red} Patch generated 58 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 167m 28s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_60 Failed junit tests | hadoop.hdfs.web.TestWebHdfsWithMultipleNameNodes |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure050 |
+|   | hadoop.hdfs.server.namenode.ha.TestEditLogTailer |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure |
+| JDK v1.7.0_79 Failed junit tests | hadoop.hdfs.TestDFSClientRetries |
+|   | hadoop.hdfs.server.blockmanagement.TestNodeCount |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=1.7.1 Server=1.7.1 Image:test-patch-base-hadoop-date2015-11-10 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12771648/HDFS-8855.008.patch |
+| JIRA Issue | HDFS-8855 |
+| Optional Tests |  asflicense  javac  javadoc  mvninstall  unit  findbugs  checkstyle  compile  xml  |
+| uname | Linux 4f3af3d401ba 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HDFS-Build@2/patchprocess/apache-yetus-ee5baeb/precommit/personality/hadoop.sh |
+| git revision | trunk / a06e6b8 |
+| Default Java | 1.7.0_79 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_60 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_79 |
+| findbugs | v3.0.0 |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/13465/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/13465/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_60.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/13465/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_79.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/13465/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_60.txt https://builds.apache.org/job/PreCommit-HDFS-Build/13465/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_79.txt |
+| JDK v1.7.0_79  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/13465/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/13465/artifact/patchprocess/patch-asflicense-problems.txt |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs U: . |
+| Max memory used | 226MB |
+| Powered by | Apache Yetus   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/13465/console |
+
+
+This message was automatically generated.
+
+, Posted a new patch v009 to remove white spaces. The UT failures are not related., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 9s {color} | {color:blue} docker + precommit patch detected. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 10m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 13m 36s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 41s {color} | {color:green} trunk passed with JDK v1.7.0_85 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 15s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 2m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 34s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 59s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 53s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 4m 5s {color} | {color:green} trunk passed with JDK v1.7.0_85 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 3m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 14m 17s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 14m 17s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 14s {color} | {color:green} the patch passed with JDK v1.7.0_85 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 12m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 19s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 2m 40s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 37s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green} 0m 1s {color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 5m 34s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 3m 1s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 4m 5s {color} | {color:green} the patch passed with JDK v1.7.0_85 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 9m 49s {color} | {color:red} hadoop-common in the patch failed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 84m 11s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 8m 56s {color} | {color:red} hadoop-common in the patch failed with JDK v1.7.0_85. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 67m 25s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_85. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red} 0m 23s {color} | {color:red} Patch generated 56 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 271m 25s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.ipc.TestDecayRpcScheduler |
+|   | hadoop.fs.shell.find.TestFind |
+|   | hadoop.test.TestTimedOutTestsListener |
+|   | hadoop.fs.shell.find.TestPrint |
+|   | hadoop.ipc.TestIPC |
+|   | hadoop.hdfs.TestSafeModeWithStripedFile |
+|   | hadoop.hdfs.TestPread |
+|   | hadoop.hdfs.security.TestDelegationTokenForProxyUser |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure110 |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithMultipleNameNodes |
+|   | hadoop.hdfs.server.namenode.ha.TestEditLogTailer |
+|   | hadoop.hdfs.TestCrcCorruption |
+|   | hadoop.hdfs.TestWriteReadStripedFile |
+|   | hadoop.hdfs.TestClientReportBadBlock |
+|   | hadoop.hdfs.server.namenode.ha.TestFailureToReadEdits |
+| JDK v1.7.0_85 Failed junit tests | hadoop.ipc.TestDecayRpcScheduler |
+|   | hadoop.fs.shell.find.TestFind |
+|   | hadoop.hdfs.TestEncryptionZonesWithKMS |
+|   | hadoop.fs.TestSWebHdfsFileContextMainOperations |
+|   | hadoop.hdfs.server.blockmanagement.TestPendingReplication |
+|   | hadoop.hdfs.TestDistributedFileSystem |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:date2015-11-20 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12773565/HDFS-8855.009.patch |
+| JIRA Issue | HDFS-8855 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  xml  |
+| uname | Linux 052cc876209c 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HDFS-Build@2/patchprocess/apache-yetus-3f4279a/precommit/personality/hadoop.sh |
+| git revision | trunk / 4539131 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/13580/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/13580/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/13580/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common-jdk1.7.0_85.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/13580/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_85.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/13580/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/13580/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/13580/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common-jdk1.7.0_85.txt https://builds.apache.org/job/PreCommit-HDFS-Build/13580/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_85.txt |
+| JDK v1.7.0_85  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/13580/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/13580/artifact/patchprocess/patch-asflicense-problems.txt |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs U: . |
+| Max memory used | 76MB |
+| Powered by | Apache Yetus   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/13580/console |
+
+
+This message was automatically generated.
+
+, The failures are not related. Kindly review and commit it., Thanks [~xiaobingo] for updating the patch. 
++1 for the latest patch. I will commit it shortly., Thanks [~xiaobingo]  and [~cnauroth] for the contribution and all for the reviews. I've committed the patch to trunk and branch-2., FAILURE: Integrated in Hadoop-trunk-Commit #8880 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/8880/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (xyao: rev fe5624b85d71720ae9da90a01cad9a3d1ea41160)
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/DatanodeHttpServer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #727 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/727/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (xyao: rev fe5624b85d71720ae9da90a01cad9a3d1ea41160)
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/DatanodeHttpServer.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #717 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/717/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (xyao: rev fe5624b85d71720ae9da90a01cad9a3d1ea41160)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/DatanodeHttpServer.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2659 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2659/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (xyao: rev fe5624b85d71720ae9da90a01cad9a3d1ea41160)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/DatanodeHttpServer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #1450 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/1450/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (xyao: rev fe5624b85d71720ae9da90a01cad9a3d1ea41160)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/DatanodeHttpServer.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #639 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/639/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (xyao: rev fe5624b85d71720ae9da90a01cad9a3d1ea41160)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/DatanodeHttpServer.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #2576 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2576/])
+HDFS-8855. Webhdfs client leaks active NameNode connections. Contributed (xyao: rev fe5624b85d71720ae9da90a01cad9a3d1ea41160)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/TestDataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/DataNodeUGIProvider.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/DatanodeHttpServer.java
+, I cherry-picked this to branch-2 and branch-2.8.]

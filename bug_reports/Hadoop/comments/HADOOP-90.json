@@ -1,0 +1,102 @@
+[I like the idea.  We have something very similar running in some of our other apps.
+
+I'm a bit concerned about using two blocks.  What if the name server only finds one of them?  I'd use block one to stage new versions and then support an operation to make it block zero "atomically".  Then there should be no confusion.  You still need to worry about generations of block zero though.
+
+Interesting problem space., adding functionality for atomic transfers of blocks is non trivial, and unnecessary in this case.
+both block 0 and 1 are replicated as many times as required to achieve any desired level of reliability.
+the generations part is straightforward - read both blocks, verify they're valid via their CRC. If just one is valid - select it, the other one hasn't been written successfully; if they're both valid, they'll have consecutive generation numbers (with rollover, so 0 follows 255), so select the larger one. Noteworty is the fact that a state file with its corresponding log file are completely equivalent to the next generation state file at the time it's created, so the name node is safe in any type of failure while writing the new state: until it's valid and safe the old state+log are there., 
+Since we have virtually no 'metadata' for a file we could have a complete description of the filesystem by adding a couple of fields to org.apache.hadoop.dfs.Block and then have the DataNodes write small block info files to the same directory as the actual block data.
+
+I actually did this one day as an experiment.
+
+class Block ...
+
+    long blkid;
+    long len;
+    UTF8 path;// the full path name of this block in the NameNode  
+    long position;// the starting position of this block in the file  
+
+The NameNode can recover it's state by just waiting for the DataNodes to report the blocks they have.
+
+The ugly part is what happens during a directory rename. Every DataNode needs to know that the blocks have changed and then re-write it. It could be a LOT of blocks.
+
+One adds this (below) to FSNamesystem:
+
+   //
+    // Keeps a Vector for every named machine.  The Vector contains
+    // blocks that have recently been part of a rename and are thought to live
+    // on the machine in question.
+    //
+    TreeMap recentRenameSets = new TreeMap();
+
+Then NameNode.getBlockWork has this code at it's beginning:
+
+        // check to see of there are blocks that need to be renamed.
+        //
+        Block blocks[] = namesystem.blocksToRename(new UTF8(sender));
+        if (blocks != null) {
+        	BlockCommand cmd = new BlockCommand(blocks);
+        	cmd.setRenameBlocks();
+        	return cmd;
+        }
+
+I don't think I'm formally proposing this scheme, but I'd like to talk about it before I go off half cocked and write the wrong thing.
+
+We are very concerned here about losing our DFS if something ever happens to the NameNode. I have the assignment to fix it, somehow, in the next couple of weeks.
+, I thought about this for a while, and I think this is how I would attack the problem.
+
+First, I introduce the concept of a 'precious file' in dfs. A precious file is a file that can be recovered even if all NameNode state is lost. This is probably not a new object but just a boolean in FSDirectory.INode to indicate that the file is precious (and a boolean in FileUnderConstruction). 
+
+A precious file is composed of PreciousBlock's, instead of Block's like a normal dfs file: 
+
+public class PreciousBlock extends Block {
+	
+	UTF8   pathName; // absolute dfs path
+	long   timestamp;// milliseconds since last change
+	int    sequence; // which block this is. ie 0th, first, etc.
+	int    total;    // count of blocks for the file
+	short  replication; 
+
+	public void write(DataOutput out) ...
+      public void readFields(DataInput in) ... etc.
+}
+
+Whenever a DataNode creates, or replicates, a block for a file that is precious it also serializes the PreciousBlock to a file in it's data directory(s).
+
+You would see something like this in a datanode directory;
+
+blk_2241143806243395050
+blk_385073589724654571
+blk_8416156569406441156
+precious_385073589724654571
+
+This would mean that block #385073589724654571 is part of a precious file. The file precious_385073589724654571 contains a serialization of PreciousBlock.
+
+Files stored this way can be recovered with out any NameNode state at all. The NameNode could simply wait until the DataNodes report their blocks and reconstruct all the precious files. If a precious file is widely replicated it becomes almost impossible to ever lose. The purpose of the timestamp is for the case where a file is renamed, or deleted and recreated, and a datanode didn't get the message.
+
+The next part is easy. The NameNode just writes its image and edits to precious files in the dfs. The NameNode can easily keep several old versions of its state, or any other good tricks. Old NameNode images could be rotated like log files, etc. 
+
+Recovery from loss, or corruption, of NameNode state is relatively simple. The NameNode recovers the precious files and then just reads the latest reliable image/edits. 
+, 
+I changed my mind. Now I'm looking for the smallest possible solution.
+
+I just want a config to enable writing the edits to more than one place. The default config works exactly the same way as the existin code.
+
+All the other details of backing up the NameNode image and edits can be handled outside of the code.
+
+Here's the patch. 
+ , seems like all the extra copies will be on the same node, right?
+so if it dies, so does the filesystem...
+perhaps the bug should be cloned, with the patch resolving a bug, but leaving the current bug open until it's more fully addressed., The low-tech thing I've done that's saved me when the namenode dies is simply to have a cron entry that rsyncs the namenode's files to another node every few minutes.  If the namenode dies, you lose at most a few minutes of computation.  It's not perfect, and its not a long-term solution, but it is a pretty effective workaround in my experience., I've done the same, alternating between two backup nodes.
+it's band-aid, until a real solution is devised., What we plan is to securely backup the 'snapshot' (the image file) after the NameNode is started. So that takes care of that part.  Now it's all about saving the edit log in a safe way. I don't like the idea of the backup being even one minute old.
+
+The failure mode is the loss of a hard drive on the NameNode server. Simply writing, ALL the time, the edit log to more than one path, and therefore to more than one drive, goes a long way towards making the data secure. If the node dies you would still have to retreive one of the edit files from one of the drives, but at least one of the drives should still work (there are 3 on our namenode). Someone needs to pull the drives and mount them on another machine before recovery can happen, but hey, it's going to be a rare event.
+
+If you are using Solaris, as we are, then sun nfs is available (or so they tell me). We mount an nfs drive, and write the edit log to that drive also. In this case recovery can happen by copying the image, and the edits, from nfs to another node, changing DNS for the name of the namenode, and starting a new namenode. 
+
+I feel, at least for us, that this IS a real solution, and not just a band-aid. , Alan,  I didn't mean to argue that cron+rsync was an ideal solution.  Yes, streaming the edits to multiple locations is the plan.  I personally don't think we should rely on NFS, but rather we should develop our own network protocol and service by which edits are sync'd, but I might be convinced otherwise., Attached a patch that allows multiple locations to store the filesystem image and the edits log. Thus, dfs.name.dir can now contain multiple directories separated by comma.
+Upon startup, the namenode scans all provided locations, and determines the most recent image and the most recent edits log. Recents all images, and writes the new image in all the locations, alongwith a timestamp file.
+Namenode format command allows one to selectively format among all the specified locations.
+One could use a more reliable disks (including NFS mounted disk) to store namesystem state.
+, Patch submitted., I just committed this.  Thanks, Milind!
+]

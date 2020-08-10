@@ -1,0 +1,210 @@
+[
+We are seeing two specific failure cases with the same cause:
+* A MR task that uses {{FsShell}}.  The shell opens a DFS, performs it's action, and the shell will close the DFS.  Now the MR input stream close to that same fileystem will fail.
+* User map task code that opens the default filesystem and subsequently closes it.  MR input stream close will fail.
+
+The problem is being seen with oozie jobs, but is not unique to oozie.  If the MR tasks opens the input/output streams with a DFS lacking a port number, then it gets a different instance of the filesystem than user code which gets the default filesystem via {{fs.default.name}} which does include the port number.  Effectively, the issue is hidden, and arguably it's a bug that getting a filesystem with and without the default port returns different filesystem instances.
+
+There are 3 approaches that can be taken:
+# {{FsShell#close}} will be a no-op
+# Closing a read stream will not generate an exception if the {{DFSClient}} is closed.
+# {{DistributedFileSystem#close}} becomes a no-op.  The finalizer will close the {{DFSClient}}.
+
+#1 & #2 are simply workarounds for specific use-cases.  The problem can still happen if user code or libraries get a filesystem and close it.
+
+#3 is a more comprehensive solution since a decision was made on an earlier jira to not add reference counting to cached filesystem objects.
+
+I'll post a patch for #3.  Please provide comments if there are superior solutions., I think it is important to note that this appears to be a regression between 0.20.204 and 1.0.  With oozie on 0.20.204 there were no errors running FSShell using a java actions, but after upgrading to 1.0 it fails consistently with an exception caused by the FileSystem.close() call in FSShell.close()., It's unclear what all changes transpired, but somehow oozie MR tasks used a DFS uri w/o a port for in/out dirs, while the task code used the {{fs.default.name}} which does include the port.  The problem was masked due to two distinct filesystem instances.  If filesystem is fixed to return the same object for a uri with and w/o the default port, then the problem comes back again., No tests because I'm only posting for community comment at this point., Daryn this happens only if use_ip is set to false right. This problem should not happen on default configuration?, Some comments:
+bq. a decision was made on an earlier jira to not add reference counting to cached filesystem objects
+Reference counting will not work. One could get a file system instance and pass it to others and then close it. This kind of code might exist in the framework.
+
+bq. DistributedFileSystem#close becomes a no-op. The finalizer will close the DFSClient.
+What is the finalizer - java finalizer? or you mean garbage collection?
+
+File system cache has been a problem that has been lurking for a while. App is expected to write the correct code - that is if the file system is closed, do not use it post that. However I am not sure if apps do handle this correctly.
+
+Other alternative solution is to disable cache. This is already configurable. See the following snippet in FileSystem.java
+{noformat}
+    String disableCacheName = String.format("fs.%s.impl.disable.cache", scheme);
+    if (conf.getBoolean(disableCacheName, false)) {
+      return createFileSystem(uri, conf);
+    }
+{noformat}
+
+, bq. What is the finalizer - java finalizer? or you mean garbage collection?
+Ignore this comment., I don't think it's related to use_ip, but I'll double check.  Even if it is related, it's still a bug.  I think using a finalizer avoids the problem you describe where something gets a fs, passes it to others, then closes it.  Or will a finalizer introduce other problems?
+
+bq.  App is expected to write the correct code - that is if the file system is closed, do not use it post that. However I am not sure if apps do handle this correctly.
+
+Let's say I'm using DFS.  I use some other package that opens the same default DFS, does something, and then closes it.  Whatever I was doing before I called the external routine is now invalidated.  What if I was writing to an output stream?  How would apps be able to reasonably recover from their fs being unexpectedly closed when there's not really an error?  Or am I misunderstanding your intent?
+
+bq.  Other alternative solution is to disable cache
+
+Isn't this going to cause multiple sockets to the same namenode?  For code that doesn't explicitly call close (perhaps because of this bug), that results in leaked fds that tie up resources.  I vaguely seem to recall that disabling the cache for a job would cause the JT(?) to overwhelm the namenode with connections.
+, bq. I don't think it's related to use_ip, but I'll double check.
+I suspect that is the case. Otherwise, we really should understand what started this problem.
+
+bq. Or will a finalizer introduce other problems?
+Finalizers have their own share of problems. Perhaps for file system it may not be severe.
+
+bq. I vaguely seem to recall that disabling the cache for a job would cause the JT to overwhelm the namenode with connections.
+I am not sure if JT creates that many file systems. Some one from mapreduce can comment on this.
+
+bq. DistributedFileSystem#close becomes a no-op. 
+This is a change in the public API., bq. Let's say I'm using DFS. I use some other package that opens the same default DFS, does something, and then closes it. Whatever I was doing before I called the external routine is now invalidated. What if I was writing to an output stream? How would apps be able to reasonably recover from their fs being unexpectedly closed when there's not really an error? Or am I misunderstanding your intent?
+
+The only way to handle is, never call close from the app if you use distributed cache. That way you get the benefit of cache where it is required (such as long running clients that create many file system instances), > distributed cache
+Sorry I am distracted. I meant file system cache. Long running clients, using file system cache should not call close., The problem appears to be a case of two wrongs make a right.  Fixing a bug in HDFS-2450 exposed another bug.  Unlike other filesystems, DFS used to strip the default port from its uris.  Ie.
+{{FileSystem.get("hdfs://host:port").getUri()}} did not return "hdfs://host:port".  It returned "hdfs://host".
+
+The result is that MR must be getting another filesystem based on {{getUri()}} of one filesystem.  When the port is stripped, two distinct filesystems are created.  It's a complete fluke that MR worked because of the former bug.
+
+So is the finalizer approach a no-go, or do you have another solution in mind?  As you mentioned it's a public api, so is it better to "fix" the public api, or tell users don't use the public api?, bq. Unlike other filesystems, DFS used to strip the default port from its uris. Ie.FileSystem.get("hdfs://host:port").getUri() did not return "hdfs://host:port". It returned "hdfs://host".
+That still should have resulted in this issue right? May be I do not understand this correctly.
+
+bq. two wrongs make a right
+Either by fluke or not, the system worked. This is the reason why I am very cautious about changes that could have unforeseen outcomes. Because all the interactions and corner cases are not understood.
+
+bq. so is it better to "fix" the public api, or tell users don't use the public api?
+Users are already using those APIs and the API has certain behavior. Turning off that functionality is not backward compatible.
+
+I think of only one solution. See if long running clients are creating a lot of file systems. If not it should be safe to turn off cache. BTW I remember conversations with Dhruba where he had indicated they do not use file system cache.
+, bq. Isn't this going to cause multiple sockets to the same namenode? For code that doesn't explicitly call close (perhaps because of this bug), that results in leaked fds that tie up resources. I vaguely seem to recall that disabling the cache for a job would cause the JT to overwhelm the namenode with connections.
+
+Connections are reused right? So this should not be an issue. I remember having some issue related to having file system cache growing huge and causing memory issues. That could still happen. Not sure how this bug was fixed., If we tell users don't call {{close()}} then I think that leaves them in an unfortunate predicament of conditionalizing all of the closes.  Ie. If the cache is on, then never call {{close()}}; if the cache is off, then you must call {{close()}} to prevent resources from leaking.  If true, that seems to be a compelling argument to make {{close()}} be smart.
+, {quote}
+  Connections are reused right? So this should not be an issue. I remember having some issue related to having file system cache growing huge and causing memory issues. 
+{quote}
+  It is correct that connections are re-used and cache growing huge is also an issue that we have seen before. It was fixed by calling closeAllForUGI in TaskTracker., We'll experiment on a performance grid and see what happens with the cache off.  I'm concerned about whether GC will keep up with all the leaked {{FileSystem}} and {{DFSClient}} objects.
+
+Just food for thought:  It seems that {{FileSystem#close}} should be smart enough to only close the fs if it's not in the cache (can check via the {{key}} field), but be a no-op if it's in the cache.  A static {{FileSystem}} method for unconditionally closing a cached {{FileSystem}} could provide symmetry to the {{get}} method which populates the cache., (Coming in late, but just to add my thoughts…)
+
+I've seen this bite users as well but its more so cause they do not understand how to use the FS objects than anything else:
+
+bq. A MR task that uses FsShell. The shell opens a DFS, performs it's action, and the shell will close the DFS. Now the MR input stream close to that same fileystem will fail.
+
+Is FsShell a publicly supported API now?
+
+bq. User map task code that opens the default filesystem and subsequently closes it. MR input stream close will fail.
+
+Users should not be closing the FS handle. Users shall open/close streams they use. Is that not the right thing to do?, {quote}
+We'll experiment on a performance grid and see what happens with the cache off. I'm concerned about whether GC will keep up with all the leaked FileSystem and DFSClient objects.
+{quote}
+
+Seems to me that turning off the cache is changing the semantics of FileSystem#close as much as some of the other proposed solutions. Rather than just temporarily avoiding this issue via a config change, can we come up with a more permanent solution that everyone will be happy with?  , {quote}Is FsShell a publicly supported API now?{quote}
+FsShell is marked as @InterfaceAudiance.Private on trunk, so no it is not a publicly supported API.  However it is used directly by Pig, and possibly others.  The use that we are referring to is an oozie action like the following.
+
+{code}
+<action name="copy">
+    <java>
+       <job-tracker>${jobTracker}</job-tracker>
+       <name-node>${nameNode}</name-node>
+       <configuration>
+            <property>
+                <name>mapred.job.queue.name</name>
+                <value>${queueName}</value>
+            </property>
+        </configuration>
+        <main-class>org.apache.hadoop.fs.FsShell</main-class>
+        <arg>-cp</arg>
+        <arg>${from}</arg>
+        <arg>${to}</arg>
+   </java>
+</action>
+{code}
+
+This is more or less the same as calling {code}hadoop fs -cp $from $to{code} it is done this way because oozie does not support copy from the fs action, because oozie does not want significant amounts of data flowing to or from the node oozie is running on.  Yes this technically is a violation of our interface visibility guidelines, but only very slightly, because it is trying to act very much like {code}hadoop fs{code} which is a public interface.  I am OK with telling the customer to fix their usage of this long term, because this is not what they are supposed to do.  We have already told them this, but the practice is quite pervasive. 
+
+It worked before, it no longer works, and this is simply because our internal code, FsShell, is ignoring the guidelines that we tell everyone else to follow.  Don't call FileSystem.close.  Which kind of reminds me of that scene from "The Emperor's new Groove" ["Why do we even have that lever"|http://www.youtube.com/watch?v=AGdFiA0A_c0]  If this API is not supposed to be called, then why has it not been deprecated, and replaced with something that has cleaner semantics that users actually understand.
+
+{quote}I've seen this bite users as well but its more so cause they do not understand how to use the FS objects than anything else:{quote}
+That seems to point to me that there is something wrong with the API if people who use our main interface have to have a deep understanding of how FileSystem caching works, and what is more that it can be disabled.  I believe that we may want to leave FileSystem.close in place but deprecate it, and provide a method that does the expected behavior of closing the FileSystem if it is not part of the cache, or nothing if it is part of the cache.  At the same time, we update FsShell to use this new API.
+
+I want to reiterate that I am not condoning the behavior that has exposed this issue.  But we have customers that are doing this, and I would really like to unblock them.  Especially if I can unblock them with a tiny change on our part instead of a massive change on their part.  Especially if doing so seems to fix an API that is causing problems. , To complicate things a bit more, keep in mind that if you do ask for FS instance using 2 different UGI instances for the same  user you end up with 2 different FS instances in the cache. This behavior -not to choke the NN- forced Oozie to do a second level cache of FS instances using the username.
+
+In Oozie we've talked about moving all the Hadoop interactions to a a command pattern where FS and JC get created/closed before/after the command invocation. And disabling caches completely. This is a huge change in Oozie but I guess we'll eventually go for it. What I don't know what will be the impact on security infrastructure (Kerberos) if suddenly, instead of getting new FS on & off (the first time a user comes to the system), it will be for each app interaction done by Oozie on behalf of the user.
+
+One possibility would be to make the cache to timeout on inactivity and the FS instance to reconnect if timedout.
+
+This issue is becoming bigger as we have long running systems using Hadoop, instead command line calls.
+
+, bq. It is correct that connections are re-used and cache growing huge is also an issue that we have seen before. It was fixed by calling closeAllForUGI in TaskTracker.
+
+If the cache is turned off, doesn't the {{FileSystem.closeAllForUGI}} improvement become irrelevant since it depends on the cache to locate the objects to close?  Ie.  Won't the {{FileSystem}}, {{DFSClient}}, and {{Connection}} float in limbo and bloat memory until the GC finalizes them?, There's opposition to disabling the cache, so here's an alternate approach to the problem.  I'm again only posting untested code for community comment.
+
+Basically if the FS is cached, then it isn't closed until removed from the cache.  This allows the cache to remain enabled so {{FileSystem.closeAll}}, {{FileSystem.closeAllForUGI}}, etc continue to work as intended: boost performance and not let objects leak.  If caching is disabled, then the object is immediately closed.
+
+Please critique., Daryn, in your proposal, if the FS is cached, close() would be a NOP. How would you remove the FS from the cache?
+, I thought about that myself.  If close removes a cached object from the cache, it's still hard to know exactly when to close it since other references may exist.  I have a much better idea in mind, will post example shortly., I'm going to try another approach of making MR get unique filesystems w/o relying on the fluke caused by the hdfs bug., Idea is basically to allow MR to be backward-compatible by maintaining cached FS objects that are distinct from the FS objects used by user code.  That's exactly how it used to work due to the DFS port-stripping bug.
+
+I pulled in minimal changes from trunk to allow a unique id in the FS cache key.  I didn't pull in the new APIs, but rather smuggled a unique id in via a config setting. It's not the cleanest, but I'm open to alternatives.
+
+I've probably missed a few spots in the MR framework, but I'd like comments on the approach before I go further., Add tests., bq. #3 is a more comprehensive solution since a decision was made on an earlier jira to not add reference 
+
+Daryn, which jira are you referring to here? I and Jitendra were discussing about Reference Counting and it seemed to work for this use-case.. Suresh had argued against reference-counting, but that argument holds even if the cache is disabled..., I don't recall the jira but it was quite a few years old and very lively.  Last week I spoke to Suresh about ref counts and he did have some legitimate concerns.  After further reflection, fs.close also closes open streams and that behavior might be expected in some cases.  Unbalanced opens & closes would lead to situations where a close, that formerly caused all fs streams to close, would be deferred into the future (if ever).
+
+I'm fine with revisiting ref counts or a more comprehensive handling of close.  In this case, my suggestion would be on another jira targeted to trunk.  I've scaled back the "fix" to be as minimal as possible, and not alter any existing behaviors.  Yes, it's a bit of a hack, but I'm paranoid of breaking something on 205/1.x and this bug is slowing production deployment.
+
+, It's probably HADOOP-4655., bq. Unbalanced opens & closes would lead to situations where a close, that formerly caused all fs streams to close, would be deferred into the future (if ever).
+
+It is a very common usage pattern that filesystem objects are not closed at all, therefore it should be ok to have less number of closes than opens, with reference count.
+ , I [opposed ref counts previously|https://issues.apache.org/jira/browse/HADOOP-4655?focusedCommentId=12650342&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-12650342] since it is indeed a "get counts".  It relies on the assumption that "for each FileSystem.get(..) call, the must be exactly a close() call."  I think this is not easy to enforce., With unbalanced closes, the filesystem will essentially never be closed unless {{closeAll}} or {{closeAllForUGI}} is called.  Open files & their leases will remain open.  It's a more complicated change that will alter the behavior of 205 with possibly unforeseen consequences.  I'm attempting to only restore 204 behavior with this jira.
+
+I know the private conf value is a bit of a hack, but I see no other way to allow unique filesystems -- and in this case, a secondary cache just for MR framework -- without changing the public api of {{FileSystem}}.  Is this implementation unacceptable?  If so, are there simple alternatives other than ref counts?, bq. Add tests.
+
+Looking at HADOOP-7973-4.patch, does it reproduce the issue we are seeing?
+In my environment, this test succeeds without your change.  I guess you would need minidfs cluster instead of running miniMR on top of local filesystem?
+
+Also, for the actual change, is this sufficient to avoid the close failure?  I thought that FileSystem throwing the actual error is not from the MapTask directly but the one opened inside TextInputFormat->LineRecordReader
+
+{noformat}
+2012-01-13 00:08:09,268 WARN org.apache.hadoop.mapred.Child: Error running child
+java.io.IOException: Filesystem closed
+        at org.apache.hadoop.hdfs.DFSClient.checkOpen(DFSClient.java:241)
+        at org.apache.hadoop.hdfs.DFSClient.access$800(DFSClient.java:74)
+        at org.apache.hadoop.hdfs.DFSClient$DFSInputStream.close(DFSClient.java:1959)
+        at java.io.FilterInputStream.close(FilterInputStream.java:155)
+        at org.apache.hadoop.util.LineReader.close(LineReader.java:83)
+        at org.apache.hadoop.mapred.LineRecordReader.close(LineRecordReader.java:168)
+        at org.apache.hadoop.mapred.MapTask$TrackedRecordReader.close(MapTask.java:254)
+        at org.apache.hadoop.mapred.MapTask.runOldMapper(MapTask.java:440)
+        at org.apache.hadoop.mapred.MapTask.run(MapTask.java:372)
+        at org.apache.hadoop.mapred.Child$4.run(Child.java:255)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:396)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1082)
+        at org.apache.hadoop.mapred.Child.main(Child.java:249)
+{noformat}
+
+bq. If the MR tasks opens the input/output streams ...
+
+Does this apply to output stream as well?  If it really does, then something needs to be changed on the reducer side as well? (I couldn't confirm this.)
+
+bq. I'm attempting to only restore 204 behavior with this jira.
+
+Just to make sure everyone is one the same page,
+the close issue itself has been there even before 0.20.205/1.0.
+
+With input/output paths without any 'hdfs://...' set, "Filesystem closed" exception above happens on any hadoop 0.20 versions.
+||version|| fs.default.name ||
+|before 0.20.205| hdfs://hostname.domain (without port) |  
+|on 0.20.205 | hdfs://hostname.domain:8020 (with port) | 
+, bq.  I guess you would need minidfs cluster instead of running miniMR on top of local filesystem?
+
+I wasn't aware the MR minicluster used local fs, I'll check that.  The beauty is if I've missed something, the tests will immediately fail.
+
+bq. Also, for the actual change, is this sufficient to avoid the close failure? I thought that FileSystem throwing the actual error is not from the MapTask directly but the one opened inside TextInputFormat->LineRecordReader
+
+The recorder reader is opened by {{MapTask#getSplitDetails}} in the framework.  It will now use a distinct fs object separate from any in the user task code, just like it (accidentally) used to do.  This is the stream that we are seeing in exceptions.
+
+bq. Does this apply to output stream as well?  If it really does, then something needs to be changed on the reducer side as well?
+
+Yes, the collector gets a unique fs.  The reducer writes the the raw local filesystem., bq. The beauty is if I've missed something, the tests will immediately fail.
+
+I'm not following.  Does your test fail without your change and succeeds with your change? 
+If it already does that, I need to take another look.  If it doesn't, please post a new test.
+, Yes, I'm reworking the test., Found issue in mapreduce v2 api, will post a modified patch., Modifications within mapred and mapreduce proved to be too difficult.  This is a twist on the original approach: {{close()}} becomes a no-op if a config key is set.  MR tasks are run with this flag set., Hi Daryn,
+
+bq. Found issue in mapreduce v2 api, will post a modified patch.
+
+The patch seems to be for 1.x branch. Is trunk unaffected by this behavior? Last I checked we still blow up if we do the FS.get.close chain inside a task., All branches have this behavior, but a fix has proved to be too contentious., Closed upon release of 1.1.0.]

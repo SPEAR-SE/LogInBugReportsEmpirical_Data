@@ -1,0 +1,272 @@
+[I believe that this is related to the refactoring done to the way User Limit is calculated in trunk / branch-2. I cannot reproduce the above use case prior to YARN-5889.
+
+I think the reason is because prior to YARN-5889 (and in 2.8), the result of {{LeafQueue#computUserLimit}} was always greater than the amount used by any given user. After YARN-5889, the return value of {{UsersManager#computeUserLimit}} can be equal to the amount used by any given user. Then, in {{LeafQueue#getTotalPendingResourcesConsideringUserLimit}}, we can have a situation where {{userLimit}} - {{user.getUsed}} always equals 0, even when it shouldn't.
+, [~sunilg], [~leftnoteasy], and [~jlowe], I would be interested in your thoughts on this JIRA. Thanks!, Thanks for the report and analysis, Eric!  So it appears YARN-5889's change to try to balance the growth of users violated the preemption monitor's forecasting of resource assignments.  One way to fix this is to change the preemption monitor's forecasting calculations to use the old user limit calculations, however I'm wondering if we should revisit the decision to change the user limit calculations in YARN-5889.
+
+I understand the desire to try to balance user growth, but it seems like this is going to significantly slow container assignment when there are multiple active users to solve a problem that I'm not sure is a real problem in practice.  If I understand the concern properly, we want to try to avoid a situation where one user can quickly rush ahead to their full user limit, well ahead of the other users, and then before the other users get to their same limit something happens (e.g.: more users become active, cluster loses capacity, etc.).  That window should be very small in practice (i.e.: a few seconds to a few tens of seconds) because the user limit should reflect capacity that is available right now.  The speed at which the user limit is reached should only be limited by the heartbeat rate of the nodes and how picky the container requests are.
+
+I'm concerned about the new approach because it looks like it will significantly slow down container assignments.  For example there are two users, A and B, each with a single active application that is asking for many more containers than the queue can provide.  User A's app is ahead of user B's app in the queue, and the queue is initially almost empty.  Before the user limit change, the user limits for each user would be 50% since they are the only two active users in the queue.  As nodes heartbeat into the scheduler, the scheduler would aggressively assign containers, likely more than one for each heartbeat, to user A until the 50% user limit is reached.  At that point it would switch to assigning containers to user B, again likely more than one per node heartbeat.  Unless the container requests are very picky, it should only take two rounds or so of node heartbeats to satisfy both users which should only be  a small number of seconds.  With the new limit calculation, the user limits for A and B are going to be only the minimal increment over what they're using.  Therefore each node heartbeat will only assign one container to each user rather than multiple since it will keep running into the user limit before it grows.  The end result is it will take a lot more node heartbeats to get everything assigned.  That will be perceived as a slow scheduler to users.  Do we really need to keep the assignments balanced as users grow to their limit?  It looks like it will be a significant performance hit to do so since we will keep hitting the limit on each node heartbeat, cutting short the number of containers we would normally assign per heartbeat., Thanks [~eepayne] for the detailed analysis. And thanks [~jlowe] for details, it makes sense. I think the optimization made in YARN-5889 had two parts, one for allocation to make it gradually shared for all users (Jason has given a very detailed explanation on this), second is for preemption part. For this preemption calculation, we have to consider all users resource as some could be non-active as well. In the example given here, I think app1 would have become deactive as all resource requests of app1 might have been served. [~eepayne] please correct me if I am wrong
+
+In this case i think {{getTotalPendingResourcesConsideringUserLimit}} is not correct.
+{code}
+        if (!userNameToHeadroom.containsKey(userName)) {
+          User user = getUser(userName);
+          Resource headroom = Resources.subtract(
+              getResourceLimitForActiveUsers(app.getUser(), clusterResources,
+                  partition, SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY),
+              user.getUsed(partition));
+          // Make sure headroom is not negative.
+          headroom = Resources.componentwiseMax(headroom, Resources.none());
+          userNameToHeadroom.put(userName, headroom);
+        }
+{code}
+
+Here I think we have to use  {{getResourceLimitForAllUsers}} instead of {{getResourceLimitForActiveUsers}}. I will wait for Eric to confirm whether app1 was not active or not.
+
+Apart from this,
+bq.Do we really need to keep the assignments balanced as users grow to their limit? 
+I think we were trying to make a uniform allocation pattern here, and I feel I can try to share more test results here how slow this is. And definitely wait for more discussion here meanwhile., Thanks for your insights, [~sunilg].
+
+bq. Here I think we have to use {{getResourceLimitForAllUsers}} instead of {{getResourceLimitForActiveUsers}}
+No, I don't think so. {{LeafQueue#getTotalPendingResourcesConsideringUserLimit}} is called during pre-preemption when attempting to calculate the total amount of resources that would be assigned to a queue if resources were to suddenly free up (by preemption). When these resources are freed up, the scheduler will use {{getResourceLimitForActiveUsers}} when deciding the amount of these resources to give to the queue. They should both use {{getResourceLimitForActiveUsers}}, which is calculating user limit for active users only.
+
+I would like to still pursue [~jlowe]'s suggestion about reverting to the pre-YARN-5889 behavior., bq. I would like to still pursue Jason Lowe's suggestion about reverting to the pre-YARN-5889 behavior.
+I think I should clarify this. I think we are specifically talking about reverting the piece of code in {{computeUserLimit}} that boils (way) down to (rouphly):
+{code:title=OLD}
+userLimit = (queueAllUsedResources < queueGuaranteedResources) ?
+    (queueGuaranteedResources / #activeUsers) :
+    ((queueAllUsedResources + minContainerSize) / #activeUsers)
+{code}
+{code:title=NEW}
+userLimit = (queueResourcesUsedByActiveUsers / #activeUsers)
+{code}, [~jlowe], [~eepayne], [~sunilg], apologize for my late response. I just checked the behavior, it's not same as Jason and Eric mentioned: 
+
+I tried to write an unit test: 
+1) A super fat node has 1000G memory. 
+2) Submit app1 to queue under user1, submit app2 to queue under user2. Each of them asks 1000 * 5G containers with locality.
+
+When UL=100, a single node heartbeat can allocate: 200 containers to app1. (no capacity left for app2).
+When UL=50, a single node heartbeat can allocate: 100 containers to app1, 100 containers to app2. 
+
+The userLimit calculation formula mentioned by [~eepayne] is not correct, it should be: 
+{code}
+userLimitResrouce = max{
+   ceil(queueResourceUsedByActiveUsers / #activeUsers),
+   ceil(queueConfiguredCapacity * userLimit%) 
+}
+{code}
+
+Because of the {{ceil}} operation, after each container allocation, we can get a new UL, and because user limit validation is a >= check instead of strict >, so it won't slow down container allocation. 
+
+But I can see an issue here is, instead of do {{max}} operation in userLimitResource calculation, we should do {{min}}. Otherwise: 
+- When we have two active users in the queue, and userLimit set to 100, first user will always get preferred until queue reaches maxCapacity., Attached demo unit-test patch., And the other place we need to change is: {{LQ#getTotalPendingResourcesConsideringUserLimit}}.
+
+Instead of do a strict headroom: {{headroom = userLimitResource - user.used}}
+We should relax this computation as well. We should give at least one container when headroom >= 0. Otherwise it makes preemption logic inconsistent to allocation logic., bq. after each container allocation, we can get a new UL, and because user limit validation is a >= check instead of strict >, so it won't slow down container allocation. 
+
+Ah, right.  I forgot it's going to recalculate the UL on each container allocate _within_ the heartbeat.  Might be an issue for batch-allocation if it's not done properly, where we would allocate more than one container per traversal of the queue hierarchy.  But I agree it shouldn't be an issue as-is today.  Sorry for the misunderstanding.
+, Thanks very much for your insights [~leftnoteasy].
+
+bq. When we have two active users in the queue, and userLimit set to 100, first user will always get preferred until queue reaches maxCapacity.
+I assume {{userLimit}} means {{minimum-user-limit-percent}}, correct? If so, then shouldn't the above statement be "first user will always get preferred until queue reaches {{Capacity * user-limit-factor}}"? If my assumptions are correct, then I think this is exactly the behavior we want. If a queue has a MULP of 100%, then by-definition only the user with the first active app gets resources. Can you please elaborate on this use case?, [~eepayne], 
+Yes you're correct, I checked the old logic:
+https://github.com/apache/hadoop/blob/branch-2.7/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java:
+{code}
+    Resource limit =
+        Resources.roundUp(
+            resourceCalculator, 
+            Resources.min(
+                resourceCalculator, clusterResource,   
+                Resources.max(
+                    resourceCalculator, clusterResource, 
+                    Resources.divideAndCeil(
+                        resourceCalculator, currentCapacity, activeUsers),
+                    Resources.divideAndCeil(
+                        resourceCalculator, 
+                        Resources.multiplyAndRoundDown(
+                            currentCapacity, userLimit), 
+                        100)
+                    ), 
+                Resources.multiplyAndRoundDown(queueCapacity, userLimitFactor)
+                ), 
+            minimumAllocation);
+{code}
+
+The {{max}} op is consistent with old behavior, we don't need to change it to {{min}}., bq. Yes you're correct, The max op is consistent with old behavior, we don't need to change it to min.
+[~leftnoteasy], Sorry, but I'm still confused about what behavior is desired. IMHO, the old behavior was more consistent with the expectations of the MULP in a capacity scheduler. That is, the first users with asking apps are elevated to their user limit as quickly as possible in a FIFO order. So, the thing I'm confused about is what the use case would be for raising all asking users more evenly in a capacity scheduler context. It seems to me that the latter could sometimes prevent any user from achieving its user limit. Thanks!
+, [~eepayne], what I found is the new code should be consistent to old behavior during allocation (but it's different in preemption). You could check the unit test code to see if that matches your expectation., bq. You could check the unit test code to see if that matches your expectation.
+I see that the patch for YARN-5889 needed to change the headroom usage in {{TestLeafQueue}} for Assersions in {{testComputeUserLimitAndSetHeadroom}} and {{testHeadroomWithMaxCap}}:
+{code}
+@@ -1123,9 +1129,9 @@ public void testComputeUserLimitAndSetHeadroom() throws IOException {
+     //testcase3 still active - 2+2+6=10
+     assertEquals(10*GB, qb.getUsedResources().getMemorySize());
+     //app4 is user 0
+-    //maxqueue 16G, userlimit 13G, used 8G, headroom 5G
++    //maxqueue 16G, userlimit 7G, used 8G, headroom 5G
+     //(8G used is 6G from this test case - app4, 2 from last test case, app_1)
+-    assertEquals(5*GB, app_4.getHeadroom().getMemorySize());
++    assertEquals(0*GB, app_4.getHeadroom().getMemorySize());
+   }
+
+   @Test
+@@ -1309,8 +1315,8 @@ public void testHeadroomWithMaxCap() throws Exception {
+     assertEquals(2*GB, app_0.getCurrentConsumption().getMemorySize());
+     assertEquals(0*GB, app_1.getCurrentConsumption().getMemorySize());
+     // TODO, fix headroom in the future patch
+-    assertEquals(1*GB, app_0.getHeadroom().getMemorySize());
+-      // User limit = 4G, 2 in use
++    assertEquals(0*GB, app_0.getHeadroom().getMemorySize());
++      // User limit = 2G, 2 in use
+     assertEquals(0*GB, app_1.getHeadroom().getMemorySize());
+       // the application is not yet active
+
+@@ -1322,15 +1328,15 @@ public void testHeadroomWithMaxCap() throws Exception {
+     assertEquals(3*GB, a.getUsedResources().getMemorySize());
+     assertEquals(2*GB, app_0.getCurrentConsumption().getMemorySize());
+     assertEquals(1*GB, app_1.getCurrentConsumption().getMemorySize());
+-    assertEquals(1*GB, app_0.getHeadroom().getMemorySize()); // 4G - 3G
+-    assertEquals(1*GB, app_1.getHeadroom().getMemorySize()); // 4G - 3G
++    assertEquals(0*GB, app_0.getHeadroom().getMemorySize()); // 4G - 3G
++    assertEquals(0*GB, app_1.getHeadroom().getMemorySize()); // 4G - 3G
+
+     // Submit requests for app_1 and set max-cap
+     a.setMaxCapacity(.1f);
+     app_2.updateResourceRequests(Collections.singletonList(
+{code} , Rather than use this JIRA to revert the {{computeUserLimit}} behavior to pre-YARN-5889, patch {{YARN-7149.001.patch}} just adds {{minimumAllocation (min container size)}} to {{resourceUsed}}. I see this as a compromise between the old and the new behavior. Please let me know your thoughts., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 52s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 14m 30s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 32s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 37s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m  4s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 22s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 28s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 35s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m  5s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 20s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 43m 33s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 67m 13s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestContainerAllocation |
+|   | hadoop.yarn.server.resourcemanager.scheduler.TestAbstractYarnScheduler |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:71bbb86 |
+| JIRA Issue | YARN-7149 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12886958/YARN-7149.001.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 783e8db84b62 3.13.0-119-generic #166-Ubuntu SMP Wed May 3 12:18:55 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / f153e60 |
+| Default Java | 1.8.0_144 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/17440/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/17440/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/17440/console |
+| Powered by | Apache Yetus 0.6.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Unit test failures are not related to this patch:
+{{TestAbstractYarnScheduler}}: Succeeds for me locally
+{{TestContainerAllocation}}: YARN-7044, [~eepayne], 
+
+Thanks for updating the patch, I like the approach which improves headroom calculation and changes to the code are minimum.
+
+I also checked changes to unit tests, behavior changes looks good to me as well. So I +1 to the attached patch.
+
+Do you think does it make sense to merge the https://issues.apache.org/jira/secure/attachment/12885847/YARN-7149.demo.unit-test.patch to your patch? Which we can prevent issues described by Jason in previous comments: 
+bq. It looks like it will be a significant performance hit to do so since we will keep hitting the limit on each node heartbeat, cutting short the number of containers we would normally assign per heartbeat., bq. Do you think does it make sense to merge the {{YARN-7149.demo.unit-test.patch}} to your patch?
+Thanks [~leftnoteasy]. I spent some time looking through the test patch to make sure I understand its purpose. I think it makes sense to merge it with this change. Attaching an updated patch., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 19s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 17m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 26s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 37s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 33s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 2 new + 413 unchanged - 0 fixed = 415 total (was 413) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 23s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 23s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 55m 16s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 21s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 82m 44s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.TestOpportunisticContainerAllocatorAMService |
+|   | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestContainerAllocation |
+| Timed out junit tests | org.apache.hadoop.yarn.server.resourcemanager.recovery.TestZKRMStateStore |
+|   | org.apache.hadoop.yarn.server.resourcemanager.TestSubmitApplicationWithRMHA |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:71bbb86 |
+| JIRA Issue | YARN-7149 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12887401/YARN-7149.002.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 4c211e950d4e 3.13.0-123-generic #172-Ubuntu SMP Mon Jun 26 18:04:35 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / de197fc |
+| Default Java | 1.8.0_144 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/17480/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/17480/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/17480/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/17480/console |
+| Powered by | Apache Yetus 0.6.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, The following unit tests are succeeding for me in my environment:
+{code}
+TestOpportunisticContainerAllocatorAMService
+TestZKRMStateStore
+TestSubmitApplicationWithRMHA 
+{code}
+
+{{TestContainerAllocation}} was modified by this patch, and the new test is succeeding. The failure in {{TestContainerAllocation#testAMContainerAllocationWhenDNSUnavailable}} is a pre-existing issue: YARN-7044., Thanks [~eepayne]! I will commit the patch shortly., Committed to trunk/branch-3.0, thanks [~eepayne] and thanks reviews from [~jlowe]/[~sunilg]!, SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #12892 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/12892/])
+YARN-7149. Cross-queue preemption sometimes starves an underserved (wangda: rev 38c14ef8d8a094a7101917eb77d90f5e62324f61)
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/UsersManager.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestContainerAllocation.java
+, Thanks a lot [~leftnoteasy].
+
+Also, this needs to be pulled back into branch-2. I will do that if there are no objections.]

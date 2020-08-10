@@ -1,0 +1,43 @@
+[Hi [~cltlfcjin], that code wasn't removed by the HDFS-7411 refactor, it was moved into HeartbeatManager by HDFS-7725. There's also TestDecommissionStatus#testDecommissionDeadDN which tests this case.
+
+Could you provide a unit test that reproduces your issue?, Thanks [~andrew.wang], I'm not sure whether or not our case is a common one. We have an upper layer application which trigger and monitor the decommissioning progress. When it finds the "Blocks with no live replicas" becoming 0 in the NN UI, it will shutdown the DN. Why not wait for being transited to decommissioned, because that sometimes we found decommissioning progress took very much time which there were only one or two "Under replicated blocks" left.
+
+So, after none of  "Blocks with no live replicas", the DN is shutdown. And its status become [Dead, Decommissioning] forever. Therefore, I need to run the four steps mentioned above to retire them.
+
+In the code of HeartbeatManager and DecommissionManager.
+{code}
+if (!node.isDecommissionInProgress() && !node.isDecommissioned()) {
+      // Update DN stats maintained by HeartbeatManager
+      hbManager.startDecommission(node);
+{code}
+Only [Dead, Normal] status can be set [Dead, Decommissioned] directly., Ah. So the issue is that there is a DN that still has a few blocks waiting for decom (probably RBW blocks from an open file), and it transitions from (Live, Decomming) to (Dead, Decomming), not (Dead, Decommed). We don't immediately transition to (Dead, Decommed) since that could lead to unintentional dataloss. If an operator wants to override this for a dead node, then they can run your procedure.
+
+Question, do these nodes truly *never* transition to (Dead, Decommed) ? Once the straggler blocks are closed and minimally replicated, (Dead, Decomming) should transition to (Dead, Decommed).
+
+Otherwise, I'm guessing the straggler blocks are caused by open-for-write files. Fixing that is more work; we could force the writing clients to do pipeline recovery to route off the decomming nodes to maintain minimal replication., I create a graph to illustrate !DecomStatus.png|thumbnail!  
+A normal process of decommission should be "1->2->3->6". My case is "1->2->5" and adding "->4->6" to fix it. So should the transition "5->6" directly be needed?  
+
+And your question, yes. And it appears frequently under the management of upper layer application in Version 2.7.1, Thanks for the diagram, that's something we should put as a code comment in DecommissionManager :)
+
+Like you say, it looks like we don't have a 5->6 transition. BlockManager#isNodeHealthyForDecommissionOrMaintenance requires the node to be alive, and actually will log a WARN with the procedure you've been running with 5->4->6. So at least it seems like this behavior is intentional.
+
+I'm betting though that the straggler blocks on the DN are caused by open-for-write files though, and I'd prefer to solve that problem rather than adding a 5->6 transition. Could you run {{hdfs fsck}} with {{-openforwrite}} and {{-files -blocks -locations}} to confirm? Also check in the NN logs since we should be printing information about what blocks are preventing decommissioning., Thanks [~andrew.wang], Sure, I will disable shutdown function in upper application to see if there are some open-for-write files in the result of fsck next time the decommissioning in process happening with a long time., Yes, you are right. The block is open for write. [~andrew.wang].
+{code}
+2017-01-10 01:43:09,906 DEBUG org.apache.hadoop.hdfs.server.blockmanagement.DecommissionManager: Processing decommission-in-progress node 10.103.58.19:50010
+2017-01-10 01:43:09,906 TRACE org.apache.hadoop.hdfs.server.blockmanagement.DecommissionManager: Block blk_4280405944_1106180180519{UCState=UNDER_CONSTRUCTION, truncateBlock=null, primaryNodeIndex=-1, replicas=[ReplicaUC[[DISK]DS-da139e63-aa77-4533-96a7-ba686d6b067d:NORMAL:10.103.58.30:50010|RBW], ReplicaUC[[DISK]DS-0b38c81f-1e3a-4e9b-acfb-97457c8ed6de:NORMAL:10.103.58.19:50010|RBW], ReplicaUC[[DISK]DS-be50263a-69d5-4efe-a70a-56585022a403:NORMAL:10.142.126.52:50010|RBW]]} numExpected=3, numLive=0
+2017-01-10 01:43:09,906 TRACE org.apache.hadoop.hdfs.server.blockmanagement.DecommissionManager: UC block blk_4280405944_1106180180519{UCState=UNDER_CONSTRUCTION, truncateBlock=null, primaryNodeIndex=-1, replicas=[ReplicaUC[[DISK]DS-da139e63-aa77-4533-96a7-ba686d6b067d:NORMAL:10.103.58.30:50010|RBW], ReplicaUC[[DISK]DS-0b38c81f-1e3a-4e9b-acfb-97457c8ed6de:NORMAL:10.103.58.19:50010|RBW], ReplicaUC[[DISK]DS-be50263a-69d5-4efe-a70a-56585022a403:NORMAL:10.142.126.52:50010|RBW]]} insufficiently-replicated since numLive (0) < minR (1)
+2017-01-10 01:43:09,906 INFO org.apache.hadoop.hdfs.server.blockmanagement.DecommissionManager: Block: blk_4280405944_1106180180519{UCState=UNDER_CONSTRUCTION, truncateBlock=null, primaryNodeIndex=-1, replicas=[ReplicaUC[[DISK]DS-da139e63-aa77-4533-96a7-ba686d6b067d:NORMAL:10.103.58.30:50010|RBW], ReplicaUC[[DISK]DS-0b38c81f-1e3a-4e9b-acfb-97457c8ed6de:NORMAL:10.103.58.19:50010|RBW], ReplicaUC[[DISK]DS-be50263a-69d5-4efe-a70a-56585022a403:NORMAL:10.142.126.52:50010|RBW]]}, Expected Replicas: 3, live replicas: 0, corrupt replicas: 0, decommissioned replicas: 0, decommissioning replicas: 1, excess replicas: 0, Is Open File: true, Datanodes having this block: 10.103.58.19:50010 , Current Datanode: 10.103.58.19:50010, Is current datanode decommissioning: true
+2017-01-10 01:43:09,906 DEBUG org.apache.hadoop.hdfs.server.blockmanagement.DecommissionManager: Node 10.103.58.19:50010 still has 1 blocks to replicate before it is a candidate to finish decommissioning.
+{code}
+
+But why the block is under_construction within so long time?, Yea, this has been a long standing issue in HDFS. This typically happens because some app is slowly writing data to an HDFS file, like Flume or HBase. In these apps, there's typically some way of closing the current file and write to a new one.
+
+Based on your output, the write pipeline has also been reduced to a single DN. We have some pipeline replacement policies that might help here, e.g. {{dfs.client.block.write.replace-datanode-on-failure.enable}} and {{dfs.client.block.write.replace-datanode-on-failure.policy}}.
+
+Finally, finding the app that is writing this file can be difficult. A heavy handed method is looking at fsck -files -blocks -locations. I remember Kihwal was also working on a patch to dump the leases on the NN., Thank you, [~andrew.wang], the hint you given is very helpful. 
+The last thing I found was there were many "three zero" nodes listed in decommissioning in NN UI and could't be completed. And after I purged the old cannot be recovered missing blocks, they all suddenly became decommissioned at the same time. So I suspend that the missing blocks could impact the decommissioning process. That's the what I will follow up., Hi [~andrew.wang], I found there are lots of logs in NameNode like below:
+{code}
+2017-03-13 03:59:52,620 INFO org.apache.hadoop.hdfs.server.blockmanagement.DecommissionManager: Block: blk_13651215184_1113964818077{UCState=COMMITTED, truncateBlock=null, primaryNodeIndex=2, replicas=[ReplicaUC[[DISK]DS-a74fff1e-dc86-4e60-8e69-9c9023a7fd3c:NORMAL:10.115.21.54:50010|RBW]]}, Expected Replicas: 3, live replicas: 0, corrupt replicas: 0, decommissioned replicas: 0, decommissioning replicas: 1, excess replicas: 0, Is Open File: true, Datanodes having this block: 10.115.21.54:50010 , Current Datanode: 10.115.21.54:50010, Is current datanode decommissioning: true
+{code}
+
+Notice the UCState=COMMITTED, and this will cause decommission_inprogress never completed. , Interesting. Do you think this is possibly related to HDFS-11499? The block might be stuck in committed state since the only remaining replicas are D_I_P.]

@@ -1,0 +1,160 @@
+[it almost seems like there is some kind of race condition between the jobs being completed and disappearing from the tracker?
+
+
+        try {
+          if (running.isComplete()) {
+            break;
+          }
+          running = jc.getJob(jobId);
+993:          String report =
+            (" map " + StringUtils.formatPercent(running.mapProgress(), 0)+
+             " reduce " +
+             StringUtils.formatPercent(running.reduceProgress(), 0));
+
+is it possible that the running.isComplete() is stale? I looked at the isComplete call a little bit more:
+
+  static long MAX_JOBPROFILE_AGE = 1000 * 2;
+
+    synchronized void ensureFreshStatus() throws IOException {
+      if (System.currentTimeMillis() - statustime > MAX_JOBPROFILE_AGE) {
+
+
+ouch - so what might be happening is the isComplete() returns false based on stale status. But when we request the job from the jobtracker - the job is gone (very high volume of jobs from the same user)?
+
+Is this a plausible theory? If so - the fix would be simply be to reduce the MAX_JOBPROFILE_AGE to match the polling loop sleep time in jobclient.
+
+, So, your assumption is that the job finished successfully and got purged from the job queue (because of high volume of job completions from the same user) within 2 seconds? 
+
+The current value of mapred.jobtracker.completeuserjobs.maximum is set to 20., well - that's the only reasonable explanation i can think of. the volume of tasks is pretty incredible in the night when this happens (i was up last night watching it :-)).
+
+the other very strange thing i saw last night was that i had a job running (and i had the job id and progress log) - but the job was not visible in the tracker for a long time. It eventually became visible - but that was pretty disconcerting (is the jsp using a different api?). 
+
+Anyway - should we just close this loophole (or at least try it out internally) ? I don't see a downside and we can verify if this makes things better., also - i don't know how the tracker purges jobs from memory. if that itself is batch oriented - then that may explain a large number of deletions at the same time., One thing to verify here is whether you see this message in the JobTracker logs - "Retired job with id:" around the time you see the NPE in the client., If this use-case is verified, a simple solution could be to delay retiring successfully completed jobs by a fixed threshold (say 5 minutes). This will ensure that clients that were polling every 2 seconds would be able to fetch the completed status from the job tracker., BTW, a slightly different approach would be to use the jobstatus store. Have a look at mapred.job.tracker.persist.jobstatus.* config items in hadoop-default.xml. The idea here is that job statuses are stored to the dfs and is available even after the jobs are purged.  , Hi Devaraj, if every job status request scans the dfs file (if it cannot find the jobid in memory), it could result in bad behaviour, especially from the viewpoint of the JT thread that will do the scan. , Introduced a new parameter mapred.jobtracker.mintime.before.retirejob that specifies the time (in milliseconds) before a completed job can be retired.
+, Hi Dhruba, that's a fair point. The RPC handler thread would be blocked during the scan. I am worried about the submitJob API as well. That does a bunch of dfs operations too. We probably should do something about that as well (later on).
+However, since we already do dfs scans per job inline in the RPC handler (and AFAIK there is no noticeable impact), I'd like to see the impact of these additional dfs lookups on your system... Would that be a lot of work at your end?, >However, since we already do dfs scans per job inline in the RPC handler (and AFAIK there is no noticeable impact)
+
+can you pl explain about this already existing dfs scan that that JT does? When does it do it?, Hi Devaraj, From my understanding, "persisting job status" is optional. For those clusters on which job-status is not persisted the attached patch may be valuable in its own right. 
+
+
+, JobClient breaks out of the polling loop when RunningJob.isComplete() returns true. During the polling of the job the client has started, as RunningJob.getJob(jobId) returning a null also essentially implies that the job is completed (and gone too), JobClient could just break out of polling in this case., Dhruba, the dfs scan happens when the job is submitted (copying of jar files, etc.). Look at the public JobInProgress constructor and this gets called from the submitJob RPC. But I haven't thought about how this can be handled better...
+Vinod's suggestion looks fine to me especially if you don't care about the final status of the completed job. In addition, if you really care about getting the status of completed jobs, you have the JobStatus store that I was talking about earlier, or, increase the number of jobs kept in memory and, maybe, tweak the retirejob interval. The former can be used to get the status of jobs that were completed a while back while the latter would be for clients that are polling very actively. Your approach would essentially be doing the latter, right?, we definitely care about the status of completed jobs (and i think most installations would - given that at least some of the uses are always programmatic invocations that check return status).
+
+does the jobstatus store need to scan dfs even when the job status is available in memory? (falling back to persistent store only when the data is missing in memory would seem like a good strategy). another question is whether job counters are available from the persisted job status?, bq. (falling back to persistent store only when the data is missing in memory would seem like a good strategy). 
+That's what it does.
+
+bq. another question is whether job counters are available from the persisted job status?
+Yes., here's a related/new observation (maybe this deserves a separate jira):
+
+- job is long complete and gone from tracker (hours). i checked the history file to confirm.
+- jobclient is hung polling for completion
+
+we are probably running with the 5 minute wait-before-purge on jobclient patch for this. i did a jstack on the jobclient:
+
+"main" prio=10 tid=0x08059c00 nid=0x7374 waiting on condition [0xf7fdb000..0xf7fdc298]
+   java.lang.Thread.State: TIMED_WAITING (sleeping)
+        at java.lang.Thread.sleep(Native Method)
+        at org.apache.hadoop.mapred.JobClient.runJob(JobClient.java:992)
+        at com.facebook.hive.common.columnSetLoader.run(columnSetLoader.java:545)
+        at org.apache.hadoop.util.ToolRunner.run(ToolRunner.java:65)
+
+i am quite confused how this can happen. anyway - i will leave it running in this state so u can take a look.
+, Incorporated review comments from Devaraj. Merged patch with latest trunk., +1, -1. I think that in this patch itself you should also make JobClient skip out of the loop when it detects the job as complete, because that is the correct fix irrespective of what the polling interval of JobClient is. Currently note that we are not sync'ing client's polling interval with MIN_TIME_BEFORE_RETIRE that you added, so if later, client's polling interval becomes configurable/increases beyond MIN_TIME_BEFORE_RETIRE, this problem surfaces again., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12392228/4296_jt_delayretire2.patch
+  against trunk revision 705155.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no tests are needed for this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    -1 findbugs.  The patch appears to introduce 1 new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3474/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3474/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3474/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3474/console
+
+This message is automatically generated., >make JobClient skip out of the loop when it detects the job as complete
+
+I do not understand Vinod's comment, can you pl explain in greater detail? The client is trying to determine if the job is complete. if the job is complete, of course the client exits. But the problem if that the JobClient was unable to fetch the status of the job from the JT, What Vinod means to say is that the JobClient could catch the exception if it happens. Instead of printing the raw exception, an error msg can be displayed like "job not found" or something.. This is what he meant I believe., The JobClient now elegantly handles the case when it fails to retrieve job status from the JobTracker. 
+Fixed findbugs warnings., Incorporated review comments. Fixed findbugs warnings., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12392272/4296_jt_delayretire3.patch
+  against trunk revision 705430.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no tests are needed for this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3481/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3481/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3481/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3481/console
+
+This message is automatically generated., Dhruba,
+
+Sorry for not looking at the entire patch earlier. The place where you are using MIN_TIME_BEFORE_RETIRE in finalizeJob to prevent retiring very recently finished jobs seems wrong to me. You should check for the condition before the job is even removed from JT.
+
+Further, are you sure we want to throw an exception in the job-client? An exception would throw a non-zero error code to the client; I'd rather log the message and just break out of the loop, thus returning a zero exit code, as we know for sure that the job is indeed complete.
+
+Having said that, I think introducing MIN_TIME_BEFORE_RETIRE here, in this blocker, doesn't seem to be very right. It is a feature. The later fix, patching the client, is the correct and sufficient fix for the problem that Joydeep initially reported., quick comment: if the job is complete - but we don't know the status (ideally this should never happen, but if it does ..) - it's better to return a non-zero error status. Saying success when it ain't so is pretty scary (for workflow pipelines that depend on correct exit status), Hi Vinod, thanks for the review.
+
+> You should check for the condition before the job is even removed from JT.
+I do not understand this. Can you pl explain?
+
+>Further, are you sure we want to throw an exception in the job-client? 
+No exceptions are being thrown in the JobClient. The pre-existing code catches those exceptions and retries (I have not changed any of these).
+
+I am pretty sure that this is not a "feature". It fixes a bug.
+
+
+, Incorporated review comments from Vinod., Incorporated review comments from Vinod., Incorporated review comments from Vinod., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12392454/4296_jt_delayretire4.patch
+  against trunk revision 706463.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no tests are needed for this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3502/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3502/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3502/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3502/console
+
+This message is automatically generated., +1 for the patch., I just committed this., Integrated in Hadoop-trunk #640 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/640/])
+    ]

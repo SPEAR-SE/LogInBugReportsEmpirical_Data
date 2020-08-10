@@ -1,0 +1,204 @@
+[this bug  occurred in the hive 0.7.0 ,see https://issues.apache.org/jira/browse/HIVE-1760  .but it was reproduced in  hive-0.10.0 , I'm seeing this same issue with hive-server2-0.10.0 and hive-metastore-0.10.0, Could you specify the last operation you tried? It will be helpful to find the bug., Thanks for your reply Teddy. I have a hive script that drops then
+re-creates a couple of tables. I assumed that it was the "drop table if
+exists" steps but upon further investigation at least in the latest
+instance it was the last step that failed.  *--uber_responsemapping*
+
+
+
+
+[root@ALLEG-P-H0001 exec_etl-wf]# cat drop_uber_tables.q
+DROP TABLE if exists ${hivedbname}.uber_responsemapping;
+DROP TABLE if exists ${hivedbname}.ubermap;
+
+--ubermap
+Create table ${hivedbname}.ubermap (
+ubermapid int,
+id int,
+value string,
+surveyid int,
+uberindex int,
+uberbit bigint,
+modifieddate string)
+Partitioned by (Maptype int )
+Clustered by (id ) into 20 BUCKETS;
+
+*--uber_responsemapping*
+*Create Table ${hivedbname}.uber_responsemapping (*
+*id int, *
+*responseid int, *
+*respondentid int, *
+*answerid int, *
+*scaleid int, *
+*responserank int, *
+*respondentstate int, *
+*modifieddatetime string, *
+*value string, *
+*answerweight int,*
+*answerdatatype string,*
+*dataaction string)*
+*Partitioned by (surveyid int)*
+*Clustered by (respondentid) into 50 BUCKETS;*
+
+
+
+, Sorry, [~thelogenator]. I'm confused. To make it clear, did you used asterisks for bold letters only?, I removed formats and executed your queries. They worked without any error. It seems like there are more causes.
+
+Can you show me more information? Such as hivedbname, whether there were tables before executing drop queries., If it becomes reproducible, then I will try to fix it again., I found that question occurred when hiveserver were running continuously several days,and concurrently creating table , note that the error message may be misleading, see HIVE-5181, maybe the cause of this question was  that SergeyShelukhin issued. but what's the some real issue?, We have seen similar issues in an environment with a lot of concurrent hive access from multiple machines all running version 0.11.  Our first thought was that we needed to turn on hive.support.concurrency.  However, after doing this on all of our hosts including the ones running hiveserver we still see an intermittent issue.  I've not been able to reliably reproduce it, but it does happen at least a few times a day as part of our regularly scheduled jobs., We are meeting the same issue in hive 0.11, standalone mode + MySQL as metastore., Every thing works well after i change connection pool from bonecp to dbcp . You can have a try., change connection poll from bonecp to dbcp, HIVE-4807 changed it to bonecp due to another bug. Maybe some additional instrumentation (such as tracking db queries) can uncover the cause of this bug, instead of just changing it, bonecp leads to communication with db fails,this is why there are unbalanced transcations ., Maybe there are some wrong usage of bonecp in hive,but i am sure bonecp is in charge of this issue., just want to add my experience and testing with this bug,
+- looks like BoneCP has bug.
+- switching to DBCP resolved this issue for me.
+, The patch is misnamed:  hive-4996.path should be hive-4996.patch.  (It downloads instead of opening when I click the link.), [~cyril.liao] What version of bonecp are you using? Bonecp has been upgraded to a newer version in this patch: [HIVE-6170|https://issues.apache.org/jira/browse/HIVE-6170]. Can you test with the newer version?, I put some instrumentation code and saw the following in one instance of this exception:
+
+1.  HMSHandler.create_table_with_core makes a series of calls to the RawStore: {open, call1, call2, call3, commmit}
+
+2.  Suddenly there is a strange BoneCP message saying it is closing the connection.
+{code}
+2014-01-28 22:50:34,565 WARN  bonecp.ConnectionPartition (ConnectionPartition.java:finalizeReferent(162)) - BoneCP detected an unclosed connection and will now attempt to close it for you. You should be closing this connection in your application - enable connectionWatch for additional debugging assistance or set disableConnectionTracking to true to disable this feature entirely.
+{code}
+
+3.  This causes a certain RawStore operation {calln} to fail on commit, and rollback to occur.  In this case, failing operation is in nested-transaction (openTransactions > 1)
+
+4.  This RawStore operation {calln} is re-tried by virtue of the retrying metastore client, and succeeds (using perhaps another BoneCP connection).
+
+5.  But there is still the final commit() call of HMSHandler operation in step 1, and it will be unbalanced.
+
+So there are two issues, one is BoneCP randomly closing the connection, and also the design of RetryingRawStore. 
+
+In my opinion, we should rely on RetryingHMSHandler and get rid of RetryingRawStore, as we should always retry the whole transaction as a unit.  It doesn't make sense too much sense to me to retry individual operations, within a nested transaction, unless I am missing something.  I could take a stab, what do people think?, Sorry there is a minor typo in 4.  It should read: 
+
+This RawStore operation {calln} is re-tried by virtue of the RetryingRawStore, and succeeds, There's attribute in retryingrawstore I think that prevents commit itself from being retries.
+Perhaps it (or something similar?) can also be used to prevent write ops from being retried? Retrying read ops might make sense., I think that most operations have read/write both, and the RetryingRawStore doesn't have enough context to tell whether the failing read has any writes before it, in which the rollback would affect.
+
+Also , it doesn't get around the unbalanced problem.  As the first open() is not called again, so the final commit() would be unbalanced after any retry, read or write.
+
+For example:
+{code}
+HMSHandler.createTable()
+   ms.open()  //openTx = 1
+   ms.getTable() // fails and rollback: set openTx = 0.  Then retries, openTx = 1, then openTx = 0 on success.
+   ms.createTable()  //openTx = 1 then openTx = 0.
+   ms.commit();  //unbalanced transaction as activeTx = 0
+{code}
+
+In normal scenario:
+
+{code}
+HMSHandler.createTable()
+   ms.open()  //openTx = 1
+   ms.getTable() // openTx = 2, then openTx = 1
+   ms.createTable()  //openTx = 2, then openTx = 1.
+   ms.commit();  //openTx = 0
+{code}, In some more testing, the workaround for the issue is to set the configuration hive.metastore.ds.retry.attempts=0, as this de-activates RetryingMetastore.  If there is any transient BoneCP error like this, RetryingHMSHandler will retry whole transaction from the beginning., One more observation about the particular BoneCP error "BoneCP detected an unclosed connection and will now attempt to close it for you."   It seems it is a problem of the 0.8.0 release.  There are some discussions about this, including at [http://jolbox.com/forum/viewtopic.php?f=3&t=387&start=10|http://jolbox.com/forum/viewtopic.php?f=3&t=387&start=10]. We have not seen the error when we reverted back to BoneCP 0.7.1.  
+
+But I guess this is an orthogonal issue, as any transient DB/Bonecp error will be hidden by RetryingRawStore bug.  Just so happens that with BoneCP 0.8.0, it seems to be more frequent., Attaching a fix., Attached the link to code review., 
+
+{color:red}Overall{color}: -1 at least one tests failed
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12626772/HIVE-4996.1.patch
+
+{color:red}ERROR:{color} -1 due to 5 failed/errored test(s), 4995 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestContribNegativeCliDriver.testNegativeCliDriver_url_hook
+org.apache.hadoop.hive.cli.TestMinimrCliDriver.testCliDriver_bucket_num_reducers
+org.apache.hadoop.hive.cli.TestMinimrCliDriver.testCliDriver_infer_bucket_sort_merge
+org.apache.hadoop.hive.cli.TestMinimrCliDriver.testCliDriver_root_dir_external_table
+org.apache.hadoop.hive.common.type.TestDecimal128.testHighPrecisionDecimal128Multiply
+{noformat}
+
+Test results: http://bigtop01.cloudera.org:8080/job/PreCommit-HIVE-Build/1170/testReport
+Console output: http://bigtop01.cloudera.org:8080/job/PreCommit-HIVE-Build/1170/console
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 5 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12626772, Fixing url_hook failure.
+
+Other failures do not seem related to this patch., 
+
+{color:red}Overall{color}: -1 at least one tests failed
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12627045/HIVE-4996.2.patch
+
+{color:red}ERROR:{color} -1 due to 2 failed/errored test(s), 5008 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.metastore.TestMetaStoreListenersError.testEventListenerException
+org.apache.hadoop.hive.metastore.TestMetaStoreListenersError.testInitListenerException
+{noformat}
+
+Test results: http://bigtop01.cloudera.org:8080/job/PreCommit-HIVE-Build/1200/testReport
+Console output: http://bigtop01.cloudera.org:8080/job/PreCommit-HIVE-Build/1200/console
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 2 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12627045, Fixing the negative-test cases., 
+
+{color:red}Overall{color}: -1 at least one tests failed
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12627269/HIVE-4996.3.patch
+
+{color:red}ERROR:{color} -1 due to 1 failed/errored test(s), 5033 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestNegativeMinimrCliDriver.testNegativeCliDriver_mapreduce_stack_trace_hadoop20
+{noformat}
+
+Test results: http://bigtop01.cloudera.org:8080/job/PreCommit-HIVE-Build/1213/testReport
+Console output: http://bigtop01.cloudera.org:8080/job/PreCommit-HIVE-Build/1213/console
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 1 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12627269, [~szehon] Thanks for taking care of this issue. I left a comment on RB., Addressing review comments + rebase., +1, 
+
+{color:red}Overall{color}: -1 at least one tests failed
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12628142/HIVE-4996.4.patch
+
+{color:red}ERROR:{color} -1 due to 2 failed/errored test(s), 5084 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver_authorization_revoke_table_priv
+org.apache.hadoop.hive.cli.TestMinimrCliDriver.testCliDriver_auto_sortmerge_join_16
+{noformat}
+
+Test results: http://bigtop01.cloudera.org:8080/job/PreCommit-HIVE-Build/1282/testReport
+Console output: http://bigtop01.cloudera.org:8080/job/PreCommit-HIVE-Build/1282/console
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 2 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12628142, I saw authorization_revoke_table_priv is broken for all recent pre-commit builds.  I ran the minimr test without the issue, it seems to be flaky., Patch committed to trunk. Thank Szehon for the patch., Thanks Xuefu for the review.]

@@ -1,0 +1,95 @@
+[The NN log shows following. The underlying FileJournalManager reported FileNotFoundException when the namenode process ran out of file descriptors. When the previous editlog files were closed, they were quickly taken away by socket connections, etc. 
+
+{panel}
+2012-xx-yy 00:00:00,000 [IPC Server handler 00 on 0000] INFO
+org.apache.hadoop.ipc.Server: IPC Server handler 00 on 00000, call:
+rollEditLog(), rpc version=1, client version=6, methodsFingerPrint=403308677
+from 1.1.1.1:12345, error: 
+java.io.IOException: Unable to start log segment 12345678: no journals
+successfully started.
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLog.startLogSegment(FSEditLog.java:840)
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLog.rollEditLog(FSEditLog.java:802)
+        at org.apache.hadoop.hdfs.server.namenode.FSImage.rollEditLog(FSImage.java:911)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.rollEditLog(FSNamesystem.java:3494)
+        at org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer.rollEditLog(NameNodeRpcServer.java:644)
+        at sun.reflect.GeneratedMethodAccessor111.invoke(Unknown Source)
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)
+        at java.lang.reflect.Method.invoke(Method.java:597)
+        at org.apache.hadoop.ipc.WritableRpcEngine$Server.call(WritableRpcEngine.java:394)
+        at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:1530)
+        at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:1526)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:396)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1212)
+        at org.apache.hadoop.ipc.Server$Handler.run(Server.java:1524)
+{panel}, This should be marked as a blocker. , Since the namenode went on serving as usual without logging any transactions, they got lost after restart.  (Doing saveNamespace might have done some good.) When it got restarted, there were leases that don't belong to any file due to lost state. namenode would blow up while trying to save fsimage during start-up.  I had to make a hot patch to get it going, which is being formalized and improved by Daryn in HDFS-4232., bq. This should be marked as a blocker. 
+
+I am not sure about other branches. Things like this must have come up during HA development, so branch-2 might be in a better shape. , bq. I am not sure about other branches. Things like this must have come up during HA development, so branch-2 might be in a better shape.
+Yes, branch-2 code might be different. I doubt this scenario is tested by HA and may happen on trunk and branch-2 as well., A simplest solution will be to make it FATAL and exit. But is it possible to "roll back" the edit rolling and continue using the old edit? Of course, in order to be immune to FD exhaustion, NN should not close the file until a new one is opened. This may not go well with the current edit rolling mechanism, especially with HA, but I do not know HA well enough to tell.
+, Given rollEditLog is called by secondary, which in turn calls startEditLog, the failure to roll an editlog results in failure of an RPC call from secondary to primary. The issue reported here is very likely to happen in setups that use secondary namenode, even in branch-2.
+
+bq. Of course, in order to be immune to FD exhaustion, NN should not close the file until a new one is opened.
+FD exhaustion is an interesting bug. I agree we should probably open a file and then finalize the previous segment. I also think we will have to add limit on number of connections accepted by the RPC server.
+, bq. FD exhaustion is an interesting bug.
+
+I am unsure of what fd exhaustion means (is it hitting nofile limits?), but since we already monitor disk space and inode resources at the NN (and get into safemode), we could throw in monitoring for this as well?, bq. I am unsure of what fd exhaustion means (is it hitting nofile limits?),....
+
+Yes. In a very big cluster, we've seen NN running out of 64K file descriptors. I was told that it can be raised further (e.g. 1M) without much negative impact on performance, at least on Linux. So there are ways to avoid it or minimize the possibility, but NN still needs to be able to deal with the situation.
+
+Monitoring and limiting number of connections can be tricky. Ideally we want the average number to be reasonable, but also want NN to absorb a short burst of requests instead of rejecting them. The client-side retry mechanism will require some changes, if IPC start actively rejecting requests. The things get very nasty if IPC connections get "reset" or fall into syn backlog and stay there for long. Massive lease renewal failures will likely occur and that will cause block recoveries and so on. In short, protecting namenode might be simple, but that sometimes actually hurt cluster availability.
+, Attached patch is the "quick death" fix for branch-0.23. It at least avoids data loss. More sophisticated fix seems riskier and may be first soaked in trunk. Also, edit rolling is used as a sync point, so if we change the order of things, it may break things.
+
+If branch-2 also has the problem, there might be a separate HA-friendly solution., Kihwal, it might be good to start with a test case that simulates the editlog error. That way we could see if this happens on trunk as well (as I said earlier it is likely to happen in setups with secondary namenode). Let me know if you need help with it.
+, Here are more details: rollEditLog() was called via RPC from SNN and opening of new edit files failed. The exception was sent back to the caller, but no action was taken locally. From this point on, the edit log state is  BETWEEN_LOG_SEGMENTS and no further rolling was allowed because endCurrentLogSegment() fails. But logSync() and logEdit() went on as if nothing is wrong.
+
+Trunk does not have this issue. In {{mapJournalsAndReportErrors()}}, if a journal marked as required fails, namenode will terminate. But if none is marked required, it will simply throw an exception even if all journals fail. But logSync() will log FATAL and terminate since JournalSet#isEmpty() works diferently in trunk.
+
+In branch-0.23, FSEditLog maintains a list of journals. logSync() invokes isEmpty(), but it won't check the validity of journals in the list. Instead it checks one by one in a loop. Although it already has a logic for counting and disabling bad journals, there is nothing equivalent to the resource availability check in trunk/branch-2.  I think the best place to add this is {disableAndReportErrorOnJournals()}. This will make the failure behavior almost same as what is already implemented in truck/branch-2.
+
+This issue does not exit in branch-1, where rollEditLog() clears {{editStreams}} before creating new edit files. Since it calls {{exitIfNoStreams()}} before returning, namenode will terminate if no edit stream was successfully created.
+
+As for test cases, trunk already has TestEditLogJournalFailures.  I will create a new patch for branch-0.23 and a test case., The patch adds one condition check. The added test fails without this change.  This bug exists only in branch-0.23., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12555405/hdfs-4233.branch-0.23.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/3576//console
+
+This message is automatically generated., Thanks Kihwal for comprehensive analysis of this issue covering all the releases. I will review the patch and post comments soon., +1. Patch looks good.
+
+Minor comments: 
+# Change in FSEditLog.java pushes the line beyond 80 chars.
+# Typo - avtive, The new patch addresses Suresh's comment., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12555437/hdfs-4233.branch-0.23.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/3578//console
+
+This message is automatically generated., Kihwal, also the test fails for me on MAC. What I see is after the newly changed test gets executed and namenode exits as expected, I see the subsequent tests fail with the error:
+{noformat}
+Tests in error: 
+  testMultiThreadedEditLog(org.apache.hadoop.hdfs.server.namenode.TestEditLog): Cannot lock storage /Users/suresh/Documents/workspace/23/hadoop-hdfs-project/hadoop-hdfs/target/test/data/dfs/name1. The directory is already locked.
+  testSyncBatching(org.apache.hadoop.hdfs.server.namenode.TestEditLog): Cannot lock storage /Users/suresh/Documents/workspace/23/hadoop-hdfs-project/hadoop-hdfs/target/test/data/dfs/name1. The directory is already locked.
+  testBatchedSyncWithClosedLogs(org.apache.hadoop.hdfs.server.namenode.TestEditLog): Cannot lock storage /Users/suresh/Documents/workspace/23/hadoop-hdfs-project/hadoop-hdfs/target/test/data/dfs/name1. The directory is already locked.
+  testEditChecksum(org.apache.hadoop.hdfs.server.namenode.TestEditLog): Cannot lock storage /Users/suresh/Documents/workspace/23/hadoop-hdfs-project/hadoop-hdfs/target/test/data/dfs/name1. The directory is already locked.
+  testCrashRecoveryNoTransactions(org.apache.hadoop.hdfs.server.namenode.TestEditLog): Cannot lock storage /Users/suresh/Documents/workspace/23/hadoop-hdfs-project/hadoop-hdfs/target/test/data/dfs/name1. The directory is already locked.
+  testCrashRecoveryWithTransactions(org.apache.hadoop.hdfs.server.namenode.TestEditLog): Cannot lock storage /Users/suresh/Documents/workspace/23/hadoop-hdfs-project/hadoop-hdfs/target/test/data/dfs/name1. The directory is already locked.
+  testCrashRecoveryEmptyLogOneDir(org.apache.hadoop.hdfs.server.namenode.TestEditLog): Cannot lock storage /Users/suresh/Documents/workspace/23/hadoop-hdfs-project/hadoop-hdfs/target/test/data/dfs/name1. The directory is already locked.
+  testCrashRecoveryEmptyLogBothDirs(org.apache.hadoop.hdfs.server.namenode.TestEditLog): Cannot lock storage /Users/suresh/Documents/workspace/23/hadoop-hdfs-project/hadoop-hdfs/target/test/data/dfs/name1. The directory is already locked.
+{noformat}
+
+The storage directory remains locked., I made a change and moved the modified test to as the last test. The tests pass after that., It is because ExitUtil's terminateCalled is static. Once it's set, it remains to be set in the next test run in the same jvm. I can add a clear method in ExitUtil for tests. Do you want it to be done in a separate common jira? Since this change will be applicable to branch-2 and trunk as well, I think doing it in a separate jira is better.
+
+Moving test can make the test pass for now, but with jdk7, test cases can run out of order and may break again. I will file a common jira for the exit util change and update this patch accordingly., Created HADOOP-9108 and made this jira depend on it., I just found out something equivalent has already been done in trunk. I will just find the jira and make that as dependency., I decided to go ahead and implement the exit status clearing in HADOOP-9108 for branch-0.23 only. The reason is stated in the jira. With HADOOP-9108, the latest patch in this jira works without any changes., After HADOOP-9108, the subsequent test cases no longer fail., I committed the patch to 0.23 branch. Thank you Kihwal., Integrated in Hadoop-Hdfs-0.23-Build #451 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/451/])
+    HDFS-4233. NN keeps serving even after no journals started while rolling edit. Contributed by Kihwal Lee. (Revision 1415502)
+
+     Result = UNSTABLE
+suresh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1415502
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+]

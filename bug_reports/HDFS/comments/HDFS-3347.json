@@ -1,0 +1,142 @@
+[All the operation are failing after this , What version of Hadoop are you using?, I got in 3.0 trunk, What is dfs.namenode.name.dir or dfs.namenode.edits.dir set to? Did it exist before running namenode?, More questions.
+
+Did it work for a while then exhibit this symptom?
+Do you see "Rolling edit logs" log message around the time the issue occurs?
+Any other exceptions or errors occurring?, Hi 
+
+Problem is with transitionToActive for namenode.
+
+Analysis:
+
+here 
+{code}
+try {
+        editLogStream.write(op);
+      } catch (IOException ex) {
+        // All journals failed, it is handled in logSync.
+      }
+{code}
+editLogStream is found to be null !!!
+
+I got the problem is in transitionToActive of NN 
+
+in
+{code}
+void startActiveServices() throws IOException {
+    LOG.info("Starting services required for active state");
+    writeLock();
+    try {
+      FSEditLog editLog = dir.fsImage.getEditLog();
+
+      if (!editLog.isOpenForWrite()) {
+        // During startup, we're already open for write during initialization.
+        editLog.initJournalsForWrite();<-- Here IAE thrown caused the transition failure
+        .
+	.
+	.
+        dir.fsImage.editLog.openForWrite();<-- Here editLogStream var is initialised this is not done due to IAE 
+      }
+      .
+      .
+      .
+  }
+{code}
+FSEditLog#startLogSegment() will populate the 'editLogStream' variable which will be done when NN is starting as active itself.
+
+Here editLog.initJournalsForWrite() can fail throwing 
+
+{code}
+java.lang.IllegalArgumentException: No class configured for bkpr
+	at org.apache.hadoop.hdfs.server.namenode.FSEditLog.getJournalClass(FSEditLog.java:1204)
+	at org.apache.hadoop.hdfs.server.namenode.FSEditLog.createJournal(FSEditLog.java:1218)
+	at org.apache.hadoop.hdfs.server.namenode.FSEditLog.initJournals(FSEditLog.java:242)
+	at org.apache.hadoop.hdfs.server.namenode.FSEditLog.initJournalsForWrite(FSEditLog.java:210)
+	at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.startActiveServices(FSNamesystem.java:596)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode$NameNodeHAContext.startActiveServices(NameNode.java:1246)
+	at org.apache.hadoop.hdfs.server.namenode.ha.ActiveState.enterState(ActiveState.java:61)
+	at org.apache.hadoop.hdfs.server.namenode.ha.HAState.setStateInternal(HAState.java:63)
+	at org.apache.hadoop.hdfs.server.namenode.ha.StandbyState.setState(StandbyState.java:49)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.transitionToActive(NameNode.java:1178)
+	at org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer.transitionToActive(NameNodeRpcServer.java:981)
+	at org.apache.hadoop.ha.protocolPB.HAServiceProtocolServerSideTranslatorPB.transitionToActive(HAServiceProtocolServerSideTranslatorPB.java:80)
+	at org.apache.hadoop.ha.proto.HAServiceProtocolProtos$HAServiceProtocolService$2.callBlockingMethod(HAServiceProtocolProtos.java:2827)
+	at org.apache.hadoop.ipc.ProtobufRpcEngine$Server$ProtoBufRpcInvoker.call(ProtobufRpcEngine.java:428)
+	at org.apache.hadoop.ipc.RPC$Server.call(RPC.java:905)
+	at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:1688)
+	at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:1684)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:396)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1205)
+	at org.apache.hadoop.ipc.Server$Handler.run(Server.java:1682)
+{code}
+
+which caused the init to fail ! 
+
+If I check the status of NN using the command
+./hdfs haadmin -getServiceState nn1 
+active
+
+I got the reply as active !!!
+
+
+Now perform any write operation which will log to edits cause the NPE.
+
+
+I feel that if any transition fails due to exception it should remain in its old state (here standby)  :)
+
+Please correct me if I am wrong
+
+
+, Or is it good to remove stream when createJournal() fails for any non 'file' scheme., Can we silently ignore from adding this stream into journal set by catching the exception so that NN can become fully active so that fix can be simple instead of reverting the state of NN back to standby.
+ , The simplest thing you can do is to change HAState.setStateInternal() so that it catches Exception and revert the state before re-throwing.  Runtime exceptions such as IAE will be logged on the server-side at WARN level by RPC Server.
+
+If we start thinking about handling exceptions and dropping streams in FSEditLog.initJournals(), the problem becomes more complex. In many places, it is assumed that FSEditLog.journalSet contains all configured edit streams, working or non-working. This can change in the future if the journal stream recovery becomes more dynamic based on something like zk-backed active journal set state storage., I agree with Kihwal. There's already another JIRA open about handling errors during state transition. IMO we should completely bail out, rather than trying to revert state -- it's too likely we're in a bizarre corner case that we haven't tested for, if we fail in the midst of a state transition., bq. IMO we should completely bail out, rather than trying to revert state
+
+Do you think following is reasonable?
+
+In HAState.setStateInternal(),
+- ServiceFailedException : revert the state while still holding the context.writelock
+- All other Throwables : bail out. 
+- When bailing out, do something similar to what's done in JournalSet.mapJournalsAndReportErrors()., bq. ServiceFailedException : revert the state while still holding the context.writelock
+
+I'm worried this is easier said than done :) But in principle I like the idea., Hi,
+I agree with kihwal lee and todd.
+
+For any ServiceFailedException we can revert the state, and for other exception(include throwable) we can revert the state.
+
+Some doubts,
+
+1. Is there any possibility of adding this logic to failover controllers rather than including the logic in NN and increase the complexity. 
+
+like
+{code}
+try {
+      HAServiceProtocolHelper.transitionToActive(
+          toSvc.getProxy(conf, rpcTimeoutToNewActive));
+    } catch (ServiceFailedException sfe) {
+      LOG.error("Unable to make " + toSvc + " active (" +
+          sfe.getMessage() + "). Failing back.");
+      failed = true;
+      cause = sfe;
+    } catch (IOException ioe) {
+      LOG.error("Unable to make " + toSvc +
+          " active (unable to connect). Failing back.", ioe);
+      failed = true;
+      cause = ioe;
++    } catch (Throwable th) {
++      LOG.error("Unexpected error" + toSvc +
++          " Failing back.", th);
++      failed = true;
++      cause = ioe;
++    }
+
+{code}
+
+2. Can we mark the NN state as Active only when it successfully do a transition to Active similarly for Standby. 
+
+This can solve any issues since for any operation we have a state check ?
+
+Thanks in advance :), IMO, I have following options with less code changes.
+1. Shutdown the NameNode for error during state transition.
+2. Validate all mandatory configurations before startup of the process., Oops, Just now I saw the fix done by Aaron in HDFS-3026, So this issue will not occur again.
+Closing this issue., Already fixed in HDFS-3026,]

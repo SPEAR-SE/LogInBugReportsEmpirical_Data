@@ -1,0 +1,91 @@
+[Won't different methods need to synchronize on different subsets of the namenode's data?  If so, then synchronizing on them separately must be done very carefully to avoid deadlocks.  Also, to the degree these subsets overlap, this will provide less speedup.  Finally, the two most CPU-intensive methods you mention need the same data structures, so finer-grained synchronization won't help them, will it?
+
+For these reasons, my instinct would be to instead try to optimize these methods, both so they use less CPU and also, if possible, minimizing the time they need to keep things synchronized.  Can much of their work be done unsynchronized, with only a few critical peeks and pokes synchronized?
+
+But my instinct could be wrong...
+, Different methods may synchronize on different subsets of the namenode's data, but it is not necessary. The global FSNamesystem lock will still be there and it will provide consistency across data structures. The other locks are per data structure. I want to keep the lock hierarchy very very simple with only two levels. My aim is to design a scheme that has very low risk of deadlocks and optimize only those methods that are really necessary. The other portions of the file system will still be protected by the global FSNamesystem lock. The lock hierarchy has only two levels:
+
+1. First acquire the global FSNasmesystem lock
+2, Then acquire any of the other data structure lock. These locks are at the same lock level, so one cannot acquire a lock while holding another. For example, one cannot acquire the lock on neededReplications while holding the lock on blocksMap.
+
+For example, there will be a lock for pendingCreates. Insertion and deletion of a file and its blocks into pendingCreates will be protected by the pendingCreates lock. Now, getAdditionalBlock() does not need to keep the global FSNamesystem lock. Similarly, addStoredBlock adds a block to the blocksMap. This will be protected by the blocksMap lock. Thus addStoredBlock does not need to hold the FSNamesystem lock. This will make addStoredBlock and getAdditionalBlock() execute in parallel.
+
+Both pendingCreates and blocksMap are backed by a HashMap. I plan on changing them to ConcurrentHashMap and measure performance. This will make multiple instances of addStoredBlock() run in parallel.
+
+We have done a first pass of performance improvements to both addStoredMap and getAdditionalBlock. The profiler clearly shows that the time to execute the code of these methods was very small, however the lock wait times were extremely high.
+
+Please let me know if this sounds reasonable. 
+
+
+
+
+
+, I think we still can optimize some things in the name-node before changing locking.
+I see at list two substantial issues.
+1) intermediate conversions of UTF8 to and from String (to be filed)
+2) remove Vectors from under the synchronized sections on the name-node HADOOP-1268
+These things should optimize addStoredBlock() and getAdditionalBlock() and reduce the wait time., 
+Could you briefly describe the load you tested with. This does not seem to have read traffic. We would expect at least 50% read traffic ( safe to assume everything written is read at least once ).
+
+I could not see actual number of calls, but from the numbers in single thread and 40 threads case, getAdditionalBloc() seems consume nearly order of magniture more cpu time than addStoredBlock().
+
+my thoughts:
+
+Of course, I don't have complete details for actual locking changes but I think using cocurrent data structures will be trouble. (Caution truism : -)  ) We should lock around logical set of data structures explicitly to gaurantee some logical consistency (e.g. if a block b exists in datanodeDescriptors map, then blockMap should contain it and 'containingNodes' for this block in blockMap should contain the descriptor).
+
+Read/Write locks should also be considered since they can provide good parallel access..  especially with considerable read traffic.
+
+
+, I agree with Konstantin's suggestion that we should try to optimize as much as possible the code in addStoredBlock and getAdditionalBlock before we try to optimize on locking behavour. The conversions from UTF8 to/from String should be avoided and is a good thing to do. But if you see the profiled output, it might not result in a big change to performance. Also, changing Vectors to ArrayList is a good thing, but this is within the global FSNamesystem lock, so there will never be a case when a thread will block on the lock of the Vector. Am I missing something?
+
+In response to Raghu's comments: the profiled load is DFSIO and it is writing to files. I have profiled "sort" too and that eats loads of CPU in the FSNamesystem.open call. The clusterMap is an ideal candidate for read/write locks because updates to it are rare but is used very often.
+
+, This is a very toned-down version of the fine-grain locking model that i was playing around with. I have successfully tested randomWriter and dfsio on a 1000 node cluster with this fix. My workload runs to a successful completion with this patch (but fails without this patch).
+
+The chooseTarget method consumes quite a bit of CPU. This method allocates a set of datanodes for a newly allocated block. This patch changes the locking to allow chooseTargets to occur outside the FSNamesystem global lock.
+
+The chooseTarget() method uses the clusterMap to determine "distances" between nodes. The cluster map used to have a lock-monitor protecting it. Now it has a reader/writer lock. This is appropriate because the rate of change to the cluster is very rare (occurs when datanodes go down/come back up).
+
+When a client request a new block for a file, the namenode acquires the FSnamesystem lock, checks leases, allocates a new blockid, inserts it into pendingCreates, etc.etc. Then it releases the FSnamesystem global lock and invokes chooseTargets(). chooseTargets acquires the clusterMap in read mode and selects a set of datanode locations for this block.
+
+This patch does not change the locking hierarchy of locks., This locking schema seems quite consistent to me, and reasonably easy to understand.
+In addition to your tests I would try to run the same (with and without new locking) 
+on a smaller cluster to make sure the performance does not degrade for smaller installations.
+By smaller cluster I mean anything that still can handle the workload both with and without locking.
+It'd be nice if we could compare the actual numbers from those runs.
+
+Some comments:
+
+- NetworkTopology.isOnSameRack() should be static and should not acquire the readLock.
+  public static boolean isOnSameRack()
+- NetworkTopology.getDistance() redundant declaration.
+    int i;
+- Host2NodesMap.add()
+The writeLock should be taken before calling contains(node). 
+Otherwise you are not guaranteed the node is not contained in the map, since you release the readLock 
+and acquire the writeLock and another thread can insert the node between switching the locks.
+You should probably use a private lock-free version of contains() in this case.
+- Host2NodesMap.java
+Indentation is wrong in many places.
+- FSNamesystem.getAdditionalBlock()
+NameNode.stateChangeLog.debug(...) can be taken out of the synchronized section.
+
+, Incorporated Konstantin's review comments.
+
+1. NetworkTopology.isOnSameRack looks at node.getParent(). These are protected by the clusterMap lock. So, I kept it as it way, did not make any change.
+
+2. NetworkTopology.getDistance(): removed redundant declaration i.
+
+3. Host2NodesMap.add locking issue. This was a good catch. I made this change. Fixed indentation.
+
+4. Moved the LOG statement in getAdditionalBlock as suggested.
+
+I also ran randomWriter on a 10 node cluster. The test ran to completion. The total elapsed time of the test without this patch was 2 hr 40 min and with this patch was 2 hours 31 minutes. Not a single task error was encountered.
+, A toned-down version of a finer grain locking model for the namenode. , +1 on the changes.
+I think we should compare the performance gain of this patch on a 500 0r > node cluster.
+I suspect gains will be more visible on larger than just 10 node clusters and it is interesting to have measurements,
+particularly to get an idea on what further fine graining could bring., > I think we should compare the performance gain of this patch on a 500 0r > node cluster.
+Equally useful will be the profiler numbers that Dhruba included in serverThread1.html (may be serverThread40.html) attachments with this patch.
+, > Equally useful will be the profiler numbers that Dhruba included in serverThread1.html (may be serverThread40.html) attachments with this patch.
+because, those numbers influenced this patch.
+, I just committed this.  Thanks, Dhruba!, Integrated in Hadoop-Nightly #122 (See [http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Nightly/122/])]

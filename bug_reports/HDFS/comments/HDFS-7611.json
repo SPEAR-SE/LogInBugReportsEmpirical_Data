@@ -1,0 +1,211 @@
+[Attaching the log for the failed run as it is not easy to catch it.
+I see only one suspicious thing: EOFException while sending heartbeat. But didn't look deeper than that., This bug happens only in tests with restarts and happens because blocks from files created in previous tests are not being deleted when replaying edits logs.
+1) I'm still investigating the source of this, but some time while replaying edits, {{DirectoryWithSnapshotFeature$cleanDirectory}} can decrement an INode's namespace quota to negative. Either the namespace count was overcounting while cleaning directories or snapshotDiff, or the INode's namespace quota wasn't counted up properly in the first place.
+2) If the INode's namespace quota happens to be -1, the blocks associated with that inode will not be deleted. When we call {{fsd.removeLastINode(iip)}} in {{FSDirDeleteOp$unprotectedDelete}}, we explicitly check whether its return code is -1. In that case, we skip collecting the blocks that should be deleted. Notice that in {{FSDirectory$removeLastINode}}, one of the possible returns is {{return counts.get(Quota.NAMESPACE)}}.
+3) Now there are blocks in the blocksMap that shouldn't be there. This will increase the number of blocks needed to get out of safeMode. The test failure depends on whether the namenode receives these blocks. If it does, then the namenode will exit safeMode and the test will suceed., Was looking at {{TestOpenFilesWithSnapshot}} which also restarts NameNode and fails intermittently with the same timeout. I see similar behavior as Byron described.
+The test creates two files {{/test/test/test2}} and {{/test/test/test3}}, then aborts the streams, creates a snapshot, deletes the files, and restarts the the NameNode. If any of the replicas of the files were created on any of DNs, then the test succeeds. If the stream is aborted before the replicas are created, then the test fails.
+So some blocks, which were deleted before the NN restart are not being garbage collected on restart, and NN cannot get out of safe mode then.
+This test does not use truncate, but does use snapshots., Found it.
+
+The problem occurs in how we do {{FSImage$loadEdits}}.
+The gist of it looks like:
+{code}
+private long loadEdits(...) {
+  try {
+    loadEdits();
+  } finally {
+    updateCountForQuota();
+  }
+}
+{code}
+
+In {{TestFileTruncate$testUpgradeAndRestart()}}, notice that we do:
+{code}
+saveNamespace();
+restart();
+deleteSnapshot();
+{code}
+
+Since there are no edits to load directly after restart, we immediately call {{updateCountForQuota()}}, which will set namespace count for the root directory from 1 to 5. Then deleting the snapshot will decrement the count from 5 to 2.
+
+However, we also do a restart in {{TestFileTruncate$testTruncateEditLogLoad()}}. In this case, there is an edit to replay, namely the {{deleteSnapshot()}}. This will decrement the namespace count from 1 to -1, and afterwards {{updateCountForQuota()}} will set it back to 2., To add on to previous findings:
+Now that {{deleteSnapshot()}} has screwed up the namespace counts, the next operation, which is a {{delete}} will fail to collect the INode's blocks for deletion. This is because {{unprotectedDelete}} checks the return code of {{removeLastInode()}}. If the return code is -1 or 0, it will skip colecting blocks and immediately return. In certain cases {{removeLastInode()}} will {{return counts.get(Quota.NAMESPACE)}} which was previously set to -1., Attached blocksNotDeletedTest.patch.
+Includes a test that reproduces this issue.
+The test fails both before and after truncate was committed.
+
+Also, I forgot to mention before that quotas must be enabled for the directory to reproduce the error. Otherwise, the {{last.computeQuotaUsage()}} call in {{unprotectedDelete()}} will actually count the namespace objects instead of extracting the number from the {{DirectoryWithQuotaFeature}} object., Byron, good job investigating and reproducing the bug.
+Sounds like a serious problem. I also confirmed it on branch-2 with your test.
+
+_So if quotas are enabled a combination of operations *deleteSnapshot* and *delete* of a file can leave orphaned blocks in the blocksMap on NameNode restart. They are counted as missing on the NameNode, and can prevent NameNode from coming out of safeMode and could cause memory leak (at least during startup)._
+
+I'll rename the jira and unlink from HDFS-3107 as it is not related to truncate., Changed the description. It used to be: TestFileTruncate.testTruncateEditLogLoad times out waiting for Mini HDFS Cluster to start., Thanks for digging deep into it.  We should fix the snapshot bug.
+
+Is there a way to change TestFileTruncate for working around the bug?  It is a bad advertisement for the new truncate feature if TestFileTruncate keeps failing., FAILURE: Integrated in Hadoop-trunk-Commit #6926 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/6926/])
+HDFS-7676. Fix TestFileTruncate to avoid bug of HDFS-7611. Contributed by Konstantin Shvachko. (shv: rev 370396509deb5c9319c5db880f3e4058b20a7514)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #84 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/84/])
+HDFS-7676. Fix TestFileTruncate to avoid bug of HDFS-7611. Contributed by Konstantin Shvachko. (shv: rev 370396509deb5c9319c5db880f3e4058b20a7514)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #818 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/818/])
+HDFS-7676. Fix TestFileTruncate to avoid bug of HDFS-7611. Contributed by Konstantin Shvachko. (shv: rev 370396509deb5c9319c5db880f3e4058b20a7514)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #2016 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2016/])
+HDFS-7676. Fix TestFileTruncate to avoid bug of HDFS-7611. Contributed by Konstantin Shvachko. (shv: rev 370396509deb5c9319c5db880f3e4058b20a7514)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk-Java8 #81 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/81/])
+HDFS-7676. Fix TestFileTruncate to avoid bug of HDFS-7611. Contributed by Konstantin Shvachko. (shv: rev 370396509deb5c9319c5db880f3e4058b20a7514)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #85 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/85/])
+HDFS-7676. Fix TestFileTruncate to avoid bug of HDFS-7611. Contributed by Konstantin Shvachko. (shv: rev 370396509deb5c9319c5db880f3e4058b20a7514)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2035 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2035/])
+HDFS-7676. Fix TestFileTruncate to avoid bug of HDFS-7611. Contributed by Konstantin Shvachko. (shv: rev 370396509deb5c9319c5db880f3e4058b20a7514)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, Thanks for digging into the issue, [~Byron Wong]!
+
+So currently we have two ways to fix the issue:
+# While applying the editlog, instead of calling {{INode#addSpaceConsumed}}, we should use {{FSDirectory#updateCount}} which checks if image/editlog has been loaded.
+# We do not compute quota change and update quota usage in {{FSDirectory#removeLastINode}} anymore. Instead, we move the quota computation/update part to its caller. In this way, the quota usage change, even if it's wrong, will not affect the real deletion.
+
+Both changes actually are necessary. But #1 requires a lot of code refactoring. Since #2 alone can also fix the reported bug, I guess we can do #1 in a separate jira. , Upload the patch using the above #2 approach., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12694651/HDFS-7611.001.patch
+  against trunk revision 6f9fe76.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.snapshot.TestOpenFilesWithSnapshot
+                  org.apache.hadoop.hdfs.server.datanode.TestBlockScanner
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/9334//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9334//console
+
+This message is automatically generated., I like option 2. Minor comments.
+# {{updateQuota()}} can be moved to {{FSDirectory}}. That way you can also reuse it in {{unprotectedDelete()}}. And call it something like {{updateQuotaIfNeeded()}}
+# _@return >0 otherwise_  is formally correct in {{removeLastINode()}}, but it actually now returns only -1. 0, or 1.
+# No need to import {{Assert}}, just use {{assertEquals()}} directly as it is already imported. This will also shorten last line to < 80 symbols.
+# It would be good to add a log message to {{MiniDFSCluster.waitClusterUp()}}. Right now it only throws IOException when it times out. But that is not reflected in the logs. Adding something like
+{code}
+         if (++i > 10) {
+-          throw new IOException("Timed out waiting for Mini HDFS Cluster to start");
++          String msg = "Timed out waiting for Mini HDFS Cluster to start";
++          LOG.error(msg);
++          throw new IOException(msg);
+         }
+{code}
+was helpful in debugging the problem., Thanks for the review, [~shv]! Update the patch to address your comments., The patch looks good. And it fixes Byron's test case.
+One thing that I worry about is that your previous patch did not fix {{TestOpenFilesWithSnapshot}}, which still timed out. When I was looking at {{TestFileTruncate}} its failure  looked similar to the failure of {{TestOpenFilesWithSnapshot}}. So either we missed some other case or  {{TestOpenFilesWithSnapshot}} has a different problem.
+, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12694816/HDFS-7611.002.patch
+  against trunk revision f56da3c.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancer
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestHAAppend
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/9348//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9348//console
+
+This message is automatically generated., I cannot reproduce the failure of TestOpenFilesWithSnapshot in my local environment. And the new Jenkins run did not complain it. Looks like this is intermittent.
+
+From the log of the previous run looks like the DNs could not finish registration and block report during {{waitClusterUp}}. Maybe this is related to 1) slow environment, and 2) the client was still trying to write data to DNs in the test thus triggered IBR which delayed the process further. We can open a separate jira to track this if you think it's necessary., Jing, unfortunately I just reproduce failure of {{TestOpenFilesWithSnapshot}} after running it seven times. It is intermittent, we knew that. Let me look more closely tomorrow. I just want to make sure it is not the same problem, because this test also does delete snapshot then delete., Sure, I will also do some further digging tomorrow., Jing, I looked closer. That is added more logging. I think there is something going with delete itself, not snapshot delete.
+On the positive side I was running this with pre-HDFS-7676 version of TestFileTruncate and it never failed.
+So I think this particular problem is fixed. Let's file another jira for TestOpenFilesWithSnapshot, if there isn't one already.
++1 for your patch., Thanks again for the review, [~shv]. I will commit the patch shortly., I've committed the patch to trunk and branch-2. Thanks for digging into the issue, figuring out the cause and providing the test case, [~Byron Wong]! Actually this is the hardest part. I also list you as the patch contributor., FAILURE: Integrated in Hadoop-trunk-Commit #6953 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/6953/])
+HDFS-7611. deleteSnapshot and delete of a file can leave orphaned blocks in the blocksMap on NameNode restart. Contributed by Jing Zhao and Byron Wong. (jing9: rev d244574d03903b0514b0308da85d2f06c2384524)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirDeleteOp.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirRenameOp.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotDeletion.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, Thanks for taking over the work for this JIRA, [~jingzhao]!, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #88 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/88/])
+HDFS-7611. deleteSnapshot and delete of a file can leave orphaned blocks in the blocksMap on NameNode restart. Contributed by Jing Zhao and Byron Wong. (jing9: rev d244574d03903b0514b0308da85d2f06c2384524)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotDeletion.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirRenameOp.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirDeleteOp.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Yarn-trunk #822 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/822/])
+HDFS-7611. deleteSnapshot and delete of a file can leave orphaned blocks in the blocksMap on NameNode restart. Contributed by Jing Zhao and Byron Wong. (jing9: rev d244574d03903b0514b0308da85d2f06c2384524)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotDeletion.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirRenameOp.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirDeleteOp.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #89 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/89/])
+HDFS-7611. deleteSnapshot and delete of a file can leave orphaned blocks in the blocksMap on NameNode restart. Contributed by Jing Zhao and Byron Wong. (jing9: rev d244574d03903b0514b0308da85d2f06c2384524)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirRenameOp.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotDeletion.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirDeleteOp.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #85 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/85/])
+HDFS-7611. deleteSnapshot and delete of a file can leave orphaned blocks in the blocksMap on NameNode restart. Contributed by Jing Zhao and Byron Wong. (jing9: rev d244574d03903b0514b0308da85d2f06c2384524)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotDeletion.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirRenameOp.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirDeleteOp.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #2020 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2020/])
+HDFS-7611. deleteSnapshot and delete of a file can leave orphaned blocks in the blocksMap on NameNode restart. Contributed by Jing Zhao and Byron Wong. (jing9: rev d244574d03903b0514b0308da85d2f06c2384524)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotDeletion.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirRenameOp.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirDeleteOp.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2039 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2039/])
+HDFS-7611. deleteSnapshot and delete of a file can leave orphaned blocks in the blocksMap on NameNode restart. Contributed by Jing Zhao and Byron Wong. (jing9: rev d244574d03903b0514b0308da85d2f06c2384524)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotDeletion.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirRenameOp.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirDeleteOp.java
+, About to make an RC for 2.6.1. Dropping the 2.6.1 label as truncate as we decided it was too much of a trouble to backport in 2.6. Pasting comments from [~sjlee0]/[~ajisakaa] from our offline conversations:
+bq. HDFS-7611 is highly problematic. It depends on HDFS-7573, which in turn depends on HDFS-7438 and possibly others. The latter 2 JIRAs are part of HDFS-7416. My suggestion would be to not include HDFS-7611.
+{quote} +1 for moving HDFS-7611 and HDFS-7676 out.
+We have an workaround for HDFS-7611:
+* Leave safe mode manually.
+* Delete the orphaned files.
+{quote}]

@@ -1,0 +1,188 @@
+[Consider the following scenario 
+1) a job is in its end stage waiting on few slow tasks to finish
+2) the jobtracker goes ahead and speculates these tasks
+3) even before the tasktracker with speculative task reports back, the non-speculative tasks report as complete
+4) jobtracker goes ahead and launches cleanup task (if any) which also completes before the task-tracker with speculative tasks report back
+5) the job completes and later retires
+6) the tracker with speculative task reports back
+
+In such a case if the tracker is not lost, then the taskToTIPMap will hold the mapping for the speculative TIP forever which internally hold a reference to its job which has retired., Good one Amar!, I think this scenario can be generalized further failed/killed jobs too. Consider the following
+1) a job is running and the jobtracker schedules some tasks
+2) even before the tasktracker with the newly scheduled task reports back, the job gets killed or is failed because of errors
+3) jobtracker goes ahead and launches cleanup task (if any) which also completes before the task-tracker with scheduled tasks report back
+4) the job completes and later retires
+5) the tracker with newly launched task reports back 
+
+The jobtracker simply ignores the updates as the job is retired. I think the problem is in general with the tasks that are scheduled but the tasktacker reports only after the job retires. Thoughts?, Attaching a patch for trunk. The only change with this fix is that JobTracker.removeJobTasks() iterates over task-ids that the tip has scheduled so far instead of iterating over task statuses. This will take care of the corner case where the task is scheduled but hasn't returned with its status before the job retires. Added a testcase to check the same. test-patch and ant tests passed on my box.
+, Attaching a patch incorporating Amareshwari's and Jothi's offline comments. Improved the testcase making it timing independent. test-patch and all ant tests passed (except TestTrackerDistributedCacheManager which passed when I re-ran the test)., This looks good. I have a few minor comments w.r.t the test case:
+
+# Should we put a limit on the number of times that we loop while waiting for the TT to join so that we return back in reasonable time in case of some errors?
+# Can we verify, just in case, that there are no Task status associated with the TIP in question?
+# {{// check that the first map to be scheduled}} - This comment needs fixing
+# I am just wondering if it is better that we let the map complete and let reducer be pending when we kill the job -- just to test the case where some tips are done and some not?
+
+, Some minor comments on the main patch:
+
+- I would recommend we log removal of a task attempt mapping in removeTaskEntry only if something is removed. Otherwise, I see there will be duplicate log lines and this might be heavy on the logs.
+- I would suggest introducing a package private API like JobInProgress.getAllTasks() which returns all the tasks - like setup, cleanup, maps and reduces. This helps cut duplicate code in removeJobTasks and would also be useful if task types change in future.
+- Rather than enumerate the task types in the javadoc of getTaskType, I would suggest we expand on the details of what is returned without actually enumerating all the task types. Basically, it is clear this API should return the task type of a task, depending on the nature of the task rather than on the task attempt id. This way we wouldn't need to worry too much about keeping the comment in sync.
+- "Get task-attempt-ids for all the tasks." - Seems incorrect for getAllTaskIDs. It should be "Get all {@link TaskAttemptID}s for a given {@link TaskInProgress}". In fact, maybe as you suggested the API can also be changed to getAllTaskAttemptIDs to be more correct.
+- I am a little worried we are returning the data structure 'tasks' directly to the caller of getAllTaskIDs. Primarily I am worried that this is a modifiable collection. Should we make it a copy or maybe return an array of these objects like we do for getTaskStatuses() ?, bq. I would suggest introducing a package private API like JobInProgress.getAllTasks() ....
+This will introduce the cost of cloning/duplicating the task references which might not be a good idea for large jobs. Another issue would be that this duplication of references might also be visible in jmap outputs which is also not desirable. I dont see any other good way of doing this with minimal code change. Thoughts?, Amar, you make a good point about duplicating the task references. I agree that seems like an overhead. My real worry is that knowledge of the different task types seems to built now in the removeJobTasks API. However, without complicating the code, I am unable to think of a better way than what I already suggested. I suppose one thing we can do is to iterate over the tasktypes and have a method in JIP to give all TIPs for a tasktype. This method in JIP can return the right array of TIPs for a given type. But I am not convinced myself it is significantly better than the current model. So, maybe the current implementation in your patch is still the best thing to do for now.
+, I took a quick look, the patch looks reasonable - I'll spend some more time on it tmrw., Attaching a patch for Yahoo!'s distribution of Hadoop incorporating review comments from Jothi and Hemanth. test-patch and ant tests (except TestNameNodeMetrics, TestJobHistory, TestKillSubProcesses and TestReduceFetch) passed. All the failed tests passed when I re-ran them., I looked at the patch for the Yahoo! distribution. I have a few comments:
+
+- Thinking a little more if we can address my concern about decoupling knowledge of task types and the removeJobTasks API,  can we refactor the code in removeJobTasks as follows:
+
+{code}
+JobInProgress {
+  Map<TaskType, TaskInProgress[]> getAllTIPsByType() {
+    Map<TaskType, TaskInProgress[]> tipsByType =
+      new HashMap<TaskType, TaskInProgress[]>();
+    tipsByType.put(TaskType.SETUP, getSetupTasks());
+    ...
+  }
+}
+
+JobTracker {
+
+  removeJobTasks() {
+    Map<TaskType, TaskInProgress[]> tipsByType = 
+      job.getAllTIPsByType();
+    for (TaskInProgress[] allTIPs : tipsByType.values()) {
+      for (TaskInProgress tip : allTIPs) {
+        for (TaskAttemptID id : tip.getAllTaskAttemptIDs()) {
+          removeTaskEntry(id);
+        }
+      }
+    }
+  }
+}
+{code}
+
+I feel this has the benefits of keeping knowledge of task types in the JIP, and also removing the duplication of code in removeJobTasks. Thoughts ?
+
+- I think we can enhance the mock test in TestJobRetire to add all types of tasks so that all loops of removeJobTasks are covered.
+- Further, it seems to me like the mock test is a regression test as well. As the status is not set for the task attempts you add, doesn't it mean that the old code would actually leave behind entries in the map reproducing the leak ? If yes, I suppose we can keep the end to end test using MiniMR temporarily until MAPREDUCE-1154 is addressed. But after that, I would assume such a test makes a lot more sense following approaches mentioned in MAPREDUCE-1154. We can inject altering behavior (like aborting the heartbeat, etc) in a more conventional manner. If you agree to this, can you please just add a comment to the end to end test case to the effect that this can be moved to a cluster test post MAPREDUCE-1154 ?, I agree with Hemanth, I'd suggest a minor variation of his idea:
+
+I'd add a JobInProgress.getTasks(TaskType type) in-lieu of JobInProgress.get{Map|Reduce|Setup|Cleanup} etc. and call it so:
+
+{noformat}
+    for (TaskType type : TaskType.values()) {
+      for (TaskInProgress tip : job.getTasks(type)) {
+        for (TaskAttemptID taskAttemptId : tip.getAllTaskAttemptIds()) {
+          removeTaskEntry(taskAttemptId);
+        }
+      }
+    }
+{noformat}, I am OK with this suggestion. One advantage I see over my proposal is that it localizes extension to support new task types in only one API getTasks(TaskType) as opposed to two - (one for introducing a getter and in my proposed getAllTIPsByType). Seems like the right thing to do from that perspective., Attaching a patch for Yahoo!'s internal 20 branch (no to committed). This patch incorporates review comments from Hemanth and Arun. Changes are as follows :
+- The junit mock test is changed to test all the task types.
+-  Also added a _getTasks(TaskType)_ api in JobInProgress. Note that the findbugs cribbed on the _getTasks(TaskType)_ change with IS2_INCONSISTENT_SYNC warning. This error occurs because except _getTasks(TaskType)_, all the task arrays (i.e maps, reduces, setup, cleanup) are accessed inside JobInProgress lock. Prior to this patch, they are accessed in an unsynchronized way. Making _getTasks(TaskType)_ synchronized might get rid of the findbugs warnings but will add some more risk to this patch. Maybe we can follow this in another jira, thoughts?
+- Note that the implementation of _JobInProgrsss.getTasks(TaskType)_ uses string comparison for enums instead of '==' or equals because of the jvm bug raised [here|http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6277781]. I think its safer to compare enum names.
+
+I ran all the tests that are touched by this patch and they have passed. I am now running the remaining tests. Will upload the test results. , bq. Prior to this patch, they are accessed in an unsynchronized way. Making getTasks(TaskType) synchronized might get rid of the findbugs warnings but will add some more risk to this patch. Maybe we can follow this in another jira, thoughts?
+
+Amar and I discussed this and to me, it makes sense. Basically this patch does not make the situation any worse than it already is. The bug identified is not in the scope of this jira. So, I'd suggest we file another JIRA to track that and live with this in the interim., All ant tests (except TestReduceFetch, TestJobHistory, TestStreamingExitStatus and TestJobTrackerRestartWithCS) passed for the patch attached [here|https://issues.apache.org/jira/secure/attachment/12430141/mapreduce-1316-v1.14-branch20-yahoo.patch]. Failed tests (except TestJobTrackerRestartWithCS) passed upon re-run. TestJobTrackerRestartWithCS timesout without the patch too. Attaching a new patch incorporating Hemanth's offline comment w.r.t comments in TestFairScheduler., bq. Note that the implementation of JobInProgrsss.getTasks(TaskType) uses string comparison for enums instead of '==' or equals because of the jvm bug raised here. I think its safer to compare enum names.
+
+The bug you point to is irrelevant in the current context i.e. JobInProgress.getTasks(TaskType) - '==' or equals is the right implementation., Minor comments/nits:
+
+{code}
+-    taskidToTIPMap.remove(taskid);
+-        
+-    LOG.debug("Removing task '" + taskid + "'");
++    if (taskidToTIPMap.remove(taskid) != null) {   
++      LOG.info("Removing task '" + taskid + "'");
++    }
+{code}
+
+This adds a lot more logging? Is it necessary or useful?
+
+{code}
+-        LOG.info("Removed completed task '" + taskid + "' from '" + 
+-                 taskTracker + "'");
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Removed marked completed task '" + taskid + "' from '" + 
++                    taskTracker + "'");
++        }
+{code}
+
+This removes some logs... you don't think they would be useful?
+
+{code}
++    LOG.info("Job " + jobId + " added successfully for user '" 
++             + job.getJobConf().getUser() + "' to queue '" 
++             + job.getJobConf().getQueueName() + "'");
+{code}
+
+Is this log necessary? I don't see how this is relevant to this patch.
+
+----
+
+Finally - can you please share some details on how this patch has helped to fix the observed bugs? Thanks!, Amar's patch with the fix to get JobInProgress.getTasks to use '==', no other changes., Arun, the logging changes will help in debugging memory leak issues caused because of stale references of TaskInProgress objects. The log changes are such that one log-line indicating task removal will be printed once per task. This is in sync with the task addition log-line and hence any mismatch in task adding and removal log-lines should point to a memory leak. This is not true today as the task removal log-line is printed in removeMarkedTasks() (caller of removeTaskEntry(), the api responsible for removing a task) which is not called for every task thats got added to the JobTracker. The log lines introduced are not in some loop and will be printed only once per task attempt. 
+
+bq. The bug you point to is irrelevant in the current context i.e. JobInProgress.getTasks(TaskType) - '==' or equals is the right implementation.
+Looks like hadoop.io serializes enum as strings hence the jvm bug I pointed out doesnt hold here.
+----
+MAPREDUCE-1316 was raised because there was a mismatch between task-attempt addition and task-attempt removal in the JobTracker. The problem was that once the job retires, the job tasks are removed based on the statuses available.  But task-status is added for a task-attempt only when the tasktracker returns back (once a task is assigned) with the next heartbeat. But there is a corner case in the removal logic.  If the tasktracker is assigned a task and the job finishes, then the newly scheduled attempt will be added to the JobTracker but will not be removed as its status is not yet available. This patch changes the task-removal logic by iterating over all the scheduled/launched attempt-ids instead of statuses thus taking care of the corner case mentioned above. , Ok, the logging changes make sense.
+
+Are you ok with the changes toJobInProgress.getTasks(TaskType) ?
+
+bq. MAPREDUCE-1316 was raised because there was a mismatch between task-attempt addition and task-attempt removal in the JobTracker. [...]
+
+*smile*
+
+I was asking for details on the tests run to verify the fix... , bq. I was asking for details on the tests run to verify the fix...
+Iyappan successfully reproduced this bug by killing jobs with tasks that are yet to report their first status (by suspending the tasktrackers). Also he successfully reproduced this bug for completed jobs with speculation turned ON and also for jobs killed while the setup is still running. He used jmap and jobtracker logs to verify the memory leak., Attaching a patch for trunk. test-patch failed on findbugs for the reasons mentioned above. All ant tests (except TestFileArgs) passed. Opened MAPREDUCE-1375 to address TestFileArgs failure. Re-ran the failed test and it passed., Trunk patch looks fine to me. Running through Hudson., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12430267/mapreduce-1316-v1.15.patch
+  against trunk revision 900159.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 12 new or modified tests.
+
+    -1 javadoc.  The javadoc tool appears to have generated 1 warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    -1 findbugs.  The patch appears to introduce 4 new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/393/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/393/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/393/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/393/console
+
+This message is automatically generated., bq. -1 javadoc. The javadoc tool appears to have generated 1 warning messages.
+
+Amar, can you please check this out ?, I ran test-patch on trunk (i.e added a log line to JobTracker) and here is the output
+{noformat}
+[exec] -1 overall.  
+     [exec] 
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+     [exec] 
+     [exec]     -1 tests included.  The patch doesn't appear to include any new or modified tests.
+     [exec]                         Please justify why no new tests are needed for this patch.
+     [exec]                         Also please list what manual steps were performed to verify this patch.
+     [exec] 
+     [exec]     -1 javadoc.  The javadoc tool appears to have generated 1 warning messages.
+     [exec] 
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+     [exec] 
+     [exec]     +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+     [exec] 
+     [exec]     +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+{noformat}
+
+Looking at the test-patch output, I see a line 
+{noformat}
+ [javadoc] src/contrib/mumak/src/java/org/apache/hadoop/mapred/SimulatorJobTracker.java:44: warning 
+          - Tag @link: reference not found: JobSubmissionProtocol
+{noformat}
+
+I dont see any JobSubmissionProtocol.java file in mapreduce trunk. I think JobSubmissionProtocol.java is renamed to ClientProtocol.java., Created MAPREDUCE-1386 and MAPREDUCE-1387 to address the test-patch failure., Attaching a patch for branch 0.21. test-patch failed because of the reason mentioned [here|http://tinyurl.com/y8d6hna] and all ant tests passed., I committed this to trunk and branch 0.21. Thanks, Amar !, Integrated in Hadoop-Mapreduce-trunk #212 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Mapreduce-trunk/212/])
+    , Integrated in Hadoop-Mapreduce-trunk-Commit #225 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Mapreduce-trunk-Commit/225/])
+    , An updated patch for earlier version of hadoop. Not for commit here.]

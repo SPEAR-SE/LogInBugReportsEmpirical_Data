@@ -1,0 +1,176 @@
+[The fix is to call stopWriter w/o the FsDatasetImpl lock. However, without lock, another thread may slip in and inject another ReplicaInfo to the map when we stop the writter. To resolve the issue, we will try to invalidate stale replica in a loop.  As the last resort, if we hang in the thread too long, we will bail out the loop with an IOException., Test with "-Dtest=FsDatasetTestUtil,LazyPersistTestCase,TestDatanodeRestart,TestFsDatasetImpl,TestFsVolumeList,TestInterDatanodeProtocol,TestLazyPersistFiles,TestRbwSpaceReservation,TestReplicaMap,TestScrLazyPersistFiles,TestWriteToReplica", {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12707746/HDFS-7999-001.patch
+  against trunk revision af618f2.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancer
+
+                                      The following test timeouts occurred in hadoop-hdfs-project/hadoop-hdfs:
+
+org.apache.hadoop.hdfs.server.blockmanagement.TestDatanodeManager
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/10089//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/10089//console
+
+This message is automatically generated., Hi, [~sinago]
+Your idea is very good, but I don't think it can solve the problem you met fundamentally, especially on hundreds of threads writing concurrently. Because the heartbeat may be can not compete with other hundreds of {{createTemporary()}} threads successfully to get the dataset lock.
+
+Actually, I think we can just remove the dataset lock of heartbeat. The details can refer to [https://issues.apache.org/jira/browse/HDFS-7060].
+
+Do you and others have any ideas?, Hi Xinwei
+Thank you for sharing the status regarding HDFS-7060. I think it is the right way to fix the heartbeat issue.  Saying that, I still think the patch here is necessary - current implementation of createTemporary() might sleep up to 60s with a lock held, it does not make sense, right?  It might block other threads besides heartbeat for a long time any way.  
+Comments?  Thoughts?, I tested TestBalancer with the patch on my rig, it can pass.  From the log of the failure, it looks like not related to the patch., [~xinwei], even if we made the heartbeat lockless, there are still many other problems associated with having {{FsDatasetImpl#createTemporary}} hold the FSDatasetImpl lock for a very long time.  Any thread that needs to read or write from the datanode will be blocked.
+
+I might be missing something (I'm not that familiar with this code), but I'm having trouble understanding the patch.  Isn't it going to throw this exception:
+{code}
+1447	            throw new ReplicaAlreadyExistsException("Block " + b
+1448	                + " already exists in state " + currentReplicaInfo.getState()
+1449	                + " and thus cannot be created.");
+{code}
+
+whereas previously it would have called {{ReplicaInfo#stopWriter}}?  Is that behavior change really intended?
+
+It seems like what we should have is a non-blocking version of {{stopWriter}}, as well as a loop that waits for the writer to stop.
+
+Also what is the significance of checking if we can get the same result from {{VolumeMap#get}} twice in a row?  Why break out of the loop when that happens?  There also seem to be some potential null pointer dereferences., Thank you for looking into the patch.  Here is some explain of the logic of createTemporary() after applying the patch:
+1.  If there is no ReplicaInfo in volumeMap for the passed in ExtendedBlock b, then we will create one, insert into volumeMap and then return from line 1443.
+2.  If there is a ReplicaInfo in volumeMap and its GS is newer than the passed in ExtendedBlock b, then throw the ReplicaAlreadyExistsException from line 1447.
+3.  If there is a ReplicaInfo in volumeMap whereas its GS is older than the passed in ExtendedBlock b, then it means this is a new write and the earlier writer should be stopped.  We will release the FsDatasetImpl lock and try to stop the earlier writer w/o the lock.  
+4.  After the earlier writer is stopped, we need to evict earlier writer's ReplicaInfo from volumeMap, to that end we will re-acquire the FsDatasetImpl lock.  However,  since this thread has released the FsDatasetImpl lock when it tried to stop earlier writer, another thread might have come in and changed the ReplicaInfo of this block in VolumeMap.  This situation is not very likely to happen whereas we have to handle it in case.   The loop in the patch is just tried to handle this situation -- after re-acuire the FsDatasetImpl lock, it will check if the current ReplicaInfo in volumeMap is still the one before we stop the writer, if so we can simply evict it and create/insert a new one then return from line 1443. Otherwise, it implies another thread has slipped in and changed the ReplicaInfo when we were stopping earlier writer.  In this condition, we check if that thread has inserted a block with even newer GS than us, if so we throws ReplicaAlreadyExistsException from line 1447. Otherwise we need to stop that thread's write just like we stop the earlier writer in step 3.
+, Yeah, It's a good and necessary idea to avoid holding the lock for a long time by the createTemporary() method., Hi [~cmccabe]
+Thanks for your comment.
+{quote}
+even if we made the heartbeat lockless, there are still many other problems associated with having FsDatasetImpl#createTemporary hold the FSDatasetImpl lock for a very long time. Any thread that needs to read or write from the datanode will be blocked.
+{quote}
+Make the heartbeat lockless can avoid the happening of dead DataNode, and I think it is a necessary patch([https://issues.apache.org/jira/browse/HDFS-7060]). 
+FSDatasetImpl lock held for a long time is another problem, May be the patch of this jira can alleviate the problem., Thanks for the explanation¸ [~sinago].  The patch makes sense.
+
+{code}
+1455	      // Hang too long, just bail out. This is not supposed to happen.
+1456	      if (Time.monotonicNow() - startTime > bailOutDuration) {
+1457	        break;
+1458	      }
+{code}
+
+Can you throw an exception from here rather than breaking?  It seems like it would be clearer.  Also, please log a WARN message to explain that there has been a problem.  I would prefer to just see a log message rather than a comment explaining that "this is not supposed to happen"
+
+Instead of naming the timeout period "bailOutDuration", how about something like "writerStopTimeoutMs".  In general, timeouts that are in milliseconds should end in ms.
+
+{code}
+1464    throw new IOException("Hang " + ((Time.monotonicNow() - startTime) / 1000)
+1465	        + " seconds in createTemporary, just bail out");
+{code}
+
+This error message seems confusing.  It should be something like "Unable to stop existing writer for $REPLICA after $WHATEVER milliseconds."
+
+I think it looks good aside from that.
+
+bq. [~xinwei] wrote: Make the heartbeat lockless can avoid the happening of dead DataNode, and I think it is a necessary
+
+I think it is a good idea to make the heartbeat lockless.  However, it is an exaggeration to say that it is necessary.  The heartbeat wasn't lockless in previous releases of Hadoop such as 2.1, 2.3, or 2.5 and there were no complaints., Thanks a lot for the comments, Colin.  I would update the patch accordingly., Test with "-Dtest=FsDatasetTestUtil,LazyPersistTestCase,TestDatanodeRestart,TestFsDatasetImpl,TestFsVolumeList,TestInterDatanodeProtocol,TestLazyPersistFiles,TestRbwSpaceReservation,TestReplicaMap,TestScrLazyPersistFiles,TestWriteToReplica,TestBalancer,TestDatanodeManager, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12708958/HDFS-7999-002.patch
+  against trunk revision 867d5d2.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/10161//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/10161//console
+
+This message is automatically generated., {code}
+1458	        LOG.warn("Fail to stop existing writer for block " + b + " in "
+1459	            + writerStopMs + " miniseconds.");
+1460	        throw new IOException("Unable to stop existing writer for block " + b
+1461	            + " after " + writerStopMs + " miniseconds.");
+{code}
+
+Can we have these both match up?  I guess both should say "Unable to stop existing writer for block..."
+
++1 once that's addressed.  Thanks, [~sinago]., Thank you, Colin. I'll update the patch soon., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12709424/HDFS-7999-003.patch
+  against trunk revision ef591b1.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/10179//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/10179//console
+
+This message is automatically generated., +1.  Thnaks, [~sinago]., Committed to 2.7.  Thanks, guys., FAILURE: Integrated in Hadoop-trunk-Commit #7515 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/7515/])
+HDFS-7999. FsDatasetImpl#createTemporary sometimes holds the FSDatasetImpl lock for a very long time (sinago via cmccabe) (cmccabe: rev 28bebc81db8bb6d1bc2574de7564fe4c595cfe09)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #156 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/156/])
+HDFS-7999. FsDatasetImpl#createTemporary sometimes holds the FSDatasetImpl lock for a very long time (sinago via cmccabe) (cmccabe: rev 28bebc81db8bb6d1bc2574de7564fe4c595cfe09)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Yarn-trunk #890 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/890/])
+HDFS-7999. FsDatasetImpl#createTemporary sometimes holds the FSDatasetImpl lock for a very long time (sinago via cmccabe) (cmccabe: rev 28bebc81db8bb6d1bc2574de7564fe4c595cfe09)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #147 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/147/])
+HDFS-7999. FsDatasetImpl#createTemporary sometimes holds the FSDatasetImpl lock for a very long time (sinago via cmccabe) (cmccabe: rev 28bebc81db8bb6d1bc2574de7564fe4c595cfe09)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #2088 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2088/])
+HDFS-7999. FsDatasetImpl#createTemporary sometimes holds the FSDatasetImpl lock for a very long time (sinago via cmccabe) (cmccabe: rev 28bebc81db8bb6d1bc2574de7564fe4c595cfe09)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #157 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/157/])
+HDFS-7999. FsDatasetImpl#createTemporary sometimes holds the FSDatasetImpl lock for a very long time (sinago via cmccabe) (cmccabe: rev 28bebc81db8bb6d1bc2574de7564fe4c595cfe09)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2106 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2106/])
+HDFS-7999. FsDatasetImpl#createTemporary sometimes holds the FSDatasetImpl lock for a very long time (sinago via cmccabe) (cmccabe: rev 28bebc81db8bb6d1bc2574de7564fe4c595cfe09)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, [~sjlee0] backported this to 2.6.1, after fixing some non-trivial merge conflicts.
+
+I just pushed the commit to 2.6.1 after running compilation., Attaching the patch for 2.6.1 that I committed.]

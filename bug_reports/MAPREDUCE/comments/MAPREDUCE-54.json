@@ -1,0 +1,72 @@
+[
+Some mappers failed with the following exception:
+
+org.apache.hadoop.ipc.RemoteException: org.apache.hadoop.dfs.NotReplicatedYetException: Not replicated yet:/xxxx/part-00583
+	at org.apache.hadoop.dfs.FSNamesystem.getAdditionalBlock(FSNamesystem.java:989)
+	at org.apache.hadoop.dfs.NameNode.addBlock(NameNode.java:350)
+	at sun.reflect.GeneratedMethodAccessor15.invoke(Unknown Source)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)
+	at java.lang.reflect.Method.invoke(Method.java:597)
+	at org.apache.hadoop.ipc.RPC$Server.call(RPC.java:379)
+	at org.apache.hadoop.ipc.Server$Handler.run(Server.java:596)
+
+	at org.apache.hadoop.ipc.Client.call(Client.java:482)
+	at org.apache.hadoop.ipc.RPC$Invoker.invoke(RPC.java:184)
+	at org.apache.hadoop.dfs.$Proxy1.addBlock(Unknown Source)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:39)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)
+	at java.lang.reflect.Method.invoke(Method.java:597)
+	at org.apache.hadoop.io.retry.RetryInvocationHandler.invokeMethod(RetryInvocationHandler.java:82)
+	at org.apache.hadoop.io.retry.RetryInvocationHandler.invoke(RetryInvocationHandler.java:59)
+	at org.apache.hadoop.dfs.$Proxy1.addBlock(Unknown Source)
+	at org.apache.hadoop.dfs.DFSClient$DFSOutputStream.locateFollowingBlock(DFSClient.java:1541)
+	at org.apache.hadoop.dfs.DFSClient$DFSOutputStream.nextBlockOutputStream(DFSClient.java:1487)
+	at org.apache.hadoop.dfs.DFSClient$DFSOutputStream.endBlock(DFSClient.java:1613)
+	at org.apache.hadoop.dfs.DFSClient$DFSOutputStream.writeChunk(DFSClient.java:1589)
+	at org.apache.hadoop.fs.FSOutputSummer.writeChecksumChunk(FSOutputSummer.java:140)
+	at org.apache.hadoop.fs.FSOutputSummer.write1(FSOutputSummer.java:100)
+	at org.apache.hadoop.fs.FSOutputSummer.write(FSOutputSummer.java:86)
+	at org.apache.hadoop.fs.FSDataOutputStream$PositionCache.write(FSDataOutputStream.java:39)
+	at java.io.DataOutputStream.write(DataOutputStream.java:90)
+	at org.apache.hadoop.util.CopyFiles$FSCopyFilesMapper.copy(CopyFiles.java:291)
+	at org.apache.hadoop.util.CopyFiles$FSCopyFilesMapper.map(CopyFiles.java:352)
+	at org.apache.hadoop.util.CopyFiles$FSCopyFilesMapper.map(CopyFiles.java:217)
+	at org.apache.hadoop.mapred.MapRunner.run(MapRunner.java:50)
+	at org.apache.hadoop.mapred.MapTask.run(MapTask.java:195)
+	at org.apache.hadoop.mapred.TaskTracker$Child.main(TaskTracker.java:1750)
+
+, 
+I suspect this is a problem in dfs.
+, This problem does not happen if the dfs write load is low.
+When a few mappers copy files, the problem did not show up.
+Only when the number of mappers reach beyond 50 (the dfs cluster has about 400 nodes), the 
+problem happened consistently.
+, It turned out to be a problem in CopyFile class.
+After a mapper got killed  due to failing to report  progress,
+a new attempt may be scheduled shortly, before the dfs lease hold
+on the destination file by the failed mapper got expired. 
+When the new attempt tries to create 
+the destination file, an exception is thrown.
+
+CopyFile should handle that exception and retry after sleeping for a short while.
+
+, Also, the retry attempt should probably use the 'overwrite' option while creating the file so that the old file is deleted and an entirely new one is created in its place., Setting 'overwrite' on a rescheduled job with more than one file in the map would copy all the files in that map, not just those that failed.
+
+If there's a way to detect the last record, there's an easy way to effect this: delete the destination of failed copies as they fail, set a flag to throw after the last record, clear 'update' and 'overwrite', and let the rescheduled copy skip anything that still exists. This would let us lose the -i (ignore read failures) flag, too., bq. After a mapper got killed due to failing to report progress, a new attempt may be scheduled shortly, before the dfs lease hold on the destination file by the failed mapper got expired. When the new attempt tries to create the destination file, an exception is thrown.
+
+Essentially it the same issue we solved for speculative-tasks with HADOOP-1127. (http://wiki.apache.org/lucene-hadoop/FAQ#9)
+
+Basically things should work if the ${mapred.output.dir} is set to "/" and the map-task should write the file out to ${mapred.output.dir} which will be magically set to /_{taskid}, and later files are promoted.
+
+Clearly once we have dfs permissions this will not work, and then the way forward maybe to run distcp as root. Thoughts?
+
+, We already have a retry framework in place in dfsClient. See HADOOP-1263 and HADOOP-1411. A retry proxy sits between dfsClient and a RPC proxy handling all the retries according a predefined retry policy. For AlreadyBeingCreatedException, our retry policy is to retry 5 times with a sleep time of LEASE_SOFTLIMIT_PERIOD (5 seconds) between two consecutive retries. I will check to see if there is a bug there causing AlreadyBeingCreated not handled correctly., Hi Runping, 
+
+You said that "this problem happened in the 2nd, 3rd, 4th attempts, after the first attempt failed." Can you pl look at the logs and verify that the timestamp between the 2nd, 3rd and 4th attempts were 1 minute apart? This information would help us figure out whether the bug is in the client or the server., I did an experiment and it showed that the client retry did not break. I suspect that it might be the server that does not handle the lease expiration correctly., I did a second experiment in which I killed a client after it created a file. I then started another client to create the same file. The experiment showed that after one retry, the file was successfully created. So it shows that the namenode handles lease correctly. 
+
+Is it possible in both 2050 and 2087, the first client did not die?, Hi Hairong, The error message printed out on the namenode log is that "the *current* leaseholder is trying to recreate the file". This means that the second client itself created the file in the first place and is then trying to recreate the file. There is no dependency on whether the first client is dead or not. Do you agree?, I just experienced this bug. I'm running Hadoop 0.15.0.
+
+Due to a SIGSEGV in a child mapred JVM (probably not related, but still very odd...), the above problem occurred for the next 4 task attempts, and killed the job. I've attached the log from the jobtracker, and the task in question, which was task_200711181711_105774_r_000003.
+
+The end result was a "corrupted" SequenceFile, which would make any map task attempting to read it fail., I'm also attaching the JVM error that occurred... unfortunately, I'm unable to find the 'hs_err_pid21026.log' that it refers to., I'd just like to note as a warning though, that this is the first time this problem has occurred in the 150K + jobs we've run on this cluster... so it might be a difficult condition to track down., Hasn't been seen in a while now.]

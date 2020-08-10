@@ -1,0 +1,76 @@
+[The patch responsible for this regression has been identified as HADOOP-3514. HADOOP-3514 uses the RawLocalFileSystem  (as opposed to LocalFileSystem) for creating and opening Intermediate Files and a buffering issue there is a likely cause for this, Jothi, I did one browse of the code and it looks like one FSDataOutputStream layer is redundant. Specifically, in the second IFile.Writer constructor, could you replace the line
+{code} this.checksumOut = new IFileOutputStream(out); {code} with {code} this.checksumOut = new IFileOutputStream(out.getWrappedStream()); {code} and see whether it helps. Of course, please verify that the functionality of the HADOOP-3514 patch remains intact with this change. Also, please ensure that all the rfs.open/create calls where buffersize is passed as an argument are indeed passed the same values as in the pre-HADOOP-3514 case (lfs.open/create)., Devaraj and I did a deep dive into this and found the following:
+
+1. On an average, the map tasks take less than a minute for completion. However, we observed that there are a few stragglers at the end of the run which take an unduly long time for completion (~15 minutes) that were primarily resulting in the overall increased run time. Most of these tasks are data-local tasks. There were other few tasks that took about 4-5 minutes, but those are expected towards the end of the run and are not the suspects.
+2. The task logs for these tasks indicated that the actual map function (up to the beginning of the first spill) took about 14 minutes, sort and spill + merge parts took less than a minute
+3. The data node log indicated that the first contact by the map task was as soon as the job started, but the map task got its final data set only after 14 minutes. 
+4. Most of these tasks ran on a few specific nodes. For example, in one run, 4 of these ran on node x, 3 ran on node y. 
+5. However, the specific nodes x and y themselves do not have any problems. On the next invocation of sort (the cluster was not reallocated, it was the same), the problem nodes were a different x' and y', all the tasks on x and y ran fine.
+6. While these straggler tasks are running, the task tracker appeared to be busy handling shuffles
+7. The nodes where these tasks were running did not show any unduly high CPU usage or Memory usage
+
+Given that the 3514 patch affects sort, spill and merge parts of the map task and not the functionality before it, it appears that the bug is more likely a side effect. 
+One change by this patch that could possibly be causing this side effect is the change to use the RawLocalFileSystem instead of the LocalFileSystem for the creation and handling of the intermediate files. However, It is not very clear how this change is affecting the data node performance?  Thoughts?
+
+, minor : I was looking at patch for HADOOP-3511, it looks like 'getRaw()' method for LocalFS was redundant since ChecksumFS already has 'getRawFileSystem()'. , > I was looking at patch for HADOOP-3511 ...
+I meant to say HADOOP-3514.
+
+> However, It is not very clear how this change is affecting the data node performance? 
+
+What is the change in performance you are observing on data nodes compared to datanodes on 0.18? It was not clear from the comment. 
+, Raghu, I pasted a portion of the beginning of the task logs for one of the map tasks where the problem showed up. Notice the time when the map started running (15:05:15) and note the time when the first spill happened (15:13:17). The entire time duration (~8 minutes) was spent in consuming ~128MB of data from the dfs (and this happened to be a task that got scheduled on a data-local node). Quite unexpected since in the normal case it takes a few seconds... The strange thing is that it is not a node issue. So for this run of the sort400, on a particular node, a couple of maps exhibited this behavior but many ran normally.. And in a subsequent sort400 run, with the same dataset, *none*  of the maps scheduled on this node exhibited the problem!
+
+
+2008-10-14 15:05:15,064 INFO org.apache.hadoop.metrics.jvm.JvmMetrics: Initializing JVM Metrics with processName=MAP, sessionId=
+2008-10-14 15:05:15,156 INFO org.apache.hadoop.mapred.MapTask: numReduceTasks: 1741
+2008-10-14 15:05:15,173 INFO org.apache.hadoop.mapred.MapTask: io.sort.mb = 128
+2008-10-14 15:05:15,378 INFO org.apache.hadoop.mapred.MapTask: data buffer = 102005480/127506848
+2008-10-14 15:05:15,379 INFO org.apache.hadoop.mapred.MapTask: record buffer = 335544/419430
+2008-10-14 15:05:15,394 INFO org.apache.hadoop.util.NativeCodeLoader: Loaded the native-hadoop library
+2008-10-14 15:05:15,396 INFO org.apache.hadoop.io.compress.LzoCodec: Successfully loaded & initialized native-lzo library
+2008-10-14 15:05:15,591 INFO org.apache.hadoop.io.compress.zlib.ZlibFactory: Successfully loaded & initialized native-zlib library
+2008-10-14 15:05:15,592 INFO org.apache.hadoop.io.compress.CodecPool: Got brand-new decompressor
+2008-10-14 15:05:15,593 INFO org.apache.hadoop.io.compress.CodecPool: Got brand-new decompressor
+2008-10-14 15:05:15,593 INFO org.apache.hadoop.io.compress.CodecPool: Got brand-new decompressor
+2008-10-14 15:05:15,594 INFO org.apache.hadoop.io.compress.CodecPool: Got brand-new decompressor
+2008-10-14 15:13:17,408 INFO org.apache.hadoop.mapred.MapTask: Spilling map output: buffer full= true, Thanks Devaraj.
+
+> The entire time duration (~8 minutes) was spent in consuming ~128MB of data from the dfs [...]
+
+to clarify, are you also saying that this was not the case with 0.18 (i.e. no such anomalies)?
+
+If this is an internal Yahoo machine, you could check if there are simon stats for this. Please send me the hostname., Yes this issue doesn't show up with the 0.19 branch just prior to HADOOP-3514 commit, at least it is not obvious. In the current case the map phase in sort400 is longer due to a handful of stragglers and all of them seems to be taking a long time to read the dfs input., Can you capture the stacktraces of those stragglers next time?
+, One thing that was different between the LocalFileSystem (LFS) and the RawLocalFileSystem (RFS) is that all the reads and writes from LFS, when they reach the  RFS layer, are in chunks of 512 bytes. I tried to mimic this behavior at the IFileInputStream and IFileOutputStream by reading and writing in 1k chunks and magically the performance degradation disappeared. What I did was something like
+ 
+{code}
+
+write (b, off, len) {
+  bytesToWrite = 0;
+  bytesWritten = 0;
+  while (bytesWritten < len) {
+    bytesToWrite = Math.min(len-bytesWritten,1024);
+    out.write (b, off+bytesWritten, bytesToWrite);
+    bytesWritten += bytesToWrite;
+  }
+}
+
+{code}
+
+Similarly for the read as well. Any thoughts on why this should work?, Just to clarify, the IFileInput/Output streams are constructed using the FSDataInput/OutputStream returned by RawLocalFileSystem.open() and create() calls.
+, 
+That is very strange. Could you post the patch you used? What is the typical write size otherwise? With the modified write(), actual  write systemcall to the file ends up being of the size "io.file.buffer.size".
+
+The performance difference you are seeing the 3 minutes over 29 minutes, right? Even 29 minutes on 0.18 was due to such stranglers?, This is the patch I used for testing.
+No, we do not notice stragglers either in 18 or when using this patch.
+And you are right, the final writes and reads that reach the disk are governed by the io.file.buffer.size. That is exactly why I did not try this change earlier, > And you are right, the final writes and reads that reach the disk are governed by the io.file.buffer.size. That is exactly why I did not try this change earlier
+
+I meant the opposite. With the patch, writes will be governed by io.file.buffer.size irrespective of IFile level write size. Without it, it will depend on IFile write size, it could less than io.file.buffer.size or more (more commonly, more). 
+, I see what you mean. This is a regular sort application and I do not think IFile writes or reads being greater than 128K, which is the io.file.buffer.size I have been using. Or may be I am wrong..., We caught one of the nodes in this state in last couple of minutes. 'sda' was very busy and the remaining disks were idle. Logs and os also reside on sda.. ssh login took more than a minute. This can explain why reading a block could take so long. Still not sure what causes the load on sda alone. we have datanode log for this node. Didn't have much time to take jstack and other info.
+, The datanode on this machine was configured to use only sda by hod. Not sure if that was intentional or not., > The datanode on this machine was configured to use only sda by hod. 
+This was incorrect. I misunderstood DN log because of symlinks. It is configured to use all the 4 disks., OK, this might be a non issue after all.
+
+All my tests have been with mapred.reduce.parallel.copies=60 and tasktracker.http.threads=100. This does not appear to be the ideal configuration for the cluster, Runping let me know that he uses parallel.copies=30 and http.threads=50. With this configuration, sort took the same time as 18 and gridmix completed in 40+ minutes, which is a reasonable time.
+
+When  reduce.parallel.copies=60 and tasktracker.http.threads=100, it is obvious that towards the end of the map phase, the load on the disks on the individual nodes is fairly high because the reducers are pulling in data from a lot more maps in parallel and possibly shuffling them to disk. This seems to be causing the stragglers that we observed. However, slowing down the maps by having them write in small chunks seems to somehow mitigate this problem as observed with both the LocalFileSystem and when breaking down the writes into chunks when using the RawLocalFileSystem., Yes, it looks like a configuration issue. IMO, with this kind of a load (100 TT http threads, 60 copiers, 5 slots for map/reduce tasks each) on the system, it is hard to have a consistently running system across code changes..., I am closing this issue., I think this highlights some issues that are worth considering for improvement.
+
+It looks as though some mapper that gets slightly behind will end up getting disproportionately hard.. slowing the progress much worse than one would expect. And it does not even need to be any hardware degredation. This kind of bad feedback gets only worse as the cluster size increases.]

@@ -1,0 +1,162 @@
+[Forgot to mention that with so many lost task trackers we run into HADOOP-1862, with the consequence that the job does not make any progress., Christian, can you attach gzipped job tracker logs (may be namnode also)? This might also help understand HADOOP-1849. If the logs are too big, please keep them so the we can look at them seperately., Attached is an early version of the patch. One thing that we noticed was that the JobTracker's DFS operations like saveOutput and discardOutput were taking too long in the large cluster. The unfortunate thing was that the JobTracker stays locked when the DFS operation is happening. So that might result in lost trackers since the JobTracker is not able to process any RPC that requires taking a lock on itself. This patch moves out the DFS ops to a separate thread. It also introduces a new task state called DFS_OPS_PENDING. This is the state after the task completes and before the JT does the DFS ops. The state helps to prevent anomalies like marking a task as successful before the dfs operation (rename) is done. Only when the dfs rename completes successfully is a task considered successful. The state is also used to not run speculative tasks (since we know that the task is in the last stage). 
+This patch is up for review. It is not well tested yet., Long-term we intend to avoid using the FileSystem API directly in MR tasks (HADOOP-1558).  Outputs should entirely be defined by the OutputFormat.  The trackers shouldn't call JobConf#getOutputPath() or FileSystem#rename() directly, but rather should invoke an OutputFormat method that does these sorts of things (and should do so in a separate jvm...).
+
+So we should call the new state something more generic, like COMMIT_PENDING., Right Doug. This is a quick solution that might be taken out later in favor of better solutions like the one you are talking about., Attached is another patch after some modifications with comments from Doug (COMMIT_PENDING state name) and Arun (offline comments). Thanks Arun and Doug., I applied Devaraj's patch lazy-dfs-ops.1.patch. Looks as if successfully prevents the job from losing task trackers.
+
+But it shifts the problem from mapred to dfs: the namenode lost **all** 1400 datanodes, which repeatedly time out sending 
+
+2007-09-14 09:01:43,008 WARN org.apache.hadoop.dfs.DataNode: java.net.SocketTimeoutException: timed out waiting for rpc response
+        at org.apache.hadoop.ipc.Client.call(Client.java:472)
+        at org.apache.hadoop.ipc.RPC$Invoker.invoke(RPC.java:165)
+        at org.apache.hadoop.dfs.$Proxy0.sendHeartbeat(Unknown Source)
+        at org.apache.hadoop.dfs.DataNode.offerService(DataNode.java:485)
+        at org.apache.hadoop.dfs.DataNode.run(DataNode.java:1310)
+        at java.lang.Thread.run(Thread.java:619)
+
+The reduces that use libhdfs to access dfs also time out:
+07/09/14 08:41:00 INFO fs.DFSClient: Could not complete file, retrying...
+07/09/14 08:41:18 INFO fs.DFSClient: Could not complete file, retrying...
+
+and other java.net.SocketTimeoutException: timed out waiting for rpc response
+
+Namenode is cpu-busy, with 3 out of 4 processors running at 100%. It is running with 60 handlers and queue size once with 100 and once with 500 * handler_count
+, Just noticed that namenode ran out of memory, i.e. more memory allocation might fix the problem -- stay tuned...
+
+Exception in thread "org.apache.hadoop.dfs.FSNamesystem$HeartbeatMonitor@6fa9fc" java.lang.OutOfMemoryError: Java heap space
+Exception in thread "IPC Server listener on 8600" java.lang.OutOfMemoryError: GC overhead limit exceeded
+, Christian, what's the heartbeat interval in your HDFS? The 3 second default with this many nodes will bring the Namenode down.
+
+We should start thinking about heartbeat intervals that are based on cluster size.
+, If things don't improve, I would suggest trying server-throttle-hack.patch, with default queue size of 100 per handler. It slows down reading new requests instead of dropping the earliest requests. This should avoid large spikes in calls dropped., Sameer, the heartbeat interval was actually set to a higher value (60 secs). So far, the main problem seems to be memory. We are still waiting for a server with more memory. In the meantime I will try to cleanup the dfs to get by with the memory I have.
+Raghu's patch might be interesting. I will try this later as well., This fixes the progress report that the client sees (with the previous patch things like %Complete for tasks would jump from 0 to 100% on the webUI/command-line). , Sorry, had attached the wrong patch earlier. This is the correct patch (lazy-dfs-ops.2.patch)., Attached is another iteration of the patch. Has some fixes., We ran the job again with lazy-dfs-ops.2.patch and  server-throttle-hack.patch, and it failed again, mainly because the namenode could not handle the load when 2600 reduces closed about 100 files each, taking longer than 20 minutes to close.
+
+Related exceptions are:
+
+on the client side:
+07/09/18 22:39:41 INFO fs.DFSClient: Could not complete file, retrying...
+07/09/18 22:40:18 INFO fs.DFSClient: Could not complete file, retrying...
+
+on the name side:
+
+2007-09-18 22:54:22,727 WARN org.apache.hadoop.ipc.Server: IPC Server handler 15 on 8600, call renewLease(DFSClient_-1403982964) from <ipaddress>:59329: output error
+java.nio.channels.ClosedChannelException
+        at sun.nio.ch.SocketChannelImpl.ensureWriteOpen(SocketChannelImpl.java:126)
+        at sun.nio.ch.SocketChannelImpl.write(SocketChannelImpl.java:324)
+        at org.apache.hadoop.ipc.SocketChannelOutputStream.flushBuffer(SocketChannelOutputStream.java:108)
+        at org.apache.hadoop.ipc.SocketChannelOutputStream.write(SocketChannelOutputStream.java:89)
+        at java.io.BufferedOutputStream.flushBuffer(BufferedOutputStream.java:65)
+        at java.io.BufferedOutputStream.flush(BufferedOutputStream.java:123)
+        at java.io.DataOutputStream.flush(DataOutputStream.java:106)
+        at org.apache.hadoop.ipc.Server$Handler.run(Server.java:628)
+
+
+, hmm.. I was wondering if the following would happen when I was submitting server throttle hack (looks like it does :():
+
+- Server gets backed up at one momemnt, and it reads slower from the client.
+- It looks like if there it does not receive anything from a client for 2 min, it closes the connection. I was not yesterday, when the client closes a connection.
+- Ideally what server should do in that case is not to process _any_ more RPCs from that connection. But since there is still readable data on the closed socket it patiently reads and executes the RPC that are going to be thrown away. Any such unnecessary work done will result in bad feedback of ever increasing load since client retries the same RPCs on different socket. I wonder what 'netstat' would have shown in this case on the namenode. My guess is that there should be a LOT of these exceptions while writing the reply.
+
+Let me know if you want to try an updated server throttle patch.
+, Christian, could you pls use the patch for HADOOP-1904 and see whether it helps the dfs issue. Pls don't use the latest patch (lazy-dfs-ops.4.patch) that I attached today. That has a bug (and hence i am cancelling the patch)., The test included 1904 (no luck at all without it) and was run with a 
+Sep 14 trunk release including the following patches:
+- 1719
+- 1763
+- 1874 (lazy-dfs-ops.2.patch and server-throttle-hack.patch)
+- 1892 (critical)
+- 1904 (critical)
+- 1907 (critical)
+, I noticed that namenode was rather disk-busy and, therefore, turned off most of the logging, but the disk-busy comes from the editlog and sync'ing:
+
+Device:    rrqm/s wrqm/s   r/s   w/s  rsec/s  wsec/s    rkB/s    wkB/s avgrq-sz avgqu-sz   await  svctm  %util
+sda          0.00 225.12  0.00 530.62    0.00 6047.25     0.00  3023.63    11.40     0.35    0.66   0.66  35.17
+sdb          0.00   0.00  0.00  0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00   0.00   0.00
+sdc          0.00   0.00  0.00  0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00   0.00   0.00
+sdd          0.00 224.79  0.00 530.12    0.00 6037.94     0.00  3018.97    11.39     0.59    1.11   1.11  58.84
+
+avg-cpu:  %user   %nice    %sys %iowait   %idle
+           7.13    0.00    2.67   10.05   80.16
+
+As a matter of fact, I changed namenode configuration to only journal to a single disk (instead to two as before) and the number of timeouts decreased a lot, although the namenode was still disk-bound (%util > 90%)
+
+So I would conclude that in the short term namenode journal fsync'ing rate should be reduced (batching up namenode operations in atomic fashion?).
+
+, This behavior is somewhat disconcerting, we shouldn't be doing so much I/O. We do batch our syncs but it looks like we may not be doing appropriate buffering. In FSEditLog.java there exists the following snippet:
+
+------
+   EditLogOutputStream(File name) throws IOException {
+      super(new FileOutputStream(name, true)); // open for append
+      this.fd = ((FileOutputStream)out).getFD();
+    }
+------
+
+FileOutputStream is unbuffered which might explain why the performance is so poor. We should put a buffer around each journal, batching edits for flush and sync is likely being defeated by the lack of buffering.
+
+
+
+ , Christian, looks like you might be using only one of the disks out of four for logging. If you still want to keep normal namenode log, you could point logs directories to one of the unused disks so that it does not conflict with editsLog.
+, This patch is w.r.t the current trunk., -1 overall.  Here are the results of testing the latest attachment 
+http://issues.apache.org/jira/secure/attachment/12366998/1874.patch
+against trunk revision r581492.
+
+    @author +1.  The patch does not contain any @author tags.
+
+    javadoc +1.  The javadoc tool did not generate any warning messages.
+
+    javac +1.  The applied patch does not generate any new compiler warnings.
+
+    findbugs -1.  The patch appears to introduce 3 new Findbugs warnings.
+
+    core tests +1.  The patch passed core unit tests.
+
+    contrib tests -1.  The patch failed contrib unit tests.
+
+Test results: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/876/testReport/
+Findbugs warnings: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/876/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/876/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/876/console
+
+This message is automatically generated., Cancelling the PA status as i am changing some things in the patch., Fixed the findbugs warnings (moved the creation of all thread in the JobTracker's constructor outside to offerService). Also incorporated the patch for HADOOP-1944 that Arun had., +1 overall.  Here are the results of testing the latest attachment 
+http://issues.apache.org/jira/secure/attachment/12367307/1874.new.patch
+against trunk revision r583037.
+
+    @author +1.  The patch does not contain any @author tags.
+
+    javadoc +1.  The javadoc tool did not generate any warning messages.
+
+    javac +1.  The applied patch does not generate any new compiler warnings.
+
+    findbugs +1.  The patch does not introduce any new Findbugs warnings.
+
+    core tests +1.  The patch passed core unit tests.
+
+    contrib tests +1.  The patch passed contrib unit tests.
+
+Test results: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/908/testReport/
+Findbugs warnings: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/908/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/908/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/908/console
+
+This message is automatically generated., Looks good. +1
+
+Minor nit: we could remove {{TaskInProgress.successfulTaskId}} and replace all reference to it with {{TaskInProgress#isComplete(String taskid)}}., Updated patch that fixes Arun's comment on the isComplete(taskid)., -1 overall.  Here are the results of testing the latest attachment 
+http://issues.apache.org/jira/secure/attachment/12367444/1874.new.patch
+against trunk revision r583328.
+
+    @author +1.  The patch does not contain any @author tags.
+
+    javadoc +1.  The javadoc tool did not generate any warning messages.
+
+    javac +1.  The applied patch does not generate any new compiler warnings.
+
+    findbugs +1.  The patch does not introduce any new Findbugs warnings.
+
+    core tests +1.  The patch passed core unit tests.
+
+    contrib tests -1.  The patch failed contrib unit tests.
+
+Test results: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/915/testReport/
+Findbugs warnings: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/915/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/915/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/915/console
+
+This message is automatically generated., I just committed this. Thanks, Devaraj!, Integrated in Hadoop-Nightly #267 (See [http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Nightly/267/]), Integrated in Hadoop-Nightly #269 (See [http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Nightly/269/])]

@@ -1,0 +1,168 @@
+[Below was pat of the log that illustrated the bug.
+1. a block was allocated for a file
+    INFO  hdfs.StateChange (FSNamesystem.java:allocateBlock(1398)) - BLOCK* NameSystem.allocateBlock: /xx/file7. blk_2248817250507458558_1010
+2. a write pipeline error occurred and a lease recovery added two datanodes to the block's blockMap (this is a bug reported at HADOOP-5134) and set this block's length to be 6
+    INFO  namenode.FSNamesystem (FSNamesystem.java:commitBlockSynchronization(1835)) - commitBlockSynchronization(lastblock=blk_2248817250507458558_1010, newgenerationstamp=1011, newlength=6, newtargets=[127.0.0.1:51021, 127.0.0.1:51024])
+3. when the block was finalized, a datanode sent blockReceived to NN. NN then called addStoredBlock which triggered the error below. DataNode 127.0.0.1:51021 did has a valid replica with a length of 63, but was wrongly marked as corrupt. 
+    WARN  namenode.FSNamesystem (FSNamesystem.java:addStoredBlock(2791)) - Inconsistent size for block blk_2248817250507458558_1011 reported from 127.0.0.1:51024 current size is 6 reported size is 63
+    WARN  namenode.FSNamesystem (FSNamesystem.java:addStoredBlock(2816)) - Mark existing replica blk_2248817250507458558_1011from 127.0.0.1:51021 as corrupt because its length is shorter than the new one.
+
+
+, I do not think name-node's decision on whether the block is corrupt or not should be based on its length. This assumes that files can only grow. If we ever decide to implement truncates, which is a reasonable extension of append, this whole logic will have to be reconsidered.
+I think the decision should rather be based on generation stamps, etc., The replicas that reported in this jira had the same generation stamp. No matter a block gets truncated or appended, a new generation number will be generated for the block. This is for sure. However, for replicas of the same generation number, if we do not handle inconsistent block length well, we might get into the problem of data loss as reported in HADOOP-4810 as well as the problem reported in this jira.
+
+By the way, should this be a blocker to 0.18.3?, If not for 0.18.3, it should surely be a blocker for 0.18.4., [See related comment here|https://issues.apache.org/jira/browse/HADOOP-5027#action_12668136], Hairong, sorry I see I was vague.
+What I really meant was that the *larger size* of the replica should not be the criteria for deciding this is the *correct replica*.
+Incorrect size should indicate the replica is corrupted - yes, but this is all the size should mean.
+Deciding which replica is correct should be based on completely other than the size properties.
+
+In this case as I understand it there is a race condition between block received and recovery from unsuccessful pipeline, right?, >2. For an under construction block, if the new replica's length is shorter than the NN rec
+
+If a block is under construction, addStoredBlock() should completely ignore it. This block is being written to by a client. The NN has relinquished control of this block to the client/datanode. Am I missing something here?, Yes, in this case, the problem is caused by the recovery from an unsuccessful pipeline. 
+
+> Deciding which replica is correct should be based on completely other than the size properties. 
+yes, i agree. But for some of cases we can decide which one is corrupt. For a finalized block (NN has received blockReceived), if the reported block length is not the same as the NN recorded length, the reported block must be corrupt. For a block that's being written (calling addStoredBlock through blockReceived), if the reported length is shorter than the NN recorded one, it must be corrupt too. If it is longer, then it is hard to decide which ones are corrupt because NN recorded length does not accurately match the length of the ones at the DataNode disk., > addStoredBlock() should completely ignore it.
+AddStoredBlock is triggerred by blockReceived not by block report processing., >AddStoredBlock is triggerred by blockReceived not by block report processing.
+
+Agreed. My point was that addStoredBlock() should complete avoid making decisions about this block if this block is under construction., When a datanode reports that the block is finalized, addStoredBlock can not completely ignore it. It should at least update the stored block length and add the replica to the blocksMap.And also if two datanodes report inconsistent block length in their blockReceived confirmation of the same block, NN should be able to handle the problem.
+
+Aslo HADOOP-5134 triggered the problem. Dhruba, could you please comment if the behavior in HADOOP-5134 is expected? If this is expected, lease recovered blocks will under the control of both client writes and NN's replication monitor., > addStoredBlock can not completely ignore it. It should at least update the stored block length and add the replica to the blocksMap.
+
+Agreed.
+
+Suppose two datanodes report inconsistent block length in their blockReceived confirmation of the same block. Suppose both replicas have the same generation stamp.
+  1. If the file is not under construction or it is not the last block of a file then the replica with the smaller size should be treated as corrupt. The larger size replica should be in the blocksMap.
+  2. if the file is the last block of a file that is under construction: then keep the longer size replica in the blocksmap but do not delete the shorter size replica from the corresponding (i.e. do not treat the shorter size replica as corrupt).  Remove the shorter size replica from the blocks map.
+ 
+Case1  typically happens when the lazy flush of OS buffers in the datanode encounters a transient error and one copy of a good replica is truncated on disk.
+
+Case 2 could occur because a datanode prematurely (because of buggy code somewhere) sends a block Received to the NN. In this case, it is safe to not treat the replica as corrupt because the existence of the lease indicates that the NN does not "own" this block. This situation will be fixed when a block report is processed after the lease is closed., Summary of an offline discussion:
+1. No block locations should be added to blocksMap for an incomplete block. So HADOOP-5134 should be fixed;
+2. The length of the previous block should set to be the default block length when client calls addBlock asking for an additional block for the file;
+3. When receiving blockReceived from DN, NameNode checks the length of the new replica:
+    If the new replica's length is greater than the default block length or smaller than the current block length, mark the new replica as corrupt;
+    If the new replica's length is greater than the current block length, set the block's length to be the new replica's length and mark the existing replicas of the block as corrupt.
+
+I believe that most of logic for 3 has already in 0.18.3 branch., > if the new replica's length is greater than the default block length or smaller than
+
+Just to mbe more explicit: the "default block length" referred to here is the the preferredBlockSize for this file. It does not refer to the default block size of the filesystem., >WARN namenode.FSNamesystem (FSNamesystem.java:addStoredBlock(2791)) - Inconsistent size for block blk_2248817250507458558_1011 reported from 127.0.0.1:51024 current size is 6 reported size is 63
+>WARN namenode.FSNamesystem (FSNamesystem.java:addStoredBlock(2816)) - Mark existing replica blk_2248817250507458558_1011from 127.0.0.1:51021 as corrupt because its length is shorter than the new one.
+
+why wasn't a blockreceived generated by 128.0.0.1:51021 after the above two log lines?, Next two lines of the log:
+WARN  hdfs.StateChange (FSNamesystem.java:addStoredBlock(2872)) - BLOCK* NameSystem.addStoredBlock: Redundant addStoredBlock request received for blk_2248817250507458558_1011 on 127.0.0.1:51024 size 63   
+WARN  hdfs.StateChange (FSNamesystem.java:addStoredBlock(2872)) - BLOCK* NameSystem.addStoredBlock: Redundant addStoredBlock request received for blk_2248817250507458558_1011 on 127.0.0.1:51021 size 63
+
+blockReceived from 128.0.0.1:51021 did come. This time it did not complain about the length but redundant addStoredBlock. The replica got added to the blocksMap but of no use because the block was already marked as corrupt.
+
+What's wrong here was that 128.0.0.1:51021 had a very good replica but NN wrongly marked it as corrupt based on some stale information., This patch implements summary 3 assuming summary 1., The logic in summary 3 should only apply to the last block of a file under construction. A complete picture should be:
+{noformat}
+if the reported block is the last block of an under-construction file {
+     do summary 3
+} else {
+    if the reported block is not the last block && its NN recorded length is not equal to the preferred size
+         set the block's NN recorded length to be the preferred block size;
+    if the reported length is not equal to the NN recorded length
+         mark the reported block as corrupt;
+}
+{noformat}, This patch needs more intensive tests. But I upload it now for initial review., This patch adds a unit test and fixes a bug in the previous patch., This patch definitely reduces the probability "committing" an incorrect block. Choosing longer block out of all replicas is better than selecting a shorter one.
+But this does not answer the question what if (as a result of a software bug or unfortunate circumstance) the longest block is actually a wrong replica. In general the name-node does not have a definite criteria to judge which replica is the right and which is not except for the generation stamp. And it would be wrong to *silently* make such a decision based on the size (or any other artificial convention).
+I am coming to a conclusion that the honest way to deal with this is to declare all replicas corrupt in this case, that is when this is the last block of a file being written to. This will be reported in fsck and an administrator or the user can deal with it.
+This should happen only as a result of an error in the code so may be we should just treat it as a corruption., If we mark all replicas as corrupt, two questions remain to be answered:
+1. What should be the length of the block: longer one or shorter one?
+2. Should the file remains to be open or could we close the file?, > 1. What should be the length of the block: longer one or shorter one?
+
+The length doesn't matter since all replicas are corrupt. It could be the default block size or 0.
+
+> 2. Should the file remains to be open or could we close the file? 
+
+I think according to our policies (at least one replica of each block should be reported) we cannot close the file. We should not wait in this case for more replicas to appear but rather return an error to the client once the problem is encountered.
+Once again this is an error condition, and that is why it is better to let the client know that an error occurred than to silently make a decision on his behalf., I am revisiting this jira. In the new append implementation, it seems to me that there is no need of the complicated length checking in addStoredBlock. The checkings have been done in DatanodeDescriptor#processReportedBlock before addStoredBlock is called. , This patch removes all of the corrupt replica detection from addStoredBlock and moves the disk space consumption code to commitBlock., is this a code cleanup issue then?, +1 This indeed looks like a code cleanup.
+# For the record could you please explain the reason one of the test cases is removed in TestFileCreation.
+# There one unused import in TestFileCreation.java, This patch removes the unnecessary import.
+
+The reason that I removed the testcase TestFileCreation is that the following assumption that it based is wrong:
+  // The test file is 2 times the blocksize plus one. This means that when the
+  // entire file is written, the first two blocks definitely get flushed to
+  // the datanodes.
+
+When an application returns from writing "2 blocks +1" bytes of data, HDFS does not provide any guarantee where the data is unless hflush is called. It is possible the data still buffer at the client side. , This patch removes a javac warning., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12429938/corruptionDetect1.patch
+  against trunk revision 897975.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    -1 javac.  The applied patch generated 25 javac compiler warnings (more than the trunk's current 24 warnings).
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/181/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/181/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/181/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/181/console
+
+This message is automatically generated., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12429954/corruptionDetect2.patch
+  against trunk revision 898134.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/182/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/182/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/182/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/182/console
+
+This message is automatically generated., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12429954/corruptionDetect2.patch
+  against trunk revision 898134.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/183/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/183/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/183/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/183/console
+
+This message is automatically generated., I've committed this!, Integrated in Hadoop-Hdfs-trunk-Commit #168 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Hdfs-trunk-Commit/168/])
+    , Integrated in Hadoop-Hdfs-trunk #199 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Hdfs-trunk/199/])
+    . Cleanup inconsistent block length handling code in FSNameSystem#addStoredBlock. Contributed by Hairong Kuang.
+, Integrated in Hdfs-Patch-h2.grid.sp2.yahoo.net #96 (See [http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h2.grid.sp2.yahoo.net/96/])
+    , Integrated in Hdfs-Patch-h5.grid.sp2.yahoo.net #196 (See [http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/196/])
+    ]

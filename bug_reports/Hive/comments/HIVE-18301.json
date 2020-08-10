@@ -1,0 +1,604 @@
+[If we can cache MapInput, will it be simpler to dynamically identify same MapInputs and cache them, in order to achieve the purpose of HIVE-17486?, yes.  I can achieve to merge the same tables into 1 mapInput and run successfully such case(DS/query28) in HIVE-17486 in spark local mode.  This exception only happens in yarn mode. , The reason why have this NPE is because [org.apache.hadoop.hive.ql.io.IOContextMap#sparkThreadLocal|https://github.com/kellyzly/hive/blob/master/ql/src/java/org/apache/hadoop/hive/ql/io/IOContextMap.java#L54 ] is ThreadLocal variable.    The value of the same ThreadLocal variable maybe different in different threads.
+we set the InputPath by
+{code}
+ CombineHiveRecordReader#init
+->HiveContextAwareRecordReader.initIOContext
+->IOContext.setInputPath
+{code}
+
+we get the InputPath by
+{code}
+SparkMapRecordHandler.processRow
+->MapOperator.process
+->MapOperator.cleanUpInputFileChangedOp
+->ExecMapperContext.getCurrentInputPath
+->IOContext#getInputPath
+{code}
+
+when cache is enabled, there is no setInputPath , so return null when call IOContext#getInputPath, [~xuefuz],[~lirui]: Is there any way to store IOcontext in some place and then reinitialize it in current code when rdd cache is enabled?, [~xuefuz],[~csun]: I read jiras about MapInput IOContext problem and enable MapInput rdd cache. And found the problem only happens OContext problem with multiple MapWorks cloned for multi-insert \[Spark Branch\] like HIVE-8920 mentioned.
+In HIVE-8920, I found the failure case is like
+{code}
+from (select * from dec union all select * from dec2) s
+insert overwrite table dec3 select s.name, sum(s.value) group by s.name
+insert overwrite table dec4 select s.name, s.value order by s.value;
+{code}
+I indeed saw the exception in my hive.log like
+{code}
+Caused by: java.lang.IllegalStateException: Invalid input path hdfs://localhost:8020/user/hive/warehouse/dec2/dec.txt
+        at org.apache.hadoop.hive.ql.exec.MapOperator.getNominalPath(MapOperator.java:406)
+        at org.apache.hadoop.hive.ql.exec.MapOperator.cleanUpInputFileChangedOp(MapOperator.java:442)
+{code}
+
+here the problem  happens on the MapInput is the union result of dec and dec2 case. But when I modify case
+{code}
+from (select * from dec ) s
+insert overwrite table dec3 select s.name, sum(s.value) group by s.name
+insert overwrite table dec4 select s.name, s.value order by s.value;
+{code}
+No such exception whether in local or yarn mode.
+
+Whether the problem only happens  in such complicated case( the rdd cache is the  union result of two tables)?  If only happen in such complicated case, why not only disable MapInput rdd cache in such case? Is there any other reason to disable MapInput#rdd cache? Please spend some time to view it as both of you have experience on it, thanks!, I think we need to investigate how the input path is used, and what the operators need to do when input file changes, etc. My understanding is these information will be lost if the HadoopRDD is cached., [~lirui]:
+{quote}
+My understanding is these information will be lost if the HadoopRDD is cached.
+{quote}
+
+You mean that HadoopRDD will not store the spark plan? If yes, actually in hive, it stores the spark plan on a file on  hdfs and deserialize and serialize from the file. See more code in 
+hive/ql/src/java/org/apache/hadoop/hive/ql/exec/Utilities.java#getBaseWork.  If not, please spend more time to explain detail.
+
+Here my question is that is there any other reason to disable MapInput#cache besides  avoiding  multi-insert cases which there is union operator after {{from}}
+{code}
+
+from (select * from dec union all select * from dec2) s
+insert overwrite table dec3 select s.name, sum(s.value) group by s.name
+insert overwrite table dec4 select s.name, s.value order by s.value;
+
+{code}
+
+If there is no other reason to disable MapInput# cache, I guess  for HIVE-17486, we can enable MapInput cache because HIVE-17486 is merge same single table.  There is few case like above ( from (select A union B) ....)., My understanding is if the HadoopRDD is cached, the records are not produced by record reader and IOContext is not populated. Therefore the information in IOContext will be unavailable, e.g. the input path. This may cause problem because some operators need to take certain actions when input file changes -- {{Operator::cleanUpInputFileChanged}}.
+So basically my point is we have to figure out the scenarios where IOContext is necessary. Then decide whether we should disable caching in such cases., I think SMB map join is one case where the "input file change" event is necessary -- whenever the big table input file changes, SMBMapJoinOperator needs to find corresponding input files for small tables in order to performa bucketed join. Maybe we can identify all such cases and make sure MapInput cache is disabled. For other cases, we can cache MapInput and just fix the NPE.
+[~xuefuz], could you share your thoughts on this? Thanks., thanks for Rui's comment, will spend some time to investigate the NPE problem .Here I want to say in [HIVE-8920|https://issues.apache.org/jira/browse/HIVE-8920], the exception is 
+{code}
+Caused by: java.lang.IllegalStateException: Invalid input path hdfs://localhost:8020/user/hive/warehouse/dec2/dec.txt
+        at org.apache.hadoop.hive.ql.exec.MapOperator.getNominalPath(MapOperator.java:406)
+        at org.apache.hadoop.hive.ql.exec.MapOperator.cleanUpInputFileChangedOp(MapOperator.java:442)
+
+{code}
+
+Not NPE, so there are two different problems. , Here some update about NPE:
+ the normal case when enable rdd cache
+the stacktrace of initIOContext which will intialize ExecMapperContext#setCurrentInputPath is
+{code}
+org.apache.hadoop.hive.ql.io.HiveContextAwareRecordReader.initIOContext(HiveContextAwareRecordReader.java:175)
+ org.apache.hadoop.hive.ql.io.HiveContextAwareRecordReader.initIOContext(HiveContextAwareRecordReader.java:211)
+ org.apache.hadoop.hive.ql.io.CombineHiveRecordReader.<init>(CombineHiveRecordReader.java:101)
+ sun.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+ sun.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:62)
+ sun.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+ java.lang.reflect.Constructor.newInstance(Constructor.java:423)
+ org.apache.hadoop.hive.shims.HadoopShimsSecure$CombineFileRecordReader.initNextRecordReader(HadoopShimsSecure.java:257)
+ org.apache.hadoop.hive.shims.HadoopShimsSecure$CombineFileRecordReader.<init>(HadoopShimsSecure.java:217)
+ org.apache.hadoop.hive.shims.HadoopShimsSecure$CombineFileInputFormatShim.getRecordReader(HadoopShimsSecure.java:346)
+ org.apache.hadoop.hive.ql.io.CombineHiveInputFormat.getRecordReader(CombineHiveInputFormat.java:712)
+ org.apache.spark.rdd.HadoopRDD$$anon$1.<init>(HadoopRDD.scala:246)
+ org.apache.spark.rdd.HadoopRDD.compute(HadoopRDD.scala:209)
+ org.apache.spark.rdd.HadoopRDD.compute(HadoopRDD.scala:102)
+ org.apache.spark.rdd.RDD.computeOrReadCheckpoint(RDD.scala:319)
+ org.apache.spark.rdd.RDD.iterator(RDD.scala:283)
+ org.apache.spark.rdd.MapPartitionsRDD.compute(MapPartitionsRDD.scala:38)
+ org.apache.spark.rdd.RDD.computeOrReadCheckpoint(RDD.scala:319)
+ org.apache.spark.rdd.RDD$$anonfun$8.apply(RDD.scala:332)
+ org.apache.spark.rdd.RDD$$anonfun$8.apply(RDD.scala:330)
+ org.apache.spark.storage.BlockManager$$anonfun$doPutIterator$1.apply(BlockManager.scala:919)
+ org.apache.spark.storage.BlockManager$$anonfun$doPutIterator$1.apply(BlockManager.scala:910)
+ org.apache.spark.storage.BlockManager.doPut(BlockManager.scala:866)
+ org.apache.spark.storage.BlockManager.doPutIterator(BlockManager.scala:910)
+ org.apache.spark.storage.BlockManager.getOrElseUpdate(BlockManager.scala:668)
+ org.apache.spark.rdd.RDD.getOrCompute(RDD.scala:330)
+ org.apache.spark.rdd.RDD.iterator(RDD.scala:281)
+ org.apache.spark.rdd.MapPartitionsRDD.compute(MapPartitionsRDD.scala:38)
+ org.apache.spark.rdd.RDD.computeOrReadCheckpoint(RDD.scala:319)
+ org.apache.spark.rdd.RDD$$anonfun$8.apply(RDD.scala:332)
+ org.apache.spark.rdd.RDD$$anonfun$8.apply(RDD.scala:330)
+ org.apache.spark.storage.BlockManager$$anonfun$doPutIterator$1.apply(BlockManager.scala:919)
+ org.apache.spark.storage.BlockManager$$anonfun$doPutIterator$1.apply(BlockManager.scala:910)
+ org.apache.spark.storage.BlockManager.doPut(BlockManager.scala:866)
+ org.apache.spark.storage.BlockManager.doPutIterator(BlockManager.scala:910)
+ org.apache.spark.storage.BlockManager.getOrElseUpdate(BlockManager.scala:668)
+ org.apache.spark.rdd.RDD.getOrCompute(RDD.scala:330)
+ org.apache.spark.rdd.RDD.iterator(RDD.scala:281)
+ org.apache.spark.scheduler.ShuffleMapTask.runTask(ShuffleMapTask.scala:79)
+ org.apache.spark.scheduler.ShuffleMapTask.runTask(ShuffleMapTask.scala:47)
+ org.apache.spark.scheduler.Task.run(Task.scala:85)
+ org.apache.spark.executor.Executor$TaskRunner.run(Executor.scala:274)
+ java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+ java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+ java.lang.Thread.run(Thread.java:745)
+{code}
+
+the stacktrace of ExecMapperContext#getCurrentInputPath
+{code}
+org.apache.hadoop.hive.ql.exec.mr.ExecMapperContext.getCurrentInputPath(ExecMapperContext.java:113)
+ org.apache.hadoop.hive.ql.exec.MapOperator.cleanUpInputFileChangedOp(MapOperator.java:512)
+ org.apache.hadoop.hive.ql.exec.Operator.cleanUpInputFileChanged(Operator.java:1187)
+ org.apache.hadoop.hive.ql.exec.MapOperator.process(MapOperator.java:543)
+ org.apache.hadoop.hive.ql.exec.spark.SparkMapRecordHandler.processRow(SparkMapRecordHandler.java:136)
+ org.apache.hadoop.hive.ql.exec.spark.HiveMapFunctionResultList.processNextRecord(HiveMapFunctionResultList.java:48)
+ org.apache.hadoop.hive.ql.exec.spark.HiveMapFunctionResultList.processNextRecord(HiveMapFunctionResultList.java:27)
+ org.apache.hadoop.hive.ql.exec.spark.HiveBaseFunctionResultList.hasNext(HiveBaseFunctionResultList.java:85)
+ scala.collection.convert.Wrappers$JIteratorWrapper.hasNext(Wrappers.scala:42)
+ org.apache.spark.storage.memory.MemoryStore.putIteratorAsValues(MemoryStore.scala:213)
+ org.apache.spark.storage.BlockManager$$anonfun$doPutIterator$1.apply(BlockManager.scala:919)
+ org.apache.spark.storage.BlockManager$$anonfun$doPutIterator$1.apply(BlockManager.scala:910)
+ org.apache.spark.storage.BlockManager.doPut(BlockManager.scala:866)
+ org.apache.spark.storage.BlockManager.doPutIterator(BlockManager.scala:910)
+ org.apache.spark.storage.BlockManager.getOrElseUpdate(BlockManager.scala:668)
+ org.apache.spark.rdd.RDD.getOrCompute(RDD.scala:330)
+ org.apache.spark.rdd.RDD.iterator(RDD.scala:281)
+ org.apache.spark.scheduler.ShuffleMapTask.runTask(ShuffleMapTask.scala:79)
+ org.apache.spark.scheduler.ShuffleMapTask.runTask(ShuffleMapTask.scala:47)
+ org.apache.spark.scheduler.Task.run(Task.scala:85)
+ org.apache.spark.executor.Executor$TaskRunner.run(Executor.scala:274)
+ java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+ java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+ java.lang.Thread.run(Thread.java:745)
+ currentInputPath is hdfs://bdpe42
+ java.lang.Thread.getStackTrace(Thread.java:1552)
+ org.apache.hadoop.hive.ql.exec.mr.ExecMapperContext.getCurrentInputPath(ExecMapperContext.java:113)
+ org.apache.hadoop.hive.ql.exec.MapOperator.cleanUpInputFileChangedOp(MapOperator.java:512)
+ org.apache.hadoop.hive.ql.exec.Operator.cleanUpInputFileChanged(Operator.java:1187)
+ org.apache.hadoop.hive.ql.exec.MapOperator.process(MapOperator.java:543)
+ org.apache.hadoop.hive.ql.exec.spark.SparkMapRecordHandler.processRow(SparkMapRecordHandler.java:136)
+ org.apache.hadoop.hive.ql.exec.spark.HiveMapFunctionResultList.processNextRecord(HiveMapFunctionResultList.java:48)
+ org.apache.hadoop.hive.ql.exec.spark.HiveMapFunctionResultList.processNextRecord(HiveMapFunctionResultList.java:27)
+ org.apache.hadoop.hive.ql.exec.spark.HiveBaseFunctionResultList.hasNext(HiveBaseFunctionResultList.java:85)
+ scala.collection.convert.Wrappers$JIteratorWrapper.hasNext(Wrappers.scala:42)
+ org.apache.spark.storage.memory.MemoryStore.putIteratorAsValues(MemoryStore.scala:213)
+ org.apache.spark.storage.BlockManager$$anonfun$doPutIterator$1.apply(BlockManager.scala:919)
+ org.apache.spark.storage.BlockManager$$anonfun$doPutIterator$1.apply(BlockManager.scala:910)
+ org.apache.spark.storage.BlockManager.doPut(BlockManager.scala:866)
+ org.apache.spark.storage.BlockManager.doPutIterator(BlockManager.scala:910)
+ org.apache.spark.storage.BlockManager.getOrElseUpdate(BlockManager.scala:668)
+ org.apache.spark.rdd.RDD.getOrCompute(RDD.scala:330)
+ org.apache.spark.rdd.RDD.iterator(RDD.scala:281)
+ org.apache.spark.scheduler.ShuffleMapTask.runTask(ShuffleMapTask.scala:79)
+ org.apache.spark.scheduler.ShuffleMapTask.runTask(ShuffleMapTask.scala:47)
+ org.apache.spark.scheduler.Task.run(Task.scala:85)
+ org.apache.spark.executor.Executor$TaskRunner.run(Executor.scala:274)
+ java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+ java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+ java.lang.Thread.run(Thread.java:745)
+{code}
+
+actually they are in the same thread, so NPE is not thrown out even {{org.apache.hadoop.hive.ql.io.IOContextMap#sparkThreadLocal}} is ThreadLocal variable.
+
+In the NPE case
+the stacktrace to ExecMapperContext#getCurrentInputPath
+{code}
+742 18/01/03 01:01:32 INFO Executor task launch worker-1 ExecMapperContext: org.apache.hadoop.hive.ql.exec.MapOperator.cleanUpInputFileChangedOp(MapOperator.java:512)
+743 18/01/03 01:01:32 INFO Executor task launch worker-1 ExecMapperContext: org.apache.hadoop.hive.ql.exec.Operator.cleanUpInputFileChanged(Operator.java:1187)
+744 18/01/03 01:01:32 INFO Executor task launch worker-1 ExecMapperContext: org.apache.hadoop.hive.ql.exec.MapOperator.process(MapOperator.java:543)
+745 18/01/03 01:01:32 INFO Executor task launch worker-1 ExecMapperContext: org.apache.hadoop.hive.ql.exec.spark.SparkMapRecordHandler.processRow(SparkMapRecordHandler.java:136)
+746 18/01/03 01:01:32 INFO Executor task launch worker-1 ExecMapperContext: org.apache.hadoop.hive.ql.exec.spark.HiveMapFunctionResultList.processNextRecord(HiveMapFunctionResultList.java:48)
+747 18/01/03 01:01:32 INFO Executor task launch worker-1 ExecMapperContext: org.apache.hadoop.hive.ql.exec.spark.HiveMapFunctionResultList.processNextRecord(HiveMapFunctionResultList.java:27)
+748 18/01/03 01:01:32 INFO Executor task launch worker-1 ExecMapperContext: org.apache.hadoop.hive.ql.exec.spark.HiveBaseFunctionResultList.hasNext(HiveBaseFunctionResultList.java:85)
+749 18/01/03 01:01:32 INFO Executor task launch worker-1 ExecMapperContext: scala.collection.convert.Wrappers$JIteratorWrapper.hasNext(Wrappers.scala:42)
+750 18/01/03 01:01:32 INFO Executor task launch worker-1 ExecMapperContext: org.apache.spark.shuffle.sort.BypassMergeSortShuffleWriter.write(BypassMergeSortShuffleWriter.java:125)
+751 18/01/03 01:01:32 INFO Executor task launch worker-1 ExecMapperContext: org.apache.spark.scheduler.ShuffleMapTask.runTask(ShuffleMapTask.scala:79)
+752 18/01/03 01:01:32 INFO Executor task launch worker-1 ExecMapperContext: org.apache.spark.scheduler.ShuffleMapTask.runTask(ShuffleMapTask.scala:47)
+{code}
+
+ExecMapperContext#getCurrentInputPath and ExecMapperContext#setCurrentInputPath is in different thread, so NPE is thrown out. I don't know why in normal case {code}
+MemoryStore.putIteratorAsValues->HiveMapFunctionResultList.processNextRecord
+{code}
+in NPE case
+{code}
+BypassMergeSortShuffleWriter.write->HiveMapFunctionResultList.processNextRecord
+{code}, [~lirui]:
+{quote}My understanding is if the HadoopRDD is cached, the records are not produced by record reader and IOContext is not populated. Therefore the information in IOContext will be unavailable, e.g. the input path. This may cause problem because some operators need to take certain actions when input file changes – {{Operator::cleanUpInputFileChanged}}.
+ So basically my point is we have to figure out the scenarios where IOContext is necessary. Then decide whether we should disable caching in such cases.
+{quote}
+Yes, if HadoopRDD is cached, it will not call
+{code:java}
+CombineHiveRecordReader#init
+->HiveContextAwareRecordReader.initIOContext
+->IOContext.setInputPath
+{code}
+. 
+ It will use the cached result to call MapOperator#process(Writable value), so NPE is thrown because at that time IOContext.getInputPath return null. Now I just modify the code of MapOperator#process(Writable value) like [link|https://github.com/kellyzly/hive/commit/e81b7df572e2c543095f55dd160b428c355da2fb]
+
+Here my question is 
+ 1. when {{context.getIoCxt().getInputPath() == null}}, I think in this situation, this record is from cache not from CombineHiveRecordReader. We need not to call MapOperator#cleanUpInputFileChanged because MapOperator#cleanUpInputFileChanged is only designed for one Mapper scanning multiple files(like CombineFileInputFormat) and multiple partitions and inputPath will change in these situations and need to call {{cleanUpInputFileChanged}} to reinitialize [some variables|https://github.com/apache/hive/blob/master/ql/src/java/org/apache/hadoop/hive/ql/exec/MapOperator.java#L532] but we need not consider reinitialization for a cached record. Is my understanding right? If right, is there any other way to judge this is cached record or not except by {{context.getIoCxt().getInputPath() == null}}
+ 2. how to initiliaze IOContext#getInputPath in cache situation? we need this variable to reinitialize MapOperator::currentCtxs in MapOperator#initializeContexts
+{code:java}
+  public void initializeContexts() {
+    Path fpath = getExecContext().getCurrentInputPath();
+    String nominalPath = getNominalPath(fpath);
+    Map<Operator<?>, MapOpCtx> contexts = opCtxMap.get(nominalPath);
+    currentCtxs = contexts.values().toArray(new MapOpCtx[contexts.size()]);
+  }
+{code}
+in the code, we store MapOpCtx for every MapOperator in opCtxMap(Map<String, Map<Operator<?>, MapOpCtx>>). In table with partitions, there will be multiple elements in opCtxMap( opCtxMap.keySet() is a set containing partition names). Currently I test on a table without partitions and can directly use opCtxMap.values().iterator().next() to initialize [context|https://github.com/kellyzly/hive/blob/HIVE-17486.4/ql/src/java/org/apache/hadoop/hive/ql/exec/MapOperator.java#L713] and runs successfully in yarn mode. But I guess this is not right with partitioned table., {quote}We need not to call MapOperator#cleanUpInputFileChanged because MapOperator#cleanUpInputFileChanged is only designed for one Mapper scanning multiple files
+{quote}
+When RDD is cached, mapper reads records from the cache. But I think those records may come from multiple underlying files right? And we won't be able to tell the file boundaries because they're cached., [~lirui]: {quote}
+And we won't be able to tell the file boundaries because they're cached.
+{quote}
+yes.  when IOContext.getInputPath() = null  only means the record is cached.  Can not know file boundaries.
+So IOContext.getInputPath is necessary.  , In HIVE-18301.patch, it provides one solution to transfer the {{IOContext::inputPath}}
+{code:java}
+  inputRDD1                inputRDD2
+        |CopyFunction            | CopyFunction
+    CopyRDD1                CopyRDD2
+        |                       |
+       MT_11                       MT_12
+        |                       |
+       RT_1                         RT_2
+         \                      /
+                     Union  
+{code}
+MT_11 will call following stack to initialize IOContext::inputPath
+{code:java}
+ CombineHiveRecordReader#init
+->HiveContextAwareRecordReader.initIOContext
+->IOContext.setInputPath
+{code}
+inputRDD1 and inputRDD2 are same table's rdd, so CopyRDD1 and CopyRDD2 are same rdd if rdd cache is enabled. When MT_12 will not call CombineHiveRecordReader#init to initialize {{IOContext::inputPath}} but {{MapOperator#process(Writable value)}} still need this value. IOContext is bound to single thread, so the value is different in different thread. {{inputRDD1-CopyRDD1-MT_11-RT_1}} and {{inputRDD2-CopyRDD2-MT_12-RT_2}} is called in different thread. So IOContext can not be shared between these two threads.
+
+For this issue, I gave following solution:
+ We save the inputPath in CopyRDD1 when {{inputRDD1-CopyRDD1-MT_11-RT_1}} is executed. CopyRDD2 get the cached value and inputPath from CopyRDD1 which is stored in spark cache manager. We reinitialized the {{IOContext::inputPath}} in {{MapOperator#process(Writable value)}} in MT_12.
+ *where to setInputPath?*
+ MapInput#CopyFunction#call, save inputPath in the first element of returned tuple
+{code:java}
+ public MapInput(SparkPlan sparkPlan, JavaPairRDD<WritableComparable, Writable> hadoopRDD) {
+     this(sparkPlan, hadoopRDD, false);
+@@ -79,10 +83,19 @@ public void setToCache(boolean toCache) {
+     call(Tuple2<WritableComparable, Writable> tuple) throws Exception {
+       if (conf == null) {
+         conf = new Configuration();
++        conf.set("hive.execution.engine","spark");
+       }
+-
+-      return new Tuple2<WritableComparable, Writable>(tuple._1(),
+-          WritableUtils.clone(tuple._2(), conf));
++      //                CopyFunction       MapFunction
++      //  HADOOPRDD-----------------> RDD1-------------> RDD2.....
++      // these transformation are in one stage and will be executed by 1 spark task(thread),
++      // IOContext.get(conf).getInputPath will not be null.
++      String inputPath = IOContextMap.get(conf).getInputPath().toString();
++      Text inputPathText = new Text(inputPath);
++      // save inputPath in the first element of returned tuple
++      // before we need not use tuple._1() in SparkMapRecordHandler#processRow
++      // so replace inputPathText with tuple._1().
++      return new Tuple2<WritableComparable, Writable>(inputPathText,
++        WritableUtils.clone(tuple._2(), conf));
+     }
+
+   }
+{code}
+*where to getInputPath?*
+{code:java}
+SparkMapRecordHandler#getInputPath
+public void processRow(Object key, Object value) throws IOException {
+....
++    if (HiveConf.getBoolVar(jc, HiveConf.ConfVars.HIVE_SPARK_SHARED_WORK_OPTIMIZATION)) {
++      Path inputPath = IOContextMap.get(jc).getInputPath();
++      // when inputPath is null, it means the record is cached 
++      if (inputPath == null) {
++        Text pathText = (Text) key;
++        IOContextMap.get(jc).setInputPath(new Path(pathText.toString()));
++      }
++    }
+....
+{code}
+[~lirui], [~xuefuz], [~stakiar],[~csun], please give me your suggesions, thanks!, Hi [~kellyzly], does the proposed solution mean we need to cache the input path for each record of the table? I wonder whether we can reuse the Text for same input paths. Besides, it's not efficient to check the job conf each time we process a row. You can just check it once and remember the value. Anyway, it's better to get some measurement of the overhead., [~lirui]:
+{quote}does the proposed solution mean we need to cache the input path for each record of the table?
+{quote}
+
+ yes.
+
+ 
+{quote}I wonder whether we can reuse the Text for same input paths. Besides, it's not efficient to check the job conf each time we process a row. You can just check it once and remember the value.
+{quote}
+OK, I will reuse to reduce some computation.
+ [~lirui], [~xuefuz],[~csun],[~Ferd]:
+
+The concern to this solution is 
+ 1. it may make the RDD bigger( I don't compare the original tuple._1() and inputPath, will do it later)
+ 2. I modify the {{HadoopRDD-CopyRDD-MT-11}}, here CopyRDD does not store the original data anymore, CopyRDD store the inputPath and orignal data. It maybe confusing.
+
+Do you think idea is ok to commit, if not ok, maybe I need to try other solution or can you provide other better solution? Thanks!, HIVE-18301.1.patch to trigger Hive QA, for the problem it may make the RDD bigger:
+
+original tuple._1() is  [CombineKey|https://github.com/apache/hive/blob/master/shims/common/src/main/java/org/apache/hadoop/hive/shims/CombineHiveKey.java] which stores offset(LongWriteObject), and in currentSolution , tuple._1() is inputPath ([org.apache.hadoop.io|https://github.com/kellyzly/hadoop/blob/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/Text.java] [.Text|https://github.com/kellyzly/hadoop/blob/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/Text.java]) whose size is decided by actual input file path length., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  1s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 15s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m  6s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  7s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 47s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  0s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 20s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 12s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 35s{color} | {color:red} ql: The patch generated 49 new + 76 unchanged - 2 fixed = 125 total (was 78) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  0s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 11s{color} | {color:red} The patch generated 7 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 14m 38s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Optional Tests |  asflicense  javac  javadoc  findbugs  checkstyle  compile  |
+| uname | Linux hiveptest-server-upstream 3.16.0-4-amd64 #1 SMP Debian 3.16.36-1+deb8u1 (2016-09-03) x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /data/hiveptest/working/yetus/dev-support/hive-personality.sh |
+| git revision | master / cebe012 |
+| Default Java | 1.8.0_111 |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-8871/yetus/diff-checkstyle-ql.txt |
+| asflicense | http://104.198.109.242/logs//PreCommit-HIVE-Build-8871/yetus/patch-asflicense-problems.txt |
+| modules | C: common ql itests U: . |
+| Console output | http://104.198.109.242/logs//PreCommit-HIVE-Build-8871/yetus.txt |
+| Powered by | Apache Yetus    http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12907839/HIVE-18301.1.patch
+
+{color:green}SUCCESS:{color} +1 due to 1 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 21 failed/errored test(s), 11839 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestAccumuloCliDriver.testCliDriver[accumulo_queries] (batchId=240)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[mapjoin_hook] (batchId=13)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[ppd_join5] (batchId=36)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[row__id] (batchId=78)
+org.apache.hadoop.hive.cli.TestEncryptedHDFSCliDriver.testCliDriver[encryption_move_tbl] (batchId=175)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[llap_smb] (batchId=152)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[bucket_map_join_tez1] (batchId=172)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=167)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid] (batchId=171)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid_fast] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[resourceplan] (batchId=164)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[sysdb] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[vectorization_input_format_excludes] (batchId=163)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[ppd_join5] (batchId=122)
+org.apache.hadoop.hive.ql.TestCreateUdfEntities.testUdfWithDfsResource (batchId=228)
+org.apache.hadoop.hive.ql.exec.TestOperators.testNoConditionalTaskSizeForLlap (batchId=282)
+org.apache.hadoop.hive.ql.io.TestDruidRecordWriter.testWrite (batchId=256)
+org.apache.hive.beeline.cli.TestHiveCli.testNoErrorDB (batchId=188)
+org.apache.hive.jdbc.TestSSL.testConnectionMismatch (batchId=234)
+org.apache.hive.jdbc.TestSSL.testConnectionWrongCertCN (batchId=234)
+org.apache.hive.jdbc.TestSSL.testMetastoreConnectionWrongCertCN (batchId=234)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/8871/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/8871/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-8871/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.YetusPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 21 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12907839 - PreCommit-HIVE-Build, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 15s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 15s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  7s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 50s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  3s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 22s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  7s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m  7s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 34s{color} | {color:red} ql: The patch generated 49 new + 76 unchanged - 2 fixed = 125 total (was 78) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  1s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 11s{color} | {color:red} The patch generated 7 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 14m 52s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Optional Tests |  asflicense  javac  javadoc  findbugs  checkstyle  compile  |
+| uname | Linux hiveptest-server-upstream 3.16.0-4-amd64 #1 SMP Debian 3.16.36-1+deb8u1 (2016-09-03) x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /data/hiveptest/working/yetus/dev-support/hive-personality.sh |
+| git revision | master / cebe012 |
+| Default Java | 1.8.0_111 |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-8872/yetus/diff-checkstyle-ql.txt |
+| asflicense | http://104.198.109.242/logs//PreCommit-HIVE-Build-8872/yetus/patch-asflicense-problems.txt |
+| modules | C: common ql itests U: . |
+| Console output | http://104.198.109.242/logs//PreCommit-HIVE-Build-8872/yetus.txt |
+| Powered by | Apache Yetus    http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12907839/HIVE-18301.1.patch
+
+{color:green}SUCCESS:{color} +1 due to 1 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 21 failed/errored test(s), 11839 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestAccumuloCliDriver.testCliDriver[accumulo_queries] (batchId=240)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[mapjoin_hook] (batchId=13)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[ppd_join5] (batchId=36)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[row__id] (batchId=78)
+org.apache.hadoop.hive.cli.TestEncryptedHDFSCliDriver.testCliDriver[encryption_move_tbl] (batchId=175)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[bucket_map_join_tez1] (batchId=172)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=167)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid] (batchId=171)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid_fast] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[mergejoin] (batchId=166)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[resourceplan] (batchId=164)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[sysdb] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[vectorization_input_format_excludes] (batchId=163)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[ppd_join5] (batchId=122)
+org.apache.hadoop.hive.cli.TestSparkPerfCliDriver.testCliDriver[query39] (batchId=250)
+org.apache.hadoop.hive.ql.exec.TestOperators.testNoConditionalTaskSizeForLlap (batchId=282)
+org.apache.hadoop.hive.ql.io.TestDruidRecordWriter.testWrite (batchId=256)
+org.apache.hive.beeline.cli.TestHiveCli.testNoErrorDB (batchId=188)
+org.apache.hive.jdbc.TestSSL.testConnectionMismatch (batchId=234)
+org.apache.hive.jdbc.TestSSL.testConnectionWrongCertCN (batchId=234)
+org.apache.hive.jdbc.TestSSL.testMetastoreConnectionWrongCertCN (batchId=234)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/8872/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/8872/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-8872/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.YetusPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 21 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12907839 - PreCommit-HIVE-Build, Hi [~kellyzly], is the input path the only thing we need to store with cached RDD? The IOContext has quite a few other fields. I wonder whether they are available if the RDD is cached., [~lirui]: thanks for question.  
+{quote}
+
+The IOContext has quite a few other fields. I wonder whether they are available if the RDD is cached.q
+
+{quote}
+Yes, IOContext#other fields are called in HiveContextAwareRecordReader and other places. We can skip fields which is only used in HiveContextAwareRecordReader, like IOContext#nextBlockStart, IOContext#isBlockPointer.  Others like IOContext#isBinarySearching is also used in FilterOperator#process.  Can not skip to cache it. , It seems that IOContext is used in many places and the logics complicated. Instead of putting the input patch in each row, like what the patch is proposing, could we send a serialized IOContext object as a special row whenever the content of the object changes? I'm not sure how feasible it's, so it's just a rough idea to be explored., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  1s{color} | {color:green} The patch does not contain any @author tags. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 23s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 46s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 15s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 54s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 10s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 24s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 18s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 40s{color} | {color:red} ql: The patch generated 51 new + 91 unchanged - 2 fixed = 142 total (was 93) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  6s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 13s{color} | {color:red} The patch generated 1 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 16m 40s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Optional Tests |  asflicense  javac  javadoc  findbugs  checkstyle  compile  |
+| uname | Linux hiveptest-server-upstream 3.16.0-4-amd64 #1 SMP Debian 3.16.36-1+deb8u1 (2016-09-03) x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /data/hiveptest/working/yetus/dev-support/hive-personality.sh |
+| git revision | master / 419593e |
+| Default Java | 1.8.0_111 |
+| checkstyle | http://104.198.109.242/logs//PreCommit-HIVE-Build-8965/yetus/diff-checkstyle-ql.txt |
+| asflicense | http://104.198.109.242/logs//PreCommit-HIVE-Build-8965/yetus/patch-asflicense-problems.txt |
+| modules | C: common ql itests U: . |
+| Console output | http://104.198.109.242/logs//PreCommit-HIVE-Build-8965/yetus.txt |
+| Powered by | Apache Yetus    http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12908669/HIVE-18301.2.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 21 failed/errored test(s), 12965 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestAccumuloCliDriver.testCliDriver[accumulo_queries] (batchId=240)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[auto_sortmerge_join_2] (batchId=49)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[mapjoin_hook] (batchId=13)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[ppd_join5] (batchId=36)
+org.apache.hadoop.hive.cli.TestEncryptedHDFSCliDriver.testCliDriver[encryption_move_tbl] (batchId=175)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[llap_smb] (batchId=152)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[bucket_map_join_tez1] (batchId=172)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=167)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid] (batchId=171)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[llap_acid_fast] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[resourceplan] (batchId=164)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[sysdb] (batchId=161)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[vectorization_input_format_excludes] (batchId=163)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[ppd_join5] (batchId=122)
+org.apache.hadoop.hive.cli.control.TestDanglingQOuts.checkDanglingQOut (batchId=221)
+org.apache.hadoop.hive.ql.exec.TestOperators.testNoConditionalTaskSizeForLlap (batchId=282)
+org.apache.hadoop.hive.ql.io.TestDruidRecordWriter.testWrite (batchId=256)
+org.apache.hive.beeline.cli.TestHiveCli.testNoErrorDB (batchId=188)
+org.apache.hive.jdbc.TestSSL.testConnectionMismatch (batchId=234)
+org.apache.hive.jdbc.TestSSL.testConnectionWrongCertCN (batchId=234)
+org.apache.hive.jdbc.TestSSL.testMetastoreConnectionWrongCertCN (batchId=234)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/8965/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/8965/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-8965/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.YetusPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 21 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12908669 - PreCommit-HIVE-Build, [~xuefuz]:
+{quote}Instead of putting the input patch in each row, like what the patch is proposing, could we send a serialized IOContext object as a special row whenever the content of the object changes?
+{quote}
+This is good idea. IOContext is bind to split not to bind to each record. So I changed to following idea.
+{code:java}
+ inputRDD1                inputRDD2
+        |CopyFunction            | CopyFunction
+    CopyRDD1                CopyRDD2
+        |                       |
+       MT_11                       MT_12
+        |                       |
+       RT_1                         RT_2
+         \                      /
+                     Union  
+{code}
+in the CopyRDD1, I only store IOContext as the tuple_1() of result when the IOContext#getInputPath is changed and store null in other situation. Thus it will reduce the size  of data increment of this solution. In MT_12, it initializes the IOContext when IOContext#getInputPath is null, once IOContext#getInputPath has value, we need not initialize it again in the same thread.  patch is provided in [^HIVE-18301.3.patch].  I guess the file boundary of original rdd is same as the file boundary of cached rdd. Only based on this theory, I guess the solution can works.  Although I don't read the source code of rdd cache, this solution passes in my test env.]

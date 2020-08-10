@@ -1,0 +1,144 @@
+[Which version are you looking at?  {{rollEditLog()}} does not and cannot solely depend on {{FSEditLog}} synchronization.  That's why it acquires the FSN write lock. This blocks everyone from edit logging. While still in the write lock, the edits are synced. This is different from regular {{logSync()}}, which happens outside the write lock.  
+
+If you are seeing such an exception, something is circumventing the FSN lock and edit logging.  There are some places where locking is more complicated like use of {{noInterruptsLock}} in {{DelegationTokenSecretManager}}, but they are also not supposed to edit log while rolling edits.  The exception clearly indicates a bug.  If you can reproduce it, make it dump the buffer before terminating so that we can find out who did edit logging., Thanks a lot [~kihwal]!
+
+About
+{quote}
+ That's why it acquires the FSN write lock. This blocks everyone from edit logging. While still in the write lock, the edits are synced.
+{quote}
+I examined and found a diff between the branch I'm using and trunk, I saw trunk has {{logSyncAll()}} in the following code:
+{code}
+FSEditLog.java
+ /**
+   * Finalize the current log segment.
+   * Transitions from IN_SEGMENT state to BETWEEN_LOG_SEGMENTS state.
+   */
+  public synchronized void endCurrentLogSegment(boolean writeEndTxn) {
+    LOG.info("Ending log segment " + curSegmentTxId);
+    Preconditions.checkState(isSegmentOpen(),
+        "Bad state: %s", state);
+    
+    if (writeEndTxn) {
+      logEdit(LogSegmentOp.getInstance(cache.get(), 
+          FSEditLogOpCodes.OP_END_LOG_SEGMENT));
+    }
+    // always sync to ensure all edits are flushed.
+    logSyncAll();  <====================================
+
+    printStatistics(true);
+    
+    final long lastTxId = getLastWrittenTxId();
+    
+    try {
+      journalSet.finalizeLogSegment(curSegmentTxId, lastTxId);
+      editLogStream = null;
+    } catch (IOException e) {
+      //All journals have failed, it will be handled in logSync.
+    }
+    
+    state = State.BETWEEN_LOG_SEGMENTS;
+  }
+{code}
+
+The {{logSyncAll()}} call is introduced by  HDFS-7964 (Add support for async edit logging), which seems to be the behavior I'm asking for in HDFS-10943 : we should flush edits before closing the stream.
+
+So likely HDFS-7964 is is not just as described "Add support for async edit logging", but likely also fixing the bug I reported here, that is, prior to HDFS-7964, we don't flush the edits before closing the stream. 
+
+What do yout think?  Hi [~daryn], welcome to comment if my above statement is correct since you worked out HDFS-7964?
+
+Many thanks.
+
+
+, Hi [~daryn],
+
+About my last comment, do you think it's a bug for {{endCurrentLogSegment}} not to call {{logSyncAll()}}, which is fixed by HDFS-7964? 
+
+Thanks a lot.
+, Unless something has changed semi-recently, you definitely cannot roll the edits w/o fsn synchronization.  Kihwal was right, he's heard me grumble many times about the edit logs not really being thread-safe.  I think I filed a jira about it many years ago...
+
+The main problem is the complex wait/notify behavior for interleaving edits and syncs.  Essentially the roll needs to be an atomic:  log segment end, close segment, open new segment, log segment start.  Relinquishing the edit log mutex anywhere during that transaction due to wait() may cause "very bad things" to happen.  Best case is an NPE when another thread tries to log between segments.  The sync won't matter if another spurious edit slips in after the end segment edit or before the start segment edit.  Must... bury... memories of scrambling to save the namespace of a few clusters after the standby crashed from corrupted edits.
+
+The answer is track down why the fsn lock is not being held.  , Thanks a lot [~daryn]!
+
+Sorry a follow-up question at the end with this comment:
+
+About
+
+Essentially the roll needs to be an atomic: 
+# log segment end, 
+# close segment, 
+# open new segment, 
+# log segment start. 
+
+Step #1 and #2 above should have flushed all edits in the buffer before closing the segment, but seems we were not doing that in {{FSEditLog#endCurrentSegment}} before HDFS-7964 added the following call:
+{code}
+    // always sync to ensure all edits are flushed.
+    logSyncAll();  <====================================
+{code}
+
+My problem is that some edits are not flushed to JN when the editlog is being rolled, and the release that has this problem doesn't have the fix of HDFS-7964.  Though HDFS-7964 is reported as an enhancement to support async edit logging, as a side product,  it also likely fixes my problem. 
+
+{quote}
+The answer is track down why the fsn lock is not being held.
+{quote}
+Are you saying that if we were not to use HDFS-7964 fix,  then the fsn lock should have been held, so we don't need to call  {{logSyncAll()}} in {{FSEditLog#endCurrentSegment}}. That is, you suspect there is some place that the fsn lock was not held (as it's supposed to) rather than the missing {{logSyncAll()}} call?
+
+Thanks.
+, The issue remains even after HDFS-7964 is included. 
+
+HDFS-7964 added the call {{logSyncAll{}}} before the edit log rolling. So either this method did not finish its job correctly, or some new edits gets in after the flush and before the edit log rolling. Created HDFS-11292 to help the diagnosis.
+, [~yzhangal] Thanks for reporting the issue. Which version did you use when observing the issue?, Hi [~zhz], I originally saw it with CDH 5.5.x. Then after digging, I think it's likely all upstream branches also have the issue. 
+, hi [~zhz],[~daryn],[~yzhangal],[~kihwal] is this issue still going on?
+I meet the same problem in my production cluster, and my hadoop version is apache hadoop-2.7.1.
+I agree that some editlog in doublebuffer is not flush. maybe it is not related to {{logSyncAll}} since compare {{logSyncAll}} to {{logSync}}, it is only different about set {{txid}} but not different for doublebuffer., I would like to provide more detail information:
+ A. NameNode logs before fatal which is same as [~yzhangal] mentioned above:
+{code:java}
+2018-04-19 13:10:24,222 INFO org.apache.hadoop.hdfs.server.namenode.FSEditLog: Rolling edit logs
+2018-04-19 13:10:24,222 INFO org.apache.hadoop.hdfs.server.namenode.FSEditLog: Ending log segment 15221708217
+2018-04-19 13:10:24,595 INFO org.apache.hadoop.hdfs.server.namenode.FSEditLog: Number of transactions: 206713 Total time for transactions(ms): 2575 Number of transactions batched in Syncs: 8218 Number of syncs: 138767 SyncTimes(ms): 42337 29016
+2018-04-19 13:10:25,264 FATAL org.apache.hadoop.hdfs.server.namenode.FSEditLog: Error: finalize log segment 15221708217, 15221914929 failed for required journal (JournalAndStream(mgr=QJM to [0.0.0.0:8485, 0.0.0.0:8485, 0.0.0.0:8485], stream=QuorumOutputStream starting at txid 15221708217))
+java.io.IOException: FSEditStream has 160370 bytes still to be flushed and cannot be closed.
+        at org.apache.hadoop.hdfs.server.namenode.EditsDoubleBuffer.close(EditsDoubleBuffer.java:66)
+        at org.apache.hadoop.hdfs.qjournal.client.QuorumOutputStream.close(QuorumOutputStream.java:65)
+        at org.apache.hadoop.hdfs.server.namenode.JournalSet$JournalAndStream.closeStream(JournalSet.java:115)
+        at org.apache.hadoop.hdfs.server.namenode.JournalSet$4.apply(JournalSet.java:235)
+        at org.apache.hadoop.hdfs.server.namenode.JournalSet.mapJournalsAndReportErrors(JournalSet.java:393)
+        at org.apache.hadoop.hdfs.server.namenode.JournalSet.finalizeLogSegment(JournalSet.java:231)
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLog.endCurrentLogSegment(FSEditLog.java:1274)
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLog.rollEditLog(FSEditLog.java:1203)
+        at org.apache.hadoop.hdfs.server.namenode.FSImage.rollEditLog(FSImage.java:1293)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.rollEditLog(FSNamesystem.java:6084)
+        at org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer.rollEditLog(NameNodeRpcServer.java:1295)
+        at org.apache.hadoop.hdfs.protocolPB.NamenodeProtocolServerSideTranslatorPB.rollEditLog(NamenodeProtocolServerSideTranslatorPB.java:142)
+        at org.apache.hadoop.hdfs.protocol.proto.NamenodeProtocolProtos$NamenodeProtocolService$2.callBlockingMethod(NamenodeProtocolProtos.java:12025)
+        at org.apache.hadoop.ipc.ProtobufRpcEngine$Server$ProtoBufRpcInvoker.call(ProtobufRpcEngine.java:616)
+        at org.apache.hadoop.ipc.RPC$Server.call(RPC.java:969)
+        at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:2049)
+        at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:2045)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:415)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1690)
+        at org.apache.hadoop.ipc.Server$Handler.run(Server.java:2043)
+2018-04-19 13:10:25,390 WARN org.apache.hadoop.hdfs.qjournal.client.QuorumJournalManager: Aborting QuorumOutputStream starting at txid 15221708217
+{code}
+B. JournalNode logs when Standby NameNode transition To Active and recovery EditLog:
+{code:java}
+2018-04-19 13:10:47,137 INFO org.apache.hadoop.hdfs.qjournal.server.Journal: Accepted recovery for segment 15221708217: segmentState { startTxId: 15221708217 endTxId: 15221913880 isInProgress: true } acceptedInEpoch: 24
+{code}
+C. CallQueue of NameNode is full and lasted no more than three seconds.
+{code:java}
+Date   Time         RpcProcessingTime  CallQueueLength RpcQueueTime
+04-19 13:10:22         0.120               0              0.031 
+04-19 13:10:24         0.505            3200             10.619 
+04-19 13:10:25      1038.286            3200            265.548
+{code}
+Based on logs, we can come to conclusions:
+ 1. only 2/3 JournalNodes active at that time since logs show {{SyncTimes(ms): 42337 29016}}
+ 2. 1049 {{FSEditLogOp}} transations (finalize TxId of NameNode before fatal: 15221914929 - endTxId of JournalNode after recovery: 15221913880) are still in {{bufCurrent}} of EditsDoubleBuffer and do not flushed out.
+ 3. All write of NameNode from DFSClient request still not return at that time, and FsEditLogOps of DFSClient's write op. still continue to put into {{bufCurrent}}., Correct:
+{quote}1. only 2/3 JournalNodes active at that time since logs show SyncTimes(ms): 42337 29016{quote}
+this conclusion is not correct, and please ignore., hi [~daryn], I wonder is there any condition to make sure that {{EditsDoubleBuffer.bufReady}} is empty when swap buffer if disable assertions. Thanks for your help., This error should not be possible.  The entire roll holds the FSN lock so nothing else can generate edits to avoid lingering bytes in the buffer.  {{endCurrentLogSegment}} does a logSync which loops calling setReadyToFlush (which flips the buffer) & flush until the last written txid is synced.  If the stream reports the last txid synced, there cannot/must-not be bytes lingering in the buffer or the stream lied.
+
+I'll take a quick look at the code., The quorum output stream will +always+ crash the NN if edits are rolled while a node is down.  The edit roll will sync, flush, close.  As we can see, closing a logger will fail if there are unflushed bytes.
+
+The issue is {{QuorumOutputStream#flush}} succeeds with only a simple majority of loggers.  The those that failed cause close to fail due to unflushed bytes.  Someone familiar with QJM (we don't use it) will need to decide if it's safe for the quorum's flush to clear the buffers of failed loggers.]

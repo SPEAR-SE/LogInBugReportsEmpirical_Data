@@ -1,0 +1,157 @@
+[Patch to fix raised issue.
+NOTE: In the stack trace, the exception happens in Scheduler.schedualPeriodically, but this function has been deprecated. Therefore, the patch is now applied within Scheduler.executePeriodically since that's what is being called now from Topic.start().
+The fix involves checking if the timer has already been called stop on before calling schedule on it. That way no calls are made if it has already been cancelled., I think that your "bigger concern" described just above the stack trace is the more important issue here, and I think that fixing that should make your patch (which just deals with the fallout when that fundamental failure occurs) unnecessary.  So I'd recommend that we fix the underlying issue in this JIRA (in 5.11) rather than using the supplied patch to Band-Aid the symptoms and submitting a separate JIRA for the underlying issue, unless for some reason it's not possible to get the underlying issue fixed for 5.11., I agree that the proposed patch is just band-aiding it. This issue, considering its origin, needs to be addressed with a larger-impact fix. To explain the root cause, following are some code excerpts:
+
+BrokerService.isStarted() is used to determine whether to create/add a corresponding (to regular destination) advisory destination and send an advisory message for it accordingly.
+
+activemq-broker/src/main/java/org/apache/activemq/advisory/AdvisoryBroker.java
+
+Lines 605 - 637 [in fireAdvisory(...)]
+if (getBrokerService().isStarted()) {
+     // code to create and populate an advisory message
+     next.send(producerExchange, advisoryMessage);
+     // send will trigger destination creation/addition for this advisory message topic
+}
+
+activemq-broker/src/main/java/org/apache/activemq/broker/BrokerService.java
+
+Lines 501 - 503
+public boolean isStarted() {
+     return started.get() && startedLatch.getCount() == 0;
+}
+
+When a broker is restarted, BrokerService.isStarted() will be false when known destinations are being re-added, so no corresponding advisory topic destinations will be created/added for such topics. Consider the following sequence of steps when the broker is re-starting:
+
+activemq-broker/src/main/java/org/apache/activemq/broker/BrokerService.java
+
+Lines 558 - 612 [in start()]
+if (stopped.get() || !started.compareAndSet(false, true)) {
+     // lets just ignore redundant start() calls
+     // as its way too easy to not be completely sure if start() has been
+     // called or not with the gazillion of different configuration
+     // mechanisms
+     // throw new IllegalStateException("Already started.");
+     return;
+}
+
+// ... some code ...
+startBroker(startAsync);
+// ... some code ... 
+
+Note that this will set to true one of the conditions (AtomicBoolean started) on which isStarted() depends on. However, the second condition (CountDownLatch startedLatch) on which isStarted() depends on will not be decremented down to 0 *until* after all of the known topics/destinations are re-added. After the startBroker(startAsync) call, execution continues within
+
+Lines 665 - 710 [in doStartBroker()]
+
+// ... some code ...
+startDestinations();
+// ... some code ...
+LOG.info("Apache ActiveMQ {} ({}, {}) is starting", new Object[]{ getBrokerVersion(), getBrokerName(), brokerId });
+broker.start();
+// ... some code ...
+startAllConnectors();
+// ... some code ...
+startedLatch.countDown();
+
+The broker.start() call above will trigger the addition of all known topics/destinations and considering the fact that startedLatch.countDown() is called later in the doStartBroker() function above, isStarted() will still be false when re-adding known destinations. Therefore, associated advisory destinations will fail to be added and advisory messages will not be sent out. That's bad. Here is the known destination re-addition code:
+
+activemq-broker/src/main/java/org/apache/activemq/broker/region/AbstractRegion.java
+
+Lines 89 - 110 [in start()]
+// ... some code ...
+context.getBroker().addDestination(context, dest, false);
+// ... some code ...
+
+In summary, the order of these calls makes it impossible for advisory destinations to be created/added for known destinations upon broker restart:
+
+1.	Set “started” AtomicBoolean variable to true
+2.	Re-add all known destinations (associated advisory destinations will fail to be created)
+3.	Decrement “startedLatch” CountDownLatch to 0
+4. isStarted() becomes true
+
+Only after step 3 does isStarted() become true. At that point, we have missed to create the advisory destinations. Other events on those destinations (removal) may trigger the advisory destination addition again, but that can run into issues like the one stated in the initial report. 
+
+To really address this, the order of these events needs to change. However, I need to learn more about all of the dependencies to make sure that other things will not be broken with a potential reordering. 
+
+Any ideas?
+
+NOTE: The order of the above-stated events was confirmed with a stack-trace:
+
+2015-01-06 15:49:41,976 | INFO  | 	at org.apache.activemq.broker.region.AbstractRegion.addDestination(AbstractRegion.java:139) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,976 | INFO  | 	at org.apache.activemq.broker.region.RegionBroker.addDestination(RegionBroker.java:330) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,976 | INFO  | 	at org.apache.activemq.broker.BrokerFilter.addDestination(BrokerFilter.java:171) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,977 | INFO  | 	at org.apache.activemq.advisory.AdvisoryBroker.addDestination(AdvisoryBroker.java:195) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,977 | INFO  | 	at org.apache.activemq.broker.BrokerFilter.addDestination(BrokerFilter.java:171) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,977 | INFO  | 	at org.apache.activemq.broker.BrokerFilter.addDestination(BrokerFilter.java:171) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,977 | INFO  | 	at org.apache.activemq.broker.MutableBrokerFilter.addDestination(MutableBrokerFilter.java:177) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,977 | INFO  | 	at org.apache.activemq.broker.region.AbstractRegion.start(AbstractRegion.java:99) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,978 | INFO  | 	at org.apache.activemq.broker.region.RegionBroker.start(RegionBroker.java:190) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,978 | INFO  | 	at org.apache.activemq.broker.jmx.ManagedRegionBroker.start(ManagedRegionBroker.java:121) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,978 | INFO  | 	at org.apache.activemq.broker.BrokerFilter.start(BrokerFilter.java:187) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,978 | INFO  | 	at org.apache.activemq.broker.BrokerFilter.start(BrokerFilter.java:187) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,979 | INFO  | 	at org.apache.activemq.broker.TransactionBroker.start(TransactionBroker.java:120) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,979 | INFO  | 	at org.apache.activemq.broker.BrokerService$5.start(BrokerService.java:2180) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,979 | INFO  | 	at org.apache.activemq.broker.BrokerService.doStartBroker(BrokerService.java:676) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,979 | INFO  | 	at org.apache.activemq.broker.BrokerService.startBroker(BrokerService.java:660) | org.apache.activemq.broker.region.AbstractRegion | main
+2015-01-06 15:49:41,979 | INFO  | 	at org.apache.activemq.broker.BrokerService.start(BrokerService.java:595) | org.apache.activemq.broker.region.AbstractRegion | main
+
+, I caught the same exception on client side
+It's happens after activating schedulerSupport="true" in the broker.
+
+Stacktrace:
+{code}
+org.springframework.jms.UncategorizedJmsException: Uncategorized exception occured during JMS processing; nested exception is javax.jms.JMSException: Timer already cancelled.
+        at org.springframework.jms.support.JmsUtils.convertJmsAccessException(JmsUtils.java:308)
+        at org.springframework.jms.support.JmsAccessor.convertJmsAccessException(JmsAccessor.java:168)
+        at org.springframework.jms.core.JmsTemplate.execute(JmsTemplate.java:474)
+        at org.springframework.jms.core.JmsTemplate.send(JmsTemplate.java:548)
+        at test.Test.send(Test.java:55)
+Caused by: javax.jms.JMSException: Timer already cancelled.
+        at org.apache.activemq.util.JMSExceptionSupport.create(JMSExceptionSupport.java:54)
+        at org.apache.activemq.ActiveMQConnection.syncSendPacket(ActiveMQConnection.java:1420)
+        at org.apache.activemq.ActiveMQSession.syncSendPacket(ActiveMQSession.java:2018)
+        at org.apache.activemq.ActiveMQMessageProducer.<init>(ActiveMQMessageProducer.java:124)
+        at org.apache.activemq.ActiveMQSession.createProducer(ActiveMQSession.java:1048)
+        at org.springframework.jms.core.JmsTemplate.doCreateProducer(JmsTemplate.java:968)
+        at org.springframework.jms.core.JmsTemplate.createProducer(JmsTemplate.java:949)
+        at org.springframework.jms.core.JmsTemplate.doSend(JmsTemplate.java:568)
+        at org.springframework.jms.core.JmsTemplate$4.doInJms(JmsTemplate.java:551)
+        at org.springframework.jms.core.JmsTemplate.execute(JmsTemplate.java:471)
+        ... 12 more
+Caused by: java.lang.IllegalStateException: Timer already cancelled.
+        at java.util.Timer.sched(Timer.java:397)
+        at java.util.Timer.schedule(Timer.java:248)
+        at org.apache.activemq.thread.Scheduler.executePeriodically(Scheduler.java:41)
+        at org.apache.activemq.broker.region.Topic.start(Topic.java:563)
+        at org.apache.activemq.broker.region.AbstractRegion.addDestination(AbstractRegion.java:141)
+        at org.apache.activemq.broker.region.RegionBroker.addDestination(RegionBroker.java:348)
+        at org.apache.activemq.broker.BrokerFilter.addDestination(BrokerFilter.java:172)
+        at org.apache.activemq.broker.BrokerFilter.addDestination(BrokerFilter.java:172)
+        at org.apache.activemq.advisory.AdvisoryBroker.addDestination(AdvisoryBroker.java:197)
+        at org.apache.activemq.broker.BrokerFilter.addDestination(BrokerFilter.java:172)
+        at org.apache.activemq.broker.BrokerFilter.addDestination(BrokerFilter.java:172)
+        at org.apache.activemq.broker.MutableBrokerFilter.addDestination(MutableBrokerFilter.java:177)
+        at org.apache.activemq.broker.MutableBrokerFilter.addDestination(MutableBrokerFilter.java:177)
+        at org.apache.activemq.broker.region.RegionBroker.send(RegionBroker.java:462)
+        at org.apache.activemq.broker.jmx.ManagedRegionBroker.send(ManagedRegionBroker.java:297)
+        at org.apache.activemq.broker.BrokerFilter.send(BrokerFilter.java:152)
+        at org.apache.activemq.broker.scheduler.SchedulerBroker.send(SchedulerBroker.java:169)
+        at org.apache.activemq.advisory.AdvisoryBroker.fireAdvisory(AdvisoryBroker.java:633)
+        at org.apache.activemq.advisory.AdvisoryBroker.fireProducerAdvisory(AdvisoryBroker.java:601)
+        at org.apache.activemq.advisory.AdvisoryBroker.fireProducerAdvisory(AdvisoryBroker.java:586)
+        at org.apache.activemq.advisory.AdvisoryBroker.addProducer(AdvisoryBroker.java:190)
+        at org.apache.activemq.broker.CompositeDestinationBroker.addProducer(CompositeDestinationBroker.java:56)
+        at org.apache.activemq.broker.BrokerFilter.addProducer(BrokerFilter.java:107)
+        at org.apache.activemq.broker.MutableBrokerFilter.addProducer(MutableBrokerFilter.java:112)
+        at org.apache.activemq.broker.MutableBrokerFilter.addProducer(MutableBrokerFilter.java:112)
+        at org.apache.activemq.broker.TransportConnection.processAddProducer(TransportConnection.java:610)
+        at org.apache.activemq.command.ProducerInfo.visit(ProducerInfo.java:108)
+        at org.apache.activemq.broker.TransportConnection.service(TransportConnection.java:334)
+        at org.apache.activemq.broker.TransportConnection$1.onCommand(TransportConnection.java:188)
+        at org.apache.activemq.transport.MutexTransport.onCommand(MutexTransport.java:50)
+        at org.apache.activemq.transport.WireFormatNegotiator.onCommand(WireFormatNegotiator.java:113)
+        at org.apache.activemq.transport.AbstractInactivityMonitor.onCommand(AbstractInactivityMonitor.java:270)
+        at org.apache.activemq.transport.TransportSupport.doConsume(TransportSupport.java:83)
+        at org.apache.activemq.transport.tcp.TcpTransport.doRun(TcpTransport.java:214)
+        at org.apache.activemq.transport.tcp.TcpTransport.run(TcpTransport.java:196)
+        at java.lang.Thread.run(Thread.java:745)
+{code}, Appears to have been fixed in AMQ-5251]

@@ -1,0 +1,124 @@
+[the deserializer api does get one column at a time. the deserialize() call doesn't have to do anything - it only has to return a handle back for lazy deserialization (where for example - the handle can contain a reference to a byte array). later on specific operators will invoke ObjectInspector interfaces to get access to particular columns - and at this point the objectinspector interface can be implemented to deserialize the relevant part of the byte array (for example).
+
+the default reflection based objectinspector does not work this way - but this is a matter of implementation (we just haven't gotten around to lazy deserialization - and anyway it's dependent on the serialization format).
+
+if u can try and implement lazy deserialization for protocol buffers - that will tell us what else needs to be added in terms of interfaces (right now i am confident that we have enough interfaces, to for example, do lazy deserialization of delimited string format)., Thanks, I'll give that a try.
+
+I haven't dug into the ObjectInspector stuff, but my initial impression is that it feels overly complex and backwards.  Perhaps part of it is the standard deserializers being spread over multiple classes.  It also seems strange that the deserializer can override the declared column types of the table.  My deserializer returns a MetadataListStructObjectInspector, causing all column types to be string.
+
+Here's a rough idea for a new interface:
+
+{noformat}
+interface ColumnSet {
+  String[] getTableColumnNames();
+  ColumnType[] getTableColumnTypes();
+  int[] getUsedColumns();
+  void setColumnValue(int n, Object o);
+}
+
+interface Deserializer {
+  void initialize(Configuration conf, Properties tbl, ColumnSet cols);
+  void deserialize(Writable blob, ColumnSet cols);
+}
+{noformat}
+
+The deserializer would call setColumnValue() for each non-null column from getUsedColumns() index list.  The ColumnSet would be pre-initialized to null for all values.  The deserializer wouldn't need to worry about caching objects, implementing complex interfaces, etc.  It simply makes a single call for each column value.
+
+There might be an overloaded setColumnValue() for standard types like int, Integer, String, etc.  Creating the actual ColumnSet object dynamically at runtime might have some performance advantages., one thing about the SerDe/Objectinspector stuff is that the schema is dictated by the serde. Essentially - the DDL in hive is just a way to create configuration for the native serde (dynamic serde). At this point - what the serde returns whatever the DDL defines.
+
+However - the DDL is not required for all tables. Tables just need to have a SerDe - and the schema will be obtained from the Serde. There is a create table command that just takes in a serde specification (although i can't recount ths syntax off the bat - and there may be issues). We have lots of custom formatted tables in our environment for which the schema is not obtained from a DDL - but from a serde implementation. 
+
+The objectinspector stuff is also complicated because we support complex and nested types. So the ObjectInspector interfaces are somewhat similar to Java Reflection apis and are recursive.
+
+Regarding the specific proposal for the columnset - i think this is implementable inside the objectinspector framework. I take it that the data model is a flat set of columns. the deserialize() implementation will just populate the equivalent of the columnset structure (which is part of ur implementation) and will return a container with reference to the underlying serialized buffer and the columnset structure. You would have to implement a StructObjectInspector (which is what the getObjectInspector() should return). If u look at the methods in this (comments on what the implementation might have to do):
+
+  public List<? extends StructField> getAllStructFieldRefs(); 
+  // this is just getTableColumnNames() from ur columnset struct
+
+  public StructField getStructFieldRef(String fieldName);
+  // this is whatever is required to extract  a field from a underlying buffer - for example some offset or index
+
+  public Object getStructFieldData(Object data, StructField fieldRef);
+  // this actually retrieves the field from the buffer. At this point - you can used information about used/unused columns to return nulls as required.
+
+  public List<Object> getStructFieldsDataAsList(Object data);
+  // this is just a transformation function - i am not entirely sure when this is invoked - but the implementation is obvious
+
+hope this explains things somewhat .. (unfortunately the design/scope of the serde stuff is not that well documented ..)
+, Our current SerDe framework is designed for allowing lazy initialization. That's why we allow the objects inside the memory to be heterogeneous and allow users to specify the object inspector to get the fields out of the object.
+
+The major difficulty that you will see when implementing a new SerDe is probably you need to parse and understand the DDL (which is in thrift). The only easy way for that is to reuse the DynamicSerDe code, and write a new Protocol instead of a new serde. Then you can reuse the code in DynamicSerDe to parse the thrift DDL. You may want to take a look at TBinaryProtocol. (Let us know if you have any other good ideas to represent the types of columns without thrift DDL).
+
+Your idea of skipping columns is an alternative way of achieving efficiency. The good thing is that you can still enjoy the majority of the efficiencies (through pruning columns) while have a simple homogeneous in-memory representation. The bad thing is that there are some potential optimizations that your framework won't be able to do: 1. for different rows, we might want to deserialize different columns because there is an IF or CASE statement; 2. there are some operations that can be calculated without deserializing the whole field: size of the list, sub-field of a field, which are very common if the field is of complex type.
+
+As a result, the use of ObjectInspector provides the best potential performance.
+, @Zheng - can we get lazy deserialization using Dynamic Serde without changing the Dynamic Serde code (and writing a new protocol only?)?
+
+alternatively - we could ignore the whole DDL thing right now and create a table with a custom serde for protocol buffers and put the schema information in the serde properties (which the create table command should support).
+
+Instead of forcing people to use dynamic serde (when they want to use DDL) - one extensibility hook we can add is to generate serde configuration from the parsed DDL information using a callback. Perhaps this can be an optional method in the SerDe. That way - people can add Hive DDL to Protocol Buffer configuration (for example) without having to use Dynamic Serde., Thank you for the detailed explanations.  I now have a much better understanding of SerDe's purpose and scope.  The design of ObjectInspector also makes sense now.  To summarize:
+
+1) SerDe, not the DDL, defines the table schema.  Some SerDe implementations use the DDL for configuration.
+2) Column types can be arbitrarily nested arrays, maps and structures.
+3) The callback design of ObjectInspector allows lazy deserialization with CASE/IF or when using complex or nested types.
+
+, I learned a lot, too. Could someone with a handle on Hive compress this discussion into reusable documentation and post it to the Hive site?, @Joydeep - Yes DynamicSerDe is just a parser for thrift DDL. It calls the respective methods of the protocol for each field. As a result, it's possible to write a protocol without a modifying the Dynamic SerDe code. I don't get your idea of the extensibility hook. I guess the hook is just the same as DynamicSerDe and its Protocols?
+, may be make DDL available to serde through TypeInfo interface (by moving it into serde package) instead of just exposing thrift ddl. joydeep, is that what you meant?, @Zheng - i finally grokked at the Dynamic SerDe code a bit. as i suspected - it reads all the fields in one shot in the deserialize code. this is natural given that the protocol is a thrift protocol and thrift reads all fields in one shot. while it can skip fields - the skipping itself has a cost (ie. if there was a format smart enough to store offsets for each field and go directly to a particular field - dynamic serde would not be able to leverage it).
+
+i did mean what Prasad inferred. that whatever data structures are used to represent type information from the ddl are exposed via a public interface. an additional method call in the serde can be optionally implemented that can take this data structure in and popularte configuration keys (that can then be stored as serdeproperties). it would be trivial to convert the dynamic serde <-> DDL interaction to follow this model as well. 
+
+(will try to educate myself a bit on protocol buffers - a jist would be greatly appreciated though - especially as far as how the serialization lends itself to efficient retrieval of specific fields?), @Jeff: see http://wiki.apache.org/hadoop/Hive/DeveloperGuide#head-075e4c5524138d2674250e664dfb0f40ed57f9ca
+
+@Joydeep: I see. You mean to make the "SQL DDL" -> hierarchical type information (TypeInfo classes) translation a job of the shared utility code? I like this idea. It saves developer a lot of time in understanding "thrift DDL".
+
+{code}
+class DDLColumnInfo {
+  String columnName;
+  TypeInfo columnType;
+}
+
+interface SerDe {
+  /** List<DDLColumnInfo> will provide the column information from SQL DDL.
+   *  If the user created the table with no column information, we will pass null.
+   *  The ObjectInspector returned by getObjectInspector() needs to have the same column names and types as the List<DDLColumnInfo> (if not null).
+   */
+  void intialize(Configuration, Properties, List<DDLColumnInfo> );
+
+  ObjectInspector getObjectInspector() throws SerDeException;
+}
+{code}
+
+By adding an additional parameter List<DDLColumnInfo>, the developers of SerDe do not need to parse the SQL DDL or Thrift DDL.
+
+We already have TypeInfo classes and we just need to move them from ql to serde. It seems trivial to do and all future SerDe can take advantage of List<DDLColumnInfo>. (Although I don't want to change DynamicSerDe at this point unless necessary).
+
+Can you confirm this is what we want?
+, another way of doing this is 
+
+add a new function to SerDe interface that returns list of ColumnInfo (why DDL?) objects. And provide a static utility method that takes a thrift DDL and converts to ColumnInfo/TypeInfo classes and any serde that wants to use DDL in this form can call this function. Others needn't do this., It's not trivial to write a thrift DDL to ColumnInfo/TypeInfo converter.  Why don't we directly go from SQL DDL to TypeInfo?
+, i thought we could pull some code from DynamicSerDe to do that, or may some thrift code. 
+
+couple of reasons are:
+1) simpler interface (imo) 
+2) How do deserializers get initialized in task trackers? we need to transport ColumnInfo objects as javabeans?
+
+But none of these are blocking are critical, so if it is really difficult to convert thrift DDL into TypeInfo then we can do it the way you proposed.
+, I like Zheng's proposal.
+
+The only thing that concerns me is whether the SerDe might find it expensive to bootstrap off DDLColumnInfo. for example - the following would be equivalent - but would allow the SerDe to cache some transformed/serialized version off the DDLInfo in it's own properties that  might be easier (ie. cheaper) for the SerDe to bootstrap off:
+
+- at table creation time - we know the serde/deserializer
+- we call a new method in the Deserializer that translates DDLInfo to some properties:
+
+interface SerDe {
+...
+Properties schemaToProperties(List<DDLColumnInfo) throws UnsupportedSchemaException;
+...
+}
+
+we store the returned Properties as part of SerDeProperties in metastore (that's available in the serde initialize call). The initialize() call signature can be what Zheng proposed. But if the SerDe wants - it can cache a serialized version of the schema in the properties that it finds easier to handle. This will also provide an opportunity for the SerDe to reject any Hive Schemas that it cannot support (for example - if a SerDe cannot support maps - it can reject DDL statements with maps in this step).
+
+Thoughts?
+
+
+]

@@ -1,0 +1,162 @@
+[ideally we would be able to have a store cursor that would walk the messages in the store independent of the dispatch/prefetch cursors. In the meantime, the intent is that the destination memory limit or the MaxExpirePageSize (which ever is smaller) should limit a browse for expiry.
+The logic in Queue.java does a loop paging in messages to reach the memory limit in maxPagesize chunks, that same logic could be applied to durable subs.
+In any event, the limit needs to be checked via the hasSpace callback from the recover call so that fix looks sensible., the follow up to https://issues.apache.org/jira/browse/AMQ-3362 introduced a fix and test for this.
+Maybe that test can be tweaked to reproduce again, not sure from where the regression arrived.
+, We still see this problem with 5.13.2, The outofmemory happens whenever I set the expiremessages other than 0. When I set to 0 and run the test  no OOO and also GC activity looks good.
+
+The other problem we see the durable topics does not seem to be getting cleaned up from active_msgs even if I set expiremessages to 60000 or 90000., We also observed similar message 
+
+2016-07-20 09:19:20,084 | WARN  | Failed to browse Topic: cemp | org.apache.activemq.broker.region.Topic | ActiveMQ Broker[localhost] Scheduler
+java.lang.OutOfMemoryError: Java heap space
+
+Active MQ version: 5.13.3
+
+Could someone please check this issue, this has become big pain now
+Every time we have to restart to over come this issue, the number of messages is quite huge and we're planning to send the records in chunk but not sure if that can solve this issue, Hi,
+I see under debugger that for version 5.13.2 in org.apache.activemq.broker.region.Topic the expireMessagesTask does not check max expire page size which is passed as a parameter to the doBrowse method:
+
+private final Runnable expireMessagesTask = new Runnable() {
+    @Override
+    public void run() {
+        List<Message> browsedMessages = new InsertionCountList<Message>();
+        doBrowse(browsedMessages, getMaxExpirePageSize());
+    }
+};
+
+
+In my case I have default settings for max expire page size eq 400. In doBrowse method are collected all messages belongs to topic into browseList and never is checked max ( or called hasSpace internal method):
+
+private void doBrowse(final List<Message> browseList, final int max) {
+    try {
+        if (topicStore != null) {
+            final List<Message> toExpire = new ArrayList<Message>();
+            topicStore.recover(new MessageRecoveryListener() {
+                @Override
+                public boolean recoverMessage(Message message) throws Exception {
+                    if (message.isExpired()) {
+                        toExpire.add(message);
+                    }
+                    browseList.add(message);
+                    return true;
+                }
+
+                @Override
+                public boolean recoverMessageReference(MessageId messageReference) throws Exception {
+                    return true;
+                }
+
+                @Override
+                public boolean hasSpace() {
+                    return browseList.size() < max;
+                }
+
+                @Override
+                public boolean isDuplicate(MessageId id) {
+                    return false;
+                }
+            });
+            final ConnectionContext connectionContext = createConnectionContext();
+   ...
+}
+ 
+In other words if you have 1 000 000 messages under ACTIVEMQ_MSGS table for same topic all messages will be collected into memory ( browseList) and this can cause OutOfMemoryError.
+, Thank you [~cszczotka], that is indeed a bug, seems only return from recoverMessage is checked by the store.
+maybe https://github.com/apache/activemq/blob/e2b4ca2c59a316be91cf391c758a10e518dd3a1f/activemq-unit-tests/src/test/java/org/apache/activemq/usecases/ExpiredMessagesWithNoConsumerTest.java can provide some inspiration for a unit test to capture this use case and the fix into the future., Question is how we can mitigate this memory issue for system where is running amq 5.13.2. I  can  try to increase –Xmx, make smaller expireMessagesPeriods so we will expire messages more frequently. Do you see other options ?, Not much can be done to truly fix it without a patch.  In the recover method of DefaultJDBCAdapter there needs to be a hasSpace() check done in the recovery loop so it can abort early if memory is full just like KahaDB does.  The proposed fix posted above does exactly this check and looks good to me so it can probably be targeted for a 5.14.1 release.
+
+In the meantime, as you pointed out you can try things like more memory and smaller expire messages period to give yourself a better chance of not running out of memory.
+, Hi,
+I see another issue in amq 5.13.2 related with topic message expiration.   I have one producer which send me messages to MyTopic and one durable subscriber/consumer. Messages are stored in DB and after 30 seconds amq broker trying to expire these messages ( I have configuration entry for this: <amq:policyEntry topic="MyTopic.>" expireMessagesPeriod="30000"> ). I’m getting NullPointerException from AdvisoryBroker and messages are never expired and remain in activemq_msgs table.
+
+java.lang.NullPointerException
+	at org.apache.activemq.advisory.AdvisoryBroker.messageExpired(AdvisoryBroker.java:430)
+	at org.apache.activemq.broker.BrokerFilter.messageExpired(BrokerFilter.java:313)
+	at org.apache.activemq.broker.BrokerFilter.messageExpired(BrokerFilter.java:313)
+	at org.apache.activemq.broker.BrokerFilter.messageExpired(BrokerFilter.java:313)
+	at org.apache.activemq.broker.MutableBrokerFilter.messageExpired(MutableBrokerFilter.java:325)
+	at org.apache.activemq.broker.region.Topic.messageExpired(Topic.java:776)
+	at org.apache.activemq.broker.region.Topic.doBrowse(Topic.java:660)
+
+It is logged on console as WARN:
+
+09:25:30.274 [ActiveMQ Broker[my-broker] Scheduler] WARN  org.apache.activemq.advisory.AdvisoryBroker - Failed to fire expired advisory, reason: java.lang.NullPointerException
+
+
+
+Under debugger I see that in org.apache.activemq.advisory.AdvisoryBroker.messageExpired  baseDestination is null and call baseDestination.getActiveMQDestination() generates NPE
+
+@Override
+public void messageExpired(ConnectionContext context, MessageReference messageReference, Subscription subscription) {
+    super.messageExpired(context, messageReference, subscription);
+    try {
+        if (!messageReference.isAdvisory()) {
+            BaseDestination baseDestination = (BaseDestination) messageReference.getMessage().getRegionDestination();
+            ActiveMQTopic topic = AdvisorySupport.getExpiredMessageTopic(baseDestination.getActiveMQDestination());
+
+ Below is code how messages are produced:
+
+public static class Producer implements Runnable {
+    public void run() {
+        try {
+            ActiveMQConnectionFactory connectionFactory = new ActiveMQConnectionFactory(BROKER_ULR);
+            Connection connection = connectionFactory.createConnection();
+            connection.start();
+            Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+            Topic destination = session.createTopic("MyTopic");
+
+            MessageProducer producer = session.createProducer(destination);
+            producer.setDeliveryMode(DeliveryMode.PERSISTENT);
+            producer.setTimeToLive(30000);
+          
+            for(int i =0; i < 10; i ++) {
+                String text = "Message number " + i +  "  From: " + Thread.currentThread().getName();
+                TextMessage message = session.createTextMessage(text);
+                message.setJMSDestination(destination);
+                producer.send(destination, message);
+
+                Thread.sleep(10000);
+            }
+            // Clean up
+            session.close();
+            connection.close();
+        }
+        catch (Exception e) {
+            System.out.println("Caught: " + e);
+            e.printStackTrace();
+        }
+    }
+}
+
+Under debugger I see that setter method setRegionDestination (org.apache.activemq.command.Message ) is called in org.apache.activemq.broker.region.Topic class before message is send:
+  
+@Override
+public void send(final ProducerBrokerExchange producerExchange, final Message message) throws Exception {
+    final ConnectionContext context = producerExchange.getConnectionContext();
+
+    final ProducerInfo producerInfo = producerExchange.getProducerState().getInfo();
+    producerExchange.incrementSend();
+    final boolean sendProducerAck = !message.isResponseRequired() && producerInfo.getWindowSize() > 0
+            && !context.isInRecoveryMode();
+
+    message.setRegionDestination(this);
+
+I don’t see call this setRegionDestination method when message is loaded from db into memory.
+
+Do you have any idea what can be wrong ? Is it issue in my messages (something is missing)  or it is another bug in amq code ?
+ 
+, Commit b9fad53fc650a9026391bef0fd74aea1bea7ec1b in activemq's branch refs/heads/master from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=b9fad53 ]
+
+https://issues.apache.org/jira/browse/AMQ-6067
+
+The JDBCMessageStore now checks hasSpace() when running a message
+recovery listener to prevent going past the max configured page size
+, Commit a99edb81757899a58d22c54a59294f7d86949659 in activemq's branch refs/heads/activemq-5.14.x from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=a99edb8 ]
+
+https://issues.apache.org/jira/browse/AMQ-6067
+
+The JDBCMessageStore now checks hasSpace() when running a message
+recovery listener to prevent going past the max configured page size
+
+(cherry picked from commit b9fad53fc650a9026391bef0fd74aea1bea7ec1b)
+, Patch and test applied to master and 5.14.x., You should create a new Jira for this issue so it can be tracked separately.]

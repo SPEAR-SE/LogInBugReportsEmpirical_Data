@@ -1,0 +1,312 @@
+[In our environment there are over 3000 datanodes, 100 million file and 150 million blocks.
+When all the datanodes are working, it will take more than one hour to restart the namenode(the time is almost used for block report).
+But if we 
+first stop all the datanodes,
+then restart the namenode,
+last start all the datanodes after the namenode finishes loading editlog,
+it will only take around 20 minutes. , Hi, [~huizane]. It looks like a blockreport storm, which may causes Namenode fullgc. Have you tried {{dfs.blockreport.initialDelay}} ?, Hi [~walter.k.su]
+dfs.blockreport.initailDelay is 600 (10minutes).
+dfs.blockreport.intervalmsec is 36000000 (10 hours)., As mentioned by [~huizane] in the description, the problem seems that blockReport() may send an incremental block report by reportReceivedDeletedBlocks() before sending the full report.  In that case, NN treats the incremental block report as the first block report but not the full report.  The processing time for the full report is increased dramatically., 
+bq. NN treats the incremental block report as the first block report but not the full report. 
+Thanks [~szetszwo]. I think that's excactly the cause:
+{code}
+      if (storageInfo.numBlocks() == 0) { 
+        // The first block report can be processed a lot more efficiently than
+        // ordinary block reports.  This shortens restart times.
+        processFirstBlockReport(storageInfo, newReport);
+      } else {
+        invalidatedBlocks = processReport(storageInfo, newReport);
+      } 
+{code}
+After incremental block report, {{storageInfo.numBlocks()}} is bigger than 0.
+Always send a incremental report before a full report is a behavior introduced in HDFS-2691. The behavior is included in the first version of HA. The reason is like what the comments said:
+{code}
+    // Flush any block information that precedes the block report. Otherwise
+    // we have a chance that we will miss the delHint information
+    // or we will report an RBW replica after the BlockReport already reports
+    // a FINALIZED one.
+{code}
+When NN restart, some DNs are not registered yet. So delHint information is already missed. I think it's ok. However, we need to treat nicely When FINALIZED blockReport arrives(from full report) before a RBW one(from incremental report). , Sorry what I said before was not clear. I mean: If we remove incremental block report before first full report. It's ok delHint is already missed. It's not ok that FINALIZED replica arrives before a RBW one., Missing delHint seems a minor issue.
+
+For reporting RBW after FINALIZED, we have to take it anyway (and the code is already taking care it) since full block report could possibly be delayed as described in the code:
+{code}
+//BlockManager.checkReplicaCorrupt(..)
+        if (reportedState == ReplicaState.RBW) {
+          // If it's a RBW report for a COMPLETE block, it may just be that
+          // the block report got a little bit delayed after the pipeline
+          // closed. So, ignore this report, assuming we will get a
+          // FINALIZED replica later. See HDFS-2791
+          LOG.info("Received an RBW replica for " + storedBlock +
+              " on " + dn + ": ignoring it, since it is " +
+              "complete with the same genstamp");
+          return null;
+        } else ...
+{code}
+
+As a conclusion, NN could safely ignore the incremental when storageInfo.numBlocks() == 0.  What do you think?, {quote}
+NN could safely ignore the incremental when storageInfo.numBlocks() == 0
+{quote}
+NN could safely ignore the incremental when storageInfo.numBlocks() == 0 && storageInfo.getBlockReportCount() == 0
+In case it's a new added DN.
+How about the 001 patch? I think it works too. The first arrived incremental report only add a few block to NN. There is no need to calculate a toRemove list. We can still use {{processFirstBlockReport()}} even when {{storageInfo.numBlocks()}} > 0, Sounds good.  Could you also add a test?  The test should have an incremental block report with some RECEIVING_BLOCK, RECEIVED_BLOCK and DELETED_BLOCK.
+, I trying to write a test covering the if statement.
+{code}
+      if (storageInfo.getBlockReportCount() == 0) {
+        // The first block report can be processed a lot more efficiently than
+        // ordinary block reports.  This shortens restart times.
+        processFirstBlockReport(storageInfo, newReport);
+      } else {
+        invalidatedBlocks = processReport(storageInfo, newReport);
+      }
+      storageInfo.receivedBlockReport();
+{code}
+At first, I try to use {{Mockito.verify(..)}} to count how many times {{BlockManager.processFirstBlockReport(..)}} being called. So I can write a test that make sure {{processFirstBlockReport(..)}} be called only once during DN register. But Mockito doesn't support mock private method. {{getBlockReportCount()}} is visible, but the result is too obviously, because report count only added when {{receivedBlockReport()}} is called. I'm new in testing. I'd appreciate any help., > ... But Mockito doesn't support mock private method. ...
+
+How about changing the method to package private?, I don't think we need to add a test case. It's too obvious {{processFirstBlockReport}} will be called once., Hi Guys,
+
+Thanks for reporting and working on this jira. I have a question here.
+
+Patch 001 does
+{code}
+  if (storageInfo.getBlockReportCount() == 0) {
+        // The first block report can be processed a lot more efficiently than
+        // ordinary block reports.  This shortens restart times.
+        processFirstBlockReport(storageInfo, newReport);
+      } else {
+        invalidatedBlocks = processReport(storageInfo, newReport);
+      }
+      storageInfo.receivedBlockReport();
+{code}
+
+where  {{storageInfo.receivedBlockReport();}} increments the blockReportCount by 1, which means {{processFirstBlockReport(storageInfo, newReport);}} will be called only once (for the first block report, incremental or full).  
+
+However, it's stated "We can still use processFirstBlockReport() even when storageInfo.numBlocks() > 0":
+{quote}
+How about the 001 patch? I think it works too. The first arrived incremental report only add a few block to NN. There is no need to calculate a toRemove list. We can still use processFirstBlockReport() even when storageInfo.numBlocks() > 0
+{quote}
+
+The question is, with patch 001, how can  {{processFirstBlockReport()}} be used even when storageInfo.numBlocks() > 0? I mean, after the first use of {{processFirstBlockReport()}}, blockReportCount is incremented by 1, thus preventing {{processFirstBlockReport()}} from being used again for later reports.
+
+Thanks.
+
+
+, When I said "even when storageInfo.numBlocks() > 0" I mean only for the first full report. Not for later reports. Sorry I didn't express myself clearly in English., Thanks [~walter.k.su].
+
+Since an incremental block report is sent before a full block report, the incremental block report will be processed by {{processFirstBlockReport(storageInfo, newReport);}} and all the rest of the block reports including the full block reports will be processed by {{invalidatedBlocks = processReport(storageInfo, newReport);}}, would you please explain how your change helps the performance issue? I guess I lack some understanding here.
+
+See [~szetszwo]'s comment
+{quote}
+As mentioned by Hui Zheng in the description, the problem seems that blockReport() may send an incremental block report by reportReceivedDeletedBlocks() before sending the full report. In that case, NN treats the incremental block report as the first block report but not the full report. The processing time for the full report is increased dramatically.
+{quote}
+
+Thanks.
+, The incremental block report is processed by {{processIncrementalBlockReport}} via RPC call {{blockReceivedAndDeleted}}, while both {{processFirstBlockReport}} and (public or private) {{processReport}} is used for full report., > I don't think we need to add a test case. It's too obvious processFirstBlockReport will be called once.
+
+Agree.  It is obvious processFirstBlockReport is only called once.  However, after the patch, processFirstBlockReport could be called when storageInfo.numBlocks() > 0.  It needs a test for checking the correctness., Hi [~walter.k.su],
+
+Thanks for clarifying. I'd suggest that we do the following renaming for better readability:
+
+- {{processReport}} to {{porcessFullBlockReport}}
+- {{porcessFirstBlockReport}} to {{processFirstFullBlockReport}}
+- {{blockReportCount}} to {{fullBlockReportCount}}
+- {{getBlockReportCount}} to {{getFullBlockReportCount}}
+
+Plus some related set methods. Doesn't have to be done in this jira though.
+
+
+
+, +1 for adding a unit test., bq. It needs a test for checking the correctness.
+It makes sense. I can do that., 003 patch is ready for review., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 29s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | javac |   7m 28s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 37s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:green}+1{color} | checkstyle |   7m 45s | There were no new checkstyle issues. |
+| {color:green}+1{color} | install |   1m 31s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   3m  6s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:green}+1{color} | native |   3m 12s | Pre-build of native portion |
+| {color:red}-1{color} | hdfs tests | 185m 45s | Tests failed in hadoop-hdfs. |
+| | | 233m 59s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.server.blockmanagement.TestDatanodeManager |
+|   | hadoop.hdfs.server.namenode.ha.TestHASafeMode |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12728688/HDFS-7980.003.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / feb68cb |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/10426/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/10426/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf909.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/10426/console |
+
+
+This message was automatically generated., The failure of TestHASafeMode.testBlocksAddedWhileStandbyIsDown seems related.  Could you take a look?, 004 patch fixes failed test.
+By the way:
+1. If a block exists in Full BR, not in IBR. It should be processed by {{processFullFullBlockReport(..)}}. ( This is how it was treated since long ago)
+2. If a block exists in Full BR, also in IBR. It's ok to be processed by {{processFullFullBlockReport(..)}}. ( Because it's well handled by IBR processing logic)
+3. If a block is not in Full BR, but in IBR. It's created and deleted very soon. The block doesn't relate to this issue.
+I think the test included in the patch is ok. If you have any idea adding more tests, please let me know. 
+Thanks., (!) The patch artifact directory has been removed! 
+This is a fatal error for test-patch.sh.  Aborting. 
+Jenkins (node H4) information at https://builds.apache.org/job/PreCommit-HDFS-Build/10495/ may provide some hints., (!) The patch artifact directory has been removed! 
+This is a fatal error for test-patch.sh.  Aborting. 
+Jenkins (node H3) information at https://builds.apache.org/job/PreCommit-HDFS-Build/10516/ may provide some hints., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  1s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12729034/HDFS-7980.004.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / a319771 |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/10744/console |
+
+
+This message was automatically generated., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12729034/HDFS-7980.004.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / a319771 |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/10770/console |
+
+
+This message was automatically generated., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12729034/HDFS-7980.004.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / ffce9a3 |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/10819/console |
+
+
+This message was automatically generated., The patch could not be applied.  Could you repost it?, reposted 004 patch., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 32s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 28s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 37s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:green}+1{color} | checkstyle |   2m 15s | There were no new checkstyle issues. |
+| {color:red}-1{color} | whitespace |   0m  1s | The patch has 1  line(s) that end in whitespace. Use git apply --whitespace=fix. |
+| {color:green}+1{color} | install |   1m 32s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 35s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   3m  4s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:green}+1{color} | native |   3m 13s | Pre-build of native portion |
+| {color:red}-1{color} | hdfs tests | 176m 48s | Tests failed in hadoop-hdfs. |
+| | | 219m 37s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.tracing.TestTraceAdmin |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12730824/HDFS-7980.004.repost.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / a583a40 |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/10833/artifact/patchprocess/whitespace.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/10833/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/10833/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf902.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/10833/console |
+
+
+This message was automatically generated., The patch looks good.  Just a question on the test:
+{code}
+    // blk_42 is finalized.
+    long receivedBlockId = 42;  // arbitrary
+    BlockInfoContiguous receivedBlock = addBlockToBM(receivedBlockId);
+{code}
+Why adding the block to BM directly before the incremental and full reports?, Fsimage saves Files, and block Ids belonging to some files. when fsimage is loaded, before first block report, and NN in safe mode. Each block should belong to some file. Because stored BlockInfo is created according to INodeFile proto. Stored BlockInfo has id, blockcollection, and empty triplets[]. triplets will be filled after block report.
+
+>... Why adding the block to BM directly before the incremental and full reports?
+I want to create stored BlockInfo has empty triplets[].
+stored BlockInfo is stored only when file is created/appended. Block report will not add stored BlockInfo. Reported block only affects triplets[] of stored BlockInfo.
+If I don't call {{addBlockToBM}}, the incremental and full reports have no effect.
+I did include a test when there is no stored BlockInfo.
+// blk_45 is not in full BR, because it's deleted.
+
+The issue here is to make sure when {{storageInfo.numBlocks()>0}} we still can use {{processFirstBlockReport}}. So I didn't include tests covering all functions of block reports., Thanks for explaining it.
+
++1 patch looks good.
+
+I have committed this.  Thanks, Walter!, FAILURE: Integrated in Hadoop-trunk-Commit #7760 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/7760/])
+HDFS-7980. Incremental BlockReport will dramatically slow down namenode startup.  Contributed by Walter Su (szetszwo: rev f9427f1760cce7e0befc3e066cebd0912652a411)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #188 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/188/])
+HDFS-7980. Incremental BlockReport will dramatically slow down namenode startup.  Contributed by Walter Su (szetszwo: rev f9427f1760cce7e0befc3e066cebd0912652a411)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk-Java8 #188 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/188/])
+HDFS-7980. Incremental BlockReport will dramatically slow down namenode startup.  Contributed by Walter Su (szetszwo: rev f9427f1760cce7e0befc3e066cebd0912652a411)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #178 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/178/])
+HDFS-7980. Incremental BlockReport will dramatically slow down namenode startup.  Contributed by Walter Su (szetszwo: rev f9427f1760cce7e0befc3e066cebd0912652a411)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Yarn-trunk #921 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/921/])
+HDFS-7980. Incremental BlockReport will dramatically slow down namenode startup.  Contributed by Walter Su (szetszwo: rev f9427f1760cce7e0befc3e066cebd0912652a411)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #2119 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2119/])
+HDFS-7980. Incremental BlockReport will dramatically slow down namenode startup.  Contributed by Walter Su (szetszwo: rev f9427f1760cce7e0befc3e066cebd0912652a411)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2137 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2137/])
+HDFS-7980. Incremental BlockReport will dramatically slow down namenode startup.  Contributed by Walter Su (szetszwo: rev f9427f1760cce7e0befc3e066cebd0912652a411)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+,    
+   Recently, we encountered the same problem in our cluster of version 2.4.1 and created a patch(https://github.com/dengzhhu653/hdfs-2.4.1/blob/master/hadoop-241.patch) according to the patch attached. let the restarted NN process the first full report by the faster processFirstBlockReport method, and add an condition AddBlockResult.ADDED==result in addStoredBlockImmediate method when FSNameSystem tries to invoke incrementSafeBlockCount method.
+   
+   The problem is I am not so sure if there exists any potential issues of the patch when I apply it to our cluster , any advises and opinions will be greatly appreciated and taken seriously, thanks!, Pulled this into 2.6.1. Made minor code changes (usage of the non-absent AddBlockResult with a boolean), dropped java-7'isms and edited the test to not use the non-absent BlockListAsLongs.Builder.
+
+Ran compilation and TestBlockManager before the push., Attaching the patch that I committed to 2.6.1.]

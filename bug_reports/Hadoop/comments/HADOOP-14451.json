@@ -1,0 +1,347 @@
+[Below are bits from stacktrace:
+
+Thread1
+{code}
+  java.lang.Thread.State: RUNNABLE
+	at org.apache.hadoop.fs.RawLocalFileSystem.setPermission(RawLocalFileSystem.java:739)
+	at org.apache.hadoop.fs.RawLocalFileSystem$LocalFSFileOutputStream.<init>(RawLocalFileSystem.java:224)
+	at org.apache.hadoop.fs.RawLocalFileSystem$LocalFSFileOutputStream.<init>(RawLocalFileSystem.java:208)
+{code}
+	
+Thread2
+{code}
+   java.lang.Thread.State: RUNNABLE
+	at org.apache.hadoop.mapred.FadvisedFileRegion.transferSuccessful(FadvisedFileRegion.java:160)
+	at org.apache.hadoop.mapred.ShuffleHandler$Shuffle$1.operationComplete(ShuffleHandler.java:1166)
+	at org.jboss.netty.channel.DefaultChannelFuture.notifyListener(DefaultChannelFuture.java:427)
+	at org.jboss.netty.channel.DefaultChannelFuture.notifyListeners(DefaultChannelFuture.java:413)
+{code}
+
+	
+The above threads looks to be blocked by below two stacks
+	
+Stack1:
+{code}
+"New I/O worker #1" #135 prio=5 os_prio=0 tid=0x00007f1f60817800 nid=0x697d in Object.wait() [0x00007f1f4429a000]
+   java.lang.Thread.State: RUNNABLE
+	at org.apache.hadoop.io.nativeio.NativeIO$POSIX.<clinit>(NativeIO.java:184)
+	at org.apache.hadoop.mapred.FadvisedFileRegion.transferSuccessful(FadvisedFileRegion.java:160)
+	at org.apache.hadoop.mapred.ShuffleHandler$Shuffle$1.operationComplete(ShuffleHandler.java:1166)
+{code}
+	
+Stack2:
+{code}
+"ContainersLauncher #16" #365 prio=5 os_prio=0 tid=0x00007f1f49c8a800 nid=0x7cd0 in Object.wait() [0x00007f1f32891000]
+   java.lang.Thread.State: RUNNABLE
+	at org.apache.hadoop.io.nativeio.NativeIO.initNative(Native Method)
+	at org.apache.hadoop.io.nativeio.NativeIO.<clinit>(NativeIO.java:645)
+	at org.apache.hadoop.fs.RawLocalFileSystem.setPermission(RawLocalFileSystem.java:739)
+{code}
+	
+*Stack1* is blocked by *Stack2* as *Stack1* thread needs *NativeIO* class initialization to finish, so the problematic stack looks to be Stack 2	
+Next in Stack 2 @  NativeIO.java:645 initNative in a native call, and it tries to initialize the native-hadoop library
+
+so in Stack 2: it try to do this in NativeIO.c via *Java_org_apache_hadoop_io_nativeio_NativeIO_initNative*
+{code}static void consts_init(JNIEnv *env) {
+  jclass clazz = (*env)->FindClass(env, NATIVE_IO_POSIX_CLASS);
+  #define NATIVE_IO_POSIX_CLASS "org/apache/hadoop/io/nativeio/NativeIO$POSIX"
+   i.e create class org.apache.hadoop.io.nativeio.NativeIO$POSIX{code}
+   
+but *Stack1* is already in {{org.apache.hadoop.io.nativeio.NativeIO$POSIX.<clint>}}
+so it deadlock and all threads hang, A flavor of https://bugs.openjdk.java.net/browse/JDK-8037567  but not same, rather caused by application code, attaching affected nodemanager jstack
+For the background of the issue, test NM seem to have all containers timeout after restart, and hence from jstack, arrived at above conclusion with deadlock in NativeIO, Some references
+https://docs.oracle.com/javase/8/docs/technotes/guides/jni/spec/functions.html#FindClass  
+https://docs.oracle.com/javase/specs/jls/se8/html/jls-12.html#jls-12.4.2  , Thank you [~ajithshetty] .Analysis makes sense to me. The same could cause dead lock.
+Tried a sample program to simulate.
+{code}
+		Thread one=new Thread(){
+			@Override
+			public void run() {
+				NativeIO.isAvailable();
+			}
+		};		
+		Thread two=new Thread(){
+			@Override
+			public void run() {
+				NativeIO.POSIX.isAvailable();
+		}
+		};
+		two.start();	
+		one.start();
+		one.join();
+		two.join();
+{code}
+*stack trace*
+{code}
+"Thread-1" #9 prio=5 os_prio=0 tid=0x00007f1b90c5f000 nid=0x6843 in Object.wait() [0x00007f1b80ba3000]
+   java.lang.Thread.State: RUNNABLE
+	at org.apache.hadoop.io.nativeio.NativeIO.initNative(Native Method)
+	at org.apache.hadoop.io.nativeio.NativeIO.<clinit>(NativeIO.java:644)
+	at org.apache.hadoop.io.nativeio.TestNative$1.run(TestNative.java:8)
+
+"Thread-2" #10 prio=5 os_prio=0 tid=0x00007f1b90c58000 nid=0x6842 in Object.wait() [0x00007f1b80ca4000]
+   java.lang.Thread.State: RUNNABLE
+	at org.apache.hadoop.io.nativeio.NativeIO$POSIX.<clinit>(NativeIO.java:184)
+	at org.apache.hadoop.io.nativeio.TestNative$2.run(TestNative.java:15)
+{code}
+
+Affected versions are *2.8.0 and hadoop3*
+
+
+cc/ [~cmccabe_impala_fa3f]  , Hi [~vinayrpet] , [~rakesh_r] , [~martinw] any thoughtss??, I am not actively working on this, so my thoughts may be wide of the mark.  Does this issue occur with
+
+{code}
+if (NativeIO.isAvailable()) {
+  NativeIO.POSIX.getCacheManipulator().posixFadviseIfPossible(identifier, fd, getPosition(), getCount(), POSIX_FADV_DONTNEED);
+}
+{code}
+
+
+
+
+, [~martinw]
+We tried the same the approach could solve the problem. But in all {{NativeIO.POSIX}} usage location we have to check.
+[~ajithshetty] Any other solution in your mind?, Only other suggestion I can think of is to break down {{initNative()}} into smaller functions, e.g. {{initNativePosix()}}, {{initNativeStat()}}... Each of which is initialised by a static block within its inner class.  , Attached a simple approach of avoiding deadlock., i think people here are more interested in uploading a patch rather than discussing with the submitter if analysis and approach is right. If i have added well amount of analysis, i would probably have a solution too. Anyways, feel free to assign to self if that's the case, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 15s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red}  0m  0s{color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 12m 29s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 30s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 59s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 15s{color} | {color:green} trunk passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 19s{color} | {color:red} hadoop-common-project/hadoop-common in trunk has 19 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 35s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 20s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 12m 20s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 30s{color} | {color:orange} hadoop-common-project/hadoop-common: The patch generated 3 new + 125 unchanged - 6 fixed = 128 total (was 131) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  6m 48s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 28s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 55m  5s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.io.nativeio.TestNativeIO |
+|   | hadoop.security.TestRaceWhenRelogin |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:14b5c93 |
+| JIRA Issue | HADOOP-14451 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12869855/HADOOP-14451-01.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux dadb630df3c8 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 1a56a3d |
+| Default Java | 1.8.0_131 |
+| findbugs | v3.1.0-RC1 |
+| findbugs | https://builds.apache.org/job/PreCommit-HADOOP-Build/12395/artifact/patchprocess/branch-findbugs-hadoop-common-project_hadoop-common-warnings.html |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/12395/artifact/patchprocess/diff-checkstyle-hadoop-common-project_hadoop-common.txt |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/12395/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/12395/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/12395/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Looks like the 'simple' approach is not working for this after all for this Native IO.
+ [~ajithshetty], Please continue your analysis., Uploaded the patch, as per [~martinw]'s suggestion.
+
+1. Split into separate code blocks in NativeIo.c
+
+{{initNative()}}, {{initNativePosix()}} and {{initNativeWindows()}}
+
+2. Refactored the workaround for threadsafe workaround for some platforms for {{getpwduid}} calls.
+ Instead of looking back from Native code for static variable 
+ {{workaroundNonThreadSafePasswdCalls}}, passing itself directly via native method itself as parameter. Currently its only required for POSIX, using this variable for {{initNativePosix()}} only (same as before).
+
+3. Tests added separate classes for Windows and POSIX to load static blocks separately in forked JVMs., Verified the tests manually. 
+
+{{TestNativeIoInitPosix}} timesout without src change as expected.
+
+{{TestNativeIoInitWindows}} passes with/without src change as this is only future proof test.
+
+Please review., | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 13s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 16m 38s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 13m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 49s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 54s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m  7s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green} 12m  7s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 12m  7s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 38s{color} | {color:orange} hadoop-common-project/hadoop-common: The patch generated 7 new + 130 unchanged - 0 fixed = 137 total (was 130) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 50s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 36s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 32s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 82m  5s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | HADOOP-14451 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12907044/HADOOP-14451-02.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 7b75bf2bba84 3.13.0-135-generic #184-Ubuntu SMP Wed Oct 18 11:55:51 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 836643d |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/14012/artifact/out/diff-checkstyle-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/14012/testReport/ |
+| Max. process+thread count | 1714 (vs. ulimit of 5000) |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/14012/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Fixed checkstyles., | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 15s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 17m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 13m 58s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  7s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 41s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 52s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m  7s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green} 12m  7s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 12m  7s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m  1s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 58s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  9m 20s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 34s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 84m  3s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | HADOOP-14451 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12907077/HADOOP-14451-03.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux e7ccc7a3e2f1 3.13.0-135-generic #184-Ubuntu SMP Wed Oct 18 11:55:51 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 6e27b20 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/14014/testReport/ |
+| Max. process+thread count | 1349 (vs. ulimit of 5000) |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/14014/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, updated the patch. 
+Unified the tests into single class., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 18s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 18m 59s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 14m 16s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 38s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 14s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m  8s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 33s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 59s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 47s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green} 12m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 12m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 38s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  3s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m  7s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  8m 41s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 35s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 86m 55s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.http.TestHttpServerWithSpengo |
+|   | hadoop.security.token.delegation.web.TestWebDelegationToken |
+|   | hadoop.log.TestLogLevel |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | HADOOP-14451 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12910549/HADOOP-14451-04.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux cb9ad4ac7418 3.13.0-135-generic #184-Ubuntu SMP Wed Oct 18 11:55:51 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 60971b8 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/14114/artifact/out/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/14114/testReport/ |
+| Max. process+thread count | 1398 (vs. ulimit of 5500) |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/14114/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+]

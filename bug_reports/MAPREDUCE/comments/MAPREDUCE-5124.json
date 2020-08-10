@@ -1,0 +1,884 @@
+[This is also similar to YARN-270 where the RM could fall behind when processing NM status updates., I've designed and prototyped to deal with this problem as follows:
+
+1. AsyncDispatcher should have the capacity of blocking queue to limit memory usage.
+2. AsyncDispatcher should have the capacity of handling events per sec to limit CPU usage.
+
+This prototype can only handle 1 in AsyncDispatcher.
+If this design is acceptable, I'll create umbrella tickets and continue to implement. Any idea?, Can you please give more details.  When you say it should have the capacity for handling event per second what does that mean?  Is it telling the tasks to stop backoff?, Also I am very nervous about the possibilities of deadlocks if the AsyncDispatcher can block.  The simple case would be two threads in the async dispatcher.  The queue is almost full and some RPC calls come in that fill it up fully.  At the same time each of these two running threads also try to insert something into the dispatcher and block.  Now we cannot process anything anymore because there are no free threads to process data.
+
+I would really prefer a model where the RPC changes and can respond with a try again later.  So that if the AM/RM is falling behind the RPC layer can detect that and throttle new events coming into the system.  We would need to also change some of the logic in the system so a node/task would not be declared as dead because the AM/RM was so far behind in events that it told the heart beats to try again later until it times out.  But that would probably just be a minimal event or even better a simple concurrent data structure., 返信
+
+> When you say it should have the capacity for handling event per second what does that mean? 
+
+It means that AsyncDispatcher#dispatch limits the consuming events per sec to avoid the starvation of CPU by a large number of event processing. It just limits the number of processing events. If the error should be returned to the tasks, it should be done when the producers of queue enqueues or RPC layer as Robert described.
+
+> Also I am very nervous about the possibilities of deadlocks if the AsyncDispatcher can block. 
+
+I understood the possibility of deadlock you pointed out. I will change the design to deal with this problem at RPC layer. The code as follow is the concept code. Is it enough to restrict at server side and retry at client side? If the answer is positive, I'll prototype it at RPC layer.
+
+{code:java}
+// client side
+try {
+  // synchronous RPC call
+  rpcMethod1();
+} catch (TemporaryBuzyException ise) {
+  // handling retry
+} catch (IOException ioe) {
+  // handling SocketTimeoutException or
+  // some connection-related eror
+}
+{code}
+
+{code:java}
+// server side(org.apache.hadoop.ipc.Server)
+void processData() {
+    if (isBusy()) {
+      setupResponse(responseBuffer, readParamsFailedCall, RPCProto.Error, 
+  TemporaryBuzyException.getClass(), …);
+    } else {
+      // process RPC usually
+    } 
+}
+{code}
+, I believe in most cases it is enough to restrict it at the server side and retry at the client side, but there are some RPC calls that are different and perhaps should be handled slightly differently.  YARN-309 went in to try and throttle the hearbeats, instead of rejecting them and asking them to retry.  I think this is preferable for heartbeats over an outright rejection.  Simply because we know that the heartbeats are going to come regularly and asking the next one to wait does not reduce the total amount of work that we are going to need to do.
+
+So I would throw a ToBusyRetryLater type of exception for once time RPC calls when the AsyncDispatcher's queue is over a high water mark, but for heartbeats I would want them to scale the frequency based off of how busy the AsyncDispatcher is.  , I apologize for delaying reply.
+
+> So I would throw a ToBusyRetryLater type of exception for once time RPC calls when the AsyncDispatcher's queue is over a high water mark, but for heartbeats I would want them to scale the frequency based off of how busy the AsyncDispatcher is.
+
+It's better idea. I'll try to implement both heartbeat-style RPC and one-time RPC., I attached a rough prototype to restrict onetime-style RPC with keeping the backward compatibility. This prototype includes changes as follows:
+
+1. adding RPC header to callType to distinguish ONETIME with HEATBEAT.
+2. adding a new error code(ToBusyRetryLaterException).
+3. adding a counter to restrict numbers of processing RPC within high-water mark to Server#Handler.
+
+In a mean while, this prototype does NOT include:
+1. test codes.
+2. creating response to decide the heatbeat period dynamically to client.
+
+If this design is acceptable, I make the next patch which include both of them. If you have any question about the design, let me know., [~jlowe], [~ozawa], [~revans2] Does increasing the task report interval sound like a viable approach to alleviate the issue here? Right now the report interval is hardcoded as 3 seconds. 
+We could make the task report interval configurable and increase the interval with some heuristics to limit the number of task status updates per unit time., For this case I think increasing the task heartbeat period would help.  The problem is the task heartbeats are piling on asynchronous events faster than they are being consumed, so if they were posted less frequent the AM could keep up.  A configurable task report interval would be a simple and straightforward approach which would give users a knob to turn when this happens for large jobs that run very wide.  Alternatively the AM could look at the number of events queued up and automatically tune the task heartbeat., Thanks a lot for your comments, [~jlowe]. [~karthik_p] and I discussed both approaches offline, and we decided to propose the former due to its simplicity and it should be sufficient in most cases. Not sure if there is anyone working on this. Can I assign this to myself and start the implementation of the making the interval configurable?, Turns out MapReduce-6242 has already made the task heartbeat period configurable (mapreduce.task.progress-report.interval). Will leave this to implement the other approach, automatic task flow control, as Jason suggested., Thank you, [~ozawa] for the patch and the design and [~jlowe], [~haibochen], [~revans2], and [~tgraves] for the design suggestions. I think there is an approach that does not cause deadlocks but it is a little bit more robust. The AM is the usual bottleneck. Because of this, it should be the side to drive the communication. Could the server (AM) send the heartbeat to the client (Task)?
+{code}
+  foreach task in tasks
+      thread.run(()->{while(…){sendHeartBeat(task);metric = receiveHeartBeat(task);process(metric);sleep(3secs);});
+{code}
+The processing of metrics, which is the bottleneck is blocking the loop above (not scheduled into AsyncDispatcher), so the heartbeat frequency will degrade gracefully as the number of tasks increase. For example, it will be a little bit more than 3 seconds with 2 tasks. It will be much longer like 40 seconds with 100000 tasks, but all the participants remain responsive and no exceptions or errors are thrown. The previously suggested approach would unnecessarily create rejected heartbeat messages on the network that may become the bottleneck at scale. The actual code may use asynchronous calls not to create a thread for each task., Having the AM send the heartbeat means the AM needs to be the client in the RPC connection since only servers receive method calls.  That creates two problems in practice.  First is the discovery problem -- how does the AM know the listening port for each task?  Second is thread scaling since the client RPC layer creates a thread for every connection.  That means a thread per task which is not going to work for large jobs.
+
+bq. The actual code may use asynchronous calls not to create a thread for each task.
+
+This is really the key and the only thing necessary to solve the problem. The root cause of this problem is that the AM is quickly sending a response to each heartbeat without actually processing it.  That creates a flow control issue since the rate of processing heartbeats is somewhat disconnected from the incoming rate.  Therefore we can receive them at a rate far greater than it takes to process, causing an unbounded pileup of backlogged events.  The reason the AM behaves this way is that it needs to free up the IPC Server handler thread so it can handle other tasks requests, like other heartbeats, new task attempt connections, task requests, etc.  There's lots of other places in YARN and MAPREDUCE where a similar tactic is taken with the resulting flow control issue as a result.
+
+The real fix is to not send a heartbeat reply until the heartbeat is completely processed.  Then there will only ever be as many outstanding heartbeats and metrics status updates as there are task attempts running at the time, rather than an unbounded number based on the rate difference between how fast the tasks are posting heartbeats and how fast the AsyncDispatcher can process them.  If we were able to synchronously process the heartbeat in a way that doesn't completely tie up an IPC Server handler thread for the duration of the heartbeat call then we're all set.  Task heartbeats naturally slow down as the ability of the AM to process them degrades.  No need for the AM to be explicit about rejecting requests or the AM itself doing any 3 second sleeping.  We just need to leverage the functionality added in HADOOP-11552 so we aren't compelled to reply to heartbeats before they are fully processed to free up an IPC Server thread.
+, Just a question - we already have https://issues.apache.org/jira/browse/HADOOP-10597. Can't we just enable this feature inside the MRAppMaster when it creates the RPC server for TaskUmbilicalProtocol? (I guess that's the message which mappers/reducers call). Then in {{TaskReporter}} we handle {{RetriableException}} and increase the heartbeat interval, let's say double it. If it succeeds after a couple of reports, we can try to decrease it again, back to the original value. This might not be the best flow control method, but we can think about this., Turning on the RPC backoff feature alone will not be enough, as the call queues aren't backing up today.  We'd have to change the processing of the heartbeat to be synchronously processed by the IPC server handler thread rather than thrown on the AsyncDispatcher event queue as it's done today.  That means we'll quickly start tying up server handler threads for large jobs, and that will end up choking out more important method calls like task assignment, task completion, etc.  It would probably work but be far from ideal when things start to become congested., Thank you, [~jlowe] for the previous reply. Let me address your concerns there. You are right, doing an asynchronous call leveraging HADOOP-11552 is probably the smallest change possible in this case.
+What I was trying to solve is the theoretical problem sending heartbeat with metrics from large amount of tasks with graceful degradation with interval T and minimal delay D. The delay for a metric is {{D+T/2}}, when read from the AM. It waited D amount of time in the queue and once available it will be sampled with a mean delay of {{T/2}}. If the server controls the heartbeat both graceful degradation and minimal delay are met, since there is no delay D=0, the heartbeat is processed right away. If the task controls the heartbeat the average wait time adds to the delay of the current metrics, so any consumer will get those later. Indeed this would also mean making the client socket connection act as an RPC server, which is quite a big change.
+I think either the server needs to control the heartbeat to minimize the delay (indeed a too big a change), or the task needs to tweak the heartbeat interval based on the previous response time as [~pbacsko] has suggested. The second option could be implemented on top of HADOOP-11552., bq. I think either the server needs to control the heartbeat to minimize the delay (indeed a too big a change), or the task needs to tweak the heartbeat interval based on the previous response time as Peter Bacsko has suggested.
+
+The issue here isn't that tasks are seeing a long delay in heartbeat response time and failing to react to that.  The problem is the AM is accepting and quickly responding to them at a rate far higher than it can actually process them in the background AsyncDispatcher thread.  In other words, by the time a task notices a significant delay in heartbeat processing time the AM has probably already started going into GC hell and it's likely too late to course-correct at that point.  The only way to get reliable feedback on how long the processing is really taking is to make the heartbeat processing synchronous, so the task doesn't get a response until the processing has actually completed.  Without async RPC call support, that has the issue of tying up the server handler threads which prevents more important calls from being processed in a timely manner., [~jlowe], I absolutely agree that the heartbeat should be synchronous, with no new call until the previous is processed and I also agree that the async RPC support is needed to process other important messages. This solves the graceful degradation issue. What I am saying is that once 100000 mappers send these heartbeats and wait for them, there will be a delay processing them due to the server bottleneck, so the metric would reach the client later, unless we minimize the delay with either a server to client approach or a dynamic heartbeat interval., Ah, sorry, I thought we were still worrying about how to keep the AM from exploding.  Sure, I could see a dynamic heartbeat still being useful once the flow control problem is addressed.  Even with the current async processing without flow control we could feedback to the task information on how long to wait until the next heartbeat (e.g.: leverage the current AsyncDispatcher event queue size to scale the next task heartbeat interval accordingly) which could help avoid continued heartbeat pileups for large jobs., [~jlowe] yesterday I had a discussion with [~miklos.szegedi@cloudera.com] about the possible implementations of this.
+
+We came up with different solutions which I'll try to summarize here.
+
+* Throttling: we try to determine whether an event for a particular task update has been processed or not. If not, then we don't try to process the new status update. We can examine the event queue of the AsyncDispatcher and try find update event that belongs to the same attempt ID. I can think of two approaches here:
+*# Server-side throttling: block inside MRAppMaster until the status update is fully processed. If I'm not mistaken, this completely blocks the current RPC server thread, so too many status updates in parallel might make it impossible to process other RPC calls.
+*# Client-side throttling: we return without dispatching {{TaskAttemptStatusUpdateEvent}} to the event queue, but set a field in {{AMFeedBack}}, indicating that the AM is busy. The client checks the result. If the flag is set, it doubles the status update interval, resulting in fewer status update calls to the AM. 
+* Use the deferred RPC response mechanism implemented in HADOOP-11552. This means that we have to retrieve the callback object from the current RPC calling context and pass it over until the full update logic is executed. This is doable, although one event might create another event and it's not entirely clear when the operation can be considered finished. Getting rid of some asynchronicity can help, although I'm not sure if this kind of change is dangerous or not.
+* Let the AM drive the whole status update mechanism as explained by Miklos. This looks too complicated and the change would be too big, at least for this JIRA.
+
+I haven't been deeply considering the pros and cons of the proposed solutions. Personally I like the client-side throttling and the deferred RPC callback.
+
+If we go for throttling, we also have to think about how we determine when we need to push the client back to send updates less frequently. We can check the size of the current event queue, but Miklos had some convincing arguments against doing it. We can look for already existing TaskAttemptStatusUpdateEvent:s (what I suggested above) but that means iteration which is more expensive. I can't see a simple, silver-bullet solution right now., As you point out, it's probably going to be bad for the IPC server thread to block since that will likely cause all server threads to block shortly thereafter preventing any RPC processing until the blockage clears.  That is definitely a throttle, but it could be severe enough to cause task failures if they can't contact the AM in a timely manner.
+
+For the throttling case we could do something similar to what was done in YARN to help mitigate NM heartbeats overwhelming the RM.  We could still dispatch status update events to the task attempts for every heartbeat, but instead of attaching the status update directly to the event we could attach the status payload to the TaskAttempt directly.  If there's already an unprocessed status event pending on the TaskAttempt we can then coalesce the two status updates into a single status update.  Coalescing should be pretty straightforward since the newer status should clobber the older status for most of the payload.  Then when the status update event arrives at the TaskAttempt it processes the status update object, if there is one, then clears it.  This should largely mitigate the problem since the memory pressure from all these events is primarily from the status payload attached to each event.  If the server thread makes sure there is only at most one outstanding status payload per task then we have an upper limit on the number of outstanding status payloads the AM has to track.
+
+With this approach I don't think it will be necessary to scan or otherwise track each status update events posted to the dispatcher.  They're going to be very small once the status payload is removed, and they'll be quick to process if its corresponding status payload was coalesced into an earlier payload.  If desired we could also combine this idea with the client-side throttle hint in the RPC response, since the server thread will know whether it coalesced a status update or not.  If it did then we could tell the client to throttle a bit for the next update.
+
+Deferred RPC response could be useful here, but I haven't thought through how tricky it would be to implement in practice.
+
+I agree that switching the AM to be the one that drives heartbeats is not appropriate here.  My feeling is it creates as many problems as it solves.
+
+My current recommendation is to try the coalesce status updates approach as was done for NM heartbeats to the RM.  That was pretty effective there at mitigating the backlog issues, and I think it could work well here too.  As a bonus it makes it trivial to determine when we should tell a client to backoff a bit if we choose to do that as well.
+, Thanks Jason for the insights.
+
+Could you give me the location of the code that handles this situation in the Resource Manager? I'd like to take a look at those.
+
+You mentioned that "coalescing" the events should do the job. Are you suggesting to update {{TaskAttemptImpl.reportedStatus}} directly? This indeed seems to be a reasonable thing to do.
+
+But are you sure this would eliminate the problem completely? We'd still put the same number of {{TaskAttemptStatusUpdateEvent}} to the dispatcher's queue, so with a lot of tasks, it could still put a considerable stress on the AM.
+
+
+, bq. Could you give me the location of the code that handles this situation in the Resource Manager?
+
+It's between RMNodeImpl and the scheduler.  RMNodeImpl's StatusUpdateWhenHealthyTransition used to blindly send a scheduler event for every node heartbeat, but now it queues up the container updates and only sends an event if it knows there isn't one already pending.  The scheduler then pulls all container updates from the queue when it receives a node status update event.  See the handling of nextHeartBeat and nodeUpdateQueue in RMNodeImpl.
+
+bq. Are you suggesting to update TaskAttemptImpl.reportedStatus directly?
+
+Maybe, or just have a separate field representing the pending status that the TaskAttempt will reference when receiving a status update event.  I haven't looked at it closely enough to see if it makes more sense to update reportedStatus directly rather than keep it separate until the status update event is processed.  There is a bit of processing that occurs when updating the status, so TaskAttemptImpl would need some way to know whether or not that has already occurred when a status update event arrives.  Keeping it separate makes it straightforward to distinguish.
+
+bq. We'd still put the same number of TaskAttemptStatusUpdateEvent to the dispatcher's queue, so with a lot of tasks, it could still put a considerable stress on the AM.
+
+Again the vast majority of the stress is because of the _payload_ of all those events.  We'd be eliminating that overhead, and processing a status event when there's no pending status payload to update would be very fast.  So the end result would be a much smaller heap (i.e.: much less GC pressure which leads to the vicious cycle) and faster processing of the extra status update events (i.e.: the AM can catch up much faster).
+
+Although now that I think about it, we can also eliminate the extra status events by doing something similar to the RMNodeImpl-YarnScheduler interaction.  If we know when we are coalescing task status updates then we know that a previous status update has not been processed yet, so we can avoid sending a redundant status update event.  That will eliminate both the payload overhead and the event overhead.
+, I've got some updates. I tried to use the deferred callback mechanism implemented in HADOOP-11552 and it doesn't work. It's because HADOOP-11552 solved the issue for {{ProtobufRpcEngine}} but MapRed status updates use {{WritableRpcEngine}}. So either we completely drop this approach or implement HADOOP-11552 for Writable RPC calls as well., bq. So either we completely drop this approach or implement HADOOP-11552 for Writable RPC calls as well.
+
+...or change TaskUmbilicalProtocol to use protobufs which would be a lot more sensible if we want to pursue the deferred call approach.  See MAPREDUCE-6706.  WritableRpcEngine is something the community has tried get rid of already, so I wouldn't recommend investing more engineering effort into it.
+
+At this point I think the status coalesce approach I described above is probably the simplest and least risky to implement.
+, I agree with the coalescing approach. I'll come up with a simple POC soon., I created a POC which uses this "event coalescing approach".
+
+I roughly describe what changed:
+* Added new method {{setNextUpdate()}} to {{TaskAttemptImpl}}
+* Added the mapping of TaskAttemptID <-> TaskAttemptImpl
+* At each {{statusUpdate()}}, we call {{setNextUpdate()}} and don't pass the status object as a payload
+* In the {{StatusUpdater}} transition, we check if we need to update the status or not. If needsUpdate=true, then we run the original updater logic.
+
+If we have backlog of task update events for a given attempt and that attempt hasn't been updated, the {{StatusUpdater}} will not do anything because {{needsUpdate}} will be false.
+
+I also kept the original updating logic, that is, retrieving it from the event. First I tried to remove the original constructor of {{TaskAttemptStatusUpdateEvent}} but it caused compilation errors in various classes. It turned out that quite a few test cases use the old approach to manipulate the status of a task attempt. I didn't want to introduce too many code changes. Not sure what's the best solution in this case.
+
+[~jlowe] could you take a look at this POC?, By the way, I tested this modification on a 8-node cluster and changed the update interval to a small value and it worked well without any problems., Hm, I believe there's a race condition in my previous patch.
+
+1. Task attempt invokes setNextStatusUpdate() via RPC
+2. This results in attempt.needStatusUpdate = true
+3. However, an update for the same attempt is already running, setting needStatusUpdate = false at the end
+4. New event is queued
+5. New event is taken from the queue, updater logic runs
+6. Updater logic sees that needStatusUpdate = false -- an update is lost
+
+I'll re-think this and update the patch., I uploaded POC v2. This should be free of race conditions. Plus, we only dispatch update events to the queue if it's necessary., Thanks for the patch!
+
+I'm not a fan of TaskAttemptListenerImpl knowing about TaskAttemptImpl.  It circumvents the TaskAttempt interface, and I don't think it's necessary.  The reason it wants to know about TaskAttemptImpl is so it can stash the status update there, but we could stash it other places which may be cleaner.
+
+For example, TaskAttemptListenerImpl could keep a collection of status updates, and the status update event could point to where the listener is holding the event.  The object in the async event would need to be an AtomicReference or something fancier so the status update event can be updated while the async event is in flight.  The first thing the TaskAttemptImpl would do when receiving the status event is atomically swap the status reference with null.  The listener can tell whether the attempt received the status by checking whether the previous reference was null when swapping it back in.
+
+I don't think it's OK to simply clobber a previous status with a subsequent status.  For example, if the previous status has counters and the later status does not, we should preserve the counters from the previous status.  Similarly, if there are fetch failures reported in the previous stauts, those need to be copied into the subsequent status.  This will make atomic updates of the status trickier, and we may need some locking involved so we can atomically update the status to prevent the attempt trying to consume a status while the listener is in the process of coalescing it., Thanks Jason.
+
+Are you sure we can't just replace the status updates? I checked the code of TaskReporter, to me it seems that counters/fetch failures cannot be removed, only altered/increased. If you think about it, we send updates in every 3 seconds anyway - so if it's a problem, then it would appear on the client side, too (that is, losing data).
+
+I agree with your comment regarding the mapping - passing a reference in the event is a good idea., Just a quick update on the GC usage improvement. I know the POC is not the final version, but I still, I decided to check how much it improves.
+
+I added a 2 second sleep to {{StatusUpdater.transition()}} to cause event backlog and used a mapper code which constantly called {{reporter.progress()}} in a loop. I also decreased update interval to 100 ms.
+
+GC events in the with the old code:
+{noformat}
+[GC (Allocation Failure)  52224K->8221K(200192K), 0.0130368 secs]
+[GC (Allocation Failure)  60445K->10200K(252416K), 0.0119459 secs]
+[GC (Metadata GC Threshold)  59477K->10902K(252416K), 0.0151800 secs]
+[Full GC (Metadata GC Threshold)  10902K->9053K(201216K), 0.0446707 secs]
+[GC (Allocation Failure)  113501K->19028K(251904K), 0.0136092 secs]
+[GC (Metadata GC Threshold)  78026K->17595K(305664K), 0.0226579 secs]
+[Full GC (Metadata GC Threshold)  17595K->12774K(347648K), 0.0501647 secs]
+[GC (Allocation Failure)  221670K->24081K(377344K), 0.0199000 secs]
+[GC (Allocation Failure)  260113K->29187K(378368K), 0.0277259 secs]
+[GC (Allocation Failure)  265219K->39660K(373248K), 0.0384575 secs]
+[GC (Allocation Failure)  267500K->48473K(378368K), 0.0370554 secs]
+[GC (Allocation Failure)  276313K->55049K(371200K), 0.0417077 secs]
+[GC (Allocation Failure)  275721K->61521K(365568K), 0.0270593 secs]
+[GC (Allocation Failure)  275025K->67873K(359936K), 0.0417392 secs]
+[GC (Allocation Failure)  274721K->74129K(345088K), 0.0531881 secs]
+[GC (Allocation Failure)  274833K->80089K(347648K), 0.0270885 secs]
+[GC (Allocation Failure)  274649K->85921K(345088K), 0.0313155 secs]   <-- I killed the job at this point
+{noformat}
+
+With the POC:
+{noformat}
+[GC (Allocation Failure)  52224K->8183K(200192K), 0.0228069 secs]
+[GC (Allocation Failure)  60407K->10370K(252416K), 0.0135163 secs]
+[GC (Metadata GC Threshold)  60383K->10958K(252416K), 0.0174618 secs]
+[Full GC (Metadata GC Threshold)  10958K->8924K(198144K), 0.0452158 secs]
+[GC (Allocation Failure)  113372K->18810K(254976K), 0.0132976 secs]
+[GC (Metadata GC Threshold)  80801K->17577K(302592K), 0.0137089 secs]
+[Full GC (Metadata GC Threshold)  17577K->12903K(345088K), 0.0579774 secs]
+[GC (Allocation Failure)  221799K->24221K(382976K), 0.0188251 secs]
+[GC (Allocation Failure)  268445K->24870K(384000K), 0.0164503 secs]
+[GC (Allocation Failure)  269094K->19999K(381952K), 0.0155673 secs]  <-- final event
+{noformat}
+
+I think the difference speaks for itself., bq. Are you sure we can't just replace the status updates?
+
+Yes.  For the counters, I was thinking of Tez which only sends the counters every other status update or so.  For MapReduce I think we're OK on the counters since they're sent every heartbeat.  However we're not OK when it comes to the failed fetch tasks.  These are only sent once, and once the status report has been sent successfully are cleared:
+{code}
+            amFeedback = umbilical.statusUpdate(taskId, taskStatus);
+            taskFound = amFeedback.getTaskFound();
+            taskStatus.clearStatus();
+{code}
+and ReduceTaskStatus wipes out the fetchFailedTasks:
+{code}
+  synchronized void clearStatus() {
+    super.clearStatus();
+    failedFetchTasks.clear();
+  }
+{code}
+
+bq. If you think about it, we send updates in every 3 seconds anyway - so if it's a problem, then it would appear on the client side, too (that is, losing data).
+
+As I mentioned above, Tez only sends them every so often and the AM tracks the last one received.  If that were to happen here and we were to clobber the counters on a previous pending status with a null counters from the current status then we would drop that update.  The listener should receive a subsequent status update eventually with counters that will correct that problem, but in the interim the counters will be inaccurate primarily due to a mishandling on the listener side that can be corrected.
+
+As for the fetch failures, these are one-time trigger events that will never be resent.  Looking at how TaskAttemptImpl and JobImpl interprets them, it doesn't expect these to be a cumulative list since otherwise it would end up repeatedly blaming maps for fetch failures every status update and would not be able to distinguish when a reducer is making a new complaint about a map versus repeating an old complaint.
+
+So we need to coalesce the fetch failures between pending status updates or they could be dropped.  Either that or we need to move the handling of those failures reported in the status from the task attempt to the task listener.
+, [~jlowe] many thanks for the detailed explanation. I believe I have a working solution but I have to test it. I was able to eliminate the locking overhead as well. Will update the POC tomorrow., I attached POC v3.
+
+Main changes:
+1. Status events are stored in TaskAttemptListener
+2. There is a mapping between attemptId <-> status
+3. Status is wrapped in an AtomicReference, so no locking is necessary
+4. When an async update is necessary, we pass the AtomicRef in the constructor of the task update event
+5. We don't simply replace already existing status update events. Counters & fetch failed maps are merged if necessary., [~jlowe] could you pls check the latest proposal? , Thanks for updating the patch!  The approach looks good to me.  Realize this is POC, but I reviewed it as a "real" patch.  Apologies if many of these were already planned on being fixed in the real patch.  Thought I'd get a head start on that patch's review.  ;-)
+
+There's a bug here:
+{code}
+     if (!lastStatusRef.compareAndSet(lastStatus, taskAttemptStatus)) {
+        // update failed - async dispatcher has processed it in the meantime
+        taskAttemptStatus.counters = oldCounters;
+        taskAttemptStatus.fetchFailedMaps = oldFetchFailedMaps;
+        asyncUpdatedNeeded = true;
+     }
+{code}
+compareAndSet doesn't set if the compare failed, so taskAttemptStatus never gets posted to the reference and ultimately ends up going nowhere after it is restored.
+
+The listener should check if we fail to lookup the ref for the specified attempt ID and throw an exception with a useful message.
+
+Is there a reason not to use the YARN attempt ID as the key?  That would preclude the need to convert it on register and unregister, and it's already being converted to the YARN record for other reasons during the status update code.
+
+The TaskAttemptListenerImpl#statusUpdate method could really use a refactor.  I recommend factoring out the portion that converts the TaskStatus into a TaskAttemptStatus and separately factor out the portion that coalesces events when necessary.
+
+The TaskAttemptListener whitespace change isn't necessary.
+
+The reportedTaskAttemptStatus field in TaskAttemptStatusUpdateEvent should be removed.  The code can have a constructor for the event that converts a status to an atomic reference of the status if we don't want to update the existing usages in the tests, but we shouldn't support anything but the reference in the getter method and in the listener code.  Way too confusing to continue exposing two getter methods.
+, Thanks for the comments [~jlowe]. I uploaded the first patch.
+
+What's new:
+1. Your comments have been addressed
+2. I added new tests and refactored {{TestTaskAttemptListenerImpl}} heavily because there was a lot of copy-paste there. I think it's much nicer now.
+
+I still have one question regarding counters. When I was writing the tests, it turned out that {{Counters}} object inside the {{TaskStatus}} cannot be null. If it is, then we got an NPE thrown from the constructor of {{AbstractCounters}}. I'm talking about this part:
+
+{noformat}
+    taskAttemptStatus.counters = new org.apache.hadoop.mapreduce.Counters(
+      taskStatus.getCounters());
+{noformat}
+
+We already know that counters are always sent from MR tasks, but what about Tez? I checked the Tez codebase, but I haven't found any call to {{statusUpdate()}}. , ping [~jlowe], Thanks for updating the patch!  Sorry for the delay.
+
+bq. We already know that counters are always sent from MR tasks, but what about Tez?
+
+Sorry for the confusion.  I was referring to Tez as an example of a framework that has counters but doesn't send them on every task update.  I didn't mean to imply Tez is calling the MR code directly.  We can remove the code that checks if the counters are null to simplify things since you found they can't be null in practice for other reasons.
+
+This comment was not addressed which will cover the case of a rogue task trying to heartbeat:
+{quote}
+The listener should check if we fail to lookup the ref for the specified attempt ID and throw an exception with a useful message.
+{quote}
+
+The EventHandler import added in TaskAttemptListenerImpl is unused.
+
+Nit: This whitespace change is more harmful than helpful to readability, IMO.
+{noformat}
+@@ -427,6 +437,8 @@ public AMFeedback statusUpdate(TaskAttemptID taskAttemptID,
+       }
+     }
+ 
++
++
+  // Task sends the information about the nextRecordRange to the TT
+     
+ //    TODO: The following are not needed here, but needed to be set somewhere inside AppMaster.
+{noformat}
+
+Nit: In StatusUpdater#transition newReportedStatus does not need a separate declaration as the code can declare it when it is assigned.
+
+Normally listener would be set to null after closing to avoid a potential double-close:
+{code}
+  public void after() throws IOException {
+    if (listener != null) {
+      listener.close();
+    }
+  }
+{code}
+
+, I also kicked Jenkins which mysteriously did not comment on this patch.  It looks like there will be some checkstyle issues that should be addressed with exceeding 80 columns and other nitty things, but it'd also be good to see a unit test run., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 10s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 45s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 14m 46s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 38s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 29s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m 16s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 32s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m  7s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 39s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 26s{color} | {color:orange} hadoop-mapreduce-project/hadoop-mapreduce-client: The patch generated 16 new + 258 unchanged - 5 fixed = 274 total (was 263) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 19s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 27s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 53s{color} | {color:green} hadoop-mapreduce-client-app in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}135m 16s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 25s{color} | {color:red} The patch generated 1 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}189m 30s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.mapreduce.security.ssl.TestEncryptedShuffle |
+|   | hadoop.mapreduce.v2.TestUberAM |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | MAPREDUCE-5124 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12897988/MAPREDUCE-5124-001.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux ae225d3068d4 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 0ed44f2 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7231/artifact/out/diff-checkstyle-hadoop-mapreduce-project_hadoop-mapreduce-client.txt |
+| unit | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7231/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7231/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7231/artifact/out/patch-asflicense-problems.txt |
+| Max. process+thread count | 1288 (vs. ulimit of 5000) |
+| modules | C: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: hadoop-mapreduce-project/hadoop-mapreduce-client |
+| Console output | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7231/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks [~jlowe] for the comments & clarifying the Tez stuff.
+
+I uploaded patch v2. I fixed numerous things, including checkstyle & formatting issues. Added a check for non-existing attemptId + test.
+
+The test failures seem to be unrelated, I was not able to reproduce those., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 10m 20s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m  9s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 15m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 37s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 32s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 59s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m 39s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 35s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m  9s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 34s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 27s{color} | {color:orange} hadoop-mapreduce-project/hadoop-mapreduce-client: The patch generated 3 new + 258 unchanged - 5 fixed = 261 total (was 263) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 49s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m 10s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 32s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  9m 19s{color} | {color:green} hadoop-mapreduce-client-app in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}131m 48s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 31s{color} | {color:red} The patch generated 1 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}198m  7s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.mapreduce.v2.TestUberAM |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | MAPREDUCE-5124 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12898881/MAPREDUCE-5124-002.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 0e6c44904d8a 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 782ba3b |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7234/artifact/out/diff-checkstyle-hadoop-mapreduce-project_hadoop-mapreduce-client.txt |
+| unit | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7234/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7234/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7234/artifact/out/patch-asflicense-problems.txt |
+| Max. process+thread count | 1350 (vs. ulimit of 5000) |
+| modules | C: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: hadoop-mapreduce-project/hadoop-mapreduce-client |
+| Console output | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7234/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks for updating the patch!  Looks good overall.  I agree the unit test failure appears to be unrelated as is the license issue.
+
+For the Preconditions check that was added, the code ends up doing all the work of constructing the message string only to throw it away most of the time.  The code should either do a straightforward null-check-and-throw or use the Preconditions method that takes a format string and format arguments so the string is only formatted if the check fails.
+
+It would be good to fix the checkstyle indentation issues.
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  9m 54s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 50s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 15m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 37s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 32s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 59s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m  7s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 35s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m  9s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 29s{color} | {color:green} hadoop-mapreduce-project/hadoop-mapreduce-client: The patch generated 0 new + 258 unchanged - 5 fixed = 258 total (was 263) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m 29s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 33s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  9m 17s{color} | {color:green} hadoop-mapreduce-client-app in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}130m  0s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 31s{color} | {color:red} The patch generated 1 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}199m 22s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.mapreduce.v2.TestUberAM |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | MAPREDUCE-5124 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12899077/MAPREDUCE-5124-003.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux efa85b6738dd 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / b46ca7e |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7235/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7235/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7235/artifact/out/patch-asflicense-problems.txt |
+| Max. process+thread count | 1360 (vs. ulimit of 5000) |
+| modules | C: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: hadoop-mapreduce-project/hadoop-mapreduce-client |
+| Console output | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7235/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, [~jlowe] I think the patch should be OK now.
+
+Do you think it makes sense to backport this to branch-2 or branch-2.9?, Thanks for updating the patch!  +1 lgtm.
+
+bq. Do you think it makes sense to backport this to branch-2 or branch-2.9?
+
+I agree this should be backported to older release lines since this is an issue that affects every 2.x release.  I'd be willing to commit this through branch-2.8 and branch-2.7 if you're willing to provide the backported patches.  Holding off on the trunk commit and leaving this JIRA open for the branch-2 (and potentially older) patches.
+, I backported the patch for branch-2, branch-2.9, branch-2.8 and branch-2.7. Let's wait for the build results., For some reason, builds have not started in Jenkins. [~jlowe] could you check it out? Not sure what I did wrong - I think patch naming is correct, that's what I did in a previous JIRA., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 19m 36s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+|| || || || {color:brown} branch-2 Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 57s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 13m  0s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 20s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 32s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 10s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 27s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 41s{color} | {color:green} branch-2 passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 10s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 17s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  1m 17s{color} | {color:red} hadoop-mapreduce-project_hadoop-mapreduce-client generated 1 new + 400 unchanged - 3 fixed = 401 total (was 403) {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 28s{color} | {color:orange} hadoop-mapreduce-project/hadoop-mapreduce-client: The patch generated 2 new + 248 unchanged - 5 fixed = 250 total (was 253) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  2s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 34s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 55s{color} | {color:green} hadoop-mapreduce-client-app in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}178m 57s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 29s{color} | {color:red} The patch generated 45 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}234m 40s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Unreaped Processes | hadoop-mapreduce-client-jobclient:10 |
+| Failed junit tests | hadoop.mapreduce.security.ssl.TestEncryptedShuffle |
+|   | hadoop.mapreduce.security.TestMRCredentials |
+| Timed out junit tests | org.apache.hadoop.mapreduce.TestMRJobClient |
+|   | org.apache.hadoop.mapred.TestMiniMRClasspath |
+|   | org.apache.hadoop.mapred.TestClusterMapReduceTestCase |
+|   | org.apache.hadoop.mapred.TestMRIntermediateDataEncryption |
+|   | org.apache.hadoop.mapred.TestMRTimelineEventHandling |
+|   | org.apache.hadoop.mapreduce.TestMapReduceLazyOutput |
+|   | org.apache.hadoop.mapred.TestMiniMRWithDFSWithDistinctUsers |
+|   | org.apache.hadoop.mapred.TestReduceFetch |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:17213a0 |
+| JIRA Issue | MAPREDUCE-5124 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12899630/MAPREDUCE-5124-branch-2.001.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux ca5aba6e88fd 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 9d406e5 |
+| maven | version: Apache Maven 3.3.9 (bb52d8502b132ec0a5a3f4c09453c07478323dc5; 2015-11-10T16:41:47+00:00) |
+| Default Java | 1.7.0_151 |
+| findbugs | v3.0.0 |
+| javac | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7241/artifact/out/diff-compile-javac-hadoop-mapreduce-project_hadoop-mapreduce-client.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7241/artifact/out/diff-checkstyle-hadoop-mapreduce-project_hadoop-mapreduce-client.txt |
+| Unreaped Processes Log | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7241/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient-reaper.txt |
+| unit | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7241/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7241/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7241/artifact/out/patch-asflicense-problems.txt |
+| Max. process+thread count | 4921 (vs. ulimit of 5000) |
+| modules | C: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: hadoop-mapreduce-project/hadoop-mapreduce-client |
+| Console output | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7241/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Manually kicking the Jenkins build worked.  Not sure what happened yesterday.
+
+The javac warning is relevant.  The patch removed the suppress directive for this.
+
+The 2.9 patch is the same as the branch-2 patch, and given those branches are super close I don't see the need to run Jenkins just for that.
+
+I'm posting the 2.8 patch again to trigger Jenkins to run on branch-2.8.  The same javac warning will be there, but it will be good to see if there's anything else it finds., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 16m 48s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+|| || || || {color:brown} branch-2.8 Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 43s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 56s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 10s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 25s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 56s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 13s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 33s{color} | {color:green} branch-2.8 passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m  8s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 11s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  1m 11s{color} | {color:red} hadoop-mapreduce-project_hadoop-mapreduce-client generated 1 new + 364 unchanged - 3 fixed = 365 total (was 367) {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 23s{color} | {color:orange} hadoop-mapreduce-project/hadoop-mapreduce-client: The patch generated 1 new + 276 unchanged - 0 fixed = 277 total (was 276) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 28s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  9m 35s{color} | {color:green} hadoop-mapreduce-client-app in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}121m 56s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 21s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}168m  0s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Unreaped Processes | hadoop-mapreduce-client-jobclient:2 |
+| Timed out junit tests | org.apache.hadoop.mapred.TestClusterMapReduceTestCase |
+|   | org.apache.hadoop.mapreduce.v2.TestMiniMRProxyUser |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:c2d96dd |
+| JIRA Issue | MAPREDUCE-5124 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12899871/MAPREDUCE-5124-branch-2.8.001.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 50926f3067c8 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / 3219b1b |
+| maven | version: Apache Maven 3.0.5 |
+| Default Java | 1.7.0_151 |
+| findbugs | v3.0.0 |
+| javac | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7242/artifact/out/diff-compile-javac-hadoop-mapreduce-project_hadoop-mapreduce-client.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7242/artifact/out/diff-checkstyle-hadoop-mapreduce-project_hadoop-mapreduce-client.txt |
+| Unreaped Processes Log | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7242/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient-reaper.txt |
+| unit | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7242/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7242/testReport/ |
+| Max. process+thread count | 1856 (vs. ulimit of 5000) |
+| modules | C: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: hadoop-mapreduce-project/hadoop-mapreduce-client |
+| Console output | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7242/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Updated patches - Javadoc & checkstyle errors were hopefully eliminated., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 20m 14s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+|| || || || {color:brown} branch-2 Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 19s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  9m 36s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 21s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 30s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  4s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 22s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 39s{color} | {color:green} branch-2 passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 10s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 17s{color} | {color:green} hadoop-mapreduce-project_hadoop-mapreduce-client generated 0 new + 401 unchanged - 2 fixed = 401 total (was 403) {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 27s{color} | {color:orange} hadoop-mapreduce-project/hadoop-mapreduce-client: The patch generated 1 new + 248 unchanged - 5 fixed = 249 total (was 253) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  2s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 34s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  9m  0s{color} | {color:green} hadoop-mapreduce-client-app in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}118m 36s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 26s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}170m 42s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Unreaped Processes | hadoop-mapreduce-client-jobclient:2 |
+| Timed out junit tests | org.apache.hadoop.mapred.TestClusterMapReduceTestCase |
+|   | org.apache.hadoop.mapred.TestMRIntermediateDataEncryption |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:17213a0 |
+| JIRA Issue | MAPREDUCE-5124 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12900029/MAPREDUCE-5124-branch-2.002.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 393cce7f2752 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 5bb6329 |
+| maven | version: Apache Maven 3.3.9 (bb52d8502b132ec0a5a3f4c09453c07478323dc5; 2015-11-10T16:41:47+00:00) |
+| Default Java | 1.7.0_151 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7243/artifact/out/diff-checkstyle-hadoop-mapreduce-project_hadoop-mapreduce-client.txt |
+| Unreaped Processes Log | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7243/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient-reaper.txt |
+| unit | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7243/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7243/testReport/ |
+| Max. process+thread count | 2313 (vs. ulimit of 5000) |
+| modules | C: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: hadoop-mapreduce-project/hadoop-mapreduce-client |
+| Console output | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7243/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks for updating the patches!  +1 for the latest branch-2 patch.  The checkstyle nit is unnecessary.  The unit test failures appear to be unrelated, as they pass for me locally with the patch applied.
+
+Uploading the branch-2.8 patch again to get a Jenkins run on it.  , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  9m 12s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+|| || || || {color:brown} branch-2.8 Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 46s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  8m 19s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 14s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 28s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  4s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 14s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 30s{color} | {color:green} branch-2.8 passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m  8s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  9s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m  9s{color} | {color:green} hadoop-mapreduce-project_hadoop-mapreduce-client generated 0 new + 365 unchanged - 2 fixed = 365 total (was 367) {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 27s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  9m 23s{color} | {color:green} hadoop-mapreduce-client-app in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}155m 50s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 23s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}194m 36s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Unreaped Processes | hadoop-mapreduce-client-jobclient:4 |
+| Timed out junit tests | org.apache.hadoop.mapred.TestClusterMapReduceTestCase |
+|   | org.apache.hadoop.mapred.TestMiniMRWithDFSWithDistinctUsers |
+|   | org.apache.hadoop.mapreduce.TestChild |
+|   | org.apache.hadoop.mapreduce.v2.TestMiniMRProxyUser |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:c2d96dd |
+| JIRA Issue | MAPREDUCE-5124 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12900069/MAPREDUCE-5124-branch-2.8.002.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 1f4c1359b5c3 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / eacccf1 |
+| maven | version: Apache Maven 3.0.5 |
+| Default Java | 1.7.0_151 |
+| findbugs | v3.0.0 |
+| Unreaped Processes Log | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7244/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient-reaper.txt |
+| unit | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7244/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7244/testReport/ |
+| Max. process+thread count | 2912 (vs. ulimit of 5000) |
+| modules | C: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: hadoop-mapreduce-project/hadoop-mapreduce-client |
+| Console output | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7244/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, +1 for the branch-2.8 patch as well.  The unit tests failures appear to be unrelated and all pass for me locally with the patch applied.
+
+Uploading the 2.7 patch which looks good to me.  Assuming Jenkins run looks good as well I'll commit everything tomorrow.
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 15m 11s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+|| || || || {color:brown} branch-2.7 Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 51s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  8m 39s{color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 26s{color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 37s{color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 10s{color} | {color:green} branch-2.7 passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  0m 53s{color} | {color:red} hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app in branch-2.7 has 1 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 42s{color} | {color:green} branch-2.7 passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 10s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 22s{color} | {color:green} hadoop-mapreduce-project_hadoop-mapreduce-client generated 0 new + 689 unchanged - 2 fixed = 689 total (was 691) {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 32s{color} | {color:orange} hadoop-mapreduce-project/hadoop-mapreduce-client: The patch generated 14 new + 616 unchanged - 8 fixed = 630 total (was 624) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  9m 34s{color} | {color:red} hadoop-mapreduce-client-app in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}309m 31s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 48s{color} | {color:red} The patch generated 16 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}357m 45s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Unreaped Processes | hadoop-mapreduce-client-jobclient:13 |
+| Failed junit tests | hadoop.mapreduce.v2.app.job.impl.TestJobImpl |
+|   | hadoop.mapred.TestMRIntermediateDataEncryption |
+|   | hadoop.mapred.TestJobSysDirWithDFS |
+| Timed out junit tests | org.apache.hadoop.mapred.TestClusterMRNotification |
+|   | org.apache.hadoop.mapred.TestMiniMRClasspath |
+|   | org.apache.hadoop.mapred.TestMultiFileInputFormat |
+|   | org.apache.hadoop.mapred.TestMRCJCFileInputFormat |
+|   | org.apache.hadoop.mapred.TestClusterMapReduceTestCase |
+|   | org.apache.hadoop.mapred.TestMRTimelineEventHandling |
+|   | org.apache.hadoop.mapred.TestJobCounters |
+|   | org.apache.hadoop.mapred.TestJobName |
+|   | org.apache.hadoop.mapred.TestJobCleanup |
+|   | org.apache.hadoop.mapred.TestMiniMRWithDFSWithDistinctUsers |
+|   | org.apache.hadoop.mapred.TestNetworkedJob |
+|   | org.apache.hadoop.mapred.TestMiniMRClientCluster |
+|   | org.apache.hadoop.mapred.TestReduceFetchFromPartialMem |
+|   | org.apache.hadoop.mapred.TestLazyOutput |
+|   | org.apache.hadoop.mapred.TestReduceFetch |
+|   | org.apache.hadoop.mapred.TestMiniMRChildTask |
+|   | org.apache.hadoop.ipc.TestMRCJCSocketFactory |
+|   | org.apache.hadoop.mapred.TestMerge |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:67e87c9 |
+| JIRA Issue | MAPREDUCE-5124 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12900107/MAPREDUCE-5124-branch-2.7.002.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 8ceb5d5f216a 3.13.0-129-generic #178-Ubuntu SMP Fri Aug 11 12:48:20 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.7 / 7252e18 |
+| maven | version: Apache Maven 3.0.5 |
+| Default Java | 1.7.0_151 |
+| findbugs | v3.0.0 |
+| findbugs | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7245/artifact/out/branch-findbugs-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-app-warnings.html |
+| checkstyle | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7245/artifact/out/diff-checkstyle-hadoop-mapreduce-project_hadoop-mapreduce-client.txt |
+| Unreaped Processes Log | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7245/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient-reaper.txt |
+| unit | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7245/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-app.txt |
+| unit | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7245/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7245/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7245/artifact/out/patch-asflicense-problems.txt |
+| Max. process+thread count | 4878 (vs. ulimit of 5000) |
+| modules | C: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: hadoop-mapreduce-project/hadoop-mapreduce-client |
+| Console output | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/7245/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, The ASF license errors are not related.  The unit test failures do not appear to be related.  The TestJobImpl failure is already tracked at MAPREDUCE-6948 and the remaining tests all passed for me locally with the patch applied.
+
+Committing this.
+, Thanks, [~pbacsko]!  I committed this to trunk, branch-3.0, branch-2,  branch-2.9, branch-2.8, and branch-2.7.
+, SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #13309 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/13309/])
+MAPREDUCE-5124. AM lacks flow control for task events. Contributed by (jlowe: rev 21d36273551fa45c4130e5523b6724358cf34b1e)
+* (edit) hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapreduce/v2/TestSpeculativeExecutionWithMRApp.java
+* (edit) hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/event/TaskAttemptStatusUpdateEvent.java
+* (edit) hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* (edit) hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* (edit) hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* (edit) hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestMRClientService.java
+* (edit) hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestFetchFailure.java
+, Hey [~pbacsko], [~jlowe] I am wondering how stable is this feature. You included it into branch-2.7 while a I was working on RC. Sorry I was not following this jira., Looking at the patch, seems like a pretty substantial change of event handling for AM.
+I'll revert it from 2.7.5 for now, since I did not get clarity on stability of this feature.
+We can later commit it to 2.7.6.
+
+Also you forgot to update CHANGES.txt in branch-2.7. I know, I forget it all the time myself., Sorry, Konstantin, I should have checked with you first.  Please feel free to revert it from 2.7.5, and apologies for the omitted CHANGES.txt.  I'll correct it when it's recommitted for 2.7.6.
+
+I am pretty confident this is a safe change for 2.7 since it only changes the status update code path and doesn't affect the task start, killed, failed, succeeded paths.  However I totally understand the logic behind punting this to 2.7.6.  The patch will get a chance to run on our 2.8 clusters at scale in the interim which will increase our confidence in it by then., Cool, thanks. I moved branch-2.7 now to version 2.7.6. Please feel free to commit there.
+Don't forget about the CHANGES :-), I committed this to branch-2.7 with a corresponding CHANGES.txt entry.
+]

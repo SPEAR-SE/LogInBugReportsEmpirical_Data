@@ -1,0 +1,641 @@
+[This issue is happening on the following code (Hive.java):
+{noformat}
+private static void copyFiles(...) {
+...
+  if (renameNonLocal) {
+      for (int counter = 1; !destFs.rename(srcP,destPath); counter++) {
+           destPath = new Path(destf, name + ("_copy_" + counter) + filetype);
+       }
+  } else {
+       destPath = mvFile(conf, srcP, destPath, isSrcLocal, srcFs, destFs, name, filetype);
+  }
+...
+}
+{noformat}
+
+Even if the file already exists on S3, the {{destFs.rename()}} call is renaming the file. 
+This does not happen with HDFS. If the file exists on HDFS, then the rename will fail, and the _copy_ string will be appended to the filename, and retry the rename.
+
+[~stevel@apache.org] Do you know if this is a known bug on the Hadoop side?, This is covered in test cases in branch-2 for S3 https://github.com/apache/hadoop/blob/branch-2/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileSystemContract.java#L103
+
+Need to change Hive to make use of {{destFs.exists}} and do a rename., destFs.exists will require another call to S3, that could affect performance. I think it should be addressed in s3a implementation. It should provide consistent behavior with HDFS., The code block Sergio posted looks like it could have some major inefficiencies, even for HDFS. If my understanding is correct, the code basically tries to rename the data with the suffix {{... + "_copy_" + counter}}, if it fails (because the files already exists), it increments the counter and then tries again. This doesn't sound like a scalable solution, what happens if there are 1000 files under the directory, any insert will require explicitly checking for the existence of files from {{... + "_copy_0"}} to {{... + "_copy_1000"}}. On HDFS, and especially on S3, this doesn't seem to be a very efficient approach (would be good to confirm this behavior).
+
+If the logic above is indeed what happens, there could be a few different ways to fix this.
+
+1: Append an UUID to the end of the file name rather than using a counter, since UUID are globally unique there should be no chance of conflict
+2: Append the query_id + a synchronized counter ({{private synchronized long counter}}) to the file name, sounds related to HADOOP-13402
+
+I am not going to express any opinion about what is "the correct" behaviour we should expect from rename, as I don't think anyone knows that. If you look at the [FS Specification|https://hadoop.apache.org/docs/stable2/hadoop-project-dist/hadoop-common/filesystem/filesystem.html] we're pretty explicit that rename is hard, and that there are different behaviours by different filesystems are.
+
+I'm not defending S3A here, just noting I'm not 100% sure of what HDFS does itself here, and how that compares to the semantics of posix's rename call (which is different from the unix command line {{mv}} operation)., Guys, [~ashutoshc], could you help me review the patch?
+
+What it does is to use the alternative condition {{mvFile}} when the destination filesystem is a blobstore. And, because this {{mvFile}} was calling {{destFs.exists()}} for every file on S3, then I changed it to get a list of files, and check whether the {{destf}} exists or not on that list., [~spena] a few comments:
+
+* It may be better to take a hybrid of the list files approach + the exists approach; for blobstores like S3 listfiles is only eventually consistent; this means listfiles may not return all the files that are actually there. One way to get around this is to first do the listfiles, and then checks if the targetFilename exists or not. This has the advantage of the perf gains of using listfiles, but avoids the consistency problems
+* I remember we discussed offline about concerns w.r.t multiple INSERT INTO queries running against the same table, but I just remembered that Hive Locking (https://cwiki.apache.org/confluence/display/Hive/Locking) should prevent that from ever happening, correct?
+* It would be nice (although not necessary) if we changed the name of {{renameNonLocal}} to something more descriptive, [~stakiar] Thanks. I updated the patch with:
+
+- Using an hybrid solution that checks if a file exists on the list status or if exists on the FS.
+- Change the renameNonLocal to renameIsAllowed
+
+For the Hive lock, yes, Hive should have a lock to avoid another client inserts data on the same table., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12839221/HIVE-15199.2.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 209 failed/errored test(s), 10664 tests executed
+*Failed tests:*
+{noformat}
+TestSparkCliDriver - did not produce a TEST-*.xml file (likely timed out) (batchId=109)
+	[enforce_order.q,ppd_join2.q,smb_mapjoin_21.q,load_dyn_part15.q,udf_min.q,groupby_resolution.q,mapjoin_memcheck.q,subquery_exists.q,join27.q,alter_merge_stats_orc.q,union_remove_2.q,vector_orderby_5.q,groupby6_map_skew.q,join12.q,union9.q]
+TestSparkCliDriver - did not produce a TEST-*.xml file (likely timed out) (batchId=128)
+	[union_remove_15.q,bucket_map_join_tez1.q,groupby7_noskew.q,bucketmapjoin1.q,subquery_multiinsert.q,auto_join8.q,auto_join6.q,groupby2_map_skew.q,lateral_view_explode2.q,join28.q,load_dyn_part1.q,skewjoinopt17.q,skewjoin_union_remove_1.q,union_remove_20.q,bucketmapjoin5.q]
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[add_part_multiple] (batchId=62)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[alter_merge_2_orc] (batchId=67)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[alter_partition_coltype] (batchId=23)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[alter_table_add_partition] (batchId=16)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[alter_table_update_status] (batchId=71)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[array_map_access_nonconstant] (batchId=20)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[autoColumnStats_3] (batchId=50)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[autoColumnStats_5] (batchId=37)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[avro_add_column2] (batchId=80)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[avrocountemptytbl] (batchId=73)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[ba_table_udfs] (batchId=22)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[cbo_rp_insert] (batchId=10)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[columnStatsUpdateForStatsOptimizer_2] (batchId=27)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[column_names_with_leading_and_trailing_spaces] (batchId=21)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[complex_alias] (batchId=15)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[concat_op] (batchId=66)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[constantPropWhen] (batchId=31)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[constantfolding] (batchId=67)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[constprog_when_case] (batchId=52)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[create_merge_compressed] (batchId=38)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[cte_5] (batchId=30)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[cte_7] (batchId=23)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[cte_mat_5] (batchId=2)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[dbtxnmgr_query1] (batchId=65)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[decimal_precision] (batchId=47)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[distinct_stats] (batchId=64)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[except_all] (batchId=41)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[exim_01_nonpart] (batchId=48)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[exim_03_nonpart_over_compat] (batchId=5)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[exim_08_nonpart_rename] (batchId=55)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[exim_10_external_managed] (batchId=62)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[exim_12_external_location] (batchId=49)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[exim_13_managed_location] (batchId=35)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[exim_14_managed_location_over_existing] (batchId=48)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[exim_22_import_exist_authsuccess] (batchId=17)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[exim_24_import_nonexist_authsuccess] (batchId=17)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[folder_predicate] (batchId=4)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[groupby_distinct_samekey] (batchId=51)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[groupby_grouping_window] (batchId=29)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[groupby_nullvalues] (batchId=72)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[implicit_decimal] (batchId=61)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert0] (batchId=4)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert1] (batchId=22)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert2] (batchId=77)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_acid_not_bucketed] (batchId=62)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_compressed] (batchId=73)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_into1] (batchId=19)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_into2] (batchId=79)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_into3] (batchId=24)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_into4] (batchId=16)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_into5] (batchId=29)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_into_with_schema2] (batchId=34)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_nonacid_from_acid] (batchId=66)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_values_acid_not_bucketed] (batchId=16)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_values_nonascii] (batchId=42)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=56)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insertoverwrite_bucket] (batchId=61)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insertvalues_espchars] (batchId=63)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[join42] (batchId=22)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[join43] (batchId=5)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[join_cond_pushdown_unqual5] (batchId=60)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[join_on_varchar] (batchId=41)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[json_serde1] (batchId=31)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[llap_uncompressed] (batchId=52)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[load_orc] (batchId=70)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[macro_1] (batchId=45)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[macro_duplicate] (batchId=36)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[mapjoin2] (batchId=9)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[mapjoin_memcheck] (batchId=37)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[mapjoin_test_outer] (batchId=1)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[materialized_view_authorization_sqlstd] (batchId=42)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[materialized_view_create] (batchId=64)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[materialized_view_describe] (batchId=61)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[multi_insert_with_join2] (batchId=70)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[multi_insert_with_join] (batchId=59)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[nonreserved_keywords_insert_into1] (batchId=24)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_merge11] (batchId=35)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_merge8] (batchId=75)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_merge9] (batchId=24)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_merge_incompat1] (batchId=60)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_merge_incompat2] (batchId=75)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_ppd_schema_evol_1b] (batchId=30)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_ppd_schema_evol_2b] (batchId=14)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_ppd_str_conversion] (batchId=28)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_schema_evolution_float] (batchId=30)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_vectorization_ppd] (batchId=36)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_wide_table] (batchId=77)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[parquet_array_map_emptynullvals] (batchId=30)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[parquet_ctas] (batchId=60)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[parquet_join2] (batchId=9)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[parquet_join] (batchId=18)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[parquet_ppd_partition] (batchId=7)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[parquet_schema_evolution] (batchId=67)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[parquet_type_promotion] (batchId=75)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[partition_coltype_literals] (batchId=12)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[ppd_join5] (batchId=32)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[ptfgroupbyjoin] (batchId=76)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[quotedid_basic] (batchId=54)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[rename_table_update_column_stats] (batchId=33)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[selectindate] (batchId=56)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[setop_no_distinct] (batchId=72)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[skewjoin_onesideskew] (batchId=64)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[smb_join_partition_key] (batchId=12)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[stats16] (batchId=4)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[statsfs] (batchId=41)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[tez_join_hash] (batchId=47)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[truncate_column_merge] (batchId=55)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[udf_folder_constants] (batchId=46)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[udtf_replicate_rows] (batchId=75)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[union37] (batchId=64)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[union_date_trim] (batchId=70)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[union_paren] (batchId=42)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[unionall_join_nullconstant] (batchId=35)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[unionall_unbalancedppd] (batchId=2)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_aggregate_9] (batchId=35)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_aggregate_without_gby] (batchId=47)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_binary_join_groupby] (batchId=73)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_bround] (batchId=30)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_bucket] (batchId=23)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_cast_constant] (batchId=8)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_char_4] (batchId=79)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_char_cast] (batchId=59)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_char_simple] (batchId=41)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_coalesce_2] (batchId=64)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_custom_udf_configure] (batchId=59)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_data_types] (batchId=68)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_date_1] (batchId=19)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_decimal_mapjoin] (batchId=50)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_decimal_round] (batchId=32)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_decimal_round_2] (batchId=21)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_distinct_2] (batchId=46)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_groupby_3] (batchId=58)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_interval_1] (batchId=14)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_left_outer_join2] (batchId=58)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_null_projection] (batchId=8)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_orderby_5] (batchId=37)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_outer_join0] (batchId=55)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_reduce1] (batchId=25)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_reduce2] (batchId=35)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_reduce3] (batchId=25)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_string_concat] (batchId=29)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_string_decimal] (batchId=2)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_struct_in] (batchId=41)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_varchar_4] (batchId=27)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_varchar_simple] (batchId=68)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vector_when_case_null] (batchId=32)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vectorized_bucketmapjoin1] (batchId=22)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vectorized_date_funcs] (batchId=68)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vectorized_distinct_gby] (batchId=67)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vectorized_timestamp] (batchId=69)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[vectorized_timestamp_funcs] (batchId=27)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[view_alias] (batchId=74)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[windowing_windowspec4] (batchId=59)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[transform_ppr2] (batchId=133)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[join_acid_non_acid] (batchId=150)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[union_fast_stats] (batchId=145)
+org.apache.hadoop.hive.cli.TestMiniTezCliDriver.testCliDriver[explainanalyze_2] (batchId=91)
+org.apache.hadoop.hive.cli.TestMiniTezCliDriver.testCliDriver[explainanalyze_4] (batchId=91)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[delete_non_acid_table] (batchId=83)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[insert_into5] (batchId=83)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[materialized_view_authorization_create_no_grant] (batchId=83)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[materialized_view_authorization_create_no_select_perm] (batchId=83)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[materialized_view_authorization_drop_other] (batchId=83)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[materialized_view_authorization_no_select_perm] (batchId=83)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[materialized_view_drop2] (batchId=83)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[materialized_view_drop] (batchId=83)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[materialized_view_replace_with_view] (batchId=83)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[partition_column_names_with_leading_and_trailing_spaces] (batchId=83)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[update_non_acid_table] (batchId=83)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[add_part_multiple] (batchId=121)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[alter_merge_orc] (batchId=119)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[create_merge_compressed] (batchId=110)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[insert_into1] (batchId=101)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[insert_into2] (batchId=130)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[insert_into3] (batchId=104)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[mapjoin_decimal] (batchId=121)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[mapjoin_test_outer] (batchId=92)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[multi_insert_with_join] (batchId=120)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[parquet_join] (batchId=100)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[ppd_join5] (batchId=107)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[stats16] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[statsfs] (batchId=111)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[union_date_trim] (batchId=126)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[union_top_level] (batchId=118)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vector_cast_constant] (batchId=96)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vector_char_4] (batchId=130)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vector_data_types] (batchId=125)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vector_decimal_mapjoin] (batchId=115)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vector_distinct_2] (batchId=114)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vector_groupby_3] (batchId=119)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vector_string_concat] (batchId=106)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vector_varchar_4] (batchId=105)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vectorization_short_regress] (batchId=112)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vectorized_ptf] (batchId=119)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vectorized_timestamp_funcs] (batchId=105)
+org.apache.hadoop.hive.metastore.hbase.TestHBaseMetastoreSql.insertIntoTable (batchId=191)
+org.apache.hadoop.hive.metastore.hbase.TestHBaseMetastoreSql.partitionedTable (batchId=191)
+org.apache.hadoop.hive.metastore.hbase.TestHBaseMetastoreSql.table (batchId=191)
+org.apache.hadoop.hive.ql.lockmgr.TestDbTxnManager2.testCompletedTxnComponents (batchId=268)
+org.apache.hadoop.hive.ql.lockmgr.TestDbTxnManager2.testMerge3Way01 (batchId=268)
+org.apache.hadoop.hive.ql.lockmgr.TestDbTxnManager2.testMerge3Way02 (batchId=268)
+org.apache.hadoop.hive.ql.lockmgr.TestDbTxnManager2.testMultiInsert (batchId=268)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.sqlCTAS (batchId=217)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.sqlInsertPartition (batchId=217)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.sqlInsertTable (batchId=217)
+org.apache.hive.jdbc.TestJdbcDriver2.testNullResultSet (batchId=211)
+org.apache.hive.jdbc.TestJdbcDriver2.testSerializedExecution (batchId=211)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/2156/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/2156/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-2156/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 209 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12839221 - PreCommit-HIVE-Build, * Is the goal to trigger mvFile when the destination file is a blobstore? I don't think thats the right approach because a {{FileUtils.copy}} will do a client-side copy when running on S3, data will be downloaded from HDFS to HS2 and then uploaded to S3; the target should be to do a server-side copy (happens internally on S3). A server side copy can only be triggered by called {{FileSystem.rename}}.
+* The listing optimization can be applied to HDFS too, right? It should increase perf when running on HDFS too.
+* A bit orthogonal to this JIRA, but {{mvFile}} should probably be called copyFile because it always copies data., # as sahil notes, blobstore copy calls must be in object store to get internal bandwidth *and avoid download costs*.
+# that can currently only be done in rename(); if we ever added a copy() command to the FS API, your life would be better
+# the fact that rename returns "false" without details makes things worse. FWIW I'm modifying spark's inner rename to throw exceptions —but as as that isn't the public FS API, it's of no use here. Though I could add an option to s3a to always throw those exceptions (a subclass of IOE) if the caller needed it. Would that help? it'd only be broadly useful if HDFS &c also did that
+
+Now, what is needed to be done here? 
+# handle the situation where a list of an object store path can be out of sync with the actual contents, something that surfaces in S3 and swift. the exists/getFileStatus() call is more robust there.
+# handle the situation where rename(src, dest), src is a file and dest is a file, will copy src onto dest.  
+
+Short term: check the destination. I know some people will worry about the cost of the existence check, but remember this is going to trigger a copy operation, which is O(data) at about 6-8 MB/s: if you are committing large files, things will be slow.
+
+Looking at the rename semantics as tested in {{AbstractContractRenameTest}}, the test {{testRenameFileOverExistingFile}} has the comment "handles filesystems that will overwrite the destination as well as those that do not (i.e. HDFS).". It's not just s3a which lets you rename over a test, so apparently does local file://. Interestingly: azure wasb:// doesn't, nor does s3n.
+
+
+I think we can consider the fact that s3a lets you overwrite an existing destination to be a bug, based on its inconsistency with HDFS, Azure, s3n, etc. Indeed, the difference between s3a and s3n makes it harder to say "s3a is a drop-in replacement for s3n". Created HADOOP-13823 for you.
+, You're right, I will do the change to use a rename() instead. This should be used on HDFS as well.
+
+The {{mvFile}} method name is good I think, Hive is moving the file from source to target by copy and delete the file from source. , Attached a new patch that addresses feedback comments. This patch will call listFiles() whatever the filesystem is, HDFS or S3, and it will call the rename() method on S3 as well to take advantage of the server-side copy.
+
+[~steve_l] Thanks for creating the bug on HADOOP. Your suggestion about the exception, when will that happen? When the destination file already exists? Isn't going to be inconsistent with the HDFS rename() that it doesn't throw the exception?, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12839415/HIVE-15199.4.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 5 failed/errored test(s), 10695 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[transform_ppr2] (batchId=133)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[join_acid_non_acid] (batchId=150)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[union_fast_stats] (batchId=145)
+org.apache.hadoop.hive.cli.TestMiniTezCliDriver.testCliDriver[explainanalyze_1] (batchId=90)
+org.apache.hadoop.hive.cli.TestMiniTezCliDriver.testCliDriver[explainanalyze_2] (batchId=91)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/2170/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/2170/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-2170/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 5 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12839415 - PreCommit-HIVE-Build, * The patch does a {{listStatus}} for each file it needs to rename, is that necessary? It may be more efficient if only one {{listStatus}} is done outside the for loop in {{copyFiles}}
+
+I would suggest modifying the following code block:
+
+{code}
+    fs.listStatus(dirPath, new PathFilter() {
+      @Override
+      public boolean accept(Path path) {
+        if (path.getName().startsWith(filename)) {
+          fileSet.add(path);
+        }
+
+        return false;
+      }
+    });
+{code}
+
+Is the use of the {{PathFilter}} necessary, a {{PathFilter}} is typically used to filter out certain files from a {{listStatus}} call, but here is it being used to populate the {{fileSet}} object; we should be able to accomplish the same thing without using the {{PathFilter}}., Yeah, doing the listSTatus() once will be better. I'll try that.
+
+About the PathFilter, I used it to fill the Set<> during the listStatus(), and avoid listStatus() to create the FileStatus[] array, and then me walking through the array to push the elements to the Set<> again. I just need the path, and that way I avoid creating FileStatus objects on memory. Regarding using a Set<>, I see this is faster by walking to the different _copy_ files and check if they're contained on the Set ( O(N) ) than walking through the FileStatus[] once per every new _copy_ file ( O(N*N) )., All tests fail due to this error:
+{noformat}
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:2.19.1:test (default-test) on project hive-it-qfile: Unable to generate classpath: org.apache.maven.artifact.resolver.ArtifactResolutionException: Unable to get dependency information for org.apache.maven.surefire:surefire-junit4:jar:2.19.1: Failed to retrieve POM for org.apache.maven.surefire:surefire-junit4:jar:2.19.1: Could not transfer artifact org.apache.maven.surefire:surefire-junit4:pom:2.19.1 from/to central (https://repo.maven.apache.org/maven2): hostname in certificate didn't match: <repo.maven.apache.org> != <repo1.maven.org> OR <repo1.maven.org>
+{noformat}
+
+This is not related to the patch, but there's no way to validate it. I'll wait until the problem goes away., In {{mvFile}} should {{while (!destFs.rename(sourcePath, destFilePath))}} be changed to {{while (!destFs.exists(destFilePath) && !destFs.rename(sourcePath, destFilePath))}} this way we always check if the file exists before renaming. While slightly less performant on HDFS, its much safer for S3 since {{listFiles}} may not return the entire contents of the directory (since its an eventually consistent operation).
+
+Other than that +1 assuming Hive QA comes back normally., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12839599/HIVE-15199.5.patch
+
+{color:green}SUCCESS:{color} +1 due to 1 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 13 failed/errored test(s), 10668 tests executed
+*Failed tests:*
+{noformat}
+TestSparkCliDriver - did not produce a TEST-*.xml file (likely timed out) (batchId=108)
+	[tez_joins_explain.q,transform2.q,groupby5.q,cbo_semijoin.q,bucketmapjoin13.q,union_remove_6_subq.q,groupby2_map_multi_distinct.q,load_dyn_part9.q,multi_insert_gby2.q,vectorization_11.q,groupby_position.q,avro_compression_enabled_native.q,smb_mapjoin_8.q,join21.q,auto_join16.q]
+TestSparkCliDriver - did not produce a TEST-*.xml file (likely timed out) (batchId=118)
+	[stats12.q,groupby4.q,union_top_level.q,groupby10.q,subquery_in.q,mapjoin_filter_on_outerjoin.q,auto_sortmerge_join_4.q,limit_partition_metadataonly.q,load_dyn_part4.q,union3.q,groupby_multi_single_reducer.q,smb_mapjoin_14.q,groupby3_noskew_multi_distinct.q,stats18.q,union_remove_21.q]
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[transform_ppr2] (batchId=133)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[join_acid_non_acid] (batchId=150)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[union_fast_stats] (batchId=145)
+org.apache.hadoop.hive.cli.TestMiniTezCliDriver.testCliDriver[explainanalyze_3] (batchId=90)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.org.apache.hadoop.hive.cli.TestSparkCliDriver (batchId=94)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[escape_sortby1] (batchId=111)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[groupby_multi_single_reducer3] (batchId=111)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[join29] (batchId=111)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[leftsemijoin] (batchId=111)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[statsfs] (batchId=111)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[union_remove_6] (batchId=111)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/2202/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/2202/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-2202/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 13 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12839599 - PreCommit-HIVE-Build, if you do listStatus(path, recursive=true) you don't get back a filestatus array, you get an interator back; on s3a branch 2.8+ this goes through the results of the list, triggering new listing requests on demand: https://github.com/apache/hadoop/blob/trunk/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Listing.java#L171
+
+To make effective use of this feature, you do have to list through the results, otherwise it won't do the listing operation...you may as well build the set up from that iteration
+
+{code}
+
+RemoteIterator<FileStatus> it = fs.listStatus(path, true)
+while (it.hasNext()) {
+  FileStatus s = it.next()
+ if (!fileSet.contains(s)) {
+   fileSet.add(s);
+ }
+}
+
+{code}
+
+On other filesystems listStatus does a recursive treewalk, no more/less expensive than doing it in your own code
+, [~stevel@apache.org] What call is better to use, listStatus() or listFiles()? I've heard listFiles() would be better if I want to get files recursively. I'm using listFiles() in the patch instead. Is that ok?, Seems all tests are flaky and no related to this patch. I'm attaching a new one that contains one little change to include the {{destFs.exists()}} call. This will also check if those flaky tests are not failing anymore., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12839735/HIVE-15199.6.patch
+
+{color:green}SUCCESS:{color} +1 due to 1 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 19 failed/errored test(s), 10728 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[auto_sortmerge_join_2] (batchId=43)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[transform_ppr2] (batchId=133)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[join_acid_non_acid] (batchId=150)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[union_fast_stats] (batchId=145)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[bucket_map_join_spark2] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[bucketmapjoin2] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[cbo_udf_udaf] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[groupby_cube1] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[join13] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[join_vc] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[ptf_decimal] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[sample3] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[smb_mapjoin_19] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[stats16] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[union23] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[union31] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[union] (batchId=93)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[union_remove_7] (batchId=93)
+org.apache.hive.spark.client.TestSparkClient.testJobSubmission (batchId=272)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/2220/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/2220/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-2220/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 19 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12839735 - PreCommit-HIVE-Build, All those tests are passing on my local machine. I'll rerun the tests on HiveQA as I see other JIRAs are not failing anymore. They might have already fixed., you are right, I am wrong: serves me right for commenting without staring at the code. you should be calling; I got confused by naming.
+
+you should be invoking
+
+{code}
+RemoteIterator<LocatedFileStatus> listFiles(Path f,  boolean recursive) 
+{code}
+with recursive = true.
+
+this defaults to a standard recursive treewalk; on object stores we can do an O(1) listing of all child files, irrespective of directory depth and width. For anything other than a flat directory, this is a significant speedup, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12839839/HIVE-15199.7.patch
+
+{color:green}SUCCESS:{color} +1 due to 1 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 5 failed/errored test(s), 10729 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[transform_ppr2] (batchId=133)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[join_acid_non_acid] (batchId=150)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[union_fast_stats] (batchId=145)
+org.apache.hadoop.hive.cli.TestMiniTezCliDriver.testCliDriver[explainanalyze_2] (batchId=91)
+org.apache.hadoop.hive.cli.TestMiniTezCliDriver.testCliDriver[explainanalyze_4] (batchId=91)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/2228/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/2228/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-2228/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 5 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12839839 - PreCommit-HIVE-Build, [~aihuaxu] [~ashutoshc] Could any of you help me review this patch or if you can refer me anyone with knowledge of this code? It was already reviewed by the folks on this JIRA. Tests are passing, and the S3 tests passed to. I just need a committer do a +1 before commit it., I really like having query_id as part of the name. It helps a lot with many problems. For s3 in particular eventual consistency is one of them., [~spena], I would love to take a look at this patch, but I don't see a link to a review board. Did I miss it?, [~yalovyyi] I just linked the RB to the jira. https://reviews.apache.org/r/53966/, That would be really helpful. I don't know how hard or easy that would be as I've seen Hive uses the _copy_# in other parts of the code. We could try to solve that in another jira as a good supportability item for S3., Attach a new patch that do not call {{destFs.exists}} when HDFS is used. This is to avoid performance penalties when HDFS Is used., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12839914/HIVE-15199.8.patch
+
+{color:green}SUCCESS:{color} +1 due to 1 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 5 failed/errored test(s), 10716 tests executed
+*Failed tests:*
+{noformat}
+TestSparkCliDriver - did not produce a TEST-*.xml file (likely timed out) (batchId=108)
+	[tez_joins_explain.q,transform2.q,groupby5.q,cbo_semijoin.q,bucketmapjoin13.q,union_remove_6_subq.q,groupby2_map_multi_distinct.q,load_dyn_part9.q,multi_insert_gby2.q,vectorization_11.q,groupby_position.q,avro_compression_enabled_native.q,smb_mapjoin_8.q,join21.q,auto_join16.q]
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[orc_ppd_schema_evol_3a] (batchId=133)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[transform_ppr2] (batchId=133)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[join_acid_non_acid] (batchId=150)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[union_fast_stats] (batchId=145)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/2234/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/2234/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-2234/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 5 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12839914 - PreCommit-HIVE-Build, I do think I'd rather fix this in s3, because it is adding 2 GET calls and a LIST before each rename, calls which take place in the rename itself. And of course, when Hadoop 2.8 or derivatives change s3a's rename to == HDFS, the check will be superfluous. Similarly, once you have a consistent FS view (s3guard, etc),  you are less likely to see a mismatch between listing and stat-ing. If you are, it means something else is writing to the same dir, putting you in trouble.
+
+Would it be possible to set this up to make it easy to turn off in future. For example: create the JIRA on stripping the exists check out?, I moved the listFiles() to the beginning of the method to avoid calling it for each new rename. However, we still have the 2 GET calls on each rename (exists && rename), I added a validation to do this on S3 only, and leave only the rename call on HDFS.
+
+As you mentioned, when S3Guard is released, this would help us a lot on consistency, and we could remove the exists() call. I think the listFiles() is still beneficial so Hive can figure out the next filename to use when renaming the file.
+
+The code change is pretty easy, so I can create a Jira to remove it in the future.
+{noformat}
++      boolean isBlobStoragePath = BlobStorageUtils.isBlobStoragePath(conf, destDirPath);
++      while ((isBlobStoragePath && destFs.exists(destFilePath)) || !destFs.rename(sourcePath, destFilePath)) {
++        destFilePath = createCopyFilePath(destDirPath, name, type, ++counter);
++      }
+{noformat}
+
+Is the S3Guard going to be released on Hadoop 2.8?, The HIVE-14535 branch might be interesting to compare, since it prevents multiple queries from using the same path., [~spena] Thank you for the CR link. I have added some comments., [~yalovyyi] what other problems with S3 do you think this would help with? In what way would this help with eventual consistency? I agree having the query-id in the file name is good, but I do agree with Sergio that we need to be careful and see what other parts of the code rely on the file name. We should also be wary if any external clients rely on these file names., Addressed issues from [~yalovyyi] on the RB.
+
+Also, I'll keep to the if (!exists || !rename) condition on S3, and not using the listFiles() to avoid OOM issues with concurrent HS2 requests. We can design a better performance approach in a different JIRA., +1 for 9th patch pending tests, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12840142/HIVE-15199.9.patch
+
+{color:green}SUCCESS:{color} +1 due to 1 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 29 failed/errored test(s), 10717 tests executed
+*Failed tests:*
+{noformat}
+TestSparkCliDriver - did not produce a TEST-*.xml file (likely timed out) (batchId=118)
+	[stats12.q,groupby4.q,union_top_level.q,groupby10.q,subquery_in.q,mapjoin_filter_on_outerjoin.q,auto_sortmerge_join_4.q,limit_partition_metadataonly.q,load_dyn_part4.q,union3.q,groupby_multi_single_reducer.q,smb_mapjoin_14.q,groupby3_noskew_multi_distinct.q,stats18.q,union_remove_21.q]
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[annotate_stats_deep_filters] (batchId=80)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[dynamic_partition_insert] (batchId=50)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[input43] (batchId=2)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[load_orc] (batchId=70)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[load_orc_part] (batchId=13)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_merge11] (batchId=36)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_merge12] (batchId=56)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_merge9] (batchId=24)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[orc_merge_incompat3] (batchId=8)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[global_limit] (batchId=133)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[orc_llap_counters1] (batchId=131)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[orc_llap_counters] (batchId=135)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[orc_ppd_basic] (batchId=131)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[orc_ppd_schema_evol_3a] (batchId=133)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[transform_ppr2] (batchId=133)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[join_acid_non_acid] (batchId=150)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[orc_merge11] (batchId=143)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[orc_merge9] (batchId=140)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[orc_merge_incompat3] (batchId=137)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[union_fast_stats] (batchId=145)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[orc_merge9] (batchId=156)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[parallel_orderby] (batchId=157)
+org.apache.hadoop.hive.cli.TestMiniTezCliDriver.testCliDriver[orc_merge12] (batchId=90)
+org.apache.hadoop.hive.cli.TestMinimrCliDriver.testCliDriver[parallel_orderby] (batchId=81)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[load_orc_negative_part] (batchId=83)
+org.apache.hive.hcatalog.pig.TestSequenceFileHCatStorer.testWriteDecimal (batchId=170)
+org.apache.hive.hcatalog.pig.TestSequenceFileHCatStorer.testWriteDecimalXY (batchId=170)
+org.apache.hive.spark.client.TestSparkClient.testJobSubmission (batchId=272)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/2250/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/2250/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-2250/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 29 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12840142 - PreCommit-HIVE-Build, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12840269/HIVE-15199.10.patch
+
+{color:green}SUCCESS:{color} +1 due to 1 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 4 failed/errored test(s), 10718 tests executed
+*Failed tests:*
+{noformat}
+TestSparkCliDriver - did not produce a TEST-*.xml file (likely timed out) (batchId=107)
+	[groupby_grouping_id2.q,input17.q,bucketmapjoin12.q,ppd_gby_join.q,auto_join10.q,ptf_rcfile.q,vectorized_rcfile_columnar.q,vector_elt.q,ppd_join5.q,ppd_join.q,join_filters_overlap.q,join_cond_pushdown_1.q,timestamp_3.q,load_dyn_part6.q,stats_noscan_2.q]
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[transform_ppr2] (batchId=133)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[join_acid_non_acid] (batchId=150)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[union_fast_stats] (batchId=145)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/2263/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/2263/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-2263/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 4 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12840269 - PreCommit-HIVE-Build, Thanks all for the code review. I committed this to master.]

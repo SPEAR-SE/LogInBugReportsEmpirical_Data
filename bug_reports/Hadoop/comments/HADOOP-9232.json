@@ -1,0 +1,188 @@
+[HADOOP-8712 will change the default hadoop.security.group.mapping to {{JniBasedUnixGroupsMappingWithFallback}}.  This will break on Windows.  A workaround would be to manually configure hadoop.security.group.mapping back to {{ShellBasedUnixGroupsMapping}}.
+
+We can fix the problem by providing a proper implementation of the method on Windows in hadoop.dll.  There is already similar logic in the winutils.exe groups command.
+
+To see the problem, start a NameNode and DataNode with hadoop.dll on the path and core-site.xml containing:
+
+{code}
+<property>
+  <name>hadoop.security.group.mapping</name>
+  <value>org.apache.hadoop.security.JniBasedUnixGroupsMappingWithFallback</value>
+</property>
+{code}
+
+When the DataNode connects to the NameNode, you'll see this stack trace in the NameNode log:
+
+{noformat}
+13/01/21 23:19:26 WARN ipc.Server: IPC Server handler 0 on 19000, call org.apache.hadoop.hdfs.server.protocol.DatanodeProtocol.versionRequest from 127.0.0.1:55352: error: java.lang.UnsatisfiedLinkError: org.apache.hadoop.security.JniBasedUnixGroupsMapping.getGroupForUser(Ljava/lang/String;)[Ljava/lang/String;
+java.lang.UnsatisfiedLinkError: org.apache.hadoop.security.JniBasedUnixGroupsMapping.getGroupForUser(Ljava/lang/String;)[Ljava/lang/String;
+	at org.apache.hadoop.security.JniBasedUnixGroupsMapping.getGroupForUser(Native Method)
+	at org.apache.hadoop.security.JniBasedUnixGroupsMapping.getGroups(JniBasedUnixGroupsMapping.java:58)
+	at org.apache.hadoop.security.JniBasedUnixGroupsMappingWithFallback.getGroups(JniBasedUnixGroupsMappingWithFallback.java:50)
+	at org.apache.hadoop.security.Groups.getGroups(Groups.java:89)
+	at org.apache.hadoop.security.UserGroupInformation.getGroupNames(UserGroupInformation.java:1311)
+	at org.apache.hadoop.hdfs.server.namenode.FSPermissionChecker.<init>(FSPermissionChecker.java:51)
+	at org.apache.hadoop.hdfs.server.namenode.FSPermissionChecker.checkSuperuserPrivilege(FSPermissionChecker.java:72)
+	at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.checkSuperuserPrivilege(FSNamesystem.java:4591)
+	at org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer.versionRequest(NameNodeRpcServer.java:962)
+	at org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolServerSideTranslatorPB.versionRequest(DatanodeProtocolServerSideTranslatorPB.java:203)
+	at org.apache.hadoop.hdfs.protocol.proto.DatanodeProtocolProtos$DatanodeProtocolService$2.callBlockingMethod(DatanodeProtocolProtos.java:18305)
+	at org.apache.hadoop.ipc.ProtobufRpcEngine$Server$ProtoBufRpcInvoker.call(ProtobufRpcEngine.java:474)
+	at org.apache.hadoop.ipc.RPC$Server.call(RPC.java:1018)
+	at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:1778)
+	at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:1774)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:396)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1450)
+	at org.apache.hadoop.ipc.Server$Handler.run(Server.java:1772)
+{noformat}
+, Attaching the patch.
+
+I introduced a separate c file for Windows native implementation, otherwise, I'd have to ifdef many places in the file.
+
+TestJNIGroupsMapping passes with the patch. I also verified that HDFS (NameNode/DataNode) works fine with the patch (previously NameNode was throwing an exception). 
+, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12566716/HADOOP-9232.branch-trunk-win.jnigroups.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/2098//console
+
+This message is automatically generated., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12566719/HADOOP-9232.branch-trunk-win.jnigroups.2.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/2099//console
+
+This message is automatically generated., Thanks, Ivan.  I applied the patch locally and tested a few HDFS operations and MapReduce jobs.  I didn't need to override the config to {{ShellBasedUnixGroupsMapping}}.  It worked great!  I also did a build with -Pnative in an Ubuntu VM to confirm that it didn't accidentally harm native compilation on Linux.
+
+Here are a few questions:
+
+1. Regarding {{throw_ioe}}, it looks like an almost-copy of the #ifdef WINDOWS path of the function in {{NativeIO.c}}.  Can we refactor and reuse the same {{throw_ioe}} everywhere, or is that too cumbersome?
+
+2. Assuming that the answer to #1 is that we really need to keep a separate {{throw_ioe}} in here, then is it intentional that this version uses LPSTR/FormatMessageA, whereas the version in {{NativeIO.c}} uses LPWSTR/FormatMessageW?
+
+{code}
+  ...
+  LPSTR buffer = NULL;
+  const char* message = NULL;
+
+  len = FormatMessageA(
+  ...
+{code}
+
+3. Once again assuming that we need to keep the separate {{throw_ioe}}, I don't think we need to NULL out buffer before returning.  For the version in {{NativeIO.c}}, this was required to prevent a double-free later in the control flow, but this version only has one possible path to calling {{LocalFree}}.
+
+{code}
+   ...
+  LocalFree(buffer);
+  buffer = NULL;
+
+  return;
+}
+{code}
+
+4. Is the following code not thread-safe?
+
+{code}
+...
+static jobjectArray emptyGroups = NULL;
+...
+  if (emptyGroups == NULL) {
+    jobjectArray lEmptyGroups = (jobjectArray)(*env)->NewObjectArray(env, 0,
+            (*env)->FindClass(env, "java/lang/String"), NULL);
+    if (lEmptyGroups == NULL) {
+      goto cleanup;
+    }
+    emptyGroups = (*env)->NewGlobalRef(env, lEmptyGroups);
+    if (emptyGroups == NULL) {
+      goto cleanup;
+    }
+  }
+{code}
+
+For example, assume 2 threads concurrently call {{getGroupForUser}}.  Thread 1 executes the NULL check, enters the if body, and then gets suspended by the OS.  Thread 2 executes and {{emptyGroups}} is still NULL, so it initializes it.  Then, the OS resumes thread 1, which proceeds inside the if body and calls NewObjectArray again.  Since {{emptyGroups}} never gets freed, I believe the net effect would be a small memory leak.
+
+5.  On the {{THROW}} calls, can we add strings that describe the point of failure (i.e. "Couldn't allocate memory for user") instead of NULL for the third argument?
+
+{code}
+  user = (*env)->GetStringChars(env, juser, NULL);
+  if (user == NULL) {
+    THROW(env, "java/lang/OutOfMemoryError", NULL);
+    goto cleanup;
+  }
+{code}
+
+Thanks, again!
+, Clicking Cancel Patch, since Jenkins only knows how to apply patches for pre-commit builds going to trunk., Addressing Chris' comments., Thanks Chris for the review, all good comments!
+
+My responses are below:
+
+1. The functions are actually slightly different and I wanted to keep them that way. Nativeio function throws a NativeIOException exception (not IOException). Also, if you take a closer look nativeio exposes some static initialization methods which are used to initialize nioe_clazz and nioe_ctor, so all is encapsulated within nativeio and I wanted to keep it this way. Let me know if this sounds good. 
+
+2. Yes, this is what we need. THROW macro definition expects char* (not WCHAR*), hence the difference. In nativeio#throw_ie, we use a slightly different conversion patterns
+
+3. Fixed
+
+4. I saw this as well. I inherited the problem from the linux implementation. As you said, it seems that the only side effect could be an extra memory allocation which isn't too bad. 
+
+5. Thanks, fixed
+
+Attached is the updated patch. Let me know if it looks good. , +1 for the new patch
+
+Thank you for addressing all of the feedback.  Regarding #4, you're right that the memory leak is already there in the Linux implementation too.  I filed HADOOP-9312 to follow up on fixing it for both Linux and Windows.
+
+I ran the new patch locally and confirmed that it works.  Thanks again for taking care of this.
+, The code looks very good!
+However, the "JniBasedUnixGroupsMappingWin" name seems a weird for me.
+I think a better approach may be to create a seperate JniBasedWinGroupsMapping.java class and add some Java code to use choose JniBasedWinGroupsMapping and JniBasedUnixGroupsMapping based on the platform. This way we can also seperate the native implementation more easily in the future., {quote}However, the "JniBasedUnixGroupsMappingWin" name seems a weird for me.
+I think a better approach may be to create a seperate JniBasedWinGroupsMapping.java class and add some Java code to use choose JniBasedWinGroupsMapping and JniBasedUnixGroupsMapping based on the platform. This way we can also seperate the native implementation more easily in the future.
+{quote}
+Thanks Chuan for the review! Actually, I will not agree on this one. We should try to make Java side interfaces platform independent (where we can) and only have platform dependent implementations. In this specific case, the interface is quite simple and works well cross platforms so I think this is fine. Let me know what you think., {quote}
+We should try to make Java side interfaces platform independent (where we can) and only have platform dependent implementations.
+{quote}
+
+Agreed with this.  The established pattern is to code platform-agnostic interfaces on the Java side and build platform-specific implementations of the JNI functions using conditional compilation.  Introducing a JniBasedWinGroupsMapping.java would be a divergence from this pattern.
+, {quote}
+However, the "JniBasedUnixGroupsMappingWin" name seems a weird for me.
+{quote}
+
+I just realized that I was not completely understanding the objection.  I agree that it is strange to see a name like this that contains both "Unix" and "Win".  It's true that the established pattern is to create platform-agnostic interfaces on the Java side, but JniBasedUnixGroupsMapping is unique in that the class name on the Java side already mentions a specific platform.
+
+I suppose the ideal thing would be to remove "Unix" from that class name on the Java side and then allow for platform-specific C implementation files: JniBasedGroupsMapping.java, JniBasedUnixGroupsMapping.c, and JniBasedWinGroupsMapping.c.  Unfortunately, I don't think that's feasible for 2 reasons.  One problem is that it would greatly expand the scope of the patch.  The other bigger problem is that JniBasedUnixGroupsMapping is mentioned in end user config files as the value of hadoop.security.group.mapping, so renaming the Java class risks breaking those users' config files.  That might have to be flagged backwards-incompatible.
+
+I think we're stuck with 1 of 2 practical options: a big conditional compilation #ifdef in the existing JniBasedUnixGroupsMapping.c, or just accept the awkward name of JniBasedUnixGroupsMappingWin.c.  My personal preference is for separation by file instead of conditional compilation.  This is what Ivan's current patch does, so I am still +1.  What do others think?
+, Hi Ivan. The branch-trunk-win code base already uses conditional compilation to separate Unix/Windows implementations (see NativeIO.c). We should probably be consistent and keep the implementation in a single file. It also resolves the naming problem for now.
+
+If we wish to rename JniBasedUnixGroupsMapping - which would be nice - we can file a separate Jira.
+
+, +1
+
+I don't have too strong an objection since it's just a naming issue.
+In my original thinking, I thought to rename JniBasedUnixGroupsMapping to JniBasedGroupsMapping, or have a new class, e.g. JniBasedWinGroupsMapping, representing Windows implementation.
+I agree with platform independent API principle; but I think we can also create platform specific code when necessary.
+
+In this case, JniBased[Platform]Mapping is already designed to suit one platform in the beginning as its name suggested. In my opinion if we want to extend the support for Windows, the next logical thing is to provide a new GroupMappingServiceProvider for Windows, e.g. JniBasedWinGroupsMapping; or we can create a new platform independent GroupMappingServiceProvider for both Windows and Unix, e.g. JniBasedGroupsMapping.
+, {quote}
+The branch-trunk-win code base already uses conditional compilation to separate Unix/Windows implementations (see NativeIO.c).
+{quote}
+
+I'm +1 for Ivan's code whether it's wrapped in conditional compilation or separate files.  I expressed a personal preference for separate files, but it's no big deal.  We could always split later if the conditional compilation becomes too cumbersome over time., I also notice ShellBasedUnixGroupsMapping has the Unix in the class name while also supporting Windows in its implementation. So I think we should be fine here., Quick recap: we have +1 from 2 contributors, and there are no blocking issues remaining on this patch.  [~sureshms], we are ready for review from a committer.  Thank you.
+, +1 for the patch. 
+
+Minor update to the patch that did not apply cleanly to latest branch-trunk-win.
+, Committed the patch to the branch.
+
+Thank you Ivan!. Thank you Arpit, Chuan and Chris for the review., I am not clear if we have fixed the root cause or the symptom?
+It looks like JniBasedUnixGroupsMappingWithFallback checks for native impl being present and if not it falls back to Shell. Thereafter, it will use the native code and fail when the native code does not have the expected function.
+In Windows, the native code is always present for other reasons. So we are never going to fall back to Shell. So basically there is no fallback.
+In the patch we have fixed the missing function in the native jni code. But is that the complete fix? For any other/new jni based function we will be back to this situation because on Windows the native code is always loaded., Thanks Bikas for reviewing!
+
+I would say that we fixed the root cause :) we do want to have native impl for getGroups on Windows. However, you bring up a really interesting point:
+bq. For any other/new jni based function we will be back to this situation because on Windows the native code is always loaded.
+Current approach of checking whether the native code is loaded or not makes sense to me. If we want to scope this down to a function, we would have to run test function call to see if it will return unresolved link error (or fallback later) what would be really ugly. The right way to handle cases where we want to gracefully degrade functionality and fallback would be to have a config that would enable the feature. In this specific instance of the problem, we also have a config which is enabled by default. Now we can argue whether it should be enabled by default or not, I believe it should, but this is an orthogonal discussion. 
+
+Now going back to your point, a good sanity test for whether a feature should be enabled by default or not could be that it is supported by all release platforms. Make sense? Thoughts?]

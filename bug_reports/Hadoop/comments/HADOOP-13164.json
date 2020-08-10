@@ -1,0 +1,263 @@
+[Instead of optimizing deleteUnnecessaryFakeDirectories to reduce the number of calls to S3, need to understand whether it is mandatory to do invoke it from S3*OutputStream.close() / S3AFileSystem.innerCopyFromLocalFile / S3AFileSystem.innerRename. Thoughts?. , The goal of the call is to eliminate upstream pseudo-directory blobs. I fear removing it would do bad things.
+
+But if it is called after every file is written, it will be expensive, especially as there is {{getStatus()}} in there (2 x {{getObjectMetadata()}} + 1 x {{listObjects()}}) , plus the {{deleteObjects()}} call. As this goes up the tree, the cost will be O(depth)
+
+Given that after a file has just been written, it is known that there is a child of any directory (i.e. it is non-empty), then you don't need to check so much. You look for the existence of a path, and if there: delete. 
+
+More deviously, you could say "delete the path without checking to see if it exists". If it's not there, a failed delete is harmless. That'd still be O(depth), but one S3 call, rather than 3 or 4.
+
+And, once you go down that path, you could say "queue up a delete for all parent paths and fire them off in one go", going from O(depth) to O(1). 
+
+Even better, you could maybe even do that asynchronously. I'd worry a bit there about race conditions between the current thread and process, but given this is just a cleanup, it might be safe —and I don't see it being any worse race-wise than what exists today, except now it may be more visible to a single thread.
+
+That would need very, very, careful testing. The one thing nobody wants is an over-zealous delete operation to lose data.
+
+, Thanks [~steve_l].  When a file is written to a location, that folder along with its parents become non-empty folders as per the FS contract.  For e.g After writing "s3a://<sample_bucket>/test/testDeleteNonEmptyDirNonRecursive/d1/d2/d3/childFile.txt",  all parent directories should exist as  per fs contract. If so, ideally it is not needed to invoked deleteUnnecessaryFakeDirectories on every file close operation. Please correct me if my understanding is wrong.  Even in rename, iteration can stop once a non-empty folder is encountered in its path., As Rajesh and I discussed offline: 
+
+# this can be done asynchronously
+# once HADOOP-13221 guarantees that there are no parent entries of a file which are themselves files, the delete operation can omit the check for parent paths existing or being directories. Submitting a single deleteObjects() request listing all parent paths should be sufficient to purge parent directories, Attaching the WIP patch for initial review.  
+
+Changes are mainly related to using async approach to delete the objects in deleteUnnecessaryFakeDirectories. 
+, You need a story at error handling here. Bear in mind that removeKey(nonexistentpath) will fail at the AWS SDK layer; your code will need to handle that. The code you cut did that by swallowing the exceptions. I'd expect that to continue.
+
+I've been thinking we can more than just delete with an async thread; you can do parent dir creation on a delete operation, validation in a create() call that there is no parent directory that is actually a file (this could be launched in the create(), the result awaited on/checked in the close()/first PUT. That argues for having an executor that takes a queue of actions pushed down, of which dir deletion is only one.
+
+We'd need queue length another metric; actually a count of #of fake directory delete calls made and actual deletes executed. That'd be something that the tests can use. 
+
+I'd like to see a way to test this. Especially the shutdown process.
+
+I'm also wondering whether we can create new sequences of operations which could lose data. Something like
+{code}
+ touch("/path/1/2/3/4/5/6")
+ delete("/path/1/2/3/4/5/6")
+ echo("/path", 'important text")
+{code}
+
+If that recursive delete hasn't completed before that echo operation happens, data gets lost. 
+
+Thinking about this some more, I really worry about the async behaviour. Maybe we should try to optimise the sync one as a single removeKeys on all the parents, Again, we could do a scale test to play with the options here, to measure what made the lowest #of calls, and the time it took, Thanks for the inputs Steve. I tried out a deleteObjects() instead of listStatus + deleteObject on the same call. Perf in standalone mode seems impressive as it cuts down recursive calls. 
+
+{noformat}
+
+Test rename of files 10 times : Without Patch:
+2016-07-26 11:48:31,408 [Thread-0] INFO  contract.ContractTestUtils (ContractTestUtils.java:end(1365)) - Duration of Time to execute 10 renames from /tests3a/src to /tests3a/dst: 75,397,648,000 nS
+2016-07-26 11:48:31,409 [Thread-0] INFO  scale.TestS3ADirectoryPerformance (TestS3ADirectoryPerformance.java:testTimeToRenameFiles(177)) - Time per call: 7,539,764,800
+2016-07-26 11:50:58,555 [Thread-0] INFO  contract.ContractTestUtils (ContractTestUtils.java:end(1365)) - Duration of Time to execute 10 renames from /tests3a/src/1/2/3/4/5 to /tests3a/dst/1/2/3/4/5: 124,240,450,000 nS
+2016-07-26 11:50:58,555 [Thread-0] INFO  scale.TestS3ADirectoryPerformance (TestS3ADirectoryPerformance.java:testTimeToRenameFiles(177)) - Time per call: 12,424,045,000
+
+
+Test rename of files 10 times : With deleteObjects request patch:
+2016-07-26 11:58:17,544 [Thread-0] INFO  contract.ContractTestUtils (ContractTestUtils.java:end(1365)) - Duration of Time to execute 10 renames from /tests3a/src to /tests3a/dst: 69,002,710,000 nS
+2016-07-26 11:58:17,545 [Thread-0] INFO  scale.TestS3ADirectoryPerformance (TestS3ADirectoryPerformance.java:testTimeToRenameFiles(177)) - Time per call: 6,900,271,000
+2016-07-26 11:59:45,022 [Thread-0] INFO  contract.ContractTestUtils (ContractTestUtils.java:end(1365)) - Duration of Time to execute 10 renames from /tests3a/src/1/2/3/4/5 to /tests3a/dst/1/2/3/4/5: 73,648,115,000 nS
+2016-07-26 11:59:45,022 [Thread-0] INFO  scale.TestS3ADirectoryPerformance (TestS3ADirectoryPerformance.java:testTimeToRenameFiles(177)) - Time per call: 7,364,811,500
+{noformat}
+
+I will upload a patch with the deleteObjects() from deleteUnnecessaryFakeDirectories. , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  6s{color} | {color:red} HADOOP-13164 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HADOOP-13164 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12828204/HADOOP-13164.branch-2-002.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/10493/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, naming is wrong
+
+go HADOOP-1234-branch-2-001.patch, Also, branch-2 have moved all tests to ITest * . this isn't against a current branch-2. I'm afraid you are going to have to check out branch-2, and adapt to the new names. Yes, this means anything for branch-2.8 isn't going to cherrypick seamlessly, but that can be done as a related JIRA *after the patch is in branch-2+*, Thanks [~stevel@apache.org]. I have rebased the patch for branch-2.
+
+S3 Test results
+{noformat}
+Results :
+Tests run: 296, Failures: 0, Errors: 0, Skipped: 5
+{noformat}, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 19s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 29s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 19s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 14s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 24s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 16s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 33s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javadoc {color} | {color:red}  0m 10s{color} | {color:red} hadoop-tools_hadoop-aws-jdk1.8.0_101 with JDK v1.8.0_101 generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 20s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_111. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 16s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 14m 33s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HADOOP-13164 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12828382/HADOOP-13164-branch-2-003.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 5a65ff52f5f8 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 3f36ac9 |
+| Default Java | 1.7.0_111 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_111 |
+| findbugs | v3.0.0 |
+| javadoc | https://builds.apache.org/job/PreCommit-HADOOP-Build/10503/artifact/patchprocess/diff-javadoc-javadoc-hadoop-tools_hadoop-aws-jdk1.8.0_101.txt |
+| JDK v1.7.0_111  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/10503/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/10503/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 21s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 30s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 19s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 24s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 33s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 17s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 10s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 20s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_111. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 14m 39s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HADOOP-13164 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12828400/HADOOP-13164-branch-2-004.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux b27e11eb2c6a 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 3f36ac9 |
+| Default Java | 1.7.0_111 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_111 |
+| findbugs | v3.0.0 |
+| JDK v1.7.0_111  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/10505/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/10505/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, # using {{ArrayList<>}} for list; no need to go near guava if we can help it.
+# tuned loop to not be a while true + break on root, but just be a {{while(!isRootPath(f))}}
+# moved check for an empty list into {{removeKeys()}}, so it is everywhere.
+# cut test out of {{ITestS3AContractRename}}. This test is *only* for testing compliance with the FS spec, and were it not for consistency problems surfacing, should have no test cases at all, just a materialized subclass of {{AbstractContractRenameTest}}
+# moved this test in {{ITestS3AFileOperationCost.testFakeDirectoryDeletion then added assertions about metric state during all the operations.
+# cut test case from {{ITestS3ADirectoryPerformance}} as it didn't contain a single assertion. This is not a test; it is a demo.
+
+I really want to call out the test changes. A key benefit of adding all those metrics is that it lets us make assertions about the no of requests made of S3, *independent of execution time*. The tests in patch 004 don't really check *anything*. They log stuff, but that's for humans to read, not anything which can be automated in a jenkins build.
+
+* the initial purpose of tests is to demonstrate that the code not only behaves as expected, but doesn't break when you try to break it
+* the secondary purpose of the test is to catch regressions: to make sure your work holds even in the presence of changes by others (including your future self).
+* all tests need to be fully automated: the results must be verifiable in Jenkins, rather than reviewed in the logs.
+
+This is [the style guide|https://github.com/steveloughran/formality/blob/master/styleguide/styleguide.md] I try to follow when coding tests, and what I like to see in reviews. Yes, it usually makes writing the tests harder than the actual production code. Which is good: production code is ideally simple and reliable. Tests are are designed to break that code and use assertions to show that they have broken it. This takes effort —but is necessary to keep and improve code quality.
+
+, One more thing. Seems to me that the cleanup after rename can be merged in with the rename(s) own delete call. That is, there is no need to add a second delete call with the list of directories, just append the directory list. This should shave off 1 HTTP call, though given how slow rename is, it is not going to have tangible benefit for non-trivial renames, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 16s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 34s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 58s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 38s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 33s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  9s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 19s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  8m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 38s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 28s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  9m 12s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 29s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 29s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 76m 26s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HADOOP-13164 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12830679/HADOOP-13164-branch-005.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux d1b8ce795a52 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 9b0fd01 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/10625/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-tools/hadoop-aws U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/10625/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, jenkins is happy, test against s3 reland are happy. 
+
++1, commited to branch-2, thanks!, SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #10514 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/10514/])
+HADOOP-13164 Optimize S3AFileSystem::deleteUnnecessaryFakeDirectories. (stevel: rev ee0c722dc8fb81ec902cd1da5958ce5adb0ab08f)
+* (edit) hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/contract/AbstractFSContractTestBase.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Statistic.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AInstrumentation.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AFileOperationCost.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
+, cherry picked into 2.8 and adjusted fix version appropriately; simplified merging of delete patch in]

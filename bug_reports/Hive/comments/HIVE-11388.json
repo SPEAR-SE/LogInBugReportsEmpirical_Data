@@ -1,0 +1,191 @@
+[cc [~vgumashta], Or leader election using ZK? At any point only the leader starts the initiator thread., A simpler idea:
+The Initiator places a row in COMPACTION_QUEUE to 'schedule' a compaction.
+Before that it generates an ID from NEXT_COMPACTION_QUEUE_ID.
+With HIVE-11948 we have support for SELECT FOR UPDATE on every DB except Derby, though even w/o it we have Serializable isolation.  Either way we should be able to check that (db,table,partition,state=Initiated/Working) combination is unique.  
+
+This allows Initiator to run on any/every metastore while ensuring there is no double-compaction happening.  
+
+Need to come up with a solution for Cleaner.  Could add another state, such as 'bc'= being cleaned, so that 1 cleaner marks a row as bc, and then others ignore it.  (This just needs to be cleaned up on failure)
+
+This avoids the ZK., A simpler way to deal with Cleaner: entries in COMPACTION_QUEUE have WORKER_ID which includes hostname of the worker.  If cleaner runs on each metastore, we can make each Cleaner only handle entries from Worker(s) from the same host.  This will ensure Cleaner don't step on each other.
+
+Side note, when metastores get restarted (perhaps even on different host), we have logic to removeTimedoutWokers() so we can piggyback on this to ensure that Cleaner doesn't miss any compactions (in the long run at least).  But also see HIVE-11685.
+
+We also want to make sure AcidHouseKeeper instances don't step on each other.
+
+, Avoiding ZK is a major bonus.  I'm wondering if your first proposal of having another state would be better.  Depending on the cleaner being on the same host seems like it has some issues:
+# How do we deal with the case where the cleaner thread on a metastore dies?  The workers will keep compacting but no one will be cleaning up.
+# How do we detect orphaned compactions in the waiting for cleaning state?  Minus something like ZK it's not immediately obvious to me how to figure out that a given metastore instance died or was shut down and that another cleaner should step in and take over.  You could wait a day or something, but even then you'd have to manage determining who stepped in.  Basically I think you'll have to have some form of coordination and doing it in the database seems like the best method., another note:  CompactionTxnHandler.cleanEmptyAbortedTxns() which runs from Initiator should ideally not run in parallel.  This won't corrupt anything, but may tax the DB unnecessarily.
+
+, here is one general purpose mechanism:
+create table MUTEX_TABLE(keyname varchar(512) PRIMARY KEY)
+
+Then any process that requires a mutex needs to insert a row into this table (as long as everyone agrees on the key) and then do a "Select for update" on this row.  If the process dies, "select for update" lock is automatically released.
+
+For example, if 2 Initiator instances want to schedule a compaction, each could
+1. select * from MUTEX_TABLE where keyname="initiator" for update.
+If the "initiator" row is already there, only 1 will succeed.  The other one, once it unblocks, will already see "this" compaction scheduled.
+2. if select in 1 misses, then Initiator can insert "initiator" row and then goto 1.  Because of PK only 1 will succeed.
+
+Since the keyname is arbitrary, it can be "db/table/partition" to coordinate Workers if necessary.
+
+A little primitive, but workable and avoids ZooKeeper and allows all parts of Compaction/HouseKeeping to run on multiple MS nodes., I would suggest adding hostname to the MUTEX_TABLE so that admins can easily figure out which instance of metastore is running a given thread.
+
+But what happens when that metastore dies?  How does one of the existing metastores know to start an initiator?  The table will also need a 'last_hearbeat' column that is updated each time the initiator runs.  Other initiator threads will need to spin checking this every minute or so to see if the previous initiator has died, and if so take over.  If the first metastore then heartbeats again it would have to discover it no longer holds the lock and kill its initiator thread., I agree that the "hostname" field may is useful.
+
+The idea is that Initiator thread is running in each metastore.
+But if it needs to perform some operation in a way that another Initiator doesn't attempt the same, then the row in MUTEX_TABLE with key="initiator" will be locked using Select for Update to provide exclusive access.  If it dies, DB will automatically release the lock and another Initiator instance will be able to proceed.  
+
+, Ok, that makes sense.  Since the row will never really appear in the database then the hostname field may not make sense.  A couple of other thoughts:
+# This "lock" will be limited by any intervening commits.  This is probably ok as we probably shouldn't be locking across commits anyway, but we want to make sure we aren't inadvertently dropping the lock midway through.
+# Can we make this a couple of protected methods in TxnHandler {{void getMutex(String mutexName)}} and {{void releaseMutex(String mutexName)}}.  This way when the HBaseMetastore work gets around to implementing TxnHandler and has to do it in a completely different way it will still have internal method to do it with.  If this adds a bunch of work you can ignore the request., I don't think "intervening commits" are an issue.  Suppose getMutex() works like this:
+1. get jdbc connection
+2. run "select for update"
+3. return "Handle" - which wraps connection/statement object.
+
+Then releaseMutex() will take "Handle" as parameter to commit/rollback to "release" the lock.
+So if any other operation uses a separate jdbc connection to do work, it will be done with a "protected" block bounded by getMutex()/releaseMutex(Handle)
+
+, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12793166/HIVE-11388.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 5 failed/errored test(s), 9789 tests executed
+*Failed tests:*
+{noformat}
+TestMiniTezCliDriver-schema_evol_text_nonvec_mapwork_table.q-orc_vectorization_ppd.q-vector_left_outer_join2.q-and-12-more - did not produce a TEST-*.xml file
+TestSparkCliDriver-groupby3_map.q-sample2.q-auto_join14.q-and-12-more - did not produce a TEST-*.xml file
+TestSparkCliDriver-groupby_map_ppr_multi_distinct.q-table_access_keys_stats.q-groupby4_noskew.q-and-12-more - did not produce a TEST-*.xml file
+TestSparkCliDriver-join_rc.q-insert1.q-vectorized_rcfile_columnar.q-and-12-more - did not produce a TEST-*.xml file
+TestSparkCliDriver-ppd_join4.q-join9.q-ppd_join3.q-and-12-more - did not produce a TEST-*.xml file
+{noformat}
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/7254/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/7254/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-TRUNK-Build-7254/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 5 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12793166 - PreCommit-HIVE-TRUNK-Build, TxnHandler.isDuplicateKeyError - There are only cases in here for Derby and MySQL.  The other options will need to be added before this is committed.
+
+Other than that looks good.
+
+
+
+, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12794647/HIVE-11388.7.patch
+
+{color:green}SUCCESS:{color} +1 due to 3 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 4 failed/errored test(s), 9850 tests executed
+*Failed tests:*
+{noformat}
+TestSparkCliDriver-groupby3_map.q-sample2.q-auto_join14.q-and-12-more - did not produce a TEST-*.xml file
+TestSparkCliDriver-groupby_map_ppr_multi_distinct.q-table_access_keys_stats.q-groupby4_noskew.q-and-12-more - did not produce a TEST-*.xml file
+TestSparkCliDriver-join_rc.q-insert1.q-vectorized_rcfile_columnar.q-and-12-more - did not produce a TEST-*.xml file
+TestSparkCliDriver-ppd_join4.q-join9.q-ppd_join3.q-and-12-more - did not produce a TEST-*.xml file
+{noformat}
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/7333/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/7333/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-TRUNK-Build-7333/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 4 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12794647 - PreCommit-HIVE-TRUNK-Build, This change makes use of JDBC Connections, and thus the connection pool may need to be larger.  Pool size is currently hardcoded.  Should fix HIVE-12592., fix for HIVE-12725 is included here, This patch also includes a 1 character fix to an issue introduced in HIVE-13013 (SQL stmt in TxnHandler.lockTransactionRecord()), [~ekoifman] I have several questions regarding patch 7.
+1. In TxnHandler.acquireLock implementation, there's a {code}if (!rs.next()){code}block, after that, shouldn't there be an else block that deals with the case when there's existing key in AUX_TABLE (thus roll back the select for update and retry)?
+2. In Cleaner.run(), I'm not sure if we need currentToCleanSet, since we're essentially checking the existence of compactId2CompactInfoMap members in toClean set.
+3. In TestTxnHandler.testMutexAPI, we can add two more asserts after //now 2 and //now 3 to confirm., 1. The purpose is to run Select For Update.  So if the key is already there, the 1st "rs = stmt.executeQuery(sqlStmt);" will do it.
+2. we do need this.  Since you may have several Cleaner processes running, they will each accumulate state in these data structures.  But you don't know which instance will end up actually cleaning files so if you remove data from these structures you'll have a memory leak.
+3. What would that confirm?  If the counts are off at this point, it means the 2nd thread somehow ran ahead and thus it will see its counts being different., Thanks Eugene.
+1. I see. It would be helpful to have a comment by the first stmt.executeQuery since it's not explicit. I didn't realize that in the first round :)
+2. I mean we do need such logic to filter out compactions cleaned by other Cleaners. I'm saying we can have simpler code by directly using toClean. But I just realized that we need to extract id from CompactionInfo to have a convenient set, so never mind.
+3. Agree.
+
+Btw what's the purpose of having column MT_KEY2?, Patch looks good. +1, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12794647/HIVE-11388.7.patch
+
+{color:red}ERROR:{color} -1 due to build exiting with an error
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/7349/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/7349/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-TRUNK-Build-7349/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Tests exited with: NonZeroExitCodeException
+Command 'bash /data/hive-ptest/working/scratch/source-prep.sh' failed with exit status 1 and output '+ [[ -n /usr/java/jdk1.7.0_45-cloudera ]]
++ export JAVA_HOME=/usr/java/jdk1.7.0_45-cloudera
++ JAVA_HOME=/usr/java/jdk1.7.0_45-cloudera
++ export PATH=/usr/java/jdk1.7.0_45-cloudera/bin/:/usr/local/apache-maven-3.0.5/bin:/usr/java/jdk1.7.0_45-cloudera/bin:/usr/local/apache-ant-1.9.1/bin:/usr/local/bin:/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/sbin:/home/hiveptest/bin
++ PATH=/usr/java/jdk1.7.0_45-cloudera/bin/:/usr/local/apache-maven-3.0.5/bin:/usr/java/jdk1.7.0_45-cloudera/bin:/usr/local/apache-ant-1.9.1/bin:/usr/local/bin:/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/sbin:/home/hiveptest/bin
++ export 'ANT_OPTS=-Xmx1g -XX:MaxPermSize=256m '
++ ANT_OPTS='-Xmx1g -XX:MaxPermSize=256m '
++ export 'M2_OPTS=-Xmx1g -XX:MaxPermSize=256m -Dhttp.proxyHost=localhost -Dhttp.proxyPort=3128'
++ M2_OPTS='-Xmx1g -XX:MaxPermSize=256m -Dhttp.proxyHost=localhost -Dhttp.proxyPort=3128'
++ cd /data/hive-ptest/working/
++ tee /data/hive-ptest/logs/PreCommit-HIVE-TRUNK-Build-7349/source-prep.txt
++ [[ false == \t\r\u\e ]]
++ mkdir -p maven ivy
++ [[ git = \s\v\n ]]
++ [[ git = \g\i\t ]]
++ [[ -z master ]]
++ [[ -d apache-github-source-source ]]
++ [[ ! -d apache-github-source-source/.git ]]
++ [[ ! -d apache-github-source-source ]]
++ cd apache-github-source-source
++ git fetch origin
+From https://github.com/apache/hive
+   28ec243..8fc708b  branch-1   -> origin/branch-1
++ git reset --hard HEAD
+HEAD is now at 39d029e HIVE-13296 Add vectorized Q test with complex types showing count(*) etc work correctly (Matt McCline, reviewed by Prasanth Jayachandran)
++ git clean -f -d
+Removing common/src/java/org/apache/hadoop/hive/conf/HiveConf.java.orig
++ git checkout master
+Already on 'master'
++ git reset --hard origin/master
+HEAD is now at 39d029e HIVE-13296 Add vectorized Q test with complex types showing count(*) etc work correctly (Matt McCline, reviewed by Prasanth Jayachandran)
++ git merge --ff-only origin/master
+Already up-to-date.
++ git gc
++ patchCommandPath=/data/hive-ptest/working/scratch/smart-apply-patch.sh
++ patchFilePath=/data/hive-ptest/working/scratch/build.patch
++ [[ -f /data/hive-ptest/working/scratch/build.patch ]]
++ chmod +x /data/hive-ptest/working/scratch/smart-apply-patch.sh
++ /data/hive-ptest/working/scratch/smart-apply-patch.sh /data/hive-ptest/working/scratch/build.patch
+The patch does not appear to apply with p0, p1, or p2
++ exit 1
+'
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12794647 - PreCommit-HIVE-TRUNK-Build, [~wzheng] could you review branch-1 patch, branch-1 patch looks good. +1, Does this need to be documented in the wiki for releases 1.3.0 and 2.1.0?, bq. Does this need to be documented in the wiki for releases 1.3.0 and 2.1.0?
+I am not sure.  [~ekoifman] is this all of the work needed to make it possible to run multiple initiators and cleaners, or just part of it?  Have we tested running them in multiple metastores?  If the answer to those is yes, then the answer to [~leftylev]'s question is: "definitely"., This has been documented. The only real change is in "hive.compactor.initiator.on" of https://cwiki.apache.org/confluence/display/Hive/Hive+Transactions#HiveTransactions-NewConfigurationParametersforTransactions. ]

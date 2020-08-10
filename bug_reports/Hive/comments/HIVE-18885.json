@@ -1,0 +1,354 @@
+[[~akolb] At least we have isolated the query. I will look to see if there are more such queries. Is the fix to create a single transaction for each alter partition call?, The current notification sequence id design has very strict constraints which slows down the entire HMS. The restrictions like continuously increasing without any holes essentially serializes all the transactions across multiple instances. We should change the design to allow for holes in the sequence ids. In order to do that it should guaranteed that notification is generated only when a transaction is committed, instead of optimistically grabbing a notification id number while holding the lock. The notification clients need to know the commit order, as long as they can figure that out based on monotonically increasing sequence ids I think its should be fine. Can we use something like below to make sure we are generating notification ids only when transaction is guaranteed to be committed. for example, something like below:
+
+{code}
+PersistenceManager pm = pmf.getPersistenceManager();
+Transaction tx = pm.currentTransaction();
+try
+{
+    tx.begin();
+
+    tx.setSynchronization(new javax.transaction.Synchronization()
+    {
+        public void afterCompletion(int status)
+        {
+            if (status == javax.transaction.Status.STATUS_COMMITTED)
+            {
+                // generate notification sequence id
+                // we can also use database sequence generators which are much more efficient
+            }
+        }
+    });
+    
+    tx.commit();
+}
+finally
+{
+    if (tx.isActive())
+    {
+        tx.rollback();
+    }
+}
+pm.close();
+{code}, [~vihangk1] Something like this would work in general but it allows for missed notifications since creating notification and storing it may fail. This means that there is some chance that certain operations succeed but do not have corresponding notifications.
+
+Another issue is that we have bulk operations which create many notifications. This means that the code should be restructured to save all these notification after transaction completes rather then inline., [~arjunmishra13] I think there are multiple cases like this. Some examples come to mind:
+
+1) Drop table/database
+2) Request to create multiple tables or to add multiple partitions.
+3) Request to drop multiple tables or partitions.
+
+The issue with ALTER TABLE CASCADE is that it walks across *all* partitions (as does drop table/database)., bq. but it allows for missed notifications since creating notification and storing it may fail. This means that there is some chance that certain operations succeed but do not have corresponding notifications.
+
+Isn't it possible even now? I see that transactional listeners are called within a transaction block but non-transaction listeners are called outside the transaction block.
+
+bq. Another issue is that we have bulk operations which create many notifications. This means that the code should be restructured to save all these notification after transaction completes rather then inline.
+
+Yes, this also gives us an opportunity to generate aggregate notifications where they make sense. If a table has thousands of partitions does it make sense to generate thousands of (expensive) notifications when cascade is true?, [~vihangk1] Non-transactional listeners do not create notifications - they are used to do some extra work. For example, in case of Sentry they are used to synchronize events between HMS and Sentry. Even though they may never execute nothing really depends on them. SO with the current design we should not have missed notifications. Note that before the {{big fat lock}} fix it was possible to get multiple notifications with the same ID and we also observed stored notification value go backwards., [~vihangk1] +1 for aggregated notifications., [~akolb] notfications are not created in the loop with the below statement 
+{code}
+        msdb.alterPartition(dbname, name, part.getValues(), part);
+{code}
+
+the above part of *HiveAlterHandler.alterTable*. Notifications are created at the end of all the operations so locks will be taken towards the end just before commit. as you said for a large query there may be lot of notifications that need to be created and that will take a lock(towards the end near commit) and lock dbNotification sequence till that transaction commits. 
+
+For replication we depend on, given a timeline with transaction commits, time ordered, then notifications w.r.t to these transactions have to follow the same order in their sequence, this was achieved by the use of lock.
+, [~anishek] You are actually right, event is added after the loop. I guess what is happening is that some operation combines more then a single event-generating action. The first one obtains the lock which is not dropped immediately because the transaction isn't closed and the subsequent one executes with lock held. In this particular case the thread that was holding the lock was the one executing alter_table_with_cascade, but it could be that it was just the lucky guy who managed to get the lock., The issue happens due to a deadlock between two concurrent transactions which acquire the same blocking db locks and the java object lock {{NOTIFICATION_TBL_LOCK}} in DbNotificationListener.java. The issue is more likely to happen in systems where DbNotificationListener is configured as a transactional listener because the db locks are not released until the top level transaction completes. Here is an example:
+
+1. Two transactions call alter_partitions on a List of non-overlapping partitions (Typical scenario happening from StatsTask from multiple concurrent queries)
+2. In alter_partitions both the transactions are executing the following loop in alter_partitions
+{code}
+for (Partition tmpPart : new_parts) {
+          Partition oldTmpPart = null;
+          if (olditr.hasNext()) {
+            oldTmpPart = olditr.next();
+          }
+          else {
+            throw new InvalidOperationException("failed to alterpartitions");
+          }
+
+          if (table == null) {
+            table = getMS().getTable(db_name, tbl_name);
+          }
+
+          if (!listeners.isEmpty()) {
+            MetaStoreListenerNotifier.notifyEvent(listeners,
+                                                  EventType.ALTER_PARTITION,
+                                                  new AlterPartitionEvent(oldTmpPart, tmpPart, table, true, this));
+          }
+        }
+{code}
+3. Transaction 1 acquires the dblock on notification_sequence table in notifyEvent method and releases the lock on {{NOTIFICATION_TBL_LOCK}}  object. The fact that notification_sequence table is a single row table makes matters worse.
+4. Transaction 2 thrift thread is scheduled and it tries to do same thing above. But now it blocks on the dbLock *while holding the lock on {{NOTIFICATION_TBL_LOCK}}*.
+5. Transaction 1 thrift thread is scheduled and it blocks on lock {{NOTIFICATION_TBL_LOCK}} which held by Transaction 2 above.
+
+Eventually, DB times out one of the transaction with DB lock time-out errors and rollbacks one of them. But in a highly concurrent workload this keeps repeating and HMS slows down so much that it practically becomes unusable., Note that th issue may happen on Hive-2 branch even for non-transactional listeners because they can easily be called in transactional context for nested transactions., [~vihangk1] i was not able to find NOTIFICATION_TBL_LOCK in the java code. Can you please point me to it, it will help me understand the java lock + db deadlock, I thought that was used earlier but was removed and is no longer present. 
+, [~anishek] It is in branch-2:
+
+{code:java}
+  private void process(NotificationEvent event, ListenerEvent listenerEvent) throws MetaException {
+    event.setMessageFormat(msgFactory.getMessageFormat());
+    synchronized (NOTIFICATION_TBL_LOCK) {
+      LOG.debug("DbNotificationListener: Processing : {}:{}", event.getEventId(),
+          event.getMessage());
+      HMSHandler.getMSForConf(hiveConf).addNotificationEvent(event);
+    }
+{code}
+
+It was removed in branch-3., [~anishek] One serious issue is that the lock may be held for relatively long time when there are many partitions involved in the operations. Combining multiple events into one event helps with that., [~akolb] Can you take a look at the patch?, [~vihangk1] will do., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12916017/HIVE-18885.02.branch-2.patch
+
+{color:red}ERROR:{color} -1 due to build exiting with an error
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/9802/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/9802/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-9802/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Tests exited with: NonZeroExitCodeException
+Command 'bash /data/hiveptest/working/scratch/source-prep.sh' failed with exit status 1 and output '+ date '+%Y-%m-%d %T.%3N'
+2018-03-24 18:38:42.030
++ [[ -n /usr/lib/jvm/java-8-openjdk-amd64 ]]
++ export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
++ JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
++ export PATH=/usr/lib/jvm/java-8-openjdk-amd64/bin/:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games
++ PATH=/usr/lib/jvm/java-8-openjdk-amd64/bin/:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games
++ export 'ANT_OPTS=-Xmx1g -XX:MaxPermSize=256m '
++ ANT_OPTS='-Xmx1g -XX:MaxPermSize=256m '
++ export 'MAVEN_OPTS=-Xmx1g '
++ MAVEN_OPTS='-Xmx1g '
++ cd /data/hiveptest/working/
++ tee /data/hiveptest/logs/PreCommit-HIVE-Build-9802/source-prep.txt
++ [[ false == \t\r\u\e ]]
++ mkdir -p maven ivy
++ [[ git = \s\v\n ]]
++ [[ git = \g\i\t ]]
++ [[ -z master ]]
++ [[ -d apache-github-source-source ]]
++ [[ ! -d apache-github-source-source/.git ]]
++ [[ ! -d apache-github-source-source ]]
++ date '+%Y-%m-%d %T.%3N'
+2018-03-24 18:38:42.033
++ cd apache-github-source-source
++ git fetch origin
+From https://github.com/apache/hive
+   ba18062..696affa  master     -> origin/master
++ git reset --hard HEAD
+HEAD is now at ba18062 HIVE-18855 : Fix unit test TestMiniLlapLocalCliDriver.testCliDriver[results_cache_1] (Jason Dere via Sergey Shelukhin)
++ git clean -f -d
++ git checkout master
+Already on 'master'
+Your branch is behind 'origin/master' by 1 commit, and can be fast-forwarded.
+  (use "git pull" to update your local branch)
++ git reset --hard origin/master
+HEAD is now at 696affa HIVE-18780 : Improve schema discovery For Druid Storage Handler (Slim Bouguerra via Ashutosh Chauhan)
++ git merge --ff-only origin/master
+Already up-to-date.
++ date '+%Y-%m-%d %T.%3N'
+2018-03-24 18:38:44.301
++ rm -rf ../yetus_PreCommit-HIVE-Build-9802
++ mkdir ../yetus_PreCommit-HIVE-Build-9802
++ git gc
++ cp -R . ../yetus_PreCommit-HIVE-Build-9802
++ mkdir /data/hiveptest/logs/PreCommit-HIVE-Build-9802/yetus
++ patchCommandPath=/data/hiveptest/working/scratch/smart-apply-patch.sh
++ patchFilePath=/data/hiveptest/working/scratch/build.patch
++ [[ -f /data/hiveptest/working/scratch/build.patch ]]
++ chmod +x /data/hiveptest/working/scratch/smart-apply-patch.sh
++ /data/hiveptest/working/scratch/smart-apply-patch.sh /data/hiveptest/working/scratch/build.patch
+error: a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java: does not exist in index
+error: patch failed: hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java:83
+Falling back to three-way merge...
+Applied patch to 'hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java' with conflicts.
+Going to apply patch with: git apply -p1
+error: patch failed: hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java:83
+Falling back to three-way merge...
+Applied patch to 'hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java' with conflicts.
+U hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java
++ exit 1
+'
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12916017 - PreCommit-HIVE-Build, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12916017/HIVE-18885.02.branch-2.patch
+
+{color:red}ERROR:{color} -1 due to build exiting with an error
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/9826/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/9826/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-9826/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Tests exited with: NonZeroExitCodeException
+Command 'bash /data/hiveptest/working/scratch/source-prep.sh' failed with exit status 1 and output '+ date '+%Y-%m-%d %T.%3N'
+2018-03-25 18:27:26.727
++ [[ -n /usr/lib/jvm/java-8-openjdk-amd64 ]]
++ export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
++ JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
++ export PATH=/usr/lib/jvm/java-8-openjdk-amd64/bin/:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games
++ PATH=/usr/lib/jvm/java-8-openjdk-amd64/bin/:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games
++ export 'ANT_OPTS=-Xmx1g -XX:MaxPermSize=256m '
++ ANT_OPTS='-Xmx1g -XX:MaxPermSize=256m '
++ export 'MAVEN_OPTS=-Xmx1g '
++ MAVEN_OPTS='-Xmx1g '
++ cd /data/hiveptest/working/
++ tee /data/hiveptest/logs/PreCommit-HIVE-Build-9826/source-prep.txt
++ [[ false == \t\r\u\e ]]
++ mkdir -p maven ivy
++ [[ git = \s\v\n ]]
++ [[ git = \g\i\t ]]
++ [[ -z master ]]
++ [[ -d apache-github-source-source ]]
++ [[ ! -d apache-github-source-source/.git ]]
++ [[ ! -d apache-github-source-source ]]
++ date '+%Y-%m-%d %T.%3N'
+2018-03-25 18:27:26.730
++ cd apache-github-source-source
++ git fetch origin
++ git reset --hard HEAD
+HEAD is now at 5b222db HIVE-18953 : Implement CHECK constraint (Vineet Garg via Ashutosh Chauhan)
++ git clean -f -d
++ git checkout master
+Already on 'master'
+Your branch is up-to-date with 'origin/master'.
++ git reset --hard origin/master
+HEAD is now at 5b222db HIVE-18953 : Implement CHECK constraint (Vineet Garg via Ashutosh Chauhan)
++ git merge --ff-only origin/master
+Already up-to-date.
++ date '+%Y-%m-%d %T.%3N'
+2018-03-25 18:27:28.107
++ rm -rf ../yetus_PreCommit-HIVE-Build-9826
++ mkdir ../yetus_PreCommit-HIVE-Build-9826
++ git gc
++ cp -R . ../yetus_PreCommit-HIVE-Build-9826
++ mkdir /data/hiveptest/logs/PreCommit-HIVE-Build-9826/yetus
++ patchCommandPath=/data/hiveptest/working/scratch/smart-apply-patch.sh
++ patchFilePath=/data/hiveptest/working/scratch/build.patch
++ [[ -f /data/hiveptest/working/scratch/build.patch ]]
++ chmod +x /data/hiveptest/working/scratch/smart-apply-patch.sh
++ /data/hiveptest/working/scratch/smart-apply-patch.sh /data/hiveptest/working/scratch/build.patch
+error: a/hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java: does not exist in index
+error: patch failed: hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java:83
+Falling back to three-way merge...
+Applied patch to 'hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java' with conflicts.
+Going to apply patch with: git apply -p1
+error: patch failed: hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java:83
+Falling back to three-way merge...
+Applied patch to 'hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java' with conflicts.
+U hcatalog/server-extensions/src/main/java/org/apache/hive/hcatalog/listener/DbNotificationListener.java
++ exit 1
+'
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12916017 - PreCommit-HIVE-Build, Can you post reviewboard request for this patch?, Looks like you are fixing two problems at once. One is described here and is only applicable to branch-3. The second poblem (cleaner thread throwing exception) is applicable to branch-3 as well, so I suggest using a separate JIRA for it.
+
+As for the fix for the second problem, I think you need to catch {{Throwable}}, not just {{Exception}} to guarantee that the cleaner thread will survive.
+
+A few more thoughts:
+
+# The comment for the {{DbNotificationListener}} class is stale and should be updated.
+# CleanerThread is static, which is Ok, but better to guarantee that the whole thing is a singleton.
+# It would be nice to have a custom name for a cleaner thread.
+
+I don't mean that all of these should be done in this patch - probably it is best to just remove the lock here and do cleaner-thread improvements as a separate JIRA (or two) since they are valid for both branch-2 and branch-3., Created a separate JIRA for cleaner thread improvements. Will update this patch to only remove the java lock and update the comment of this class.
+
+It is interesting to read the outdated java doc of this class. The original DbNotificationListener seems to have asynchronous way of generating the notifications which don't block the transactions. I guess somewhere down the line this was repurposed for transactional notification events. I am curious to look at the older version of this listener to see if there are certain things which we can incorporate, Attached the patch with [~akolb]'s suggestions. I would make a separate change to fix the cleaner thread. Also, fixed the patch name so that precommit tests could run., Adding a review board link as requested, update the RB with the suggested changes., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12916288/HIVE-18885.04-branch-2.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 14 failed/errored test(s), 10667 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestAccumuloCliDriver.testCliDriver[accumulo_queries] (batchId=227)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[avro_tableproperty_optimize] (batchId=22)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[explaindenpendencydiffengs] (batchId=38)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[llap_smb] (batchId=142)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[orc_ppd_basic] (batchId=139)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[table_nonprintable] (batchId=140)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[join_acid_non_acid] (batchId=158)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[union_fast_stats] (batchId=153)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[vectorized_parquet_types] (batchId=155)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[merge_negative_5] (batchId=88)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[explaindenpendencydiffengs] (batchId=115)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vectorization_input_format_excludes] (batchId=117)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vectorized_ptf] (batchId=125)
+org.apache.hive.hcatalog.api.TestHCatClient.testTransportFailure (batchId=176)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/9858/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/9858/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-9858/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.YetusPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 14 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12916288 - PreCommit-HIVE-Build, +1 LGTM, Test failures are unrelated., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12916288/HIVE-18885.04-branch-2.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 17 failed/errored test(s), 10664 tests executed
+*Failed tests:*
+{noformat}
+TestHS2HttpServer - did not produce a TEST-*.xml file (likely timed out) (batchId=192)
+org.apache.hadoop.hive.cli.TestAccumuloCliDriver.testCliDriver[accumulo_queries] (batchId=227)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[avro_tableproperty_optimize] (batchId=22)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[explaindenpendencydiffengs] (batchId=38)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[llap_smb] (batchId=142)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[orc_ppd_basic] (batchId=139)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[table_nonprintable] (batchId=140)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[join_acid_non_acid] (batchId=158)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[union_fast_stats] (batchId=153)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[vector_if_expr] (batchId=144)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[vectorized_parquet_types] (batchId=155)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[merge_negative_5] (batchId=88)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[explaindenpendencydiffengs] (batchId=115)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vectorization_input_format_excludes] (batchId=117)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vectorized_ptf] (batchId=125)
+org.apache.hive.hcatalog.api.TestHCatClient.testTransportFailure (batchId=176)
+org.apache.hive.jdbc.TestJdbcDriver2.testSelectExecAsync2 (batchId=222)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/9872/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/9872/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-9872/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.YetusPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 17 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12916288 - PreCommit-HIVE-Build, Patch merged to branch-2 and branch-2.3 Thanks for the review [~akolb] and [~pvary]]

@@ -1,0 +1,66 @@
+[This seems to fix this issue (also includes unit test), I'm having trouble applying this patch to FB branch & 0.20-append branch.  Are there any JIRA prerequisites?, Hey Nicolas. Sorry, looks like I never uploaded my final patch for the RBW replica stuff in HDFS-142. I just posted recover-rbw-v2.txt patch there, which this ought to apply on top of., hey todd,
+
+i was looking at this patch, and while it has certainly reduced the chance of problems, isn't it still possible a new writer thread could be created 
+
+1. between the kill loop in startBlockRecovery() and the synchronized block
+2. between the startBlockRecovery() call and updateBlock() call
+
+I seem to recall reasoning with dhruba that while in theory these could occur from the DN perspective, the circumstances that would have to occur outside were not (once you fixed hdfs-1260 anyway, where genstamp checks work right in concurrent lease recovery).
+
+what's your take on this?  is it full-proof now?  (1 & 2 can't happen)  or what about introducing a state like RUR here?  (at least disabling writes to a block while under recovery, maybe timing out in case the lease recovery owner dies)
+, Hi Sam, thanks for taking a look. I think you're right that in some really weird timing scenarios we might have a problem:
+
+{noformat}
+writer writes offset 1 and syncs, gs=1
+
+NN recovery starts:
+  - interrupts writer, gets metadata (len 1)
+  - recovering DN hangs for a little bit
+
+writer recovery starts, picks a different primary DN:
+  - interrupts writer (noop)
+  - gets metadata (len 1)
+  - gets new GS=2
+  - syncs blocks to GS=2 len=1
+  - restarts pipeline
+  - writes and syncs some more data to block with GS=2
+
+NN-directed recovery proceeds:
+  - gets new GS=3   (this has to be at least 10 seconds after above due to lastRecoveryTime check)
+  - calls updateBlock on all DNs, which truncates files
+{noformat}
+
+I think the issue here is that the genstamp can be incremented in between startBlockRecovery() and updateBlock(), and thus updateBlock is allowing an update based on stale recovery info. If we simply added a check in tryUpdateBlock() that oldblock.getGenerationStamp() == oldgs, I think we'd be safe. What do you think?
+, yea, i think so.  let me repeat slightly different to make sure I get this at a higher level:
+
+1. we make sure that a lease recovery that starts with a old gs at one stage (that's synchronized) actually mutates the block data of only the same gs
+2. new writer that come in between start of recovery and actual stamping must have a new gs since they can only come into being via lease recovery
+
+this is effectively saying that if concurrent lease recoveries get started, the first to complete wins (as it should), and later completions just fail.
+
+sounds like optimistic locking/versioned puts in the cache world actually: updateBlock requires the source to match an expected source.
+
+nice idea
+
+
+, I'm wondering if there is still some sort of weird issue, though...
+Let's say there are two concurrent recoveries, one trying to update to genstamp 2 and the other trying to update to genstamp 3, and there are 3 DNs.
+
+Let's say that GS=2 recovery wins on dn A and B, and GS=3 recovery wins on DN C, a little bit later. The commitBlockSynchronization() call for GS=3 works, even though the client started writing again to GS=2.
+
+It's almost as if we need to track through the lease holder name through the block synchronization, and only allow nextGenerationStamp and commitBlockSynchronization to succeed if the lease holder agrees?, how could this happen?  the GS=2 stamp succeeds on A and B.  for GS=3 to win on C, GS=2 had to fail which means it went 2nd.  The primary for GS=2 would get a failure doing the stamping of DN C and would fail the lease recovery, right?, The lease recovery only fails if *all* replicas fail to updateBlock. As long as at least one updates, it succeeds and calls commitBlockSynchronization, I think you can make this argument:
+
+1. each node has to make a transition from x -> x+k
+2. at most one node owns any x -> x+k transition as the primary of a recovery
+3. success requires all DNs to complete x -> x+k
+4. primary then commits x -> x+k
+
+and until commitBlockSync completes, no transition y -> y+j with y > x can come in
+
+right?
+, step 3 is where the flaw is: success currently requires ONE DN to complete x -> x + k, hmm i wonder why only 1?  if the client thinks there are 3 DNs in the pipeline and asks to recovery 3, i think it should fail with less than 3.  a client can request fewer if that works (in which case we do have to handle the problem you lay out)
+
+so in your sol'n, you are saying that the lease holder, the client, needs to be contacted to verify the primary is the only one doing lease recovery? (or at least the latest)
+, wait, why can't commitBlockSync on the NN just do the same check on genstamps?  if two primaries start concurrent lease recoveries and split the remaining nodes as far as who wins in stamping, and the NN can resolve the issue of who wins in the end?   then the loser will be marked as an invalid and replication takes over to fix it
+
+or i have this sinking feeling i am still missing something?, Is there a reason why this is 0.20-append only?  What did 0.21 & 0.22 do to fix this issue?, Likely only a blocker for 0.20 append branch., Patch for 0.20-security., +1 for the patch., New patch with missing file added., Suresh committed this for 0.20.205, Closed upon release of 0.20.205.0]

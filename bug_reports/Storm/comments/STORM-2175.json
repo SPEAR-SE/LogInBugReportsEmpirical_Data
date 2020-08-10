@@ -1,0 +1,97 @@
+[[~revans2] This seems to provoke the errors reasonably often https://github.com/srdo/storm/blob/STORM-2175-reproduction/examples/storm-starter/test/jvm/org/apache/storm/starter/tools/STORM2175.java, [~Srdo],
+
+Thanks I was able to reproduce the issue with this.  I could not make it happen on master though, so I am really interested to see what is going on., OK I was looking through the logs and found what happened (and honestly I think it is actually a good thing).
+
+When shutting down a local mode cluster inside testing.clj we have.
+
+{code}
+  (doseq [s @(:supervisors cluster-map)]
+    (.shutdownAllWorkers s)
+    ;; race condition here? will it launch the workers again?
+    (.close s))
+  (ProcessSimulator/killAllProcesses)
+{code}
+
+NOTE: the comment above is not what is causing this issue.
+
+So all of the supervisors are shut down, first by killing all of the worker processes and then by closing the supervisor.
+After all of the supervisors are shut down, just to be sure, we then kill all of the processes still registered with the process simulator.
+
+The code for killing all of the workers in a supervisor is the following...
+
+{code}
+    public synchronized void shutdownAllWorkers() {
+        for (Slot slot: slots.values()) {
+            slot.setNewAssignment(null);
+        }
+
+        for (Slot slot: slots.values()) {
+            try {
+                int count = 0;
+                while (slot.getMachineState() != MachineState.EMPTY) {
+                    if (count > 10) {
+                        LOG.warn("DONE waiting for {} to finish {}", slot, slot.getMachineState());
+                        break;
+                    }
+                    if (Time.isSimulating()) {
+                        Time.advanceTime(1000);
+                        Thread.sleep(100);
+                    } else {
+                        Time.sleep(100);
+                    }
+                    count++;
+                }
+            } catch (Exception e) {
+                LOG.error("Error trying to shutdown workers in {}", slot, e);
+            }
+        }
+    }
+{code}
+
+It tells the Slot that it is not assigned anything any more and waits for it to kill the worker under it.  I saw in the logs that for the one worker in question it timed out ("DONE waiting for...") and went on to kill/shut down other things. 
+
+The ProcessSimulator code to kill local mode worker is.
+
+{code}
+    /**
+     * Kill a process
+     *
+     * @param pid
+     */
+    public static void killProcess(String pid) {
+        synchronized (lock) {
+            LOG.info("Begin killing process " + pid);
+            Shutdownable shutdownHandle = processMap.get(pid);
+            if (shutdownHandle != null) {
+                shutdownHandle.shutdown();
+            }
+            processMap.remove(pid);
+            LOG.info("Successfully killed process " + pid);
+        }
+    }
+
+    /**
+     * Kill all processes
+     */
+    public static void killAllProcesses() {
+        Set<String> pids = processMap.keySet();
+        for (String pid : pids) {
+            killProcess(pid);
+        }
+    }
+{code}
+
+Inside the logs I don't see a corresponding "Successfully killed process " for the "Begin killing process ".  This means that an exception was thrown during the shutdown process.  Looking at the code the only exception that could have caused this is an InterruptedException or something caused by it (or else the entire processes would have exited).
+
+This means that the ProcessSimulator partially shut down the worker, then the worker threw the exception, and ProcessSimulator failed to remove the worker from the map.  That way when the follow on code to kill anything registered with the process simulator that might have leaked is called it ends up trying to shoot the process yet again, which the code we found does not like.
+
+Everything seems perfectly reasonable, except for the part where some of our data structures don't like to be shut down multiple times.  This seems against what most other software does.  Exactly once is hard so lets make sure at least once works., Thanks for the explanation. You're right, it's much easier if the structures can handle being closed repeatedly. So this issue should probably become about changing timer, executor, worker and DisruptorQueue (or really anything Shutdownable) so they can handle multiple calls to shutdown., Yes, that is just what I am doing, and also making ProcessSimulator eat InterruptedExceptions (because a test shouldn't fail for an exception that we expect to happen and ignore in other parts of the code)., I put up two pull requests, one for master and another for 1.x.  I manually forced Interrupted exceptions for the test [~Srdo] posted and verified that this works.
+
+I also found a number of leaked threads from nimbus and a few other possible places. I'll file a follow on JIRA for them, because they are not causing issues right now., I ran the 1.x version of the PR against our test set. It seems to solve this issue, but introduces a new one. One of our tests uses the storm-kafka-clients spout, which can't handle being closed multiple times, because the underlying KafkaConsumer can only be closed once, and the spout doesn't check if it's already been closed. We might want to add a note to ISpout and IBolt that close may be called repeatedly, and we should probably also make sure that the spouts/bolts shipping with Storm can handle repeated closes., Actually I'm wondering if that's the right way to go about this. Bolt/spout closes would have to support both being closed multiple times, and being partially closed by the Slot, interrupted and closed again by ProcessSimulator. Maybe it would be better if local mode just gave the Slot significantly longer to close the components it's responsible for? , I am fine with giving them more time to shut down.  I am even OK with throwing an exception if it does not shut down within the desired amount of time.  We already limit the amount of time a worker has before it kills itself to 1 second, so I can see why something that normally is at most once needs to be at least once for local mode can be confusing.
+
+I'll close the pull requests and update them accordingly., [~Srdo],
+
+I updated the code with your suggestions.  If you could try again that would be great., [~revans2] 
+Thanks, this is a good change, and most of our tests now pass (though not entirely reliably). I'm running into the timeout for the test using the Kafka spout fairly consistently though. I've posted a small PR against the 1.x version of the branch to disable the timeout in local mode. Tests may fail spuriously due to a slow machine, or bolts/spouts being slow to close.
+ 
+Raising the timeout in shutdownAllWorkers isn't guaranteed to work for everyone, and making it configurable is fiddly in tests and irrelevant for distributed mode, due to the 1 second limit on worker suicide. Giving up on shutting down the worker properly leads to leaking resources in local mode, since we can't just kill the JVM. I think removing the timeout for shutdownAllWorkers in local mode is a decent fix. It's still very visible if a Slot is hanging for some reason, since the warning about a slow Slot shutdown is still printed, and we avoid dealing with issues like Slots being slow to shutdown due to tests with a high fork count, or tests on slow machines, or optimistic bolt/spout close functions that don't time limit themselves., Thanks [~revans2], I merged into master, 1.x, 1.0.x branches respectively.]

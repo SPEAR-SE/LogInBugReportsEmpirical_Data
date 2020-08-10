@@ -1,0 +1,487 @@
+[Extracted Jstack detect deadlock
+{noformat}
+Found one Java-level deadlock:
+=============================
+"org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$VerifyActiveStatusThread":
+  waiting to lock monitor 0x0000000000a39138 (object 0x00000000c0234980, a org.apache.hadoop.yarn.state.StateMachineFactory$InternalStateMachine),
+  which is held by "AsyncDispatcher event handler"
+"AsyncDispatcher event handler":
+  waiting to lock monitor 0x0000000000a391e8 (object 0x00000000c02347e0, a org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore),
+  which is held by "org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$VerifyActiveStatusThread"
+
+Java stack information for the threads listed above:
+===================================================
+"org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$VerifyActiveStatusThread":
+	at org.apache.hadoop.yarn.state.StateMachineFactory$InternalStateMachine.doTransition(StateMachineFactory.java:448)
+	- waiting to lock <0x00000000c0234980> (a org.apache.hadoop.yarn.state.StateMachineFactory$InternalStateMachine)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.updateFencedState(RMStateStore.java:449)
+	- locked <0x00000000c02347e0> (a org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.notifyStoreOperationFailed(RMStateStore.java:713)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$VerifyActiveStatusThread.run(ZKRMStateStore.java:1030)
+"AsyncDispatcher event handler":
+	at java.lang.Object.wait(Native Method)
+	- waiting on <0x00000000c02347e0> (a org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$ZKAction.runWithCheck(ZKRMStateStore.java:1043)
+	- locked <0x00000000c02347e0> (a org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$ZKAction.runWithRetries(ZKRMStateStore.java:1070)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.existsWithRetries(ZKRMStateStore.java:975)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.updateApplicationAttemptStateInternal(ZKRMStateStore.java:667)
+	- locked <0x00000000c02347e0> (a org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore$UpdateAppAttemptTransition.transition(RMStateStore.java:246)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore$UpdateAppAttemptTransition.transition(RMStateStore.java:231)
+	at org.apache.hadoop.yarn.state.StateMachineFactory$SingleInternalArc.doTransition(StateMachineFactory.java:362)
+	at org.apache.hadoop.yarn.state.StateMachineFactory.doTransition(StateMachineFactory.java:302)
+	at org.apache.hadoop.yarn.state.StateMachineFactory.access$300(StateMachineFactory.java:46)
+	at org.apache.hadoop.yarn.state.StateMachineFactory$InternalStateMachine.doTransition(StateMachineFactory.java:448)
+	- locked <0x00000000c0234980> (a org.apache.hadoop.yarn.state.StateMachineFactory$InternalStateMachine)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.handleStoreEvent(RMStateStore.java:699)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore$ForwardingEventHandler.handle(RMStateStore.java:754)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore$ForwardingEventHandler.handle(RMStateStore.java:749)
+	at org.apache.hadoop.yarn.event.AsyncDispatcher.dispatch(AsyncDispatcher.java:173)
+	at org.apache.hadoop.yarn.event.AsyncDispatcher$1.run(AsyncDispatcher.java:106)
+	at java.lang.Thread.run(Thread.java:745)
+
+Found 1 deadlock.
+{noformat}, Hi [~rohithsharma]
+I feel we need to have separate object to lock on for zoo keeper client related flows and another object for ZKRMState store related flows. As "AsyncDispatcher event handler" on waiting for ZK client releases ZKRMStateStore object's lock but holds on to StateMachineFactory$InternalStateMachine obj's lock, during this time some other thread can take lock on ZKRMStateStore object's lock which is not correct. So i suggest the flows where we are setting the Zkclient to null and checking for other ZKConnection we can have new object and remove the current syncronization on ZKRMStateStore's instance, Looking into deep RMStateStore and ZKRMStateStore, all the ZK updation are done by obtaining the lock on ZKRMStateStore.class 
+# Either directly on ZKRMStateStore. Ex : RMAppAttemptImpl#rememberTargetTransitionsAndStoreState
+# Or {{StateMachine.doTransition() ---> ZKRMStateStore.class}} inorder.
+
+But on StoreOperationFailed exception, the order of lock is obtained from {{ZKRMStateStore(updateFencedState method synchronized) --> StateMachine.doTransition}} inside updateFencedState(). This results in interlocking causing deadlock.
+
+I feel Issue can be resolved in either of the 2 ways
+# Remove {{synchronized}} keyword from updateFencedState().
+# Keeping signature of method updateFencedState() same, trigger event to RMStateStore dispatcher in method updateFencedState() instead of calling StateMachine.doTransition. And let event be processed via handleStoreEvent(). This transition would be slow if dispatcher has more events in queue. , [~rohithsharma], I think first approach suggested by you should resolve the issue.
+Below method should not be synchronized.
+
+{code}
+ public synchronized void updateFencedState() {
+    this.stateMachine.doTransition(RMStateStoreEventType.FENCED,
+         new RMStateStoreEvent(RMStateStoreEventType.FENCED));
+  }
+{code}
+
+Here, {{synchronized}} is unnecessary and leads to deadlock., Thanks [~varun_saxena] for your suggestion.
+,  I wrote small program(TestYARN2946.java attached) to simulate exact deadlock scenario. The same naming convention I have used for better understanding same as deadlock involved classes and its same implementation logic. Running TestYARN2946.java with synchronized keyword in method updateFencedState() causes deadlock.After the fix i.e by removing synchronized keyword runs the program without deadlock in while loop. This is only simulation.
+
+In the attached patch, I have done 2 changes
+# Removed *synchronized* keyword from method updateFencedState().
+# Changed the method updateFencedState() modifier from public to private since it is used only from method notifyStoreOperationFailed().
+
+Kindly review the analysis and attached patch., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12686604/0001-YARN-2946.patch
+  against trunk revision 0bcea11.
+
+    {color:red}-1 patch{color}.  Trunk compilation may be broken.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6093//console
+
+This message is automatically generated., looks good,  +1, Thanks [~jianhe] for reviewing analysis and patch. It seems some compilation error,I will take look at this and update patch., I was changed method modifier from public to private causing compilation error but it directly used from test. I will update patch without modifying method modifiers., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12686604/0001-YARN-2946.patch
+  against trunk revision 0bcea11.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:red}-1 javac{color:red}.  The patch appears to cause the build to fail.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6095//console
+
+This message is automatically generated., [~rohithsharma], making the method private makes sense. You can probably use VisibleForTesting annotation., I guess same package access can be given instead of public. Private may not work because the annotation is only for documentation purposes. , I updated patch by changing test case.It should be fine now., Kindly review the updated new patch fixing compilation errors., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12686723/0002-YARN-2946.patch
+  against trunk revision f6f2a3f.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 15 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager:
+
+                  org.apache.hadoop.yarn.server.resourcemanager.TestWorkPreservingRMRestart
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6097//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/6097//artifact/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6097//console
+
+This message is automatically generated., Another deadlock detected in different flow after fixing previous deadlock :-(
+Basically, by convention all the locks should acquire from *StateMachine.doTransition() -> zkRMStateStore.class* or directly zkRMStateStore.class , but in {{RMStateStore#isFencedState()}} method locking order is reversed i.e *zkRMStateStore.class -> StateMachine.doTransition()*
+{noformat}
+Found one Java-level deadlock:
+=============================
+"org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$VerifyActiveStatusThread":
+  waiting to lock monitor 0x0000000000e55698 (object 0x00000000c0272cb0, a org.apache.hadoop.yarn.state.StateMachineFactory$InternalStateMachine),
+  which is held by "AsyncDispatcher event handler"
+"AsyncDispatcher event handler":
+  waiting to lock monitor 0x00000000013adcf8 (object 0x00000000c0272b10, a org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore),
+  which is held by "org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$VerifyActiveStatusThread"
+
+Java stack information for the threads listed above:
+===================================================
+"org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$VerifyActiveStatusThread":
+	at org.apache.hadoop.yarn.state.StateMachineFactory$InternalStateMachine.getCurrentState(StateMachineFactory.java:442)
+	- waiting to lock <0x00000000c0272cb0> (a org.apache.hadoop.yarn.state.StateMachineFactory$InternalStateMachine)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.isFencedState(RMStateStore.java:693)
+	- locked <0x00000000c0272b10> (a org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$VerifyActiveStatusThread.run(ZKRMStateStore.java:1020)
+"AsyncDispatcher event handler":
+	at java.lang.Object.wait(Native Method)
+	- waiting on <0x00000000c0272b10> (a org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$ZKAction.runWithCheck(ZKRMStateStore.java:1043)
+	- locked <0x00000000c0272b10> (a org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$ZKAction.runWithRetries(ZKRMStateStore.java:1070)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.doMultiWithRetries(ZKRMStateStore.java:906)
+	- locked <0x00000000c0272b10> (a org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.doMultiWithRetries(ZKRMStateStore.java:920)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.createWithRetries(ZKRMStateStore.java:929)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.storeApplicationStateInternal(ZKRMStateStore.java:608)
+	- locked <0x00000000c0272b10> (a org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore$StoreAppTransition.transition(RMStateStore.java:146)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore$StoreAppTransition.transition(RMStateStore.java:131)
+	at org.apache.hadoop.yarn.state.StateMachineFactory$SingleInternalArc.doTransition(StateMachineFactory.java:362)
+	at org.apache.hadoop.yarn.state.StateMachineFactory.doTransition(StateMachineFactory.java:302)
+	at org.apache.hadoop.yarn.state.StateMachineFactory.access$300(StateMachineFactory.java:46)
+	at org.apache.hadoop.yarn.state.StateMachineFactory$InternalStateMachine.doTransition(StateMachineFactory.java:448)
+	- locked <0x00000000c0272cb0> (a org.apache.hadoop.yarn.state.StateMachineFactory$InternalStateMachine)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.handleStoreEvent(RMStateStore.java:699)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore$ForwardingEventHandler.handle(RMStateStore.java:754)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore$ForwardingEventHandler.handle(RMStateStore.java:749)
+	at org.apache.hadoop.yarn.event.AsyncDispatcher.dispatch(AsyncDispatcher.java:173)
+	at org.apache.hadoop.yarn.event.AsyncDispatcher$1.run(AsyncDispatcher.java:106)
+	at java.lang.Thread.run(Thread.java:745)
+
+Found 1 deadlock.
+{noformat}, Above 2 deadlock's can be directly fixed by removing *synchronized* keyword which was not really required. 
+
+But I see there many other potential deadlocks which can appear easily in the following methods. Below all methods does reverse locking i.e *zkRMStateStore.class -> StateMachine.doTransition()* through {{RMStateStore#isFencedState()}}
+# Method {{RMStateStore#storeRMDTMasterKey()}}
+# Method {{RMStateStore#removeRMDTMasterKey()}}
+# Method {{RMStateStore#storeRMDelegationTokenAndSequenceNumber()}}
+# Method {{RMStateStore#removeRMDelegationToken()}}
+# Method {{RMStateStore#updateRMDelegationTokenAndSequenceNumber()}}
+# Method {{ZKRMStateStore#storeOrUpdateAMRMTokenSecretManagerState()}}
+
+
+So only fixing 1 or 2 deadlock flows does not really fix other potential dead lock issues.
+
+*I propose following solution to handle all these deadlock flows*
+Option-1 : 
+# For all above mentioned method's causing deadlock , introduce StateMachine in RMStateStore like handling application store. So all the execution flows from StateMachine->zkRMStateStore.class.
+# Along with 1st , StateMachine should be guarded with Read-Write lock.
+
+Option-2 : 
+# Fix the visible eadlocks i.e 2 found in this jira. And Option-1 do in separate improvement task.
+
+Handling all the deadlock flows, i would like to do in one umbrella jira. This is to ensure we do not miss any these deadlock flows.
+
+
+Please let me your suggestions/thoughts?, [~rohithsharma], good catch. As you said {{synchronized}} can be removed from {{RMStateStore#isFencedState()}}.
+
+Regarding the methods you listed out, I think we can avoid reverse locking i.e. *ZKRMStateStore.class -> StateMachine.doTransition()* by making the following changes.
+# Remove {{synchronized}} keyword from each one of the methods listed above. 
+# Separate out State machine synchronization(invoked by call to {{isFencedState}} & {{notifyStoreOperationFailed}}) and ZKRMStateStore synchronization by putting the relevant code in a synchronized block.
+
+For example, code for RMStateStore#storeRMDTMasterKey() can be changed as under :
+{code:title=RMStateStore.java|borderStyle=solid}
+public void storeRMDTMasterKey(DelegationKey delegationKey) {
+    if(isFencedState()) {
+      LOG.info("State store is in Fenced state. Can't store RM Delegation " +
+               "Token Master key.");
+      return;
+    }
+    try {
+      synchronized(this) {
+        storeRMDTMasterKeyState(delegationKey);
+      }
+    } catch (Exception e) {
+      notifyStoreOperationFailed(e);
+    }
+  }
+{code}, Frankly, as all of these methods *merely have a single line calling another method* in {{ZKRMStateStore}}, in addition to call to isFencedState and notifyStoreOperationFailed. Hence, we *do not even need a synchronized block* in these methods in RMStateStore. Just make the relevant method in ZKRMStateStore *synchronized*. , bq. For all above mentioned method's causing deadlock , introduce StateMachine in RMStateStore like handling application store. So all the execution flows from StateMachine->zkRMStateStore.class. 
+I think this is a reasonable way. We can call the transitions synchronously in each storeToken or storeMasterKey methods.   This way we make all store operations follow the same path - all going through state machines, Thanks [~jianhe] and [~varun_saxena] for your suggestions.
+
+[~jianhe] , I am trying to understand before implementing state machine for DT keys updates on store,  is there any specific reason why state machine was not implemented? Does state machine for updating DT keys cause any potential issues?, it was not there because we need to do the update tokens/keys synchronously. I think with state-machine, we can achieve the same result by calling each transition synchronously., Thanks [~jianhe] for your confirmation. I will go ahead with implementations, I updated the patch with following fix
+# All the token storage handled synchronously via state machine.
+# Removed unnecessary synchronization from the method. This ensures 1st point
+
+For the test, deployed in cluster by integrating with JCarder. Executed same scenario as per my earlier comment for checking any deadlock cycles. JCarder has not identified any deadlock cycles.
+
+Kindly review the patch, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12688362/0001-YARN-2946.patch
+  against trunk revision 6635ccd.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 14 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager:
+
+                  org.apache.hadoop.yarn.server.resourcemanager.TestRM
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6156//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/6156//artifact/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6156//console
+
+This message is automatically generated., [~rohithsharma], I had a quick look at the patch. one comment is:
+In each store/update method, instead of doing this:
+{code}
+      if (isFencedState()) {
+        LOG.info("State store is in Fenced state. Can't remove RM Delegation "
+            + "Token Master key.");
+        return;
+      }
+      this.stateMachine.doTransition(RMStateStoreEventType.UPDATE_AMRM_TOKEN,
+          new RMStateStoreAMRMTokenEvent(amrmTokenSecretManagerState, isUpdate,
+              RMStateStoreEventType.UPDATE_AMRM_TOKEN));
+{code}
+we can do this 
+{code}
+handleStoreEvent(RMStateStoreEvent event)
+{code}, Thanks [~jianhe] for review.. I updated the patch fixing above review comment..
+Kindly review the update patch, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12688659/0003-YARN-2946.patch
+  against trunk revision a696fbb.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 15 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager:
+
+                  org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.TestContainerAllocation
+
+                                      The following test timeouts occurred in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager:
+
+org.apache.hadoop.yarn.server.resourcemanager.TestRMRestart
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6168//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/6168//artifact/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6168//console
+
+This message is automatically generated., Checked test failures, TestContainerAllocation is fails intermediately in trunk.
+And I am looking into TestRMRestart test failure., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12688659/0003-YARN-2946.patch
+  against trunk revision fdf042d.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 15 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The following test timeouts occurred in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager:
+
+org.apache.hadoop.yarn.server.resourcemanager.TestRMRestart
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6172//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/6172//artifact/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6172//console
+
+This message is automatically generated., Since handleStoreEvent() called from event dispatcher for RMApp Store events and syncronously for DT store, TestRMRestart was overriding handleStoreEvent() simulate test scnario which was causing start up failure.
+Will correct test case and update patch., Updated the patch for fixing the test failure TestRMRestart. 
+Kindly review the updated patch, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12688829/0003-YARN-2946.patch
+  against trunk revision 5caebba.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 15 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6174//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/6174//artifact/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6174//console
+
+This message is automatically generated., Looks good, minor comment:
+We can remove the exception handling in ZKRMStateStore#storeOrUpdateAMRMTokenSecretManagerState as it’s already handled in StoreOrUpdateAMRMTokenTransition.
+{code}
+  } catch (Exception ex) {
+      LOG.info("Error storing info for AMRMTokenSecretManager", ex);
+      notifyStoreOperationFailed(ex);
+    }
+{code}, similar for other file systems.., Updated patch fixing comment. Kindly reivew the updated patch., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12688974/0004-YARN-2946.patch
+  against trunk revision 2067425.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 15 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The following test timeouts occurred in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager:
+
+org.apache.hadoop.yarn.server.resourcemanager.TestResourceTrackerService
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6186//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/6186//artifact/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6186//console
+
+This message is automatically generated., Test case failure is unrelated to this patch. I am able to run this test case locally., +1, Committed to trunk and branch-2, thanks Rohith !
+thanks [~varun_saxena] for reviewing the patch !, Looking into last one year, there many deadlock issues reported!! It would be great if by default HadoopQA can integrate JCarder tool or any other tool for identifying suspecious deadlock cycles. Can it be integrated to QA? any thoughts in community?, FAILURE: Integrated in Hadoop-trunk-Commit #6787 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/6787/])
+YARN-2946. Fixed potential deadlock in RMStateStore. Contributed by Rohith Sharmaks (jianhe: rev 4f18018b7abb405f38d269da096ec9fd80c81d9a)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/LeveldbRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/AMRMTokenSecretManager.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTMasterKeyEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreAMRMTokenEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
+, bq. Can it be integrated to QA? any thoughts in community?
+good point, would you like to raise this in the  mailing list ?, bq. would you like to raise this in the mailing list ?
+Yes, sure., FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #51 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/51/])
+YARN-2946. Fixed potential deadlock in RMStateStore. Contributed by Rohith Sharmaks (jianhe: rev 4f18018b7abb405f38d269da096ec9fd80c81d9a)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/AMRMTokenSecretManager.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTMasterKeyEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreAMRMTokenEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/LeveldbRMStateStore.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTEvent.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #785 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/785/])
+YARN-2946. Fixed potential deadlock in RMStateStore. Contributed by Rohith Sharmaks (jianhe: rev 4f18018b7abb405f38d269da096ec9fd80c81d9a)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/LeveldbRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreAMRMTokenEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreEventType.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/AMRMTokenSecretManager.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTMasterKeyEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #1983 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1983/])
+YARN-2946. Fixed potential deadlock in RMStateStore. Contributed by Rohith Sharmaks (jianhe: rev 4f18018b7abb405f38d269da096ec9fd80c81d9a)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/AMRMTokenSecretManager.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTMasterKeyEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/LeveldbRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreAMRMTokenEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
+* hadoop-yarn-project/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk-Java8 #48 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/48/])
+YARN-2946. Fixed potential deadlock in RMStateStore. Contributed by Rohith Sharmaks (jianhe: rev 4f18018b7abb405f38d269da096ec9fd80c81d9a)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/AMRMTokenSecretManager.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreAMRMTokenEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/LeveldbRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTMasterKeyEvent.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #52 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/52/])
+YARN-2946. Fixed potential deadlock in RMStateStore. Contributed by Rohith Sharmaks (jianhe: rev 4f18018b7abb405f38d269da096ec9fd80c81d9a)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/AMRMTokenSecretManager.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreAMRMTokenEvent.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/LeveldbRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTMasterKeyEvent.java
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk #2002 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2002/])
+YARN-2946. Fixed potential deadlock in RMStateStore. Contributed by Rohith Sharmaks (jianhe: rev 4f18018b7abb405f38d269da096ec9fd80c81d9a)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreAMRMTokenEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/AMRMTokenSecretManager.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreRMDTMasterKeyEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/LeveldbRMStateStore.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
+]

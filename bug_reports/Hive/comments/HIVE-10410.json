@@ -1,0 +1,72 @@
+[[~Richard Williams] Can you try with an embedded metastore rather than a remote one? This has been reported for the non-http transport mode as well with remote metastore: HIVE-6893, [~ekoifman] FYI., In HIVE-10404 the "out of sequence response" is caused by threads sharing instance of Hive which effectively shares MetaStoreClient which itself is not thread safe.  Maybe something similar is happening here., [~vgumashta] I can confirm that this issue only seems to manifest with a remote metastore.
+
+[~ekoifman] That's what I suspect as well. I was taking a look at the code that implements asynchronous execution of submitted statements in org.apache.hive.service.cli.operation.SqlOperation, and I noticed this suspicious-looking bit of code in the runInternal method:
+
+{noformat}
+// ThreadLocal Hive object needs to be set in background thread.
+// The metastore client in Hive is associated with right user.
+final Hive parentHive = getSessionHive();
+// Current UGI will get used by metastore when metsatore is in embedded mode
+// So this needs to get passed to the new background thread
+final UserGroupInformation currentUGI = getCurrentUGI(opConfig);
+// Runnable impl to call runInternal asynchronously,
+// from a different thread
+Runnable backgroundOperation = new Runnable() {
+@Override
+public void run() {
+  PrivilegedExceptionAction<Object> doAsAction = new PrivilegedExceptionAction<Object>() {
+    @Override
+    public Object run() throws HiveSQLException {
+      Hive.set(parentHive);
+      SessionState.setCurrentSessionState(parentSessionState);
+      // Set current OperationLog in this async thread for keeping on saving query log.
+      registerCurrentOperationLog();
+      try {
+        runQuery(opConfig);
+      } catch (HiveSQLException e) {
+        setOperationException(e);
+        LOG.error("Error running hive query: ", e);
+      } finally {
+        unregisterOperationLog();
+      }
+      return null;
+    }
+  };
+
+{noformat}
+
+Correct me if I'm wrong, but it seems to me that passing the parent thread's ThreadLocal Hive object to Hive.set in the children will effectively thwart the usage of ThreadLocal, resulting in the children and the parent all sharing the same Hive object. There are a number of paths in which calls to one of the Hive.get methods result in the current ThreadLocal Hive object being removed from the ThreadLocal map and replaced with a new Hive instance; however, I don't see anything that guarantees that that always happens on the first call to Hive.get in the child threads., I think you are right, ThreadLocal in this case doesn't prevent multiple threads sharing a connection., Yep, that was it--after removing the call to Hive.set that passes in the parent's Hive object, the problem went away. 
+
+Looking back at SQLOperation's history, it looks like that call was introduced in HIVE-6864 to ensure that user information gets propagated from the thread that submits the asynchronous operation to the pooled thread that executes it. However, HIVE-6907 added a UserGroupInformation.doAs call to the submitted operation that seems as though it should accomplish the same thing without causing the pooled thread to share a connection with the submitting thread. 
+
+[~vgumashta] and [~ekoifman], do you agree that HIVE-6907 makes the call to Hive.set unnecessary? If so, I'll regenerate my patch based on the Hive trunk (since we're running Hive 0.13.1, the version I'm currently running was based on that instead) and submit it., [~Richard Williams] We ran into the same problem and I also think that the sharing Hive object (MetaStoreClient) of parent session in child threads can cause the observed issue. What is your use scenario? Do you have multiple concurrent statements running with same connection?, [~Richard Williams] are you still working on the patch?, I think not only the Hive object, but also sessionState and HiveConf shared in child threads may also cause the race issue., [~ctang.ma] Specifically, we have found that this issue occurs whenever numerous JDBC clients (or rather, numerous clients that set the runAsync flag in TExecuteStatementReq to true, as JDBC does) are executing queries against HiveServer2 concurrently, as that is what causes multiple threads in the async execution thread pool to use their shared MetaStoreClient at once. 
+
+I'll go ahead and regenerate the patch we've been running based on the Hive trunk. It's very simplistic--it just removes the code that sets the Hive objects in the pooled threads to the Hive object from the calling thread. As for the shared SessionState and HiveConf, those are suspicious as well, and might be causing other problems; however, since we began patching HiveServer2 to prevent the sharing of the Hive object, this particular issue has disappeared for us., [~Richard Williams]
+Are you sharing the same session for multiple queries in your cluster or set hive.exec.parallel=true ? That is only case where I think this would happen.
+Also, there is a problem with the change in the patch. The HiveMetaStoreClient within Hive object is associated with a specific user, so if it re-uses any Hive object from the current thread, it would get the wrong user. There is a safeguard against this that was added recently, but it would result in an expensive creation of new Hive object and (hive metastore client).
+I think instead of pursing that option, we should just look at synchronizing thrift client use within metastore client. There is already a HiveMetaStoreClient.newSynchronizedClient that Hive object could use to get a synchronized client.
+
+We also need to look at other issues like what [~ctang.ma] mentioned, but all of it does not have to happen in this jira.
+
+, [~thejas] In the test case I use to reproduce this issue, I'm not sharing a session among multiple queries or setting hive.exec.parallel=true. I am, however, using the same session across multiple calls to the HiveServer2 Thrift API--in particular, I'm running many concurrent processes that each open a session, execute an asynchronous operation, poll HiveServer2 for the status of that operation until it completes, and then close their session. I think that what's happening is that the foreground thread is continuing to talk to the metastore using its Hive object while the pooled background thread is executing the asynchronous operation (and thus also using the same Hive object).
+
+Right, the issue you mentioned is what I was talking about in my earlier comment--the patch I uploaded relies on the UserGroupInformation.doAs call in the submitted background operation to ensure that the current user in the background thread is the same as the current user in the foreground thread. Thus, when the background thread calls Hive.get, the call to isCurrentUserOwner will return false if the existing MetaStoreClient is associated with the wrong user and a new connection, this time associated with the correct user, will be created. Presumably the code that does this is the safeguard you're referring to?
+
+{noformat}
+  public static Hive get(HiveConf c, boolean needsRefresh) throws HiveException {
+    Hive db = hiveDB.get();
+    if (db == null || needsRefresh || !db.isCurrentUserOwner()) {
+      if (db != null) {
+        LOG.debug("Creating new db. db = " + db + ", needsRefresh = " + needsRefresh +
+          ", db.isCurrentUserOwner = " + db.isCurrentUserOwner());
+      }
+      closeCurrent();
+      c.set("fs.scheme.class", "dfs");
+      Hive newdb = new Hive(c);
+      hiveDB.set(newdb);
+      return newdb;
+    }
+
+{noformat}
+
+We haven't noticed any performance issues attributable to frequent reconnections to the metastore to as a result of this change. Then again, we probably wouldn't; we're using Sentry and thus have HiveServer2 impersonation disabled, so I would expect the current user to always be the user running the HiveServer2 process. When I get a chance, I'll try changing Hive.createMetaStoreClient to wrap the client it creates using HiveMetaStoreClient.newSynchronizedClient instead of removing the code that sets the background thread's Hive object., [~thejas] [~ctang.ma] Given this issue and the latest comments, should the patch for HIVE-6893 be committed? It had resolved a few issues for customers that has been running with the fix. Thoughts? Thanks, HIVE-10956 fixed some HiveMetaStoreClient sync issue. It should help, in case it is a race to HMS., [~jxiang] We have been running CDH 5.4.4 (which includes HIVE-10956) without our attached patch to prevent sharing of connections among threads for about two weeks now, and this problem has not reemerged. Unless other people are still running into this issue after applying the patch for HIVE-10956 ([~ctang.ma]?), I think it's safe to say that the patch for HIVE-10956 has fixed this issue as well., [~rich williams], thanks a lot for reporting the issue, and the verification. I marked the issue fixed for now., Is this error fixed for hive 0.13.1 version? We can still observer this issue. Are the parches for https://issues.apache.org/jira/browse/HIVE-10956 issue merged into 0.13.1 hive version?]

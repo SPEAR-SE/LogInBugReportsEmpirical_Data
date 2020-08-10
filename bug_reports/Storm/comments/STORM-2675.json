@@ -1,0 +1,46 @@
+[Hi.
+
+Sorry about the following wall of text, I wrote some notes while debugging this, and I thought it might be helpful to understand how Trident works.
+
+As I understand it Trident spouts don't save progress to Kafka. The progress should be saved to Storm's Zookeeper. The OpaquePartitionedTridentKafkaSpout should be getting passed the previous batch's ending offset as part of the metadata passed to emitPartitionBatch.
+
+I'm not very experienced with how Trident works internally, but from what I can tell, the spout will be asked to emit a batch with a given transaction id via emitPartitionBatch, as well as some metadata for the last batch. The return value is some metadata that can be used to construct the following batch later. In Kafka's case the metadata is the starting and end offsets for the batch. The metadata is saved to Zookeeper once state has been committed for the batch. When a batch succeeds, the metadata for earlier batches are removed from Zookeeper. If the spout worker is restarted, the last committed metadata is read back from Zookeeper, which should determine which offset the spout restarts at.
+
+https://github.com/apache/storm/blob/64e29f365c9b5d3e15b33f33ab64e200345333e4/storm-client/src/jvm/org/apache/storm/trident/spout/OpaquePartitionedTridentSpoutExecutor.java is the code that wraps around the OpaquePartitionedTridentKafkaSpout. The writes to Zookeeper should happen via the RotatingTransactionalState object here https://github.com/apache/storm/blob/64e29f365c9b5d3e15b33f33ab64e200345333e4/storm-client/src/jvm/org/apache/storm/trident/spout/OpaquePartitionedTridentSpoutExecutor.java#L116. If the spout has just restarted and there is no in-memory metadata for the last batch, the last committed metadata is read from Zookeeper here https://github.com/apache/storm/blob/64e29f365c9b5d3e15b33f33ab64e200345333e4/storm-client/src/jvm/org/apache/storm/trident/spout/OpaquePartitionedTridentSpoutExecutor.java#L140.
+
+Here is the metadata returned by emitPartitionBatch from the kafka spout https://github.com/apache/storm/blob/master/external/storm-kafka-client/src/main/java/org/apache/storm/kafka/spout/trident/KafkaTridentSpoutEmitter.java#L130
+It should contain the first and last offsets for the current batch.
+
+The metadata path in Zookeeper is constructed from these two classes https://github.com/apache/storm/blob/64e29f365c9b5d3e15b33f33ab64e200345333e4/storm-client/src/jvm/org/apache/storm/trident/topology/state/TransactionalState.java#L63 and https://github.com/apache/storm/blob/a4afacd9617d620f50cf026fc599821f7ac25c79/storm-client/src/jvm/org/apache/storm/trident/topology/state/RotatingTransactionalState.java. OpaquePartitionedTridentSpoutExecutor will create instances of each of these, based on the partition ids returned by the spout emitter. For example, for me the Zookeeper path for metadata for the Trident spout in examples/storm-kafka-client-examples TridentKafkaClientWordCountNamedTopics was /transactional/spout1/user/test-trident@0 and /transactional/spout1/user/test-trident-1@0. The path format for the kafka spout is /$transactional.zookeeper.root/$spoutComponentName/user/$topicName@partitionNumber. 
+
+When I ran the TridentKafkaWordCountNamedTopics example on master, shut it down and restarted it, I think I got the behavior you described. Here is the Zookeeper metadata after I shut down the example topology the first time:
+{code}
+get /transactional/spout1/user/test-trident@0/6204
+org.apache.storm.kafka.spout.trident.KafkaTridentSpoutBatchMetadata@507e1faf{topicPartition=test-trident-0, firstOffset=1412, lastOffset=1412}
+{code}
+After restart
+{code}
+get /transactional/spout1/user/test-trident@0/6271
+org.apache.storm.kafka.spout.trident.KafkaTridentSpoutBatchMetadata@50982f4e{topicPartition=test-trident-0, firstOffset=71, lastOffset=71}
+{code}
+I tried logging the RotatingTransactionalState on creation.
+{code}
+2017-08-03 17:44:37.767 o.a.s.t.t.s.RotatingTransactionalState Thread-26-spout-spout1-executor[10, 10] [DEBUG] Created RotatingTransactionalState{_state=org.apache.storm.trident.topology.state.TransactionalState@29823124, _subdir='test-trident@0', _curr={6204=null}} org.apache.storm.trident.topology.state.RotatingTransactionalState.<init>(RotatingTransactionalState.java:47)
+{code}
+The txid is correct, but the associated metadata object is null, which causes the spout to restart.
+
+I looked into it a bit more, and it turns out the TransactionalState code assumes the metadata object can be round trip serialized/deserialized with the json-simple library. When json-simple can't figure out how to json serialize an object, it'll instead quietly return the object's toString (IMO it should be throwing an exception instead of quietly doing the wrong thing). That's what ends up being saved to Zookeeper for the Kafka spout, and our metadata object's toString doesn't return json. When TransactionalState tries to load the metadata back in from Zookeeper, it (apparently deliberately) uses a method from json-simple that quietly returns null if json parsing fails. The result is that we end up both quietly failing to write the metadata properly to Zookeeper, and quietly fail to read the incorrectly serialized data back. The spout ends up restarting every time the executor is rebooted, because it can't read the data in Zookeeper. , thanks Stig for analysis.. somehow I was thrown out by https://github.com/apache/storm/blob/master/external/storm-kafka-client/src/main/java/org/apache/storm/kafka/spout/trident/KafkaTridentSpoutEmitter.java#L167  where Kafka consumer looks at last offset from Kafka __consumer_offset topic and since we are not updating the offset in Kafka its always start from earliest message in case of UNCOMMITTED_EARLIEST strategy? 
+So now my doubt is even if we fix the issue with Zookeeper metadata parsing isn't the above logic going to ignore that information. To me it seems like incomplete implementation?, Yes, I think we should remove the part where it looks at consumer.committed. I'd also like to change the handling of first poll strategy a bit, because it's inconsistent with the way it works for the regular spout. Right now there is no real difference between UNCOMMITED_EARLIEST/LATEST and EARLIEST/LATEST. I think we should change it so if the strategy is EARLIEST/LATEST and isFirstPoll is true, it should seek to start/end even if lastBatchMeta is set. That's how the regular spout works, it ignores how far any previous instances got when it restarts. Then UNCOMMITTED_* should do the same only if lastBatchMeta is null and isFirstPoll is true., Yes make sense..
+what do you think is next step to get it fixed?
+
+, I think we should change the metadata object so it returns a Map to Trident instead of the current KafkaTridentSpoutBatchMetadata. json-simple knows how to handle Map. I'll open a PR soon assuming it works. It might be nice in the future to replace json-simple with something more flexible, like Jackson so spout implementations can use whatever object type they want, but for now I'd rather just fix this., Do we have any SLA for the fix? Don't want to rush you but just need to plan on my side since current version is not very useful for my use case?, [~Preet] No promises, but I'm hoping to have a PR up sometime late this week for master., [~Preet] Opened a PR here https://github.com/apache/storm/pull/2271. I'd appreciate it if you would check if it works for you., hi srd, sorry did not see your last message before. I will test it.
+do I need to pull master (storm-kafka-client) and use this patch to generate the new artifact or is there any specific 1.1.0 branch I can use for checkout?
+
+Also, do you know how early can we have a maven version with this PR?, [~Preet] 1.x version https://github.com/srdo/storm/tree/STORM-2675-1.x. I don't know when the next release will be, but there's at least one other issue with the Trident spout I think we should fix before releasing (https://issues.apache.org/jira/browse/STORM-2691)., I had assumed if 
+auto.commit.enable is true, and 
+auto.commit.interval.ms is relatively small, and
+if we do not force kill the topology, all consumed messages would be automatically committed by the kafka consumer. If this was the case, then when we start with UNCOMMITED_EARLIEST/LATEST we should be continuing from the last committed position. This would be the case only for the first batch, and all later batches would depend on zookeeper.
+
+I am just curious, why it didn't follow the above behavior even with the above bug where first metadata is always null., [~janithkv] As far as I can tell it does follow your description when auto commit is true. Auto commit is disabled by default for KafkaSpoutConfig though. , [~Srdo], thanks for confirming that. , [~Srdo],
+
+I merged your pull request into master, but when I tried to cherry-pick it into 1.x I got merge conflicts.  If you want this in the 1.x line please put up a pull request for that.  Thanks for all your work., Also merged into 1.x branch.]

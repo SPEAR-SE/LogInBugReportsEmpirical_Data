@@ -1,0 +1,146 @@
+[trying to get a response here. ignore initial filing comments. tasks dying due to exit code 65 is the #1 cause of task failure in our environment. we have a timeout value of 10s and a substantial set of tasks fail with this error. fixing this would substantially improve the efficiency of our cluster. i understand this is simply the task committing suicide after failing to ping the tasktracker.
+
+i am going to try some things out - for starters just trying to run tasktrackers at higher process priority than the slave nodes. i don't want to raise the global timeout because it makes everything less responsive (retries take toooo long). 
+
+if developers have some insight on how to tune the ping codepath to make it more resilient - that would be awesome. , I am thinking whether the task should base its decision on whether to kill itself or not on _connect_ as opposed to the ping RPC failures. As your tasktracker logs points out, the tasktracker is just too slow in processing the RPCs for some reason, and might eventually recover. In the case where the tasktracker is actually down, the _connect_ call would fail and task can kill itself. Also, the task should kill itself when the ping RPC is successful and returns a false. Comments?, that would seem acceptable. 
+
+on similar lines - the start-stop scripts look at the pids file to detect if the tasktracker is running. we could use the same logic (signal the tasktracker pid to see if it's alive). dunno if this is easily doable in java., after the latest burst of problems - i am reasonably sure that the underlying cause for these timeouts are expensive synchronized methods in the taskTracker:
+
+  private synchronized void purgeJob(KillJobAction action) throws IOException {
+ ...
+          fConf.deleteLocalFiles(SUBDIR + Path.SEPARATOR + JOBCACHE +
+                                 Path.SEPARATOR +  rjob.getJobId());
+...
+}
+  public synchronized boolean ping(String taskid) throws IOException {
+
+every time the task tracker gets a kill job action - it's unpingable for a fair bit of time. All the childs error out. I have plenty of logs to bear this out. For example, see silent gap in log and immediate child errors after killjobaction:
+
+2008-01-25 11:44:24,399 INFO org.apache.hadoop.mapred.TaskTracker: task_200801140959_4200_m_000001_0 0.88915026% hdfs://hadoop001.sf2p.facebook.com:9000/use
+r/facebook/warehouse/ad_imps_annotated/ds=2008-01-06/part-00000:67108864+67108864
+2008-01-25 11:44:24,421 INFO org.apache.hadoop.mapred.TaskTracker: Received 'KillJobAction' for job: job_200801140959_4161
+2008-01-25 11:44:24,422 INFO org.apache.hadoop.mapred.TaskRunner: task_200801140959_4161_r_000023_1 done; removing files.
+2008-01-25 11:44:26,531 INFO org.apache.hadoop.mapred.TaskRunner: task_200801140959_4161_m_000107_0 done; removing files.
+2008-01-25 11:44:41,252 INFO org.apache.hadoop.mapred.TaskRunner: task_200801140959_4161_m_000164_0 done; removing files.
+2008-01-25 11:44:53,044 INFO org.apache.hadoop.mapred.TaskRunner: task_200801140959_4161_r_000005_0 done; removing files.
+2008-01-25 11:44:53,045 INFO org.apache.hadoop.mapred.TaskRunner: task_200801140959_4161_m_000027_0 done; removing files.
+2008-01-25 11:44:55,642 WARN org.apache.hadoop.mapred.TaskRunner: task_200801140959_4200_r_000013_0 Child Error
+java.io.IOException: Task process exit with nonzero status of 65.
+        at org.apache.hadoop.mapred.TaskRunner.runChild(TaskRunner.java:402)
+
+
+I think for now -the workaround is simple - i will just increase the ping retry count. but this seems pretty bad. we should not be doing expensive file io in a synchronized method. gotta queue it up and do it in a different thread. i checked the trunk - the code looks pretty much the same., bq. after the latest burst of problems - i am reasonably sure that the underlying cause for these timeouts are expensive synchronized methods in the taskTracker:
+
+You are right, thanks for the analysis.
+
+I did make TaskTracker.purgeJob a synchronized method via HADOOP-1461 to solve a corner-case deadlock, which in-hindsight might have been the wrong way to fix it.
+
+I need to check if my original analysis in HADOOP-1461 is still valid and if the alternate fix I've proposed there can be done, watch this space., To be honest, in later versions of Hadoop we haven't seen this particular issue being a problem; this is not to say your analysis is wrong., In general, I think we should do things like file deletions outside the synchronized block., just to emphasize - this is a really critical bug. we see other problems that can be attributed to blocked task trackers (like tasks taking forever to get initialized). (i was able to work around the ping problem by increasing the retry count in Task.java).
+
+I think these problems are hidden at Yahoo's setup because of speculative execution, large timeouts, and excess compute capacity. They show up like a sore thumb in smaller clusters with lots of load. , ping.
+
+we see this everytime a large job with a lot of mappers is killed (this one had 20K mappers on 100 nodes - so about 200 map tasks per node) - all other jobs start timing out. of course - a legitimate question is whether we need so many mappers - but in this case - the input was arranged as a large number of files (and it's hard to train all users to use MultiFileInputFormat).
+
+in looking at the code - i can patch this for the most part - what i don't understand entirely is:
+
+purgeJob():
+
+        for (TaskInProgress tip : rjob.tasks) {
+          tip.jobHasFinished(false);
+        }
+        // Delete the job directory for this                                                                                                                                   
+        // task if the job is done/failed                                                                                                                                      
+        if (!rjob.keepJobFiles){
+          fConf.deleteLocalFiles(SUBDIR + Path.SEPARATOR + JOBCACHE +
+                                 Path.SEPARATOR +  rjob.getJobId());
+        }
+
+
+- is there a dependency that the deleteLocalFiles() should only happen after the task cleanup? (It's easy to make the task cleanup happen in the taskrunner thread itself by setting the kill bit and making the wait for process status into one with timeouts).
+
+any pointers appreciated ..
+
+(changing the purgeJob routine to being a non-synchronized method seems way more risky/hard to me ..)
+
+
+, How about doing this: create a daemon thread that will just do deletes for paths queued up in its queue. So any call to deleteLocalFiles (this is called from two places in the TaskTracker) esentially just inserts the path to be deleted in this queue. This will ensure minimal changes in the flow of execution and keep it simple., Here is patch adding a daemon thread to the tasktracker delete files that are queued up. TaskTracker queues up all the file deletions to this new thread. This should remove the io operations in purgeJob()., resubmitting for hudson, Sorry, the tasktracker should do a join on the cleanup thread in order to give it a chance to complete cleanup of the paths the tasktracker asked it to. Also, the LOG message has "directory" misspelt., The patch adds join for task cleanup thread and directory cleanup thread in TaskTracker.shutdown() as suggested., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12383440/patch-2393.txt
+  against trunk revision 663487.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no tests are needed for this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2585/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2585/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2585/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2585/console
+
+This message is automatically generated., Testfailures org.apache.hadoop.fs.TestHarFileSystem.testArchives, org.apache.hadoop.streaming.TestStreamingFailure.testCommandLine are not related to the patch. 
+This issue is fixing the bug by moving cleaup code from synchronization block. Test case is not written, because the existing tests will verify the correctness., Pls make the shuttingDown volatile., boolean shuttingDown is made volatile. 
+Tested the patch on cluster., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12383453/patch-2393.txt
+  against trunk revision 663487.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no tests are needed for this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2590/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2590/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2590/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2590/console
+
+This message is automatically generated., class CleaupQueue is made private in TaskTracker., trying hudson again, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12383535/patch-2393.txt
+  against trunk revision 663841.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no tests are needed for this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2603/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2603/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2603/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2603/console
+
+This message is automatically generated., TestFailures are not related to the patch., I just committed this. Thanks, Amareshwari!]

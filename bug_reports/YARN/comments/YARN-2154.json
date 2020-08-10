@@ -1,0 +1,70 @@
+[Started looking into this. Today, we just look at the amount of resources to be preempted. Instead, we should collect a list of applications for which we are preempting containers. Iterate through these applications and their ResourceRequests to find potential matches in free resources and subsequently in resources assigned to another application that is over its fairshare. 
+
+Will post a patch for this once YARN-2395 and YARN-2394 get committed. , At an abstract level, I propose the following:
+# For each queue, the child {{Schedulable}}s should be sorted in the ascending order of (desiredShare - fairShare). In case of FSLeafQueue, this corresponds to running applications.
+# Add {{FSQueue#estimateStarvation(List<FSAppAttempt>)}} to find enough applications, considering minshare and fairshare starvation in that order. Or, should we have two methods, one for each kind of starvation. 
+# For a starved queue, we do a depth-first traversal (in the order of deprivation) to find these applications. If none of child queues/applications are under their shares, we pick the application (if it exists) with a positive demand and least over its share.
+# Once the application list is computed, we traverse through the ResourceRequests (ordered first by application, second by priority) and preempt any matching containers currently assigned to an application over its share.
+# As a follow up, we can consider looking at this application list first at schedule time.
+
+Thoughts? , bq. 1. For each queue, the child {{Schedulable}}s should be sorted in the ascending order of (desiredShare - fairShare). In case of FSLeafQueue, this corresponds to running applications.
+Do we still need to do the sorting? As we traverse from the root queue, and take applications from the queues which are starvated for min/fair share. I think we collect all applications from starvated queues.
+
+bq. 4. Once the application list is computed, we traverse through the ResourceRequests (ordered first by application, second by priority) and preempt any matching containers currently assigned to an application over its share.
+To sort the applications, do we still need to follow the policy? For example, for two applications belong to the same FSLeafQueue, they should be sorted according to the leafQueue's policy; for two applications belong to two different leaf queues, may need to refer to parent queue's policy. 
+And, after preempting one container and assigning the resource to one application in the list, we also need to check whether that application and its parent queue is still starvated., bq. Do we still need to do the sorting? As we traverse from the root queue, and take applications from the queues which are starvated for min/fair share. I think we collect all applications from starvated queues.
+Queues might starve without their children starving. The sorting is for those cases. 
+
+bq. To sort the applications, do we still need to follow the policy? 
+We shouldn't need to sort the applications. The first application corresponds to the queue that is starved the most even though the application itself might not be the most starved one. , Just discussed this with [~ashwinshankar77] offline. He rightly pointed out the sort order should take usage into account. I ll post what the order should be, as soon as I get to consult my notes. , I'd like to add another constraint that I've been thinking about into the mix.  We don't necessarily need to implement it in this JIRA, but I think it's worth considering how it would affect the approach.
+
+A queue should only be able to preempt a container from another queue if every queue between the starved queue and their least common ancestor is starved.  This essentially means that we consider preemption and fairness hierarchically.  If the "marketing" and "engineering" queues are square in terms of resources, starved teams in engineering shouldn't be able to take resources from queues in marketing - they should only be able to preempt from queues within engineering.
+
+, Moving all tickets targeted for the already closed release 2.6.0 into 2.6.1/2.7.2., Moving features/improvements from previously closed releases to next major release 2.8.0., This looks like it is required for a complete solution to YARN-3453
+[~kasha], Thanks for proposing this. If are you working on this actively, do you mind if I take it up ? I have a couple of ideas., Please go ahead and take it. , Would be nice to discuss approaches on JIRA before putting in the effort to code it up. 
+
+, Attaching a proof-of-concept patch.
+
+The patch introduces an extra stage in the current preemption logic. Salient points to note :
+# In the first stage, we iterate through starved LeafQueues and obtain an aggregate  of the {{ResourceDeficit}}, which has two fields:
+## unmarked resources : The deficit for which the queue is starved for, essentially, no app can be allocated to the queue due to the deficit
+## marked resources : These are app specific deficits, viz. node specific resources that an app is waiting on to launch a container.
+# In the second stage, we try to match the Marked resources obtained in the first step with containers owned by apps that are consuming above their fair/min share. If we find such a container,
+## we first see if any app is already reserved on the Node hosting the container.
+## If no, we Reserve the app originating the resource Request on the Node
+## we then place the container in the {{warnedContainers}} list
+## we return the totalResources that we reclaimed
+# In the last stage, we call {{preemptResources}} as before.. with the unmarked resources + the reclaimed resources in the previous stage. At which time, the {{warnedContainers}} list will be iterated over and containers will be killed.
+
+TODO:
+# The Matching can happen more efficiently. In the current patch, all first matching container that fits a resourcereq is targeted for preemption. This can probably be modified to a best fit algorithm 
+# Fixing test cases., Thanks for posting the approach here, Arun. 
+
+Observation: We are prioritizing marked resources over unmarked resources. If a queue has some large jobs that have already started and a small job waiting for resources for its AM to start, we prioritize large jobs. Is this okay? I feel it might be., Hi, I've been watching this ticket since this has been a big problem on our cluster.    Karthik, your last comment concerned me because it seems like it will violate one of the things FairScheduler is supposed to promise:
+
+"Unlike the default Hadoop scheduler, which forms a queue of jobs, this lets short jobs finish in reasonable time while not starving long jobs.'
+
+and
+
+"When other jobs are submitted, tasks slots that free up are assigned to the new jobs, so that each job gets roughly the same amount of CPU time. "
+
+If a job can't even get an AM, it surely won't be able to get an equitable portion of slots for Maps and Reduces -- being able to get small jobs through quickly even when the pool has huge jobs running is the reason we use FairScheduler.  
+
+Sorry if I'm misunderstanding that comment., [~bpodgursky] - I was only observing what the patch seems to be doing. 
+
+The patch prioritizes currently running apps over pending apps. The pending apps aren't necessarily starved - subsequent preemptions should handle them. [~asuresh] - could you please confirm the same. If this is not the case, I agree with [~bpodgursky] that we shouldn't starve small apps. 
+
+, Apart from this, the patch changes the order of choosing which apps to preempt from. Earlier it would prefer apps most over the limit and now there is no order. The previous ordering is better since if you happen to choose something just above its fairShare, after preemption it may go below and cause additional preemption, causing excessive thrashing of resources., bq. The previous ordering is better since if you happen to choose something just above its fairShare, after preemption it may go below and cause additional preemption, causing excessive thrashing of resources.
+
+Has been a while since I saw the patch, but would think that it honors the guarantees FairScheduler provides:
+# Resources are preempted from a Schedulable, only if it is above its fairshare.
+# Preempting resources from a Schedulable doesn't take it under its fairshare. In other words, it shouldn't lead to additional preemption. It is possible that its fairshare goes up right after a preemption and triggers additional preemption, but I guess we can't foresee it. 
+
+Ordering shouldn't affect correctness of 1 or 2. Ordering does reduce the impact of preemption in case the fairshare increases because another queue goes inactive. 
+
+[~asuresh] - could you confirm the patch conforms to the above guarantees? Do we have unittests that check these invariants? Once we identify all the apps we could preempt from, can we order them for efficiency purposes? What would be the cost of such ordering?  , Thanks for going thru the patch [~adhoot], [~kasha] and [~bpodgursky],
+
+bq. ..The previous ordering is better since if you happen to choose something just above its fairShare, after preemption it may go below and cause additional preemption, causing excessive thrashing of resources.
+This will not happen, as the current patch has a check to only preempt from an app, a container above its fair/min share.
+
+Am still working on the unit tests.., The new logic would solve the issue raised in YARN-3405 and YARN-4134. link them for tracking.]

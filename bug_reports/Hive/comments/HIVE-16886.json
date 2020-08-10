@@ -1,0 +1,816 @@
+[[~thejas] [~sushanth] Have you experience this issue before? Do you have multiple HMS running in parallel?, [~anishek] created HIVE-16738 where he commented that this is possible in a single metastore case itself. However, I am not sure if we have seen that in practice so far.
+I guess you are right about the multi-metastore case as well. 
+
+What happens when the table goes into that state ? Does DbNotifcationListener start erroring out ?
+
+cc [~anishek] [~sushanth] [~sankarh] 
+, FYI, A different issue that we observed in a production system was slowness in UPDATE queries in this table. We haven't got to the bottom of that issue yet -
+
+There was slowness seen around the following query -
+
+Pasting from slow query logs in that jira -
+{code}
+UPDATE `NOTIFICATION_SEQUENCE` SET `NEXT_EVENT_ID`=XXXX94 WHERE `NNI_ID`=1;
+# Query_time: 236.294821  Lock_time: 0.000044 Rows_sent: 0  Rows_examined: 1
+UPDATE `NOTIFICATION_SEQUENCE` SET `NEXT_EVENT_ID`=XXXX94 WHERE `NNI_ID`=1;
+# Query_time: 222.241997  Lock_time: 0.000049 Rows_sent: 0  Rows_examined: 1
+{code}
+
+There is also lot updates that was happening with same next_event_id seen in that -
+
+{code}
+grep NOTIFICATION_SEQUENCE  mysql-slowquery.log  |sort | uniq -c
+ 830 UPDATE `NOTIFICATION_SEQUENCE` SET `NEXT_EVENT_ID`=XXXX43 WHERE `NNI_ID`=1;
+  13 UPDATE `NOTIFICATION_SEQUENCE` SET `NEXT_EVENT_ID`=XXXX44 WHERE `NNI_ID`=1;
+..
+..
+{code}
+(masked some digits in what is pasted above)
+, HIVE-16738 also refers to the problem of multiple events getting same id in case of multiple Hive metastore instances. The lock has to be at the db level to get unique ids., The problem when this happens is that some events are lost and consumers who depend on them may get into an inconsistent state.
+
+The slowness may be caused by the fact that such Read-Modify-Write on a single row involves a row lock, so concurrent threads doing updates contend on the same row lock., [~akolb] In DBNotificationListener the events will still get logged with some of them having the same id, If the consumer of the events is using the event id (which is reasonable) and processing them assuming there is going to be unique event ids per event then such consumers will lead to inconsistent data. We definitely need this fixing as part of replication v2.
+, [~anishek] This means that some events may not have a defined order - correct? This also makes consumer job very tricky since it doesn't know whether it processed all events or not. Consumers may be running on different processes - the only thing they may know is what event ID they processed. If we have multiple events with the same ID they will not know that., [~akolb] yeh agree with it., A reasonable way to make it unique is 
+
+* Declare a unique constraint
+* Add a new value into a separate row
+
+It would be good to have some retry transaction logic, but it may be a bigger change. , Another mode to achieve the same would be the way hibernate versioning works, there seems to be a jdo versioning available which looks the same. , Can you clarify what versioning scheme you have in mind?, http://www.datanucleus.org/products/accessplatform_4_1/jdo/versioning.html
+
+, This is used in connection with Optimistic transactions are they used by ObjectStore? I was investigating the use of application-based versioning a while ago but couldn't find a single example of how it could be used., Not sure which transaction isolation level across sql db's (that metastore supports) translates to optimistic transactions. I have used this with hibernate versioning and it worked very well. I saw this on DataNucleus as well so I think will require some work to identify how well it fits our use case. 
+ , For DataNucleus this is orthogonal to transaction isolation level and can be enabled for specific transactions. , just to understand it better, isolation level is for updates where as locking seems to be for reads and i can get later with specific sql constructs within a isolation level. 
+
+for ex with mysql:
+{code}
+    <name>datanucleus.transactionIsolation</name>
+    <value>read-committed</value>
+{code}
+
+but then fire a {{select ... for lock in share mode}}  rather than 
+
+{code}
+    <name>datanucleus.transactionIsolation</name>
+    <value>serializable</value>
+{code}
+
+would be same right ?
+
+anyways jdo versioning 
+http://www.datanucleus.org/products/accessplatform_4_1/jdo/versioning.html
+with transaction locking _*"Optimistic Locking"*_ in
+http://www.datanucleus.org/products/accessplatform_4_1/jdo/transactions.html
+
+so we should be able to get it by adding a column 
+{code}
+      <version strategy="version-number" column="VERSION">
+      <field name="version">
+              <column name="VERSION" jdbc-type="BIGINT" allows-null="false"/>
+            </field>
+      </version>
+{code}
+in  {{MNotificationNextId}}
+
+, [~anishek] What is the default isolation used by HMS? I think it is read-committed - right?
+I suspect that select ... for update is pretty heavy lock. In similar situations in Apache Sentry we rely on uniqueness constraint on the primary key (or on the unique key), effectively simulating optimistic locking.
+
+When I looked at DataNucleus optimistic support, it wasn't clear how to use it with the column that is managed by the application rather then DN itself., [~anishek] [~thejas] While running some tests with duplicated events IDs in HMS HA mode, I see that the NL_ID is never duplicated and is always consecutive and in order. Do you know why we're not using this ID instead? Seems more consistent and better to use.
+
+[~akolb] FYI
+
+{noformat}
+[hive1]> select NL_ID, EVENT_ID, EVENT_TIME, EVENT_TYPE, DB_NAME from NOTIFICATION_LOG where NL_ID >= 5431 and NL_ID <= 5440;
++-------+----------+------------+-----------------+----------------------------------------+
+| NL_ID | EVENT_ID | EVENT_TIME | EVENT_TYPE      | DB_NAME                                |
++-------+----------+------------+-----------------+----------------------------------------+
+|  5431 |     5094 | 1501109698 | CREATE_DATABASE | metastore_test_db_HIVE_HIVEMETASTORE_2 |
+|  5432 |     5097 | 1501109698 | CREATE_TABLE    | metastore_test_db_HIVE_HIVEMETASTORE_2 |
+|  5433 |     5098 | 1501109699 | ADD_PARTITION   | metastore_test_db_HIVE_HIVEMETASTORE_2 |
+|  5434 |     5101 | 1501109791 | DROP_TABLE      | metastore_test_db_HIVE_HIVEMETASTORE_2 |
+|  5435 |     5104 | 1501109792 | DROP_DATABASE   | metastore_test_db_HIVE_HIVEMETASTORE_2 |
+|  5436 |     5096 | 1501109698 | CREATE_DATABASE | metastore_test_db_HIVE_HIVEMETASTORE_1 |
+|  5437 |     5097 | 1501109698 | CREATE_TABLE    | metastore_test_db_HIVE_HIVEMETASTORE_1 |
+|  5438 |     5100 | 1501109699 | ADD_PARTITION   | metastore_test_db_HIVE_HIVEMETASTORE_1 |
+|  5439 |     5102 | 1501109791 | DROP_TABLE      | metastore_test_db_HIVE_HIVEMETASTORE_1 |
+|  5440 |     5105 | 1501109792 | DROP_DATABASE   | metastore_test_db_HIVE_HIVEMETASTORE_1 |
++-------+----------+------------+-----------------+----------------------------------------+
+{noformat}, Btw, the getNextNotification() method fetches all notifications after an EVENT_ID > X, so if we already fetched EVENT_ID = 5098, then the getNextNotification won't fetch those events after 5098 that are less than 5098. Seems we can get it better with NL_ID, [~spena] I am not exactly sure why we dont use the NotificationLog Id, i think there is some limitation when we use ORACLE db as metastore RDBMS, I think [~thejas] might be able to provide a more definitive answer, but 
+
+* the test above would be more comprehensive if you can provide an example of unique NL_ID with duplicate EVENT_ID.
+* looking at the mapping NL_ID is generated using *native* strategy which falls back to sequence/identity/increment for different DB, the default values for these strategies will differ based on which underlying db is used, if *increment* gets used anywhere then in HMS HA mode there will be a cache of 10 sequence numbers that Datanuclues will maintain and this will definitely lead to duplicates / failues( since we have PK constraint), we might want to add additional retry logic in that case.
+* if we can move to *sequence* based identity strategy generation for NL_ID that will be great, though might have to look if all supported rdbms will work with them., [~anishek] Got it, I will run some tests with ORACLE db as well to see if we have the same behavior. Btw, the above example has a duplicated EVENT_ID with a different NL_ID, here're the lines:
+{noformat}
+|  5432 |     5097 | 1501109698 | CREATE_TABLE    | metastore_test_db_HIVE_HIVEMETASTORE_2 |
+
+|  5437 |     5097 | 1501109698 | CREATE_TABLE    | metastore_test_db_HIVE_HIVEMETASTORE_1 |
+{noformat}
+
+The {{HIVE_HIVEMETASTORE_N}} is a row written by a different HMS. In this cases we have HMS 1 and HMS 2 writing the same event ID., Thanks [~spena] i didnt realize there were additional rows in between the two., [~lina.li] This issue may be interesting for you as well., [~spena] are you working on this one ? if not i am planning to have a go at it.
+, for the supported database NL_ID will be generated either using the *auto_increment* or *identity* column, the problem though is column mappings of type *datastore-identity* cannot be mapped by datanucleus to the java representation of the notification log member variable, which means replication will not work since the event id is serialized to a file.  hence we cant use NL_ID., I read on the datanucleus doc that those datastore-identity objects may be accessed by something like {{Object id = pm.getObjectId(obj);}}, do you know how if that would work? can we read and add the NL_ID into the object to be returned back to the client?
+
+http://www.datanucleus.org/products/datanucleus/jdo/datastore_identity.html, Yeh we can do that though  we have to explicitly parse and typecast the data-store identity in metastore code. Additionally sql query in datanuclues has to be used instead of object query for 
+
+{code}public NotificationEventResponse getNextNotification(NotificationEventRequest rqst){code} in object store. 
+
+I have the code in place which will address the current issue with the use of {{NL_ID}} as event id and remove the use of 
+* {{MNotificationNextId}} 
+* {{EVENT_ID}} from {{MNotificationLog}} such that without modifying the metastore db schema, we just populate a default of value "0" for this column in db.
+
+though the problem is how do we manage deployments who are using repl v1 who are dependent on {{EVENT_ID}} and with the new release suddenly will move to {{NL_ID}}
+* -one way is we map both {{NL_ID}} and {{EVENT_ID}}  in {{MNotificationLog}} and the external tool based on the value of {{EVENT_ID=0}} switches to using id's from {{NL_ID}}- looking at the code dont think this is possible as for getCurrentNotificationId we wont be able to make a distinction. 
+* other way is to completely redo the whole replication deployment with repl v2 rather than repl v1. 
+* if we make an assumption that the {{NL_ID}} is always  > {{EVENT_ID}} in existing metastore rdbms then we can do something to automatically shift user to new mapping by writing some additional code in the hivemetastore which looks at all previous events and if nothing found start using the new mapping. 
+
+, [~anishek] I think we should keep the EVENT_ID as it is for now, and can add a new variable to the MNotificationLog that tracks the NL_ID. Then when getting new notifications, we can check for the NL_ID if the new variable has a value or fall back to the EVENT_ID if not. This way we can keep the compatibility with current clients using these notifications.
+
+Btw, in the Sentry side, we're going to request HMS notifications in a time window so that we can fetch these duplicated events IDs and reapply them in the client. Currently, HMS guarantees that IDs are committed in order but duplicated events could exist and committed later if an HMS server has delayed the transaction commit on the DB. , I think due to the flaws with current EVENT_ID, the NL_ID would be right value (from db) to use. Longer term we should just have one value and remove the EVENT_ID sourced information.
+There are two possible approaches to switch to the new 'fixed' value.
+One is to introduce a new NL_ID field at api level (maybe EVENT_ID_V2 for clarity ?) and eventually drop EVENT_ID field from API. Other option is to just switch EVENT_ID field to values sourced from NL_ID. With second approach, no changes to applications are needed for the deprecation. Applications would get a bump in the event id numbers due to it being sourced from NL_ID which would be >= EVENT_ID nos (due to the duplicate issue).
+
+[~spena] What are your thoughts ? 
+, I am just going to provide some more detail information so that we all get to understand what is happening with this bug.
+
+As of now the plan is to hopefully have a backward compatibility with replication v1, though primary focus is going to be fixing the issue of duplicate event ids with multiple HMS, which is specifically detrimental for replication v2, which is now going to replication point-in-time state of the database rather than the latest state as was  in repl v1. 
+
+As for the fix, there are few tests i am going to fix and have a patch for all of you, hopefully today/tomorrow,  to review. 
+* mapping for {{NOTIFICATION_SEQUENCE}}  has been removed.
+* there are effectively two class mappings for {{NOTIFICATION_LOG}} , one representing the current state namely using {{EVENT_ID}} as event id and new implementation that will use {{NL_ID}}, with the new mapping putting a default value of 0 for {{EVENT_ID}}. 
+* Backward compatibility in terms of replication v1 not being broken, should be possible if the following assumption holds in the metastore rdmbs : ??value of NL_ID is greater than the EVENT_ID for same rows, including only events that are not yet replicated to replica warehouse.??
+* Code to switch mappings in the metastore from {{EVENT_ID}} to {{ND_ID}} is in place, depending on what is required, For ex for existing repl v1, it will first provide all the events using the {{EVENT_ID}} and post that start providing events with {{NL_ID}} since {{NL_ID > EVENT_ID}} it would allow existing setup to continue working.
+, [~anishek] [~thejas] Thanks for starting working on this. I have a few of comments about using NL_ID that we should keep in mind on the patch. This is based on some other tests we have done with datastore incremental IDs.
+
+1. Use the {{sequence}} strategy on the NL_ID. This should keep increments atomic. However, we have found that these increments do not guarantee an order when committing them. We have seen commits ID of order 1,3,2 because of some delay in the transaction commit. We call this out-of-order as 'holes' because when fetching updates we may get 1,3 only (2 is not there because will be committed later).
+
+2. To solve the holes problem on our client requests when getting new notifications, we should request them in a temporal order instead of ID order. To do that, we should write a new API to get notifications based on a timestamp instead of an ID. Timestamps will keep the order correctly.
+
+3. Use a SQL timestamp instead of using the one on DbNotificationListener#now() method. If possible, use a milliseconds timestamp, such as {{current_timestamp(6)}} from SQL. The now() method run in different HMS servers may be different and may be out-of-sync having a weird order sometimes. We found that {{current_timestamp(6)}} is executed at the moment of the SQL execution; so it is the best time we can get of the transaction.
+
+This next section only applies to what we do as a client requesting notifications (not part for the patch, but useful to know).
+
+On the client side, we sometimes do not request notifications for a period higher than the HMS clean-up thread. This means that we may miss notifications that were removed during that time. To avoid this issue on our side, we're requesting HMS notifications for a time window period and reapplying all of them for that time. If for some reason we get fewer notifications than expected, then we assume that older events were purged, and we may request a new HMS snapshot if necessary., [~spena] thanks for your insights.
+
+* Sequence is not present in Mysql 5.6 and MS SQL and hence using that as the datastore-identity strategy will not work for all supported databases (https://cwiki.apache.org/confluence/display/Hive/AdminManual+MetastoreAdmin).
+* leaving it to "native" should work for us since the underlying column is a bigint and should result in numeric generation, I am not aware of a database generating, out of order numeric values when using "auto-increment", do you know of any such use case ?
+* I like the sequential guarantee that point 3, provides, but this should happen only for concurrent transactions / queries / modifying disjoint operations. In such cases it should not matter if one is applied before the other or vice versa, the database would still be in valid state ? even if we use the current_timestamp from db it would result in similar order of events as we do currently such that you can get 1,3,2 because it will be enforced at database insert time and not when the operation started. From what I see point 1, looks like clients want the order of events to be the order in which they were started rather than the order which they were committed, where in the latter makes sense since at the database level that is how the events were applied. 
+
+Please let me know what you think ?, attaching patch for test run., From what I saw all mechanisms supported by DataNucleus can not guarantee that there are no holes (although tehy deal with duplicates). There may be two kinds of holes - temporary ones (that will be filled later when transaction is committed) and permanent ones (which will be never filled in). 
+
+MySQL InnoDB has a mechanism to provide no-holes semantics (https://dev.mysql.com/doc/refman/5.7/en/innodb-auto-increment-handling.html) but ir seems that Oracle and PostgreSQL don't have similar mechanisms.
+
+Holes create troubles for consumers. E.g. when consumer reads notification ID 10 some earlier IDs may be committed later so they may be skipped or not processed properly. Also, consumers have no way of knowing whether the hole will be filled in later (when corresponding transaction commits) or never (if the transaction that allocated ID fails).
+
+There is a way to guarantee that there re no holes and duplicates:
+
+a) Make the ID primary key (which doesn't allow duplicates)
+b) As part of the transaction, read the value of ID, increment it by 1 and persist it.
+
+This approach guarantees that there are no holes or duplicates, but transactions can fail because of the ID conflicts, so it is important to retry such transactions. HMS doesn't provide per-transaction retries, but may be per-operation retries are Ok as well., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12883016/HIVE-16886.1.patch
+
+{color:green}SUCCESS:{color} +1 due to 2 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 26 failed/errored test(s), 10995 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[unionDistinct_1] (batchId=143)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[spark_vectorized_dynamic_partition_pruning] (batchId=169)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query14] (batchId=235)
+org.apache.hadoop.hive.common.TestFileUtils.testCopyWithDistCpAs (batchId=250)
+org.apache.hadoop.hive.common.TestFileUtils.testCopyWithDistcp (batchId=250)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testAlters (batchId=218)
+org.apache.hive.hcatalog.api.TestHCatClient.testPartitionRegistrationWithCustomSchema (batchId=180)
+org.apache.hive.hcatalog.api.TestHCatClient.testPartitionSpecRegistrationWithCustomSchema (batchId=180)
+org.apache.hive.hcatalog.api.TestHCatClient.testTableSchemaPropagation (batchId=180)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.addPartition (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.alterIndex (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.alterPartition (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.alterTable (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.createDatabase (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.createFunction (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.createIndex (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.createTable (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.dropDatabase (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.dropFunction (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.dropIndex (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.dropPartition (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.dropTable (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.exchangePartition (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.filter (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.insertPartition (batchId=233)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.insertTable (batchId=233)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/6480/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/6480/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-6480/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 26 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12883016 - PreCommit-HIVE-Build, [~anishek] I attached a patch that probes we can have holes when using datastore identity IF delays happen during the commit() transaction call. I made some modifications on the ObjectStore to allow seeing this behavior:
+
+getNextNotification() reads the NL_ID and replaces EVENT_ID with NL_ID so that I can read what the actual NL_ID was persisted.
+
+addNotificationEvent() has some count down latches that signal the persist and commit order. 
+
+The problem we saw is that NL_ID is created on the {{makePersistent}} call (sql execution), but it is not seen by getNextNotification() until is committed. This commit() may be delayed due to issues on network, GC or anything else. We run into this problem in Sentry when we were running several stress tests on a cluster with Sentry HA.
+
+Apply the patch on master, and run the test case:
+{noformat}
+$ mvn test -Dtest=TestObjectStore#testDatanucleusHoles
+{noformat}
+
+The test case have assertions to probe the hole, but to look at the actual holes, you can take a look at the log:
+{noformat}
+$ cat metastore/target/surefire-reports/org.apache.hadoop.hive.metastore.TestObjectStore-output.txt
+
+2017-08-22T14:36:06,090  INFO [main] metastore.TestObjectStore: 1st notification request will get only one event with ID = 2
+2017-08-22T14:36:06,090  INFO [main] metastore.TestObjectStore: ID = 2, TYPE = null
+2017-08-22T14:36:06,092  INFO [main] metastore.TestObjectStore: 2nd notification request should get last event ID = 2 and a new event with ID = 1
+2017-08-22T14:36:06,092  INFO [main] metastore.TestObjectStore: ID = 1, TYPE = null
+2017-08-22T14:36:06,092  INFO [main] metastore.TestObjectStore: ID = 2, TYPE = null
+{noformat}, [~spena]/[~akolb] I agree to the  points you have made and i have been thinking, if we introduce another column with auto-increment and primary key constraint  at the db level and datanuclues having no mapping for the field, in this case the id will be given at commit time and not at makePersistent done in our code. only thing that kept me from doing this was doing db schema change for metastore but i think we need it here., [~anishek] I was investigating this some time ago and seems like only MySQL with InnoDB has a mechanism to guarantee precise auto-increment without holes. Seems that neither Oracle nor PostgreSQL provide such mechanisms (please correct me if I am wrong - I am in no way a DB expert). I didn't find any generic way to achieve this without manually simulating "optimistic transactions" which means a combination of defining ID as a primary key and using something along these lines:
+
+{code}
+OPEN TRANSACTION
+perform_some_work()
+id = retrieve max(id)
+persist(id+1)
+CLOSE TRANSACTION
+{code}
+
+Because of the uniqueness constraint, this either succeeds and increments the value or fails due to a duplicate value. In both cases we have neither duplicates nor holes. We can never have a case where fort two IDs K and N where K < N, and K is committed after N.
+
+The current situation is bad not only because we have duplicates but also because when we read some value N, a smaller value K<N may still appear later and go undetected.
+, [~anishek] To clarify - what we discovered is that auto-increment allocates IDs not at commit time, so later values may be committed earlier then earlier values., There is some discussions of pros and cons of alternative approaches in SENTRY-1855., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12883195/datastore-identity-holes.diff
+
+{color:green}SUCCESS:{color} +1 due to 1 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 33 failed/errored test(s), 10860 tests executed
+*Failed tests:*
+{noformat}
+TestCommands - did not produce a TEST-*.xml file (likely timed out) (batchId=180)
+TestDbNotificationListener - did not produce a TEST-*.xml file (likely timed out) (batchId=233)
+TestEximReplicationTasks - did not produce a TEST-*.xml file (likely timed out) (batchId=180)
+TestExport - did not produce a TEST-*.xml file (likely timed out) (batchId=218)
+TestHCatClient - did not produce a TEST-*.xml file (likely timed out) (batchId=180)
+TestHCatClientNotification - did not produce a TEST-*.xml file (likely timed out) (batchId=233)
+TestHCatHiveCompatibility - did not produce a TEST-*.xml file (likely timed out) (batchId=233)
+TestHCatHiveThriftCompatibility - did not produce a TEST-*.xml file (likely timed out) (batchId=233)
+TestLocationQueries - did not produce a TEST-*.xml file (likely timed out) (batchId=218)
+TestNoopCommand - did not produce a TEST-*.xml file (likely timed out) (batchId=180)
+TestObjectStore - did not produce a TEST-*.xml file (likely timed out) (batchId=201)
+TestReplicationScenarios - did not produce a TEST-*.xml file (likely timed out) (batchId=218)
+TestReplicationScenariosAcrossInstances - did not produce a TEST-*.xml file (likely timed out) (batchId=218)
+TestReplicationTask - did not produce a TEST-*.xml file (likely timed out) (batchId=180)
+TestRetriesInRetryingHMSHandler - did not produce a TEST-*.xml file (likely timed out) (batchId=201)
+TestSemanticAnalyzerHookLoading - did not produce a TEST-*.xml file (likely timed out) (batchId=218)
+TestSequenceFileReadWrite - did not produce a TEST-*.xml file (likely timed out) (batchId=233)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[spark_dynamic_partition_pruning] (batchId=169)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[spark_vectorized_dynamic_partition_pruning] (batchId=169)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[repl_dump_requires_admin] (batchId=90)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[repl_load_requires_admin] (batchId=90)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query14] (batchId=235)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query23] (batchId=235)
+org.apache.hadoop.hive.common.TestFileUtils.testCopyWithDistCpAs (batchId=250)
+org.apache.hadoop.hive.common.TestFileUtils.testCopyWithDistcp (batchId=250)
+org.apache.hive.jdbc.TestJdbcWithMiniHS2.testReplDumpResultSet (batchId=228)
+org.apache.hive.minikdc.TestJdbcWithDBTokenStore.testConnection (batchId=241)
+org.apache.hive.minikdc.TestJdbcWithDBTokenStore.testIsValid (batchId=241)
+org.apache.hive.minikdc.TestJdbcWithDBTokenStore.testIsValidNeg (batchId=241)
+org.apache.hive.minikdc.TestJdbcWithDBTokenStore.testNegativeProxyAuth (batchId=241)
+org.apache.hive.minikdc.TestJdbcWithDBTokenStore.testNegativeTokenAuth (batchId=241)
+org.apache.hive.minikdc.TestJdbcWithDBTokenStore.testProxyAuth (batchId=241)
+org.apache.hive.minikdc.TestJdbcWithDBTokenStore.testTokenAuth (batchId=241)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/6492/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/6492/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-6492/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 33 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12883195 - PreCommit-HIVE-Build, auto increments can have holes if
+
+* a transaction was aborted.
+* or the sequence generation is happening in code by explicitly calling the next_val on the sequence behind the auto increment and then doing the insert from the application in which case the problem mentioned by [~spena] with GC in app can cause holes or unordered inserts.
+
+holes can happen and are not guaranteed because of the above cases, however we should not care about the case 1 of aborted transactions until we get increasing ordered unique numbers. 
+
+as for the second case if we use the auto_increment at DB and not use datanuclues datastore-identity with auto-increment, we should be able to get them in order. 
+
+the test provided by  [~spena]  works on mysql with both positive and negative mapping. 
+
+negative mapping -- existing mapping with mysql.
+positive mapping -- auto increment as part of create table for notification log, on NL_ID, on a fresh db. 
+
+for the patch rather than using the existing columns i think i will create another column that will be auto increment at db level.  I will try the fix on a postgres sql db also to see if there is separate behavior, however if the race condition happens at the db level such that two transactions are committed from the application (HMS) at the same time but the db will order them depending on which acquires the lock to auto_increment first. how ever since replication is not realtime this lag of a few nano/micro secs should not be a problem. 
+
+retrying the whole metastore operation with optimistic locking in application code is just calling for a lot of retries on HMS side with the possibility of retrying complete metastore operations to be redone if something fails when one commit is larger than other commits. additionally this will need us to do perfect distributed transactions on rdbms + hdfs. , There are two types of holes that can be observed:
+
+1. Temporary hole - the transaction allocated the ID and is in progress but not committed yet. The hole will be filled at some time in the future when transaction commits.
+2. Persistent hole in case when transaction was aborted.
+
+Both cases present some problems for consumers. Suppose consumers process IDs in order and they read 1, 3. What should they do? If they continue going forward, ID 2 will not be handled at all. They don't know whether 2 will appear later or will never appear. Usually it will appear (in most cases transactions go through) but clients don't know when. Should they process 3 or not? If they do and 2 appears later and they detect it, they will apply operations out of order.
+
+That said, it is better then having duplicate IDs. But this still creates hard problems for consumers who rely on accurate stream of IDs., 1. this will not happen as the id will *not* be allocated before commit, its at DB commit level, that id is generated and *not* at some future time when commit is happening.
+2. this can happen.
+
+since 1 is not happening consumers should keep processing elements in order 1,3 etc and not wait for 2 to appear later. 
+, [~anishek] We actually observed this behavior. Seems that DBs allocate this ID not at commit time., Here is some discussion of the issue on the Oracle side - I don't know how accurate this is. https://dba.stackexchange.com/questions/3945/can-i-implement-a-gapless-identity-column-in-oracle
+
+The statement there is that not only it is impossible to have gapless sequence, it is also impossible to guarantee ordering which means that earlier ID values may appear after later ones., link seems to be discussing sequences and like i mentioned earlier the subsequent transactions will be in commit phase in db when ids get generated so unless something is happening as a trigger on new insert into notification log there is no problem with replication.
+
+Doing retry with optimistic transactions in application code is not something we want to do since it will affect performance of straggle some users. do you have any other ideas ?, Thinking more on this, might be we just do "select for update' for getting the next event id from notification_sequence. this should work on most of the problems we have but will make metastore operations slow. 
+
+also just wondering even in single standalone HMS we can have this issue, as the NOTIFICATION_TBL_LOCK is within a nested transaction and multiple threads can still read the same value across threads and update it separately., {{select for update}} will work, but is, indeed a hammer, plus now we might have deadlocks. But I am not aware of any solution that guarantees the semantics we need and doesn't hurt performance., [~akolb] the {{select for update}} will be on {{notification_sequence}} and since its an *exclusive* lock ,so why would there be deadlocks ?, [~anishek] I am not saying there would be a deadlock, it all depends on specifics - the notification id is updated as part of a larger transaction where lock ordering may be not that easy to enforce - but it may be a non-issue here., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12883836/HIVE-16886.2.patch
+
+{color:green}SUCCESS:{color} +1 due to 2 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 15 failed/errored test(s), 11005 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=61)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[spark_vectorized_dynamic_partition_pruning] (batchId=169)
+org.apache.hadoop.hive.cli.TestMiniTezCliDriver.testCliDriver[explainanalyze_2] (batchId=100)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query14] (batchId=235)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query23] (batchId=235)
+org.apache.hadoop.hive.ql.parse.TestExport.shouldExportImportATemporaryTable (batchId=218)
+org.apache.hive.beeline.TestSchemaTool.testHiveMetastoreDbPropertiesTable (batchId=222)
+org.apache.hive.beeline.TestSchemaTool.testMetastoreDbPropertiesAfterUpgrade (batchId=222)
+org.apache.hive.beeline.TestSchemaTool.testSchemaInit (batchId=222)
+org.apache.hive.beeline.TestSchemaTool.testSchemaUpgrade (batchId=222)
+org.apache.hive.beeline.TestSchemaTool.testValidateLocations (batchId=222)
+org.apache.hive.beeline.TestSchemaTool.testValidateNullValues (batchId=222)
+org.apache.hive.beeline.TestSchemaTool.testValidateSchemaTables (batchId=222)
+org.apache.hive.beeline.TestSchemaTool.testValidateSchemaVersions (batchId=222)
+org.apache.hive.beeline.TestSchemaTool.testValidateSequences (batchId=222)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/6550/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/6550/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-6550/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 15 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12883836 - PreCommit-HIVE-Build, We did testing and it shows when executing SQL command in transactions concurrently, the result is determined by the order of SQL execution order (if SQL1 is executed before SQL2 and both set value of the same column in the same row and same table, the result is the same as the value set by SQL2, i.e., the last executed wins). The result is NOT determined by the transaction commit order.
+
+When Sentry gets notifications and apply them, it should apply them in the same order as hive applies those changes. Otherwise, sentry may end up getting different path state from what hive has. It is undesirable.
+
+In order to achieve consistent synchronization, could hive make sure that the event ID order is the same as the path sql execution order? One way to achieve this is to keep the notification log in the same transaction of the path sql statement, and the order in the transaction is to persist notification log after the path SQL statement
+{
+Execute path SQL statements,
+Persist notification log
+}, [~lina.li] changes to notification log are in nested transactions with enclosing transaction executing the necessary statements for the user initiated operations, its as you have stated in you example { Execute path SQL statements, Persist notification log }.
+
+, fixing errors for derby schema and removing the java lock for updating notification logs since we do a db lock for multiple HMS, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12884096/HIVE-16886.3.patch
+
+{color:green}SUCCESS:{color} +1 due to 2 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 3 failed/errored test(s), 11013 tests executed
+*Failed tests:*
+{noformat}
+TestTxnCommandsBase - did not produce a TEST-*.xml file (likely timed out) (batchId=280)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=61)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[spark_vectorized_dynamic_partition_pruning] (batchId=169)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/6565/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/6565/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-6565/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 3 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12884096 - PreCommit-HIVE-Build, fixing oracle schema upgrades, Failing tests are from older builds.
+
+[~thejas]/[~daijy]/[~sankarh] please review., [~anishek] Would you mind adding a link to reviewboard?, GitHub user anishek opened a pull request:
+
+    https://github.com/apache/hive/pull/237
+
+    HIVE-16886: HMS log notifications may have duplicated event IDs if multiple HMS are running concurrently
+
+    …ltiple HMS are running concurrently
+
+You can merge this pull request into a Git repository by running:
+
+    $ git pull https://github.com/anishek/hive HIVE-16886
+
+Alternatively you can review and apply these changes as the patch at:
+
+    https://github.com/apache/hive/pull/237.patch
+
+To close this pull request, make a commit to your master/trunk branch
+with (at least) the following in the commit message:
+
+    This closes #237
+    
+----
+commit 1d358291c5c5fc46e3d921d74967e51d1a7418b5
+Author: Anishek Agarwal <anishek@gmail.com>
+Date:   2017-08-24T00:10:00Z
+
+    HIVE-16886: HMS log notifications may have duplicated event IDs if multiple HMS are running concurrently
+
+----
+, Is there any reason you don't want to use
+
+Query q = pm.newQuery(...);
+q.setSerializeRead(true);
+
+which does convert to appropriate SELECT FOR UPDATE statements? See http://www.datanucleus.org/products/accessplatform_3_0/jdo/transaction_types.html for some description., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12884156/HIVE-16886.4.patch
+
+{color:green}SUCCESS:{color} +1 due to 2 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 4 failed/errored test(s), 11014 tests executed
+*Failed tests:*
+{noformat}
+TestTxnCommandsBase - did not produce a TEST-*.xml file (likely timed out) (batchId=280)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[auto_sortmerge_join_2] (batchId=46)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=61)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[spark_vectorized_dynamic_partition_pruning] (batchId=169)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/6572/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/6572/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-6572/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 4 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12884156 - PreCommit-HIVE-Build, [~akolb] the transaction for handling the dbnotification update is a nested transaction and i didnt want to set the whole transaction to setSerializedRead, as even though currently this is done as the last set of actions in HMS, it might change in future and then every additional queries run in the transaction will be serializedRead. Setting the same on the query was again confusing as the result of change should not be visible to other transactions till commit and hence even though we are setting is on the query object, it might just be internally doing it on the current open transactions which brings us back to the first problem.
+
+Also since code to handle {{select.. for update}} was already there as part of ACID, i just reused the same, as it gives more confidence that there are no problems with this semantics rather than the setSerializedRead on Datanucleus.
+, adding configurations to manage retry limit and sleep time for acquiring the lock on the notification sequence., add {{NOTIFICATION_SEQUENCE_LOCK_MAX_RETRIES}} and {{NOTIFICATION_SEQUENCE_LOCK_RETRY_SLEEP_INTERVAL}} to docs, configurations for sleep and retry intervals for notification sequence lock, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12884316/HIVE-16886.5.patch
+
+{color:green}SUCCESS:{color} +1 due to 2 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 80 failed/errored test(s), 11000 tests executed
+*Failed tests:*
+{noformat}
+TestTxnCommandsBase - did not produce a TEST-*.xml file (likely timed out) (batchId=280)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=61)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[spark_vectorized_dynamic_partition_pruning] (batchId=169)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query14] (batchId=234)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.org.apache.hadoop.hive.cli.TestSparkCliDriver (batchId=109)
+org.apache.hadoop.hive.metastore.TestObjectStore.testNotificationOps (batchId=201)
+org.apache.hadoop.hive.ql.parse.TestExport.shouldExportImportATemporaryTable (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testAlters (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testBasic (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testBasicWithCM (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testBootstrapLoadOnExistingDb (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testBootstrapWithConcurrentDropPartition (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testBootstrapWithConcurrentDropTable (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testConcatenatePartitionedTable (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testConcatenateTable (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testConstraints (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testDrops (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testDropsWithCM (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testDumpLimit (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testEventTypesForDynamicAddPartitionByInsert (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testExchangePartition (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testIncrementalAdds (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testIncrementalInsertDropPartitionedTable (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testIncrementalInsertDropUnpartitionedTable (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testIncrementalInsertToPartition (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testIncrementalInserts (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testIncrementalLoad (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testIncrementalLoadFailAndRetry (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testIncrementalLoadWithVariableLengthEventId (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testIncrementalRepeatEventOnExistingObject (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testIncrementalRepeatEventOnMissingObject (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testInsertOverwriteOnPartitionedTableWithCM (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testInsertOverwriteOnUnpartitionedTableWithCM (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testInsertToMultiKeyPartition (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testRenamePartitionWithCM (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testRenameTableWithCM (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testStatus (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testTruncatePartitionedTable (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testTruncateTable (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testTruncateWithCM (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenarios.testViewsReplication (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenariosAcrossInstances.testBootstrapFunctionReplication (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenariosAcrossInstances.testCreateFunctionIncrementalReplication (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenariosAcrossInstances.testCreateFunctionWithFunctionBinaryJarsOnHDFS (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenariosAcrossInstances.testDropFunctionIncrementalReplication (batchId=218)
+org.apache.hadoop.hive.ql.parse.TestReplicationScenariosAcrossInstances.testMultipleStagesOfReplicationLoadTask (batchId=218)
+org.apache.hive.hcatalog.api.TestHCatClient.testReplicationTaskIter (batchId=180)
+org.apache.hive.hcatalog.api.TestHCatClientNotification.addPartition (batchId=232)
+org.apache.hive.hcatalog.api.TestHCatClientNotification.createDatabase (batchId=232)
+org.apache.hive.hcatalog.api.TestHCatClientNotification.createTable (batchId=232)
+org.apache.hive.hcatalog.api.TestHCatClientNotification.dropDatabase (batchId=232)
+org.apache.hive.hcatalog.api.TestHCatClientNotification.dropPartition (batchId=232)
+org.apache.hive.hcatalog.api.TestHCatClientNotification.dropTable (batchId=232)
+org.apache.hive.hcatalog.api.TestHCatClientNotification.filter (batchId=232)
+org.apache.hive.hcatalog.api.TestHCatClientNotification.filterWithMax (batchId=232)
+org.apache.hive.hcatalog.api.TestHCatClientNotification.getOnlyMaxEvents (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.addPartition (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.alterIndex (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.alterPartition (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.alterTable (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.cleanupNotifs (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.createDatabase (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.createFunction (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.createIndex (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.createTable (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.dropDatabase (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.dropFunction (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.dropIndex (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.dropPartition (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.dropTable (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.exchangePartition (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.filter (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.filterWithMax (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.getOnlyMaxEvents (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.insertPartition (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.insertTable (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.sqlCTAS (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.sqlDb (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.sqlInsertPartition (batchId=232)
+org.apache.hive.hcatalog.listener.TestDbNotificationListener.sqlInsertTable (batchId=232)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/6586/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/6586/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-6586/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 80 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12884316 - PreCommit-HIVE-Build, fixing the Configuration object reference, fixing configuration object reference, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12884341/HIVE-16886.6.patch
+
+{color:green}SUCCESS:{color} +1 due to 2 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 6 failed/errored test(s), 11014 tests executed
+*Failed tests:*
+{noformat}
+TestTxnCommandsBase - did not produce a TEST-*.xml file (likely timed out) (batchId=280)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=61)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[union_remove_15] (batchId=82)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[spark_vectorized_dynamic_partition_pruning] (batchId=169)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query14] (batchId=234)
+org.apache.hive.jdbc.TestJdbcWithMiniHS2.testHttpRetryOnServerIdleTimeout (batchId=227)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/6588/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/6588/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-6588/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 6 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12884341 - PreCommit-HIVE-Build, Looks like SQLGenerator.createInsertValuesStmt() may be subject to SQL injection attack since it uses provided values to generate SQL statements. Perhaps it should use prepared statements instead?, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12884341/HIVE-16886.6.patch
+
+{color:green}SUCCESS:{color} +1 due to 2 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 7 failed/errored test(s), 11000 tests executed
+*Failed tests:*
+{noformat}
+TestTxnCommandsBase - did not produce a TEST-*.xml file (likely timed out) (batchId=280)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=61)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[transform_acid] (batchId=19)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[spark_vectorized_dynamic_partition_pruning] (batchId=169)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query14] (batchId=234)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query23] (batchId=234)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.org.apache.hadoop.hive.cli.TestSparkCliDriver (batchId=102)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/6592/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/6592/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-6592/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 7 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12884341 - PreCommit-HIVE-Build, [~akolb] {{SQLGenerator}} is a artifact of the ACID implementation and we are just reusing the clause, from the looks of it SQL injection might be possible but i am not an expert in that area so I will let [~ekoifman] have a look at it, also may be track this as a separate bug.
+
+I am just running the failed test to see if there are any problems, will upload a patch soon with log comment fixes suggested by [~spena]
+, * org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[transform_acid] : works fine on local machine
+* org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query23] : fails on local, only order of the first two statements is in correct which was specifically changed as part of HIVE-17037 not sure why its failing now and its not part of the current set of changes.
+*  org.apache.hadoop.hive.cli.TestSparkCliDriver.org.apache.hadoop.hive.cli.TestSparkCliDriver : seems like a disk IO operation that failed, not a test failure, running this on local machine for the last 10 mins and there is no end to it, so stopping it.
+
+
+Other tests are failing from older build, fixing log comments, 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12884510/HIVE-16886.7.patch
+
+{color:green}SUCCESS:{color} +1 due to 2 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 7 failed/errored test(s), 11014 tests executed
+*Failed tests:*
+{noformat}
+TestTxnCommandsBase - did not produce a TEST-*.xml file (likely timed out) (batchId=280)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[auto_sortmerge_join_5] (batchId=84)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=61)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[load_dyn_part5] (batchId=154)
+org.apache.hadoop.hive.cli.TestMiniSparkOnYarnCliDriver.testCliDriver[spark_vectorized_dynamic_partition_pruning] (batchId=169)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query14] (batchId=234)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query23] (batchId=234)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/6606/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/6606/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-6606/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 7 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12884510 - PreCommit-HIVE-Build, [~anishek], [~akolb] I think SQL injection would be an issue if the class allowed you to run a query.  It does not.  It just manipulates text., Patch looks good to me. [~akolb], [~lina.li], I am going to commit in next 24h if I don't hear further comments from you., It looks good [~daijy] [~anishek]. I run the Mysql tests in a cluster with HMS HA and execute several DDL statements. There are no duplicates nor gaps, this is a good approach. I haven't tested the performance, though, but that's something we would handle later if we see something bad with it.
+
++1, [~anishek], the patch is out of sync especially in TestObjectStore.java. Can you rebase?, rebased from master [~daijy] , 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12886343/HIVE-16886.8.patch
+
+{color:green}SUCCESS:{color} +1 due to 2 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 6 failed/errored test(s), 11033 tests executed
+*Failed tests:*
+{noformat}
+TestAccumuloCliDriver - did not produce a TEST-*.xml file (likely timed out) (batchId=230)
+TestDummy - did not produce a TEST-*.xml file (likely timed out) (batchId=230)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[char_udf1] (batchId=86)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[insert_values_orig_table_use_metadata] (batchId=61)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query14] (batchId=234)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query23] (batchId=234)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/6763/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/6763/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-6763/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 6 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12886343 - PreCommit-HIVE-Build, Patch pushed to master., Doc note:  This adds *hive.notification.sequence.lock.max.retries* and *hive.notification.sequence.lock.retry.sleep.interval* to HiveConf.java, so they need to be documented in the wiki.
+
+Apparently they belong in the metastore section.
+
+* [Configuration Properties -- MetaStore | https://cwiki.apache.org/confluence/display/Hive/Configuration+Properties#ConfigurationProperties-MetaStore]
+
+Added a TODOC3.0 label., [~anishek] [~thejas] What do you think about implementing SELECT FOR UPDATE using the mechanism from HIVE-18526? It is much simpler and uses documented DataNucleus semantics., [http://www.datanucleus.org/products/accessplatform_4_1/jdo/transactions.html]
+{quote}By default DataNucleus does not currently lock the objects fetched with pessimistic locking, but you can configure this behaviour for RDBMS datastores by setting the persistence property datanucleus.SerializeRead to true. This will result in all "SELECT ... FROM ..." statements being changed to be "SELECT ... FROM ... FOR UPDATE". *This will be applied only where the underlying RDBMS supports the "FOR UPDATE" syntax.*
+{quote}
+for SQLServer this will not work since the syntax is different. the code shows us using datanuclues 4.1 version btw., * This will be effective only where the underlying RDBMS supports the "FOR UPDATE" syntax. [http://www.datanucleus.org/products/accessplatform_4_1/jdo/transactions.html]
+ * {color:#0000ff}MySql, Oracle,  DB2, Derby{color} {color:#0000ff}support this "SELECT FOR UPDATE" syntax.{color}
+ * {color:#333333}[https://dev.mysql.com/doc/refman/5.7/en/innodb-locking-reads.html]{color}
+ * {color:#333333}[https://www.toadworld.com/platforms/oracle/w/wiki/1875.select-for-update]
+{color}
+ * {color:#333333}[https://www.ibm.com/support/knowledgecenter/en/SSEPEK_11.0.0/sqlref/src/tpc/db2z_sql_selectstatementexamples.html]
+{color}
+ * {color:#333333}[https://www.postgresql.org/docs/9.0/static/sql-select.html]
+{color}
+ * {color:#333333}[https://db.apache.org/derby/docs/10.2/ref/rrefsqlj31783.html]
+{color}
+ * {color:#333333}The SQL standard specifies a {{FOR UPDATE}} clause to be applicable for cursors. Most databases interpret this as being applicable for all {{SELECT}}statements. An {color:#ff9900}exception{color} to this rule are the {color:#ff9900}CUBRID{color} and {color:#ff9900}SQL Server{color} databases, that do not allow for any {{FOR UPDATE}} clause in a regular SQL [https://www.jooq.org/doc/3.6/manual/sql-building/sql-statements/select-statement/for-update-clause/]{color}, [~anishek] [~LinaAtAustin] 
+
+The documentation isn't telling the whole story. Actual MSSQLServerAdapter does implement it. Looking at 
+
+getSelectStatement() we see:
+{code:java}
+if (lock && dba.supportsOption(DatastoreAdapter.LOCK_OPTION_PLACED_AFTER_FROM))
+{
+    sql.append(" WITH ").append(dba.getSelectWithLockOption());
+}
+{code}
+ 
+
+Now, looking at MSSQLServerAdapter, it has:
+{code:java}
+public String getSelectWithLockOption()
+{
+    return "(UPDLOCK, ROWLOCK)";
+}
+{code}
+So it is implemented for MS SQL Server as well by Data Nucleus.
+
+ 
+
+And MS SQL adapter does define 
+{code:java}
+LOCK_OPTION_PLACED_AFTER_FROM{code}, [~akolb] seems to work based on code as you suggest, if you could test this as well against a mssqlserver that will be great, I am ok with reimplementing this patch.
+
+[~thejas] anything else we need to take care of ?
+
+ , [~anishek] I don't have access to MS SQL server - do you have something? The test requires tables created for HMS (at least two notification tables, the rest are irrelevant)., nope i dont have one either., [~anishek] I verified that the DataNucleus based patch works on MS SQL server (and that test fails without the patch). How should we proceed?
+
+I'm mostly interested in branch-2 patch for now, but it would be best to have similar code in branch-2 and branch-3. Would the following work for you:
+ * We put DataNucleus based patch in branch-2
+ * We figure out the way to update branch 3 to have the same fix.
+
+Or you'd rather prefer some other way forward?, [~akolb] i would rather not have difference between the two branches, if you could make sure that the branch 3 is also updated with the fix very soon, in near future that would be great, assuming you are doing branch-2 fix first. 
+, [~anishek] I am fine with updating branch 3 as well. Do you want to do it yourself or you'd like me to do it? I think we need to do the following:
+ * Make sure you are Ok with the suggested fix
+ * Revert the original fix
+ * Apply new fix.
+
+So this will be two commits on branch-3 and one commit on branch-2.
+
+Please4 let me know what you think about it., Hive 3.0.0 has been released so closing this jira., Github user anishek closed the pull request at:
+
+    https://github.com/apache/hive/pull/237
+]

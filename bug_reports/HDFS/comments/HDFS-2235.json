@@ -1,0 +1,133 @@
+[The bug is that HttpServletRequest#getPathInfo in jetty (and other popular servlet implementations, see [1]) don't consider semicolons and the characters that follow before the query fragment as part of the path for some reason. Eg for "foo;bar?a=b" getPathInfo returns "foo" rather than "foo;bar".
+
+One workaround is to use getRequestURI which will return "foo;bar", but unlike getPathInfo the result is not decoded, therefore the parts of the path that need encoding (eg contain spaces) and get encoded when the URI object is created will not get decoded. URL decoding the value  getRequestURI returns doesn't work however because it will decode paths that contain reserved URI characters (eg will decode "+" into a space) - the decoding needs to be the same path decoding that eg jetty would perform [2], ie doesn't decode reserved characters.
+
+A suggestion from Todd is to encode the path used when creating the URL. Eg URL encode each individual segment of the path when creating the "/data" URL, and then decode each segment when retrieving the path with getPathInfo.
+
+1. http://cdivilly.wordpress.com/2011/04
+2. http://jetty.codehaus.org/jetty/jetty-6/xref/org/mortbay/util/URIUtil.html, We could also go back to passing the filename as a parameter as was done pre HDFS-1109 and just encode/decode the passed parameter., The section on [this page|http://www.w3.org/Addressing/URL/uri-spec.html] recommends preserving the hierarchy (ie not encoding slashes) and encoding each path segment when mapping from a local scheme to URLs., I agree with not encoding slashes since it's really hard to read unless you've learned to manually decode part of the Matrix stream.  But... using a custom (en/de)coding seems iffy since someone always forgets to use it.  I'm probably missing something, but the following snippet returns true in both cases.
+
+{code}
+URI u;
+// encode on client-side
+String path = "/a?b;c/d+ e/f";
+u = new URI("http", null, "host", -1, path, null, null);
+System.out.println("uri="+u.toString());
+System.out.println("match="+u.getPath().equals(path));
+// use this to decode jetty's getRequestURI on the server-side?
+u = URI.create(u.toString());
+System.out.println("uri="+u.toString());
+System.out.println("match="+u.getPath().equals(path));
+{code}, Per the original comment then problem is that ";" needs to be encoded in the path otherwise  HttpServletRequest#getPathInfo will strip it and following characters out. Therefore the path needs to be encoded. Per the URI spec you need to do this for cases for reserved URI characters that can't always map 1:1, there's no standard way of doing this because the mapping is specific to the scheme used for the local file system. You can URL encode the whole thing, which is how we encode path names passed as a parameters, however that loses the hierarchy and as you say, makes it more difficult to debug. , I read the wordpress ref, but I didn't look closely at the uri printed out in my sample to see that semicolons were not encoded.
+
+BTW, I stumbled on why jetty drops everything after a semicolon.  VMS interprets it as file;version and it won't execute a version.  This was viewed as a security hazard since "GET /my.jsp;1" would retrieve the source of the jsp, thus the semantics of one obscure OS dictate a restriction for every OS!, Looks like Jetty's URIUtil already has [encodePath and decodePath functions|http://jetty.codehaus.org/jetty/jetty-6/apidocs/org/mortbay/util/URIUtil.html#encodePath(java.lang.String)] which do what  we want, and we're already using them (introduced in HDFS-1575). I'll use them here.
+
+
+, Patch attached.
+
+Modifies the various Hftp and servlets (data, streamFile, fileChecksum, getFileChecksum, and contentSummary) to pass encoded paths in the URI path component. Fixes redirection handling to use URLs so we don't re-encode paths during redirection.
+
+This patch depends on the methods introduced in HADOOP-7531. I ended up using Commons Http client's URIUtil class as it was more suitable. , The relationship between some of the methods seems odd.  I haven't looked at the entire patch, but I've noticed the following:
+
+# {{getNamenodeFileURL(Path path)}} is encoding the path and encoding a query string with the ugi, then calls {{getNamenodeURL(String path, String query)}}.  Then other methods like {{HftpFileSystem#open}} are doing the same encoding as {{getNamenodeFileURL(Path path)}} before calling {{getNamenodeURL(String path, String query)}}?  Shouldn't the 1-arg just call the 2-arg with a null query string?  Then the 2-arg should do the encoding like the 1-arg used to, thus the callers of the 2-arg aren't all doing the same redundant work?
+# {{URIUtil.encodeQuery}} is being called on the entire query instead of the values of the query.  This means that any special characters (ie. &, =, etc) in a value can be used to exploit the parsing of the query string.  I think you need something like:
+{code}
+String encodeKVP(String key, String value) {
+  return URIUtil.encodeQuery(key) + "=" + URIUtil.encodeQuery(value);
+}
+{code}
+# There's a lot of redundancy in the opening of connections, ie:
+{code}
+HttpURLConnection connection = openConnection(
+    "/listPaths" + ServletUtil.encodePath(path),
+    ServletUtil.encodeQuery("ugi=" + getUgiParameter() + (recur? "&recursive=yes" : "")));
+{code}
+Perhaps those could be simplified to avoid redundancy and improve readability:
+{code}
+HttpURLConnection connection = openServletURL("listPaths", path, encodeKVP("recursive", "yes"));
+{code}
+The method could automatically tack on the ugi on to the query string so every caller doesn't have to do it., Updated patch.
+# Removes getNamenodeFileURL since it's a helper for a test and is pkg visible
+# Yes, modified these to use encodeWithinQuery, see latest in HADOOP-7531.
+# Cleaned up the openConnection callers some, though going to punt on openServletURL., {code}
++    return new URL(scheme, hostname, port,
++        "/streamFile" + status.getFullName(encodedPath) + '?' +
+{code}
+it seems like this will lack encoding on the last segment of the path (ie the basename)
+
+- maybe make the redirection test iterate over that same list of nasty URLs?, Actually, getFullName is not needed here since encodedPath is always the full path. I've removed it. Also update the redirection tests to try all test paths for good measure (this is already covered by the previous test which hits all the servlets). Updated patch attached. , {noformat}
++1 overall.  
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 17 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 system test framework.  The patch passed system test framework compile.
+{noformat}, +1, lgtm., I've committed this. Thanks Daryn and Todd!, Integrated in Hadoop-Hdfs-trunk-Commit #829 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/829/])
+    HDFS-2235. Encode servlet paths. Contributed by Eli Collins
+
+eli : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1156967
+Files : 
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/HsftpFileSystem.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/ContentSummaryServlet.java
+* /hadoop/common/trunk/hdfs/src/test/hdfs/org/apache/hadoop/hdfs/server/namenode/TestStreamFile.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/datanode/DatanodeJspHelper.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/ListPathsServlet.java
+* /hadoop/common/trunk/hdfs/CHANGES.txt
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/DfsServlet.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/FileDataServlet.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/HftpFileSystem.java
+* /hadoop/common/trunk/hdfs/src/test/hdfs/org/apache/hadoop/hdfs/server/datanode/TestDatanodeJsp.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/FileChecksumServlets.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/StreamFile.java
+* /hadoop/common/trunk/hdfs/src/test/hdfs/org/apache/hadoop/hdfs/TestHftpFileSystem.java
+, Integrated in Hadoop-Common-trunk-Commit #737 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/737/])
+    HDFS-2235. Encode servlet paths. Contributed by Eli Collins
+
+eli : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1156967
+Files : 
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/HsftpFileSystem.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/ContentSummaryServlet.java
+* /hadoop/common/trunk/hdfs/src/test/hdfs/org/apache/hadoop/hdfs/server/namenode/TestStreamFile.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/datanode/DatanodeJspHelper.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/ListPathsServlet.java
+* /hadoop/common/trunk/hdfs/CHANGES.txt
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/DfsServlet.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/FileDataServlet.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/HftpFileSystem.java
+* /hadoop/common/trunk/hdfs/src/test/hdfs/org/apache/hadoop/hdfs/server/datanode/TestDatanodeJsp.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/FileChecksumServlets.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/StreamFile.java
+* /hadoop/common/trunk/hdfs/src/test/hdfs/org/apache/hadoop/hdfs/TestHftpFileSystem.java
+, {noformat}
+     [iajc] /Users/szetszwo/hadoop/t3/hdfs/src/test/aop/org/apache/hadoop/hdfs/server/namenode/FileDataServletAspects.aj:38 
+[warning] advice defined in org.apache.hadoop.hdfs.server.namenode.FileDataServletAspects has not been applied [Xlint:adviceDidNotMatch]
+     [iajc] 1 warning
+
+Total time: 2 minutes 41 seconds
+{noformat}
+It seems that this broke fault injection tests., Thanks for the heads up Nicholas. Here's a patch that fixes the FI test., The FI tests run cleanly now with this patch, I've committed it., Integrated in Hadoop-Hdfs-trunk-Commit #830 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/830/])
+    Fix HDFS-2235 FI test failure.
+
+eli : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1156972
+Files : 
+* /hadoop/common/trunk/hdfs/src/test/aop/org/apache/hadoop/hdfs/server/namenode/FileDataServletAspects.aj
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/FileDataServlet.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/FileChecksumServlets.java
+, Integrated in Hadoop-Common-trunk-Commit #738 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/738/])
+    Fix HDFS-2235 FI test failure.
+
+eli : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1156972
+Files : 
+* /hadoop/common/trunk/hdfs/src/test/aop/org/apache/hadoop/hdfs/server/namenode/FileDataServletAspects.aj
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/FileDataServlet.java
+* /hadoop/common/trunk/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/FileChecksumServlets.java
+, Hi Eli, somehow aop system test cannot be compiled; see HDFS-2270.  It seems that aop compilation is not using the latest common jar., Yea, Allejandro is addressing that as part of HDFS mavenization. You can still run the AOP tests locally by doing mvn install from common and running with resolvers=internal in hdfs.]

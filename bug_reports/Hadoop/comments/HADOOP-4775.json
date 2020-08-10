@@ -1,0 +1,112 @@
+[I have no clue as to what is causing this; I'm currently doing a long run of our application to see if I can trigger it with debugging turned on.
+
+It's been pretty easy to crash, and I'm working to find the exact cause (other than "use it for a long time").  I'll update this JIRA as more info becomes available., It seems that this might be memory-leak related.  PS output:
+
+root     26631 34.3 27.4 1462748 1108148 ?   Ssl  Dec03 426:50 fuse_dfs -oserver=hadoop-name -oport=9000 /mnt/hadoop -oallow_other
+
+This is a 4GB nodes, so fuse-dfs is using about 1GB of memory.  Suspicious.  I haven't had much luck with GDB on the fuse_dfs process, as multithreaded apps are tough to step through., Hi Brian,
+
+Have you tried 4616 and 4635 patches?
+
+4616 fixes a memory leak of a group name and 4635 fixes a memory leak of not detroying a mutex.
+
+you could also compile with -Dlibhdfs.noperms=1 just to ensure it isn't related to groups.
+
+When investigating 4635, we saw that it's very hard to judge fuse-dfs's use of memory because of the JVM GC of the DFSClient is hard to judge.
+
+-- pete
+, Another thing occurred to me is that on a 4GB machine, how big is the default memory allocation?  1GB? How big is the DFSClient buffer per file? if it is the block size, then 8 concurrent reads blows away 1GB.
+
+Was there any output in the syslog?
+
+, Hey Pete,
+
+I'll have our sysadmins try out the 4616 and 4635 patches
+
+There were no messages in syslog, meaning it probably didn't segfault (is this correct?)
+
+Here's what the failure looks like:
+http://jobrobot.web.cern.ch/JobRobot/errors_081205.html#T2_US_Nebraska
+http://jobrobot.web.cern.ch/JobRobot/errors_081204.html#T2_US_Nebraska
+
+I've got a hard time believing that a memory leak alone could disconnect the FUSE endpoint... 1/3 of the workers are 4GB, 1/3 are 8GB, 1/3 are 16GB.  It would take quite a bit of effort to get a memory leak to cause the problems on the 16GB nodes.  Plus, I didn't see OOM killing anything in dmesg.
+
+I set up a debug FUSE instance on a node and hit it with a similar workflow.  No problems at all; it may be that, in debug mode, FUSE doesn't allow multiple threads?
+
+My suspicion is that either FUSE-DFS or libhdfs has a problem with error recovery which causes an infinite loop (like we've seen in other places).  The interesting thing for the "ps" output I showed above is that the fuse_dfs process was using 30% CPU *when nothing was using FUSE* and the node wasn't swapping.
+
+Nagios now restarts FUSE-DFS whenever the problem occurs, so I don't get much of a chance to debug.  Still, about 7% of our jobs die because FUSE conks out mid-job., Attached the back traces of the fuse_dfs process.  Most of them look like harmless java threads, but:
+
+1) no active FUSE threads?
+2) Still, this is using 1GB of memory.  Has not had any FUSE usage for awhile, so I would suspect that any Java memory usage should be garbage collected at this point.
+
+Does this help anyone?  Is there a way to view what part is used by java and what's memory lost to the C-side?, Attached pmap of the process.  It does like something malloc'd a 600MB area in memory.
+
+Hopefully this helps.  Let me know if you can think of anything else I can look at.  The application *only* opens files and reads; no listing of directories, no stat'ing, no writing., I finally found a process that was stuck which had a usable stack trace, below.
+
+It appears that the JVM is deadlocking when hdfsPread invokes jni_NewByteArray.
+
+So,
+1) Can I somehow adjust the "DFSClient buffer per file" as Pete suggests above?  I wasn't able to find a config option for this.
+2) I'll be upgrading the JVM to 1.6.0-11 from 1.6.0-7.
+3) I'll allocate more memory for the fuse_dfs client
+4) Is there anything else which can be done from the Hadoop side to avoid deadlocking on this call?
+
+(gdb) bt
+#0  0x0000003587b08b3a in pthread_cond_wait@@GLIBC_2.3.2 () from /lib64/tls/libpthread.so.0
+#1  0x0000002a95c6ba5f in Monitor::wait () from /mnt/nfs04/opt-2/osg-wn-source/jdk1.5/jre/lib/amd64/server/libjvm.so
+#2  0x0000002a95ded329 in VMThread::execute () from /mnt/nfs04/opt-2/osg-wn-source/jdk1.5/jre/lib/amd64/server/libjvm.so
+#3  0x0000002a95c95938 in ParallelScavengeHeap::mem_allocate () from /mnt/nfs04/opt-2/osg-wn-source/jdk1.5/jre/lib/amd64/server/libjvm.so
+#4  0x0000002a9591cad7 in CollectedHeap::common_mem_allocate_noinit () from /mnt/nfs04/opt-2/osg-wn-source/jdk1.5/jre/lib/amd64/server/libjvm.so
+#5  0x0000002a95db9977 in typeArrayKlass::allocate () from /mnt/nfs04/opt-2/osg-wn-source/jdk1.5/jre/lib/amd64/server/libjvm.so
+#6  0x0000002a95ae7af8 in jni_NewByteArray () from /mnt/nfs04/opt-2/osg-wn-source/jdk1.5/jre/lib/amd64/server/libjvm.so
+#7  0x0000002a9555a891 in hdfsPread (fs=Variable "fs" is not available.
+) at hdfs.c:708
+#8  0x00000000004027f2 in dfs_read ()
+#9  0x0000002a9566b7f2 in fuse_lib_read (req=0x70f480, ino=Variable "ino" is not available.
+) at fuse.c:1961
+#10 0x0000002a9566ff93 in do_read (req=0x11a6b, nodeid=0, inarg=Variable "inarg" is not available.
+) at fuse_lowlevel.c:623
+#11 0x0000002a9566edb0 in fuse_do_work (data=Variable "data" is not available.
+) at fuse_loop_mt.c:100
+#12 0x0000003587b06137 in start_thread () from /lib64/tls/libpthread.so.0
+#13 0x00000035874c9883 in clone () from /lib64/tls/libc.so.6
+, I have found quite a few more processes which are stuck on the NewByteArray method.  We're trying to increase the available memory in LIBHDFS_OPTS; we'll post if this fixes things., After increasing the memory in LIBHDFS_OPTS, fuse_dfs no longer completely deadlocks.  Instead, it continues to use 100-200% CPU and 1-1.5GB memory, but still processes new requests.
+
+It seems that something (maybe an error handling routine?) is causing an infinite loop which caused the deadlocks.
+
+Brian, Could this code be the problem in line 857 of fuse_dfs.c:
+
+  if (size >= dfs->rdbuffer_size) {
+    int num_read;
+    int total_read = 0;
+    while (size - total_read > 0 && (num_read = hdfsPread(fh->fs, fh->hdfsFH, offset + total_read, buf + total_read, size - total_read)) > 0) {
+      total_read += num_read;
+    }
+    return total_read;
+  } 
+
+Notice that if hdfsPread fails, then it will still return successfully.  In other instances of hdfsPread, we have:
+
+      if (num_read < 0) {
+        // invalidate the buffer 
+        fh->bufferSize = 0;
+        syslog(LOG_ERR, "Read error - pread failed for %s with return code %d %s:%d", path, (int)num_read, __FILE__, __LINE__);
+        ret = -EIO;
+, Ah, it's this code:
+
+    size_t num_read;
+    size_t total_read = 0;
+    while (size - total_read > 0 && (num_read = hdfsPread(fh->fs, fh->hdfsFH, offset + total_read, buf + total_read, size - total_read)) > 0) {
+      total_read += num_read;
+    }
+    if (num_read < 0) {
+      // invalidate the buffer 
+      syslog(LOG_ERR, "Read error - pread failed for %s with return code %d %s:%d", path, (int)num_read, __FILE__, __LINE__);
+      return -EIO;
+    }
+    return total_read;
+
+size_t is an unsigned integer.  You are checking to see if an unsigned integer is less than 0: this is never going to be true.  This means that fuse-dfs will never be able to do any error recovery *and* the first error is going to throw a thread into an infinite loop.  Each error will eat up 100% CPU on a new core, and quickly hit lots and lots of used memory.
+
+Problem solved!  Unittest anyone?, It appears that HADOOP-4616 fixes this problem too (although you can't tell that from the summary...).  Marking this ticket as duplicate.]

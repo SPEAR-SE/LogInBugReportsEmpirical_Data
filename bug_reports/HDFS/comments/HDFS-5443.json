@@ -1,0 +1,213 @@
+[We are seeing couple of issues for the open files with snapshots in our testing clusters. Some were already filed recently.
+
+Here snapshotted under-construction files are getting loaded as INodeFile instead of INodeFileUnderConstructionWIthSnapShot
+Because of this blocktotal  is not getting decremented for this files, so NN is not exiting safemode.
+HDFS-5283 was fixed as workaround to increment the safeblockcount of reported block is associated to snapshotted file and it is unserconstruction. But here special case is, block wa allocated only in Namenode but pipeline not established to DNs Yet, so, physical block is not created in Datanodes. So, DN will not report any blocks. But due to loading underconstruction snapshotted file as INodeFile if original INodefile deleted, it is expecting this block also to reported.
+
+Couple of points to discuss in solving this issue.
+
+Option 1) Why can't we save underconstuction boolan flag for all INode as true or false.
+    So, while reading the INodes itself we can place INodeFilesUnderConstruction in tree and we can increment the underconstruction block count here and use it for decrements from blockTotal. Currently this count is getting calculated as blockMap.blocktotal- [lease file block total] . So, we need not depend on lease files.
+
+Option 2) May be we have to deal snapshotted underconstruction files with some special care here. If original file deleted with out finalizing etc, may leads to have such files in snapshot as underconstuction but no track on them  for safeblock counts etc. May be we can collect the files which were deleted originally but present in snapshot with underconstuction state and save them and load them separately.
+
+, {quote}...block wa allocated only in Namenode but pipeline not established to DNs Yet, so, physical block is not created in Datanodes.{quote} 
+This happens too even when snapshot is not involved. But without capturing the underconstruction file in snapshot, this problem is hard to notice.  
+
+{quote}Option 1) Why can't we save underconstuction boolan flag for all INode as true or false.{quote} 
+This can increase memory usage. Underconstructed files are expected to be a very small portion in the namespace.
+
+{quote}Option 2) May be we have to deal snapshotted underconstruction files with some special care here.{quote} 
+When the snapshot is taken, the block allocated but size is zero (no matter it's because pipeline-not-created or sized-not-reported-yet). In this case, the zero sized block may not need to be recorded in the snapshot at all., {quote}
+This happens too even when snapshot is not involved. But without capturing the underconstruction file in snapshot, this problem is hard to notice.
+{quote}
+Yes, No problem in case of normal files underconstruction, as we save them separately and reload them for building leases. So, this blocks will be decremented from blocks total for safeblok count. But incase of snapshotted fils underCOnstruction, they are loading as normal INodeFiles incase if we delete original parent directory of this snapshotted files. We don't have any tracking for them on reload.
+ 
+
+
+{code}
+This can increase memory usage. Underconstructed files are expected to be a very small portion in the namespace.
+{code}
+Yeah. For some Inodes this is already introduced like If Node is snapshot node. But saving for all will increase.
+
+{quote}
+When the snapshot is taken, the block allocated but size is zero (no matter it's because pipeline-not-created or sized-not-reported-yet). In this case, the zero sized block may not need to be recorded in the snapshot at all.
+{quote}
+clean up of this 0 size block is happening only when we delete original file. But if we delete original directory itself this is not happening.
+
+When we delete directory:
+{code}
+ Map<INode, INode> priorDeleted = null;
+    if (snapshot == null) { // delete the current directory
+      recordModification(prior, null);
+      // delete everything in created list
+      DirectoryDiff lastDiff = diffs.getLast();
+      if (lastDiff != null) {
+        counts.add(lastDiff.diff.destroyCreatedList(this, collectedBlocks,
+            removedINodes));
+      }
+    } 
+{code}
+
+But when we delete file directly, your proposed adjustment done here.
+{code}
+ if (snapshot == null) { // delete the current file
+      recordModification(prior, null);
+      isCurrentFileDeleted = true;
+      Util.collectBlocksAndClear(this, collectedBlocks, removedINodes);
+      return Quota.Counts.newInstance();
+    }
+{code}, bq. When we delete directory:
+I think we still handle the files. After the "if-else" section, we have the following code, which will go down to clean the files.
+{code}
+counts.add(cleanSubtreeRecursively(snapshot, prior, collectedBlocks,
+        removedINodes, priorDeleted, countDiffChange));
+{code}
+And for INodeFile(UnderConstruction)WithSnapshot, we call FileWithSnapshot.Util#collectBlocksAndClear to clear the blocks, which will also remove the 0-sized block:
+{code}
+        for(long size = 0; n < oldBlocks.length && max > size; n++) {
+          size += oldBlocks[n].getNumBytes();
+        }
+     
+        // starting from block n, the data is beyond max.
+{code}, Scenario may be the following too
+1. Namenode crashed with block having 0 locations + client crash
+2. after restart snapshot taken
+3. original file deleted
+4. checkpoint happened
+5. NN restarted again with latest fsimage
+
+At this time underconstruction file in snapshot will be loaded as complete file with COMPLETE blocks. 
+Since crashed block was not written to any DN, no report will come for this .
+So NN will be in safemode forever.
+
+
+Latest patch attached to HDFS-5428 will solve most of the problem related to openfiles deletion and rename with snapshot and checkpoint. Current issue also will be solved with that. Contains test for this too.
+Please review HDFS-5428 , counts.add(cleanSubtreeRecursively(snapshot, prior, collectedBlocks,
+        removedINodes, priorDeleted, countDiffChange));
+Even with this method also it is not deleting the files under the recursively,when i debugged,i observed that,for one level of directory and file structure this method works,if directory structure is large like
+example:-
+i have taken snaphot for root directory,under that directory there is one subdirectory,under that one more like five levels,and the file we kept in fifth level,and if we delete the first level directory,as the directory diff's are maintaining only two levels for a particular deleted directory,parent of that directory and child of that directory,it is not deleting that file and not removing the zero sized blocks., bq. for one level of directory and file structure this method works,if directory structure is large like
+
+Thanks [~sathish.gurram]! I guess the issue is like this:
+# If the file is already an INodeFileUnderConstructionWithSnapshot, the current code will finally call collectBlocksAndClear and remove the 0-sized block.
+# If the file is just an INodeFileUC (but not INodeUCWithSnapshot), when we delete its parent directory or ancestral directory, the current code will do nothing and leave the 0-sized block there.
+
+So I think we may first want to fix the above issue here. I.e., when we delete a file, we make sure the 0-sized block always gets deleted (unless it's a rename). I will write some unit test to verify this and create a separate jira if necessary., Thanks Jing and Sathish.  If we delete dir deep in the tree, they are just noramal INode*, so flow goes in diff path, where we are not wiping out on some conditions. Thanks Sathish for digging into it. 
+I don't think separate Jira is needed, as this JIRA mainly talks about that 0-sized blocks wiping out. If you have test please post here., Hi Uma,
+problem of 0-sized blocks is there with normal files also (HDFS-4516), but that will not cause in NN safemode because file will be an under construction file and 0-sized block will not be counted in safemode threshold.
+
+Here actual problem is not containing the 0-sized blocks, but counting them also in safemode threshold as these are loaded as COMPLETE blocks
+
+{quote}If the file is already an INodeFileUnderConstructionWithSnapshot, the current code will finally call collectBlocksAndClear and remove the 0-sized block.
+If the file is just an INodeFileUC (but not INodeUCWithSnapshot), when we delete its parent directory or ancestral directory, the current code will do nothing and leave the 0-sized block there.{quote}
+HDFS-5428 handles above scenarios as well.
+
+[~sathish.gurram] Can you verify the same scenario with the latest patch in HDFS-5428
+, bq. Here actual problem is not containing the 0-sized blocks, but counting them also in safemode threshold as these are loaded as COMPLETE blocks
+
+Agree. But in the meanwhile, we also should clear these 0-sized block since if the corresponding file is only in snapshot, no one will finalize the block I guess. That's why I think maybe we should fix this part in a separate jira. I think for the safemode part, as Vinay mentioned, the key issue is still the current code fails to recognize INodeFileUC if the file is in snapshot and the deletion is on its parent/ancestral directory, while loading the fsimage. 
+
+I think HDFS-5428 can solve the problem, but it may overkill the problem because in the current HDFS-5428 patch we need to keep records in the lease map, and maintain these records even for snapshot deletion and renaming. Since the safemode issue only happens when starting NN, can we fix the problem by:
+1. recording extra information in fsimage to indicate INodeFileUC that are only in snapshots
+2. re-generating all the INodeFileUC when loading fsimage
+3. using a similar workaround as in HDFS-5283.
+
+For 1&2, we need to cover the files that are deleted through its ancestral directory. To avoid the incompatibility of fsimage, we can put the extra information to the "under construction files" section of the fsimage., Upload unit tests to reproduce the issue while clearing the 0-sized blocks., {quote}
+problem of 0-sized blocks is there with normal files also (HDFS-4516), but that will not cause in NN safemode because file will be an under construction file and 0-sized block will not be counted in safemode threshold.
+{quote}
+Yep, This JIRA explains the same. Please see description and first comment.
+
+{quote}
+ut counting them also in safemode threshold as these are loaded as COMPLETE blocks
+{quote}
+Here point was we no need to keep them in snapshotted files.(There was inconsistency in the flow) . If there is simple way to wipe out all the file 0-sized blocks consistently in someway, that will be good to address this. Anyway, leases maintaining may solve as that will be same as normal file UC.
+Let Sathish verify this with that patch. 
+But I am little uncomfortable for managing leases for snapshotted files as they are readonly files, no need of leases. If all others ok on that point, I will not object.
+, Oh, I did not see your comment. Thanks Jing for patch.
+
+{quote}
+I think HDFS-5428 can solve the problem, but it may overkill the problem because in the current HDFS-5428 patch we need to keep records in the lease map, and maintain these records even for snapshot deletion and renaming. 
+{quote}
+Exactly. This is what I was trying to indicate with my above comment., bq. 1. recording extra information in fsimage to indicate INodeFileUC that are only in snapshots
+These extra information only kept as snapshot leases. It will keep track all the time instead of only at the time of checkpointing. Also it will keep 
+
+bq. 2. re-generating all the INodeFileUC when loading fsimage
+This will happen as loading leases. and also blocksmap will be updated with UNDERCONSTRUCTION state
+
+bq. 3. using a similar workaround as in HDFS-5283.
+As we already excluding under construction blocks, this workaround no more required.
+
+bq. To avoid the incompatibility of fsimage, we can put the extra information to the "under construction files" section of the fsimage.
+Yes. exactly because of this reason I went for the approach of storing these files as leases. Because this section will be 
+stored from the leases and leases will be loaded from this section., Upload a simple patch that tries to delete the 0-sized block for INodeFileUC., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12612292/HDFS-5443.000.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5340//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5340//console
+
+This message is automatically generated., Thanks Jing for the patch.
+I verifyied this patch in my env,it is working correctly.This patch is whiping out the zero sized blocks,so NN is coming out of safemode
+Along with this pacth,if we merge the patch HDFS-5428-v2.patch,i feel it will clear all the problems for the underconstruction files with in the snapshot, +1 patch looks good. Thanks Jing, Vinay Sathish for your efforts.
+, Thanks Uma, Sathish and Vinay! I will commit the patch tomorrow morning in case there is no more comments., Patch will not clear the blocks in this case.
+1. rename underconstruction file/directory with 0-sized blocks after snapshot
+2. delete the renamed directory.
+
+because INode is saved to snapshot while renaming itself. so updation will not happen during deletion., But, without making this patch much complex, if want to go ahead for committing, I have no objection as this will be covered anyway in HDFS-5428. , bq. because INode is saved to snapshot while renaming itself. so updation will not happen during deletion.
+
+Thanks for the comments Vinay! I still think our current rename implementation will not lead to this scenario. But let's continue this discussion in HDFS-5428 and add possible fix there. I will commit the current patch shortly., I've committed this to trunk and branch-2., SUCCESS: Integrated in Hadoop-trunk-Commit #4701 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/4701/])
+HDFS-5443. Delete 0-sized block when deleting an under-construction file that is included in snapshot. Contributed by Jing Zhao. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1539754)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFileUnderConstruction.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotBlocksMap.java
+, SUCCESS: Integrated in Hadoop-Yarn-trunk #386 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/386/])
+HDFS-5443. Delete 0-sized block when deleting an under-construction file that is included in snapshot. Contributed by Jing Zhao. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1539754)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFileUnderConstruction.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotBlocksMap.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1603 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1603/])
+HDFS-5443. Delete 0-sized block when deleting an under-construction file that is included in snapshot. Contributed by Jing Zhao. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1539754)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFileUnderConstruction.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotBlocksMap.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #1577 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1577/])
+HDFS-5443. Delete 0-sized block when deleting an under-construction file that is included in snapshot. Contributed by Jing Zhao. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1539754)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockInfoUnderConstruction.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/INodeFileUnderConstruction.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestSnapshotBlocksMap.java
+, SUCCESS: Integrated in Hadoop-trunk-Commit #4859 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/4859/])
+Move HDFS-5257,HDFS-5427,HDFS-5443,HDFS-5476,HDFS-5425,HDFS-5474,HDFS-5504,HDFS-5428 into branch-2.3 section. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1550011)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, I've merged this to branch-2.3., FAILURE: Integrated in Hadoop-Yarn-trunk #418 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/418/])
+Move HDFS-5257,HDFS-5427,HDFS-5443,HDFS-5476,HDFS-5425,HDFS-5474,HDFS-5504,HDFS-5428 into branch-2.3 section. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1550011)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #1609 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1609/])
+Move HDFS-5257,HDFS-5427,HDFS-5443,HDFS-5476,HDFS-5425,HDFS-5474,HDFS-5504,HDFS-5428 into branch-2.3 section. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1550011)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1635 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1635/])
+Move HDFS-5257,HDFS-5427,HDFS-5443,HDFS-5476,HDFS-5425,HDFS-5474,HDFS-5504,HDFS-5428 into branch-2.3 section. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1550011)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+]

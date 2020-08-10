@@ -1,0 +1,369 @@
+[[~thejas] [~prasadm] - do agree that these tokens do not have a renew process at present? If so, I think we can add a background thread to renew them in [SessionManager|https://github.com/apache/hive/blob/trunk/service/src/java/org/apache/hive/service/cli/session/SessionManager.java#L150]., Yes, this does look like a problem. 
+Regarding the way to renew it, I think it would be better if we can renew it from a HMS client implementation on a failure-retry, similar to how reloginFromKeyTab was added to the client in HIVE-4233.  This way any client of HMS could potentially benefit from this change. I haven't explored this fully, so I am not sure if there are any impediments for this,  this is just something to consider.
+, The renewal of credentials done in HIVE-4233 is similar to how I believe its done in HDFS/MR/Yarn clients.
+, I think the attached might work., 
+
+{color:green}Overall{color}: +1 all checks pass
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12697589/HIVE-9625.1.patch
+
+{color:green}SUCCESS:{color} +1 7540 tests passed
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/2736/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/2736/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-TRUNK-Build-2736/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12697589 - PreCommit-HIVE-TRUNK-Build, [~brocknoland] Are you able to verify the patch on with secure HS2, HMS ? 
+I suspect that just calling getDelegationToken() on error won't help. AFAIR the expired tokens are not auto renewed. There's a GC thread that runs every hour to remove the expired token. You might have to renew or drop the token before re acquiring it.
+, Before calling {{getDelegationToken}} we call {{Hive.closeCurrent}} for this reason. I'll test it and see what happens., I think that getting a new token on failure is going to be pretty difficult. The only places I can see retrying are in the metastore package in {{HMSC}} or {{RetryingMetastore}} but there is no way to get a new token there. Additionally I believe the token needs to be acquired outside of a {{doas(user)}} call.
+
+Looks like a non-trivial change., [~brocknoland], [~prasadm], could we move this forward?, [~xuefuz] My apologies for late response. 
+The patch look fine to me. It will handle cases when a long running client sessions, metastore restart or cancellation of ticket by another session etc .
+Metastore has a garbage collection thread that removes expired tokens. However that still leaves a window (1 hour by default) where clients could retrieve a token that's expired or about to expire. I guess an option is for metastore handle expired tokens inline. We can do that in a followup patch.
+
++1
+, Thanks, Prasad. I created HIVE-10574 for the followup and it's linked here., Patch is rebased with the latest master and branch-1.
+[~prasadm], could you give it another look? Thanks., Thanks [~xuefuz] for rebasing the patch!
+
++1 for both master and branch-1 patches.
+, Thanks all for working on this.
+Seeing the same issue.We then add a re-acquire token step during reconnect and it works.The limitation is that you have to use RetryingMetaStoreClient.
+And the benefits is it both works for hiveserver2 and hcatalog(and others that use RetryingMetaStoreClient).Hope this idea can be accepted,too.
+Here is the piece of code changed in HiveMetaStoreClient.java:
+{code:java}
+  @Override
+  public void reconnect() throws MetaException {
+    if (localMetaStore) {
+      // For direct DB connections we don't yet support reestablishing connections.
+      throw new MetaException("For direct MetaStore DB connections, we don't support retries" +
+          " at the client level.");
+    } else {
+      // Swap the first element of the metastoreUris[] with a random element from the rest
+      // of the array. Rationale being that this method will generally be called when the default
+      // connection has died and the default connection is likely to be the first array element.
+      promoteRandomMetaStoreURI();
+      reacquireToken();
+      open();
+    }
+  }
+
+private void reacquireToken() throws MetaException {
+      if (!conf.getBoolVar(ConfVars.METASTORE_USE_THRIFT_SASL)) {
+        return;
+      }
+
+      String preTokenSig = conf.get("hive.metastore.token.signature");
+      String token = null;
+      try  {
+        token = Utils.getTokenStrForm(preTokenSig);
+      } catch (IOException ex) {
+        LOG.warn("Could not get token.", ex);
+        throw new MetaException("Could not get token: " + ex.getMessage());
+      }
+
+      if (null == preTokenSig || null == token) {
+        return;
+      }
+
+      try {
+        conf.unset("hive.metastore.token.signature");
+        int retriesLeft = RETRY_LIMIT;
+        while (true) {
+          try {
+            final String curUser = conf.getUser();
+            token = UserGroupInformation.getLoginUser().doAs(new PrivilegedExceptionAction<String> () {
+              @Override
+              public String run() throws Exception {
+                HiveMetaStoreClient client = new HiveMetaStoreClient(conf);
+                return client.getDelegationToken(curUser, curUser);
+              }
+            });
+            break;
+          } catch (Exception ex) {
+            if (retriesLeft > 0) {
+              LOG.error("Could not get a new token. Attempts left: " + retriesLeft--, ex);
+              try {
+                Thread.sleep(THIRTY_SECONDS);
+              } catch (InterruptedException ex2) {
+                LOG.debug("Sleep is interrupted.");
+              }
+              continue;
+            }
+            throw new MetaException("Could not get a new token: " + ex.getMessage());
+          }
+        }
+      } finally {
+        conf.set("hive.metastore.token.signature", preTokenSig);
+      }
+      try {
+          Utils.setTokenStr(UserGroupInformation.getCurrentUser(), token, preTokenSig);
+      } catch (IOException e) {
+        LOG.error("Couldn't setup delegation token in the ugi", e);
+        throw new MetaException("Couldn't setup delegation token in the ugi: " + e.getMessage());
+      }
+    }
+{code}, 
+
+{color:red}Overall{color}: -1 no tests executed
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12742370/HIVE-9625.1.patch
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/4423/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/4423/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-TRUNK-Build-4423/
+
+Messages:
+{noformat}
+**** This message was trimmed, see log for full details ****
+[INFO] Excluding org.apache.hadoop:hadoop-yarn-common:jar:2.4.0 from the shaded jar.
+[INFO] Excluding com.google.inject.extensions:guice-servlet:jar:3.0 from the shaded jar.
+[INFO] Excluding com.google.inject:guice:jar:3.0 from the shaded jar.
+[INFO] Excluding javax.inject:javax.inject:jar:1 from the shaded jar.
+[INFO] Excluding aopalliance:aopalliance:jar:1.0 from the shaded jar.
+[INFO] Excluding com.sun.jersey.contribs:jersey-guice:jar:1.9 from the shaded jar.
+[INFO] Excluding org.apache.commons:commons-collections4:jar:4.0 from the shaded jar.
+[INFO] Excluding org.apache.tez:tez-runtime-library:jar:0.5.2 from the shaded jar.
+[INFO] Excluding org.apache.tez:tez-common:jar:0.5.2 from the shaded jar.
+[INFO] Excluding org.apache.tez:tez-runtime-internals:jar:0.5.2 from the shaded jar.
+[INFO] Excluding org.apache.tez:tez-mapreduce:jar:0.5.2 from the shaded jar.
+[INFO] Excluding commons-collections:commons-collections:jar:3.2.1 from the shaded jar.
+[INFO] Excluding org.apache.spark:spark-core_2.10:jar:1.3.1 from the shaded jar.
+[INFO] Excluding com.twitter:chill_2.10:jar:0.5.0 from the shaded jar.
+[INFO] Excluding com.twitter:chill-java:jar:0.5.0 from the shaded jar.
+[INFO] Excluding org.apache.hadoop:hadoop-client:jar:1.2.1 from the shaded jar.
+[INFO] Excluding org.apache.spark:spark-network-common_2.10:jar:1.3.1 from the shaded jar.
+[INFO] Excluding org.apache.spark:spark-network-shuffle_2.10:jar:1.3.1 from the shaded jar.
+[INFO] Excluding net.java.dev.jets3t:jets3t:jar:0.7.1 from the shaded jar.
+[INFO] Excluding org.apache.curator:curator-recipes:jar:2.6.0 from the shaded jar.
+[INFO] Excluding org.eclipse.jetty.orbit:javax.servlet:jar:3.0.0.v201112011016 from the shaded jar.
+[INFO] Excluding org.apache.commons:commons-math3:jar:3.1.1 from the shaded jar.
+[INFO] Excluding org.slf4j:jul-to-slf4j:jar:1.7.10 from the shaded jar.
+[INFO] Excluding org.slf4j:jcl-over-slf4j:jar:1.7.10 from the shaded jar.
+[INFO] Excluding com.ning:compress-lzf:jar:1.0.0 from the shaded jar.
+[INFO] Excluding net.jpountz.lz4:lz4:jar:1.2.0 from the shaded jar.
+[INFO] Excluding org.roaringbitmap:RoaringBitmap:jar:0.4.5 from the shaded jar.
+[INFO] Excluding commons-net:commons-net:jar:2.2 from the shaded jar.
+[INFO] Excluding org.spark-project.akka:akka-remote_2.10:jar:2.3.4-spark from the shaded jar.
+[INFO] Excluding org.spark-project.akka:akka-actor_2.10:jar:2.3.4-spark from the shaded jar.
+[INFO] Excluding com.typesafe:config:jar:1.2.1 from the shaded jar.
+[INFO] Excluding org.spark-project.protobuf:protobuf-java:jar:2.5.0-spark from the shaded jar.
+[INFO] Excluding org.uncommons.maths:uncommons-maths:jar:1.2.2a from the shaded jar.
+[INFO] Excluding org.spark-project.akka:akka-slf4j_2.10:jar:2.3.4-spark from the shaded jar.
+[INFO] Excluding org.scala-lang:scala-library:jar:2.10.4 from the shaded jar.
+[INFO] Excluding org.json4s:json4s-jackson_2.10:jar:3.2.10 from the shaded jar.
+[INFO] Excluding org.json4s:json4s-core_2.10:jar:3.2.10 from the shaded jar.
+[INFO] Excluding org.json4s:json4s-ast_2.10:jar:3.2.10 from the shaded jar.
+[INFO] Excluding org.scala-lang:scalap:jar:2.10.0 from the shaded jar.
+[INFO] Excluding org.scala-lang:scala-compiler:jar:2.10.0 from the shaded jar.
+[INFO] Excluding org.apache.mesos:mesos:jar:shaded-protobuf:0.21.0 from the shaded jar.
+[INFO] Excluding com.clearspring.analytics:stream:jar:2.7.0 from the shaded jar.
+[INFO] Excluding io.dropwizard.metrics:metrics-graphite:jar:3.1.0 from the shaded jar.
+[INFO] Excluding com.fasterxml.jackson.module:jackson-module-scala_2.10:jar:2.4.4 from the shaded jar.
+[INFO] Excluding org.scala-lang:scala-reflect:jar:2.10.4 from the shaded jar.
+[INFO] Excluding oro:oro:jar:2.0.8 from the shaded jar.
+[INFO] Excluding org.tachyonproject:tachyon-client:jar:0.5.0 from the shaded jar.
+[INFO] Excluding org.tachyonproject:tachyon:jar:0.5.0 from the shaded jar.
+[INFO] Excluding org.spark-project:pyrolite:jar:2.0.1 from the shaded jar.
+[INFO] Excluding net.sf.py4j:py4j:jar:0.8.2.1 from the shaded jar.
+[INFO] Excluding org.spark-project.spark:unused:jar:1.0.0 from the shaded jar.
+[INFO] Excluding org.apache.hadoop:hadoop-core:jar:1.2.1 from the shaded jar.
+[INFO] Excluding xmlenc:xmlenc:jar:0.52 from the shaded jar.
+[INFO] Excluding com.sun.jersey:jersey-core:jar:1.14 from the shaded jar.
+[INFO] Excluding com.sun.jersey:jersey-json:jar:1.14 from the shaded jar.
+[INFO] Excluding org.codehaus.jettison:jettison:jar:1.1 from the shaded jar.
+[INFO] Excluding com.sun.xml.bind:jaxb-impl:jar:2.2.3-1 from the shaded jar.
+[INFO] Excluding org.codehaus.jackson:jackson-jaxrs:jar:1.9.2 from the shaded jar.
+[INFO] Excluding org.codehaus.jackson:jackson-xc:jar:1.9.2 from the shaded jar.
+[INFO] Excluding com.sun.jersey:jersey-server:jar:1.14 from the shaded jar.
+[INFO] Excluding asm:asm:jar:3.1 from the shaded jar.
+[INFO] Excluding commons-configuration:commons-configuration:jar:1.6 from the shaded jar.
+[INFO] Excluding commons-digester:commons-digester:jar:1.8 from the shaded jar.
+[INFO] Excluding commons-beanutils:commons-beanutils:jar:1.7.0 from the shaded jar.
+[INFO] Excluding commons-beanutils:commons-beanutils-core:jar:1.8.0 from the shaded jar.
+[INFO] Excluding org.mortbay.jetty:jetty:jar:6.1.26 from the shaded jar.
+[INFO] Excluding org.mortbay.jetty:servlet-api:jar:2.5-20081211 from the shaded jar.
+[INFO] Excluding org.mortbay.jetty:jetty-util:jar:6.1.26 from the shaded jar.
+[INFO] Excluding tomcat:jasper-runtime:jar:5.5.12 from the shaded jar.
+[INFO] Excluding tomcat:jasper-compiler:jar:5.5.12 from the shaded jar.
+[INFO] Excluding org.mortbay.jetty:jsp-api-2.1:jar:6.1.14 from the shaded jar.
+[INFO] Excluding org.mortbay.jetty:servlet-api-2.5:jar:6.1.14 from the shaded jar.
+[INFO] Excluding org.mortbay.jetty:jsp-2.1:jar:6.1.14 from the shaded jar.
+[INFO] Excluding ant:ant:jar:1.6.5 from the shaded jar.
+[INFO] Excluding commons-el:commons-el:jar:1.0 from the shaded jar.
+[INFO] Excluding hsqldb:hsqldb:jar:1.8.0.10 from the shaded jar.
+[INFO] Excluding org.eclipse.jdt:core:jar:3.1.1 from the shaded jar.
+[INFO] Excluding org.apache.hadoop:hadoop-tools:jar:1.2.1 from the shaded jar.
+[INFO] Excluding org.slf4j:slf4j-api:jar:1.7.5 from the shaded jar.
+[INFO] Excluding org.slf4j:slf4j-log4j12:jar:1.7.5 from the shaded jar.
+[INFO] Replacing original artifact with shaded artifact.
+[INFO] Replacing /data/hive-ptest/working/apache-github-source-source/ql/target/hive-exec-2.0.0-SNAPSHOT.jar with /data/hive-ptest/working/apache-github-source-source/ql/target/hive-exec-2.0.0-SNAPSHOT-shaded.jar
+[INFO] Dependency-reduced POM written at: /data/hive-ptest/working/apache-github-source-source/ql/dependency-reduced-pom.xml
+[INFO] Dependency-reduced POM written at: /data/hive-ptest/working/apache-github-source-source/ql/dependency-reduced-pom.xml
+[INFO] 
+[INFO] --- maven-install-plugin:2.4:install (default-install) @ hive-exec ---
+[INFO] Installing /data/hive-ptest/working/apache-github-source-source/ql/target/hive-exec-2.0.0-SNAPSHOT.jar to /home/hiveptest/.m2/repository/org/apache/hive/hive-exec/2.0.0-SNAPSHOT/hive-exec-2.0.0-SNAPSHOT.jar
+[INFO] Installing /data/hive-ptest/working/apache-github-source-source/ql/dependency-reduced-pom.xml to /home/hiveptest/.m2/repository/org/apache/hive/hive-exec/2.0.0-SNAPSHOT/hive-exec-2.0.0-SNAPSHOT.pom
+[INFO] Installing /data/hive-ptest/working/apache-github-source-source/ql/target/hive-exec-2.0.0-SNAPSHOT-tests.jar to /home/hiveptest/.m2/repository/org/apache/hive/hive-exec/2.0.0-SNAPSHOT/hive-exec-2.0.0-SNAPSHOT-tests.jar
+[INFO] Installing /data/hive-ptest/working/apache-github-source-source/ql/target/hive-exec-2.0.0-SNAPSHOT-core.jar to /home/hiveptest/.m2/repository/org/apache/hive/hive-exec/2.0.0-SNAPSHOT/hive-exec-2.0.0-SNAPSHOT-core.jar
+[INFO]                                                                         
+[INFO] ------------------------------------------------------------------------
+[INFO] Building Hive Service 2.0.0-SNAPSHOT
+[INFO] ------------------------------------------------------------------------
+[INFO] 
+[INFO] --- maven-clean-plugin:2.5:clean (default-clean) @ hive-service ---
+[INFO] Deleting /data/hive-ptest/working/apache-github-source-source/service/target
+[INFO] Deleting /data/hive-ptest/working/apache-github-source-source/service (includes = [datanucleus.log, derby.log], excludes = [])
+[INFO] 
+[INFO] --- maven-enforcer-plugin:1.3.1:enforce (enforce-no-snapshots) @ hive-service ---
+[INFO] 
+[INFO] --- build-helper-maven-plugin:1.8:add-source (add-source) @ hive-service ---
+[INFO] Source directory: /data/hive-ptest/working/apache-github-source-source/service/src/model added.
+[INFO] Source directory: /data/hive-ptest/working/apache-github-source-source/service/src/gen/thrift/gen-javabean added.
+[INFO] 
+[INFO] --- maven-remote-resources-plugin:1.5:process (default) @ hive-service ---
+[INFO] 
+[INFO] --- maven-resources-plugin:2.6:resources (default-resources) @ hive-service ---
+[INFO] Using 'UTF-8' encoding to copy filtered resources.
+[INFO] skip non existing resourceDirectory /data/hive-ptest/working/apache-github-source-source/service/src/main/resources
+[INFO] Copying 3 resources
+[INFO] 
+[INFO] --- maven-antrun-plugin:1.7:run (define-classpath) @ hive-service ---
+[INFO] Executing tasks
+
+main:
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- maven-compiler-plugin:3.1:compile (default-compile) @ hive-service ---
+[INFO] Compiling 177 source files to /data/hive-ptest/working/apache-github-source-source/service/target/classes
+[INFO] -------------------------------------------------------------
+[WARNING] COMPILATION WARNING : 
+[INFO] -------------------------------------------------------------
+[WARNING] /data/hive-ptest/working/apache-github-source-source/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java: Some input files use or override a deprecated API.
+[WARNING] /data/hive-ptest/working/apache-github-source-source/service/src/java/org/apache/hive/service/cli/operation/SQLOperation.java: Recompile with -Xlint:deprecation for details.
+[WARNING] /data/hive-ptest/working/apache-github-source-source/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TByteColumn.java: Some input files use unchecked or unsafe operations.
+[WARNING] /data/hive-ptest/working/apache-github-source-source/service/src/gen/thrift/gen-javabean/org/apache/hive/service/cli/thrift/TByteColumn.java: Recompile with -Xlint:unchecked for details.
+[INFO] 4 warnings 
+[INFO] -------------------------------------------------------------
+[INFO] -------------------------------------------------------------
+[ERROR] COMPILATION ERROR : 
+[INFO] -------------------------------------------------------------
+[ERROR] /data/hive-ptest/working/apache-github-source-source/service/src/java/org/apache/hive/service/cli/session/HiveSessionImplwithUGI.java:[150,73] cannot find symbol
+  symbol:   method getUsername()
+  location: class org.apache.hive.service.cli.session.HiveSessionImplwithUGI
+[ERROR] /data/hive-ptest/working/apache-github-source-source/service/src/java/org/apache/hive/service/cli/session/HiveSessionImplwithUGI.java:[150,88] cannot find symbol
+  symbol:   method getUsername()
+  location: class org.apache.hive.service.cli.session.HiveSessionImplwithUGI
+[INFO] 2 errors 
+[INFO] -------------------------------------------------------------
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Summary:
+[INFO] 
+[INFO] Hive .............................................. SUCCESS [15.086s]
+[INFO] Hive Shims Common ................................. SUCCESS [12.831s]
+[INFO] Hive Shims 0.20S .................................. SUCCESS [3.294s]
+[INFO] Hive Shims 0.23 ................................... SUCCESS [11.064s]
+[INFO] Hive Shims Scheduler .............................. SUCCESS [1.999s]
+[INFO] Hive Shims ........................................ SUCCESS [2.147s]
+[INFO] Hive Common ....................................... SUCCESS [16.677s]
+[INFO] Hive Serde ........................................ SUCCESS [17.541s]
+[INFO] Hive Metastore .................................... SUCCESS [37.672s]
+[INFO] Hive Ant Utilities ................................ SUCCESS [2.014s]
+[INFO] Spark Remote Client ............................... SUCCESS [21.695s]
+[INFO] Hive Query Language ............................... SUCCESS [2:49.986s]
+[INFO] Hive Service ...................................... FAILURE [9.339s]
+[INFO] Hive Accumulo Handler ............................. SKIPPED
+[INFO] Hive JDBC ......................................... SKIPPED
+[INFO] Hive Beeline ...................................... SKIPPED
+[INFO] Hive CLI .......................................... SKIPPED
+[INFO] Hive Contrib ...................................... SKIPPED
+[INFO] Hive HBase Handler ................................ SKIPPED
+[INFO] Hive HCatalog ..................................... SKIPPED
+[INFO] Hive HCatalog Core ................................ SKIPPED
+[INFO] Hive HCatalog Pig Adapter ......................... SKIPPED
+[INFO] Hive HCatalog Server Extensions ................... SKIPPED
+[INFO] Hive HCatalog Webhcat Java Client ................. SKIPPED
+[INFO] Hive HCatalog Webhcat ............................. SKIPPED
+[INFO] Hive HCatalog Streaming ........................... SKIPPED
+[INFO] Hive HWI .......................................... SKIPPED
+[INFO] Hive ODBC ......................................... SKIPPED
+[INFO] Hive Shims Aggregator ............................. SKIPPED
+[INFO] Hive TestUtils .................................... SKIPPED
+[INFO] Hive Packaging .................................... SKIPPED
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD FAILURE
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time: 5:24.160s
+[INFO] Finished at: Sun Jun 28 05:41:06 EDT 2015
+[INFO] Final Memory: 171M/752M
+[INFO] ------------------------------------------------------------------------
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.1:compile (default-compile) on project hive-service: Compilation failure: Compilation failure:
+[ERROR] /data/hive-ptest/working/apache-github-source-source/service/src/java/org/apache/hive/service/cli/session/HiveSessionImplwithUGI.java:[150,73] cannot find symbol
+[ERROR] symbol:   method getUsername()
+[ERROR] location: class org.apache.hive.service.cli.session.HiveSessionImplwithUGI
+[ERROR] /data/hive-ptest/working/apache-github-source-source/service/src/java/org/apache/hive/service/cli/session/HiveSessionImplwithUGI.java:[150,88] cannot find symbol
+[ERROR] symbol:   method getUsername()
+[ERROR] location: class org.apache.hive.service.cli.session.HiveSessionImplwithUGI
+[ERROR] -> [Help 1]
+[ERROR] 
+[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.
+[ERROR] Re-run Maven using the -X switch to enable full debug logging.
+[ERROR] 
+[ERROR] For more information about the errors and possible solutions, please read the following articles:
+[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoFailureException
+[ERROR] 
+[ERROR] After correcting the problems, you can resume the build with the command
+[ERROR]   mvn <goals> -rf :hive-service
++ exit 1
+'
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12742370 - PreCommit-HIVE-TRUNK-Build, 
+
+{color:red}Overall{color}: -1 at least one tests failed
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12742392/HIVE-9625.2.patch
+
+{color:red}ERROR:{color} -1 due to 3 failed/errored test(s), 9020 tests executed
+*Failed tests:*
+{noformat}
+TestCliDriver-protectmode2.q-authorization_create_temp_table.q-tez_self_join.q-and-12-more - did not produce a TEST-*.xml file
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver_index_auto_mult_tables
+org.apache.hive.jdbc.TestSSL.testSSLFetchHttp
+{noformat}
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/4426/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/4426/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-TRUNK-Build-4426/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 3 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12742392 - PreCommit-HIVE-TRUNK-Build, The above test failures seems rather infrastructural. Patch #2 is committed to both master and branch-1. Thanks to Brock and Prasad., [~nemon], could you please describe what problem your proposal is addressing? I'm not sure if that's for the same problem here or an enhancement to the current solution. Please feel free to create a follow-up JIRA if necessary. Thanks., [~xuefuz],thanks for your attention.What i propose is a workaround for the lack of renewing HMS tokens (not only for HiveServer2).The solution has been used in our production environment,and quite follow Thejas M Nair 's advice:
+{quote}
+I think it would be better if we can renew it from a HMS client implementation on a failure-retry, similar to how reloginFromKeyTab was added to the client in HIVE-4233. This way any client of HMS could potentially benefit from this change. 
+{quote}
+Here,"any client of HMS" can be HiveServer2,WebHcat,Impala,SparkSQL,etc in my opinion.
+Since HIVE-9625 already has its solution and accepted by the Hive community,I think it's ok to fix this problem without the solution i provided.
+And thanks Brock Noland and Xuefu Zhang for working on this.
+]

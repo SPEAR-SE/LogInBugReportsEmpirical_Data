@@ -1,0 +1,239 @@
+[Found out that the issue happens in 0.20.1 too. I still don't know what the root cause is, but it happens pretty reliably on a 100-node cluster., Forgot to add: my temporary "fix" is to set ipc.ping.interval to 5000 (down from 60000) in mapred-site.xml. This is definitely not ideal., Investigation:
+===========
+1. Task.TaskReporter thread sends status updates/pings periodically to TaskTracker. Default
+"PROGRESS_INTERVAL" is set to 3000 ms. If it needs to send the task progress, it sends STATUS_UPDATE message
+to TaskTracker. Otherwise, it sends a PING signal to check if the TaskTracker is alive.
+
+2. When the map phase is over, it calls TaskReporter.stopCommunicationThread() which interrupts this thread.
+
+3. If the system was trying to commnuicate with the server at the time of interrupts, it breaks the connection to the
+server.Since the interrupt was issued, the stream throws ClosedByInterruptException and doesn't send any information.
+
+5. However in Client.java, Client keeps waiting for the response in
+Client->Connection->receiveResponse()->readInt(). After the "ipc.ping.interval", it basically
+timesout and rethrows this exception.
+
+Since the default "ipc.ping.value" is set to 60000ms, it waits for 1 minute before throwing this exception.
+This causes heavy variations in runtimes of small jobs which get executed in couple of minutes.
+
+Patch:
+=====
+I applied a patch (one line change) which would interrupt the Client.java's Connection upon any IOException in
+sendParam(). I checked with hadoop-0.20.2xx version and ran PigMix benchmark. It works fine and
+there are no timeouts happening with this patch.
+
+, Just one quick observation. Currently, to close a connection that has already been set up, all other threads would set the shouldCloseConnection flag by calling markClosed() and the actual close() (cleanup) is done by the receiver thread itself. Your current patch simply interrupts this thread. This may cause it to bypass the cleanup., A couple questions.
+
+> Since the interrupt was issued, the stream throws ClosedByInterruptException and doesn't send any information.
+
+Which stream is this and where was the ClosedByInterruptException thrown? From your log, the exception that IPC client sees is ClosedChannelException. If so, which thread causes this connection to be closed? Just trying to understand the sequence of events that happened. Please attach relevant log if possible., Hi Kan,
+
+Thanks for the comments. Here is the stacktrace I observed in task logs of TaskTracker.
+
+This is the stream which was setup to send status update to the tasktracker. Task sends periodic updates to TaskTracker about its progress.
+
+java.nio.channels.ClosedByInterruptException
+	at java.nio.channels.spi.AbstractInterruptibleChannel.end(AbstractInterruptibleChannel.java:184)
+	at sun.nio.ch.SocketChannelImpl.write(SocketChannelImpl.java:341)
+	at org.apache.hadoop.net.SocketOutputStream$Writer.performIO(SocketOutputStream.java:55)
+	at org.apache.hadoop.net.SocketIOWithTimeout.doIO(SocketIOWithTimeout.java:142)
+	at org.apache.hadoop.net.SocketOutputStream.write(SocketOutputStream.java:146)
+	at org.apache.hadoop.net.SocketOutputStream.write(SocketOutputStream.java:107)
+	at org.apache.hadoop.security.SaslOutputStream.write(SaslOutputStream.java:163)
+	at java.io.BufferedOutputStream.flushBuffer(BufferedOutputStream.java:65)
+	at java.io.BufferedOutputStream.flush(BufferedOutputStream.java:123)
+	at java.io.DataOutputStream.flush(DataOutputStream.java:106)
+	at org.apache.hadoop.ipc.Client$Connection.sendParam(Client.java:698)
+	at org.apache.hadoop.ipc.Client.call(Client.java:952)
+	at org.apache.hadoop.ipc.RPC$Invoker.invoke(RPC.java:222)
+	at $Proxy1.statusUpdate(Unknown Source)
+	at org.apache.hadoop.mapred.Task$TaskReporter.run(Task.java:625)
+	at java.lang.Thread.run(Thread.java:619)
+
+
+Another alternate approach is to let TaskReporter.stopCommunicationThread() to interrupt TaskReporter thread ONLY after completing the status update to tasktracker. This would also ensure that the stream is not abruptly closed. I will test this new approach and post the patch. This patch would involve changes to Task.java->TaskReporter and does not require any changes to Client.java., Attaching the patch which fixes the issue in Task.java. 
+
+This would also ensure that the statusupdate stream is not abruptly
+closed. I have tested patch and this involves changes to Task.java->TaskReporter and does not require any changes to Client.java. Tasks no longer threw timeout exceptions in multiple runs of performance benchmarks., We met the same problem with hadoop 0.19.1 when run terasort. Here is the task log:
+2011-04-19 01:10:33,715 INFO org.apache.hadoop.mapred.TaskRunner: Task attempt_201104190103_0002_r_000442_0 is allowed to commit now
+2011-04-19 01:10:33,723 INFO org.apache.hadoop.mapred.FileOutputCommitter: Saved output of task 'attempt_201104190103_0002_r_000442_0' to hdfs://r05b02043.yh.aliyun.com:9000/group/dc/willwu/terasort-out
+2011-04-19 01:11:33,725 INFO org.apache.hadoop.mapred.TaskRunner: Communication exception: java.io.IOException: Call to /127.0.0.1:48950 failed on local exception: java.nio.channels.ClosedByInterruptException
+	at org.apache.hadoop.ipc.Client.wrapException(Client.java:736)
+	at org.apache.hadoop.ipc.Client.call(Client.java:704)
+	at org.apache.hadoop.ipc.RPC$Invoker.invoke(RPC.java:216)
+	at org.apache.hadoop.mapred.$Proxy0.statusUpdate(Unknown Source)
+	at org.apache.hadoop.mapred.Task$1.run(Task.java:417)
+	at java.lang.Thread.run(Thread.java:662)
+Caused by: java.nio.channels.ClosedByInterruptException
+	at java.nio.channels.spi.AbstractInterruptibleChannel.end(AbstractInterruptibleChannel.java:184)
+	at sun.nio.ch.SocketChannelImpl.write(SocketChannelImpl.java:341)
+	at org.apache.hadoop.net.SocketOutputStream$Writer.performIO(SocketOutputStream.java:55)
+	at org.apache.hadoop.net.SocketIOWithTimeout.doIO(SocketIOWithTimeout.java:140)
+	at org.apache.hadoop.net.SocketOutputStream.write(SocketOutputStream.java:146)
+	at org.apache.hadoop.net.SocketOutputStream.write(SocketOutputStream.java:107)
+	at java.io.BufferedOutputStream.flushBuffer(BufferedOutputStream.java:65)
+	at java.io.BufferedOutputStream.flush(BufferedOutputStream.java:123)
+	at java.io.DataOutputStream.flush(DataOutputStream.java:106)
+	at org.apache.hadoop.ipc.Client$Connection.sendParam(Client.java:473)
+	at org.apache.hadoop.ipc.Client.call(Client.java:691)
+	... 4 more
+
+2011-04-19 01:11:33,728 INFO org.apache.hadoop.mapred.TaskRunner: Task 'attempt_201104190103_0002_r_000442_0' done.
+
+Hope this bug to be fixed ASAP., Attaching the patch for trunk, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12477210/HADOOP-5380.patch
+  against trunk revision 1095958.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/hudson/job/PreCommit-HADOOP-Build/374//console
+
+This message is automatically generated., Moved the JIRA from Hadoop-Common to Hadoop-MapReduce. Resubmitting for hudson build, resubmitting for hudson build., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12477611/mapreduce-2450.patch
+  against trunk revision 1097315.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+    +1 system test framework.  The patch passed system test framework compile.
+
+Test results: https://builds.apache.org/hudson/job/PreCommit-MAPREDUCE-Build/190//testReport/
+Findbugs warnings: https://builds.apache.org/hudson/job/PreCommit-MAPREDUCE-Build/190//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/hudson/job/PreCommit-MAPREDUCE-Build/190//console
+
+This message is automatically generated., Ran large sort job and GridMix-V3 with 1200 jobs to verify this patch. Large sort-job/gridmix-v3 often simulated the problem reported in the bug and with the patch sort job/gridmix-v3 executed fine without timeout issues in tasklogs.
+
+This patch doesn't call for any additional testcases., Would this also be fixed by HADOOP-6762?, >> Todd Lipcon added a comment - 19/May/11 06:41
+Would this also be fixed by HADOOP-6762?
+
+Hi Todd,
+
+Hadoop-6762 could be fixing this issue as well. 
+
+However, I haven't tested with Hadoop-6762. 
+
+The patch proposed in https://issues.apache.org/jira/secure/attachment/12477611/mapreduce-2450.patch is well tested in large scale cluster repeatedly.
+
+
+
+
+, https://issues.apache.org/jira/browse/MAPREDUCE-2450, Sorry to come in late, the patch has gone stale. Can you please rebase? Thanks.
+, This is the patch we committed to hadoop-0.20.2xx, forward-ported to 0.23. No tests since it's hard to unit test this., Thanks to Rajesh for the original patch. This helps 0.23 a *lot*, ran a number of benchmarks., +1 the patch looks good to me., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12510796/MAPREDUCE-2450.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1617//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1617//console
+
+This message is automatically generated., I just committed this to trunk & branch-0.23, already in branch-1. Thanks Rajesh!, Integrated in Hadoop-Hdfs-0.23-Commit #375 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Commit/375/])
+    Merge -c 1232314 from trunk to branch-0.23 to fix MAPREDUCE-2450. MAPREDUCE-2450. Fixed a corner case with interrupted communication threads leading to a long timeout in Task.
+
+acmurthy : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1232315
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
+, Integrated in Hadoop-Hdfs-trunk-Commit #1624 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/1624/])
+    MAPREDUCE-2450. Fixed a corner case with interrupted communication threads leading to a long timeout in Task. Contributed by Rajesh Balamohan.
+
+acmurthy : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1232314
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
+, Integrated in Hadoop-Common-0.23-Commit #385 (See [https://builds.apache.org/job/Hadoop-Common-0.23-Commit/385/])
+    Merge -c 1232314 from trunk to branch-0.23 to fix MAPREDUCE-2450. MAPREDUCE-2450. Fixed a corner case with interrupted communication threads leading to a long timeout in Task.
+
+acmurthy : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1232315
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
+, Integrated in Hadoop-Common-trunk-Commit #1551 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/1551/])
+    MAPREDUCE-2450. Fixed a corner case with interrupted communication threads leading to a long timeout in Task. Contributed by Rajesh Balamohan.
+
+acmurthy : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1232314
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
+, Integrated in Hadoop-Mapreduce-0.23-Commit #398 (See [https://builds.apache.org/job/Hadoop-Mapreduce-0.23-Commit/398/])
+    Merge -c 1232314 from trunk to branch-0.23 to fix MAPREDUCE-2450. MAPREDUCE-2450. Fixed a corner case with interrupted communication threads leading to a long timeout in Task.
+
+acmurthy : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1232315
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
+, Integrated in Hadoop-Mapreduce-trunk-Commit #1569 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Commit/1569/])
+    MAPREDUCE-2450. Fixed a corner case with interrupted communication threads leading to a long timeout in Task. Contributed by Rajesh Balamohan.
+
+acmurthy : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1232314
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
+, Integrated in Hadoop-Hdfs-trunk #928 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/928/])
+    MAPREDUCE-2450. Fixed a corner case with interrupted communication threads leading to a long timeout in Task. Contributed by Rajesh Balamohan.
+
+acmurthy : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1232314
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
+, Integrated in Hadoop-Hdfs-0.23-Build #141 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/141/])
+    Merge -c 1232314 from trunk to branch-0.23 to fix MAPREDUCE-2450. MAPREDUCE-2450. Fixed a corner case with interrupted communication threads leading to a long timeout in Task.
+
+acmurthy : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1232315
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
+, Integrated in Hadoop-Mapreduce-0.23-Build #163 (See [https://builds.apache.org/job/Hadoop-Mapreduce-0.23-Build/163/])
+    Merge -c 1232314 from trunk to branch-0.23 to fix MAPREDUCE-2450. MAPREDUCE-2450. Fixed a corner case with interrupted communication threads leading to a long timeout in Task.
+
+acmurthy : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1232315
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
+, Integrated in Hadoop-Mapreduce-trunk #961 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/961/])
+    MAPREDUCE-2450. Fixed a corner case with interrupted communication threads leading to a long timeout in Task. Contributed by Rajesh Balamohan.
+
+acmurthy : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1232314
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/Task.java
+]

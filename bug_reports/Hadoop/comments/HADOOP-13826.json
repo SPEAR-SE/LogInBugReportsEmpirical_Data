@@ -1,0 +1,358 @@
+[Just attaching an integration test that reproduces the problem. It'll create 2 64 MB files and try to rename them both at once with multi-part uploads. It can't complete.
+
+One can work around this problem by increasing the number of threads (Amazon recommends an unbounded executor). I would suggest that perhaps a better approach is to implement the executor with 2 separate thread pools and task queues: one for "control tasks" and one for "sub tasks". This could make configuring maximum threads, etc. a little tricky, but without just removing all limits, this will at least allow real work to progress even when the pool / queue for control tasks is saturated. Unfortunately it looks like we'd have to rely on classes internal to the S3 SDK to do this, so I'm going to open an issue with them to see if they can provide a more explicitly supported way to achieve something like this., Attaching a proof-of-concept of my proposed solution. It still needs some polish and has the major drawback of depending on classes in com.amazonaws.services.s3.transfer.internal. It also has the major drawback of not working. It can work with more concurrent renames, but it would appear there isn't a simple division between 'control tasks' and 'sub tasks'. I had the control task pool fill up while the subtask pool was still empty, and it deadlocked. Things considered a control task can spawn other control tasks. I don't think tasks ever spawn other tasks of the same type, so I'm going to try just having another tier for the other control tasks. 
+
+There's also a question once all the other obstacles are out of the way, about how this gets configured. It's no longer a single pool of resources, yet it's configured that way. Maybe we have a rule of thumb that 20% of the threads are for control tasks, and the rest are for subtasks, or something along those lines?, This is an interesting problem.
+
+Now, one thing I don't understand. "rename with multipart uploads". copy doesn't, AFAIK, use upload bandwidth; it's just a PUT with an x-copy-from header. A call to s3a.rename() shouldn't be doing multipart uploads, just PUT calls whose duration is {{filesize/in-s3-bandwidth}}. Can you post/attach a stack trace of the blocked process to help clarify what's happening her?
+
+In HADOOP-13600, I'm setting up for parallel copy in rename...I was going to have a separate thread pool there just to allow for blocking COPY commands to not block, but sharing the same xfer manager. I think I'd need to hook this in somehow. I am cautious there of creating too many thread pools up front or support unbounded threadpools, as that has led to memory problems already; I'd been planning to have a v. low minimum thread count (1?), maxing out something else < the threadpool size
+
+
+From a quick look at the code, codewise, tests are pretty raw, production code less so. You do know that slf4J supports logs of the form {{LOG.info("logging {}", path)}} and the strings are only built up if the log is needed? It's a key benefit from adopting that API —lets us avoid the isDebugEnabled clauses., [~stevel@apache.org] I think Sean may have meant multi-part copies, which are allowed in S3: http://docs.aws.amazon.com/AmazonS3/latest/dev/CopyingObjctsUsingLLJavaMPUapi.html
+
+This is triggered inside the TransferManager if the files exceed a certain threshold, similar to the logic to trigger mutli-part uploads: https://github.com/aws/aws-sdk-java/blob/master/aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/transfer/internal/CopyCallable.java#L129, ah, that makes sense. I'll change the title. It's not expensive to have multiple copy parts on in progress; in constrast, multipart upload actually slows down the more parts are being uploaded at a time, as the bandwidth gets cut back. Here, the parallel copy of each part will in fact speed up large file rename relative to monolithic files, so should be encourage.
+
+changing the title of the JIRA, Mmmh, sorry,  I caused this when introducing the bounded pool to protect against OOM when streaming the upload from a memory buffer. To my defense, at time of implementation we were programming against aws-sdk 1.7.4 where the docs don't seem to mention this :( 
+
+The bounded threadpool blocks the clients (data producers) so memory usage is bounded. The TransferManager has built in throttling so they do not need this and advocate using an unbounded pool. However, the TransferManager does not offer functionality to do "block-based" uploads. So for S3ABlockOutputStream we need a different solution. The first thing that came to my mind was two threadpools (1 unbounded for TransferManager, 1 bounded for Block) which have a shared limit for number of active (uploading) threads but would like something simpler if possible. Have not yet studied [~mackrorysd]'s solution in detail, will have a look., {quote}tests are pretty raw, production code less so.{quote}
+
+Yeah, not remotely proposing this for inclusion yet - just a proof of concept. As I increased the number of parallel renames, I start hitting deadlocks again. I had a threadpool dedicated entirely to ControlMonitor tasks, and once that filled up it was deadlock. I guess this is because my executor gets wrapped by other executors that have a single queue, and if the next item is a ControlMonitor task and the ControlMonitor task pool is filled, then we're back to square one. Rather than getting wrapped in 2 other types of executors (to add the listening and blocking behavior, respectively) I think to make this work we would have to bring that logic inside my S3TransferExecutor class so that all tasks were immediately segregated by type as soon as they were handed off from the AWS SDK.
+
+I'll hold off until actually implementing that until there's more consensus on if that's even the right approach. My approach definitely increased the number of parallel operations you could get away with before hitting a deadlock, but until the entire executor chain does this it can't fix the core issue., I think we should accept an unbounded one for the TM, but track it via metrics, to keep an eye on what's happening, though this will have implications for the max #of http connections set in {{fs.s3a.connection.maximum}}, won't it?, Yes, that is set on the AmazonS3Client, which we use both for the TM as for our block uploads. The threadpools would share the connections, just as would let them share the number of active threads (as per my previous comment)., Interesting, did not know that about mutli-part uploads. In that case, we may want to consider separating the configuration of mutli-part uploads and multi-part copies, right now the S3AFileSystem sets the same threshold and part size for multi-part copies and uploads, they are both controlled by fs.s3a.multipart.size and fs.s3a.multipart.threshold, they're kept consistent for a reason, not just because it simplifies configuration in general.
+
+S3 stores separate parts in separate files; you should get better performance when reading parts separately; that is, for max speed you should set s3a  block size == upload partition size. By doing a copy with copy partition size == upload part size, we hope to preserve that performance on later reads. Who knows, maybe it will even help copy performance.
+
+what would be ideal would be to know the part size of an object; HADOOP-13261 proposed adding a custom header for this. However, time spent looking at split calculation performance has convinced me that a new header would be useless there; the overhead of querying the objects makes it too expensive. We could start uploading it though, and maybe use it for a copy. still expensive though; a 400mS HEAD would be about 2MB of copy bandwidth based on my (ad-hoc) measurements of copy B/W of 6 MB/s, Where are we with this? We're about to cut the 2.8 branch, and I can see this being something to get in, I can probably do a patch for the separate threadpools for TM and BlockOutputStream, probably by the end of the week... I like it - sounds like there's consensus on that approach., Thanks Steve for nominating this into 2.8. I put this issue on our 2.8 tracking list: https://cwiki.apache.org/confluence/display/HADOOP/Hadoop+2.8+Release. [~mackrorysd], I just assign this issue to you given you already contribute several patches on it., I think [~mackrorysd]'s implementation is heading in the right direction.
+
+Some questions / suggestions:
+* The {{controlTypes}} do not have a large memory and bandwidth impact as they carry little payload. Consequently, I think we can allow a lot of active threads here and the waiting room can be unbounded. I hope this would fix the issues [~mackrorysd] is still encountering. (In contrast to my earlier thinking above, I don't think the number of active threads needs to be shared between the two types, it seems unlikely that {{controlTypes}} will use significant resources) 
+* The {{subTaskTypes}} have the potential to overwhelm memory and bandwidth usage and should thus be run from the  bounded threadpool. We need to take care that all relevant classes are captured here.
+* I am not 100% sure if what I propose here would eliminate all deadlocks. I do not understand the deadlock scenario entirely (yet) from the discussion above. If you would have more insight please help me out., one thing to consider: now that we've gone to fast upload streams each with their own bounded queues, does the main queue need to be bounded at all? I guess we have to limit it by the size of the active connections.
+
+we know the big ones are PUT, PUT-PART, COPY and COPY-PART right? The puts are limited per stream; if that is locked down (todo: check those numbers), then there's no overload on memory unless there are many streams trying to write simultaneously.
+
+Copy could get the same treatment: we will need to throttle the number of active copy request across the entire FS. Which means the parallel renaming should share a blocking pool with all other threads trying to do copies
+
+Oh, and I'd like to submit async delete and simple zero-byte put operations somewhere, alongside any async parent directory check (goal: do the full parent treewalk on create(), but async and only validate the results before that first PUT). , For the sake of trying stuff out, attaching a patch that gives an unbounded ThreadPoolExecutor to the BlockingThreadPoolExecutorService, and the original unbounded one to everything else. All tests pass, including the new test that was previously able to induce a deadlock.
+
+I like [~Thomas Demoor]'s point about the control tasks not being memory intensive: having control tasks in an unbounded queue and not having to worry about them overwhelming resources too easily would solve the concern about how to make all these individual pools easily configurable. I'm fairly certain my original proposal would work more completely if rather than having 3 nested executors and only the inner-most one separating tasks into isolated pools, the outer-most executor immediately separated tasks into their own queues as well, and that would still need to be done, but there's still also the concern about relying on internal AWS APIs, which we should probably avoid., | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  1m  1s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  8m 59s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 18s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 24s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 20s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 26s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 14s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 10s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 9 new + 3 unchanged - 1 fixed = 12 total (was 4) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 20s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 15m 50s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | HADOOP-13826 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12842000/HADOOP-13826.003.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux bcdaecea4f3c 3.13.0-95-generic #142-Ubuntu SMP Fri Aug 12 17:00:09 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / ea2895f |
+| Default Java | 1.8.0_111 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11213/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11213/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11213/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, [~mackrorysd] your last patch seems simple but I think it might do the trick. I like simple solutions.
+
+{{putObject()}} uses the (unbounded) TransferManager, {{putObjectDirect()}}  and {{uploadPart()}} use the bounded threadpool so I think the (potentially) memory intensive parts are nicely isolated and under control.
+ 
+My only slight concern is that now both pools can have {{MAX_THREADS}} active. From my reading of the code, both threadpools cannot be doing large object PUTs at the same time (an instance of s3a uses the block-based uploads or the regular S3AOutputstream, never both at the same time). What is possible, is that during a large block-based upload, which is saturating the bounded executor, another client thread might {{rename}} a directory, invoking a lot of parallel copies, hence saturating the TransferManager. But copies are are not data-intensive (see below) so I assume this is manageable.
+
+I like [~stevel@apache.org]'s ideas for further separating out the different types of operations, but have one remark: for me COPY is not similar to PUT. COPY is completely server-side and is thus generally much less resource-intensive and much quicker than PUT (the smaller your bandwidth to S3, the bigger the difference becomes)., [~Thomas Demoor] Thanks. The more I think about it, the more I prefer .003 patch. I played around with my original approach (distinct resource pools for different types of tasks) today. I restructured it so tasks were segregated immediately upon being passed from TransferManager, instead of having layers of shared queues on top of them. Even then, control tasks were able to saturate their pool and deadlock it. But the unbounded pool you suggested fixed that problem - but wanting to avoid unbounded pools is my main concern with the .003 patch anyway.
+
+It's also still a bit kludgy trying to separate tasks based on internal Amazon APIs (which I griped about this morning: https://github.com/aws/aws-sdk-java/issues/939) and to a lesser extent when S3AFastOutputStream still causes tasks to be submitted to the executor wrapped in other types of Callable., Ok, I've sat down for a review. Like I said before, the test needs some work. BTW, {{S3AFastOutputStream}} is gone. Are you referring to {{S3ABlockOutputStream}}?
+
+h2. {{S3AFileSystem}} 
+
+Aren't there limits on the size of the AWS httpclient pool, or is there something I'm missing?
+
+
+h2. {{ITestConcurrentOps}} 
+
+This must be a subclass of {{AbstractS3ATestBase}}, so only run when {{-Dscale}} is set. This will automatically give it extended test timeout, and allow that timeout to be overridden in the config or on the maven command line.
+* Must use {{path(subpath)}} to get a unique path which works in parallel execution, rather than {{new Path("/ITestS3AManyFiles");}}
+* {{getRestrictedFileSystem}} can just go "5M" and "10M" when setting sizes
+* {{teardown()}} must check auxFS for being null, just in case something went wrong in setup.
+* Note you can use {{ContractTestUtils.dataset()}} to create a 1MB file; it writes in a range of values so it's easier to detect problems on reads. Not really needed here, but you should get into the habit of using those methods where possible.
+* {{testParallelRename}} must give the threads useful names. 
+* {{testParallelRename}} should use Callables, so any exceptions raised in threads can be raised by test runner. We don't want tests to go wrong and us not to notice.
+* If {{testParallelRename}} logs exceptions, it must use {{LOG.error()}}
+* {{testParallelRename}} must check that the dest files exist, and that the source ones don't. Otherwise, it's not actually verifying that the rename worked,
+only that a parallel series of operations completed.
+
+-{{{setup()}} should actually create the test files by uploading one and then (sequentially) copying it. Why? Gives you the S3 copy bandwidth, not the upload B/W, and parallelises better.- . We can't do that unless we expose an explicit COPY method in S3A FS. Something to consider for testing, maybe also the commit logic, though I don't see a need for that (I do want a rename-no-overwrite there tho')
+
+Ideally, I'd like that upload/copy to be  in the test itself, as the test runner will include its execution time in the test timings. It'd also be interesting to use {{ContractTestUtils.NanoTimer}} to time the copy operations, so we can get more stats on overall copy times. That's the setup copy calls, as well as the parallel ones., Also, we may want to think about allowing for progress callbacks on a copy, if they come in, and, in the tests, log@debug every MB. Good for understanding what's happening in long operations, bq. COPY is completely server-side and is thus generally much less resource-intensive
+
+Yes: it keeps TCP channel open, but consumes no bandwidth. In contrast, the more PUTs you have, the longer each one takes. This is why the Huge* tests all have to run sequentially. The new test here doesn't, but it still need to be a scale test to make it optional (it's still slow, doing big uploads, ...), Hi [~stevel@apache.org] and [~mackrorysd], how close are we to make on this jira? I am planning to kick off 2.8 RC soon (this weekend or early next week), so please let me know if we want this fix to fit the plan or can defer to our next release., I don't know were we are here; I've been offline
+, I'll rev the patch on Steve's last feedback. It would be nice to get this into 2.8 if it doesn't delay things., Attaching a patch that I believe addresses pretty much all your feedback. Not acting on the ideas about adding an explicit copy-only operation just yet, or the callbacks. I think that would be best addressed as a separate issue, independent of changing the resource pools?, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 11s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 13m 51s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 19s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 21s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 15s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 14s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 10s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 14 new + 3 unchanged - 1 fixed = 17 total (was 4) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 25s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 19m 53s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | HADOOP-13826 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12845660/HADOOP-13826.004.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 7e8e19764434 3.13.0-103-generic #150-Ubuntu SMP Thu Nov 24 10:34:17 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / a0a2761 |
+| Default Java | 1.8.0_111 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11366/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11366/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11366/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, thanks, I'll look at this now, Just pinging - it would be nice for this to get settled soon., thx for the reminder; forgotten that it was ready for review. Been laptopless for a week, so still recovering. I'll try for the end of the week, 
+Production code LGTM (mostly); test code needed some tweaking, though the core test algorithm is good
+
+Hence: HADOOP-13286 patch 005
+
+Production code
+* thread pool given a name
+* imports tweaked
+
+Test code:
+* moved test to org.apache.hadoop.fs.s3a.scale.ITestS3AConcurrentOps to emphasise scale nature & for s3a
+* all constant strings -> refs off Constants, to aid finding & avoid typos
+* timeout logic integrating with S3AScaleTestBase rules.
+* move off assert true/false to asserts with meaningful messages/error diagnostics
+* various other IDE-suggested cleanups of the test code
+
+Tested: S3a ireland @ scale.
+
+Once yetus is happy I'll put this in, (oops, hadn't pressed submit-patch. Done, now awaiting Yetus response), | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 16s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 24s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 19s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 19s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 27s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  1m  2s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 36s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 16s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 20s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 18s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  0m 18s{color} | {color:red} hadoop-tools_hadoop-aws-jdk1.8.0_121 with JDK v1.8.0_121 generated 1 new + 23 unchanged - 0 fixed = 24 total (was 23) {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 17s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  0m 17s{color} | {color:red} hadoop-tools_hadoop-aws-jdk1.7.0_121 with JDK v1.7.0_121 generated 1 new + 29 unchanged - 0 fixed = 30 total (was 29) {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 12s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 11 new + 8 unchanged - 0 fixed = 19 total (was 8) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 11s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 22s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 16s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 15m 55s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HADOOP-13826 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12853266/HADOOP-13206-branch-2-005.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux dc0937f0cdba 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 8a88e8e |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| javac | https://builds.apache.org/job/PreCommit-HADOOP-Build/11657/artifact/patchprocess/diff-compile-javac-hadoop-tools_hadoop-aws-jdk1.8.0_121.txt |
+| javac | https://builds.apache.org/job/PreCommit-HADOOP-Build/11657/artifact/patchprocess/diff-compile-javac-hadoop-tools_hadoop-aws-jdk1.7.0_121.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11657/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11657/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11657/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, javac warning seems legit; checkstyles are all about indentation in my modified test code. Will fix. And will look at (new) IDE indentation settings, Patch 006; me applying yetus feedback to the test code I'd changed., testing, s3 ireland, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 18s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 48s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 20s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 13s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 26s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 34s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 20s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 11s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 2 new + 8 unchanged - 0 fixed = 10 total (was 8) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 10s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 23s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 15m  5s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HADOOP-13826 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12853607/HADOOP-13826-branch-2-006.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 8038c3aee9e4 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 274c02d |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11662/artifact/patchprocess/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11662/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11662/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, patch 007: checkstyle corrections to test suite. Also patched up base pathname to match renamed test classname.
+
+There's still a warning about unchecked conversion of an array; I can't make that go away (even with an attempt to suppress it), so am going to ignore that complaint, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 21s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m  7s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 18s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 19s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 13s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 27s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 14s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 34s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 13s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 15s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 15s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 16s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 16s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 10s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 12s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 23s{color} | {color:green} hadoop-aws in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 15m 32s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HADOOP-13826 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12853763/HADOOP-13826-branch-2-007.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 261fe579bd01 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 00ca9f1 |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11674/testReport/ |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11674/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, OK, +1 to this
+
+While I'm tainted by tweaking the test code, I haven't gone near the production code, and yetus has kicked my changes into shape, committed; thanks for working on this Sean, SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #11283 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/11283/])
+HADOOP-13826. S3A Deadlock in multipart copy due to thread pool limits. (stevel: rev 2158496f6bed5f9d14751b82bd5d43b9fd786b95)
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/BlockingThreadPoolExecutorService.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+* (add) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/ITestS3AConcurrentOps.java
+]

@@ -1,0 +1,483 @@
+[Here's the recovery from the perspective of the NN:
+
+{code}
+2012-08-28 19:16:33,532 INFO org.apache.hadoop.hdfs.server.namenode.FSNamesystem: updatePipeline(block=BP-1507505631-172.29.97.196-1337120439433:blk_2632740624757457378_140581786, newGenerationStamp=140581806, newLength=44281856, newNodes=[172.29.97.219:50010], clientNam
+2012-08-28 19:16:33,597 INFO org.apache.hadoop.hdfs.server.namenode.FSNamesystem: updatePipeline(BP-1507505631-172.29.97.196-1337120439433:blk_2632740624757457378_140581786) successfully to BP-1507505631-172.29.97.196-1337120439433:blk_2632740624757457378_140581806
+{code}
+
+Here's the recovery from the perspective of the middle node:
+
+{code}
+2012-08-28 19:16:33,531 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Recovering replica ReplicaBeingWritten, blk_2632740624757457378_140581786, RBW
+  getNumBytes()     = 44867072
+  getBytesOnDisk()  = 44867072
+  getVisibleLength()= 44281856
+  getVolume()       = /data/2/dfs/dn/current
+  getBlockFile()    = /data/2/dfs/dn/current/BP-1507505631-172.29.97.196-1337120439433/current/rbw/blk_2632740624757457378
+  bytesAcked=44281856
+  bytesOnDisk=44867072
+{code}
+
+and then the later checksum exception from the block scanner:
+
+{code}
+2012-08-28 19:23:59,275 WARN org.apache.hadoop.hdfs.server.datanode.BlockPoolSliceScanner: Second Verification failed for BP-1507505631-172.29.97.196-1337120439433:blk_2632740624757457378_140581806
+org.apache.hadoop.fs.ChecksumException: Checksum failed at 44217344
+{code}
+
+Interestingly, the checksum exception noticed by the block scanner is less than the "acked length" seen at recovery time.
+
+On the node in question, I see a fair number of weird errors (page allocation failures etc) in the kernel log. So my guess is that the machine is borked and was silently corrupting memory in the middle of the pipeline. Hence, because the recovery kicked out the wrong node, it ended up persisting a corrupt version of the block instead of a good one., Just to brainstorm, here's one potential solution:
+- if the tail node in the pipeline detects a checksum error, then it returns a special error code back up the pipeline indicating this (rather than just disconnecting)
+- if a non-tail node receives this error code, then it immediately scans its own block on disk (from the beginning up through the last acked length). If it detects a corruption on its local copy, then it should assume that _it_ is the faulty one, rather than the downstream neighbor. If it detects no corruption, then the faulty node is either the downstream mirror or the network link between the two, and the current behavior is reasonable.
+
+Depending on the above, it would report back the errorIndex appropriately to the client, so that the correct faulty node is removed from the pipeline., This sounds like the symptom I mentioned in HDFS-3874. The tail node in the pipeline containing three detected a corruption, but it's report failed due to HDFS-3874 and it just went away. Since the last of the three in the pipeline just disappeared, the corrupt packet was acked with {SUCCESS, SUCCESS, FAIL}. So recreation of pipeline using the remaining two ended up containing the corrupt portion of data.
+
+bq. Depending on the above, it would report back the errorIndex appropriately to the client, so that the correct faulty node is removed from the pipeline.
+
+* This should cover the cases where a particular datanode corrupting data IF the client checksum and storage checksum method is identical.
+
+* If the two checksum methods are different, datanodes would have recalculated and wrote out data along with their own checksum. Even if incoming data was corrupt, it would appear okay on disk of these nodes. The tail node can detect corruption, but if it somehow terminates or get ignored, there is no retrospective scan that will tell us the integrity of the stored block, since the checksum may have been recreated to match the corrupted data.  Maybe we should force datanodes to verify checksum if the two checksums types are different.
+
+* Even if we don't have the above issue, a special handling is needed for the case where client is corrupting data. After recreating a pipeline, the same thing will repeat since client moves un-acked packets to its data queue and resend. Fail after trying twice? Or may be the client should do self integrity check of the packets in the ack queue if a corruption is present in the first datanode.
+
+* How will it work with reportBadBlocks() being called by the last node in the pipeline? The semantics of this method does not seem compatible with the blocks being actively written and could be recovered by calling recoverRbw().
+
+* Given all these issues, simply failing/abandoning block may be the easiest way out without missing any other possible corner cases.  This will be even more convincing if we have any evidence showing that client-side corruption is the most common cause. , bq. If the two checksum methods are different, datanodes would have recalculated and wrote out data along with their own checksum. Even if incoming data was corrupt, it would appear okay on disk of these nodes.
+
+It appears the checksum verification is already done if {{needsChecksumTranslation}} is true. There is one less thing to worry about. , Potential blocker for 2.0.3-alpha., I don't think calling reportBadBlocks() alone does any good. Without client knowing details of a corruption, it won't be able to recover the block properly. reportBadBlocks() during create is only useful when a corruption is confined to one replica. If we get the in-line corruption detection and recovery right, this call will not be needed during write operations.
+
+If the meaning of response in the data packet transfer is to be extended to cover packet corruption,
+
+* A tail node should not ACK until the checksum of a packet is verified. Currently, an ack is enqueued before verifying checksum, which in case of tail node causes immediate transmission of ACK/SUCCESS.
+
+* When the tail node is dropped from a pipeline, other nodes should not simply ack with success since that would mean checksum was okay on those nodes. 
+
+* The portions that were ACK'ed with SUCCESS are guaranteed to be not corrupt. To be precise, there can be corruption on disk due to local issues, but not in the data each datanode received. I.e. any on-disk corruption must be an isolated corruption, not caused by propagated corruption.
+
+For the second point, we could have datanodes to verify checksums when they lose the mirror node or explicitly get ACK/CORRUPTION. But this can be simplified if we can guarantee that no ACK/SUCCESS is sent back when a corruption is detected in the packet or the mirror node is lost. We can just drop the portion of data by not ACKing the corrupt packet or sending ACK/CORRUPTION back for it. I think client will redo the un-ACK'ed packet in this case. 
+
+The worst case is rewriting some packets. But advantage is simplicity and avoiding checksum verification of written data., The key is to prevent ACKing the corrupt packet. Data corruption can be avoided with this alone. For a better error-recovery, datanodes should return a specific error code to let client know. {{Status}} already has ERROR_CHECKSUM defined. I will have a patch ready soon., Thanks for looking into this, Kihwal. Your analysis makes sense to me.
+
+Arun - not sure this should be a blocker - while it's a nasty corruption issue, I don't think it's anything new. AFAIK the write pipeline has always had this issue since the ancient days, right? Or did the HDFS-265 rewrite end up changing the order of the ack send and the CRC verification?, bq. while it's a nasty corruption issue, I don't think it's anything new...
+I think its a good idea to keep this as blocker even if this issue is not a new one, given it is a corruption issue. Nicholas, any comments on if this applies to old pipeline vs new pipeline?, This looks like similar to HDFS-1595.
+
+Does the writer able to close the file successfully?  If yes, then it is a real data loss case caused by only one faulty datanode., > ... Nicholas, any comments on if this applies to old pipeline vs new pipeline?
+
+Both the old and the new pipelines should have the similar problem since, when machine A sends some data to machine B and it fails, it is generally impossible to detect whether A, B or the network is faulty.  Of course, we can detect it for some special cases such as one of the machine dead.
+
+> Potential blocker for 2.0.3-alpha.
+
+I would say that this is not a blocker for 2.0.3-alpha since this is not a regression., > Does the writer able to close the file successfully?
+Yes. In one case the corrupt block ended up in the middle of a file. Of course all replicas were corrupt, so when Nn tried to up the repl factor, all replicas got marked corrupt.
+
+I will post my patch for review, not for precomit build, although I ran all tests and only testBlockCorruptionRecoveryPolicy2 failed probably due to change in how corruption recovery works.  I haven't debugged it yet.  Please take a look and see if the approach seems reasonable., The attached patch is not a commit candidate. At minimum, there is a test breakage to be fixed., Two new patches for trunk are attached. The two has the identical implementation of the bug fix. One includes a test case and necessary changes to make the test work.  Since the test is a bit invasive, the no test version is also attached.
+
+The test simulates corruption during data transmission. It demonstrates the effectiveness of patch. Without the patch, corruption is detected much later after the data is written and acked, which makes recovery impossible.
+
+The patch for branch-0.23 requires a slightly different patch., I originally changed PipelineACK to return errors instead of making writer terminate. It generally worked, but some corner cases required a significant change in DFSOutputStream. So I decided to simplify and make it not send ACK-back on checksum errors and terminate as it would in case of any other error.  Local AckStatus is saved in each status tracking packet(not actual data packet), so that successful acks enqueued before checksum error still can be sent., Attaching patches for branch-0.23., Attaching slightly optimized trunk patches. , Again, the test is a bit invasive as it requires modification of DFSOutputStream. Nevertheless, it can effectively emulate data corruption during transmission and verify the patch works., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12555626/hdfs-3875.trunk.with.test.patch.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 3 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.TestReplaceDatanodeOnFailure
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/3585//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/3585//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/3585//console
+
+This message is automatically generated., There is something missing in the latest patch that was in the original. The test failure is caused by it. I will post updated the patch in a moment
+, Attaching updated patch. The missing part applies only to the trunk path, thus only updating the trunk version., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12555643/hdfs-3875.trunk.no.test.patch.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/3587//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/3587//console
+
+This message is automatically generated., kihwal, I will review the patch shortly and post comments by the evening., Hi Kihwal,
+
+In a client write pipeline, only the last datanode verifies checksum.  If there is a checksum error, we don't know what goes wrong.  It could be the cases that one of the datanodes is faulty or a network path is faulty.  So, the client must stop but cannot simply take out a datanode and continue.  Do you agree?
+
+In the patch, only the last datanode possibly reports checksum error.  If it does, all statuses in the ack become ERROR_CHECKSUM.  The approach seems reasonable.
+
+Some questions on the patch:
+- receivePacket() returns -1 for checksum error.  Why not throw an exception?  Returning -1 should mean exit normally.
+- The exception caught is not used below.  Should it re-throw the exception?
+{code}
++      if (shouldVerifyChecksum()) {
++        try {
++          verifyChunks(dataBuf, checksumBuf);
++        } catch (IOException e) {
++          // checksum error detected locally. there is no reason to continue.
++          if (responder != null) {
++            ((PacketResponder) responder.getRunnable()).enqueue(seqno,
++                lastPacketInBlock, offsetInBlock,
++                Status.ERROR_CHECKSUM);
++          }
++          // return without writing data.
++          checksumError = true;
++          return -1;
++        }
+{code}
+, Whether it returns or throws an exception the result is not very different. The packet responder will log the checksum error and initiate the shutdown. If an exception is thrown, datanode ends up logging much more with multiple stack traces. I thought clean termination of the writer (DataXceiver) thread is acceptable, since it is a controlled shutdown with a purpose and expected outcome, rather than a panic shutdown. If you think throwing exception makes more sense, I will update the patch., Also, checksumError is set true before returning, so receiveBlock() will actually end up throwing an exception. I experimented with receiveBlock() throwing an exception and also simply returning and they all worked fine. I thought you were refering to this. 
+
+To answer your question better, the occurance checksum error is already logged and the exception thrown in receiveBlock() will clearly show what happened. We could catch IOexception in receiveBlock(), check checksumError and rethrow. , If you have already well tested the patch.  I am okay with it.
+
+Suresh, any comment?, It took me a lot of time to review this code. BlockReceiver code is a poorly documented code. One of these days I will add some javadoc to make understanding the code and reviewing easier :-).
+
+Why do you have two variants of the patch - with and without tests?
+
+Comments for patch with no tests:
+# Comment against #checkSumError could have - "Indicates checksumError. When set block receiving and writing is stopped." It is better to initialize it to false than in the constructor.
+# #shouldVerifyChecksum() - could we describe the condition when checksum needs to be verified in javadoc? Along the lines - "Checksum verified in the following cases - 1. if the datanode is the last one in the pipeline with no mirrorOut. 2. If the block is being written by another datanode for replication. 3. If checksum translation is needed." There is some equivalent comment where shouldVerifyChecksum() is presently called. That comment can be removed.
+# receivePacket() returned -1 earlier when a block was completely written or length of packet received. Now it also returns -1 on checksum error. It would be good to add a javadoc to this method indicating returns -1.
+# receivePacket() - do you see it is a good idea to print warn/info level logs when returning -1 on checksum error or when checksumError is set to -1? This will help debugging these issues on each datanode in the pipeline using the logs. Given that these are rare errors it should not take up too much of log space.
+# Comment "If there is a checksum error, responder will shut it down". Can you please clairfy this comment saying "responder will shut itself and interrupt the receiver."
+# In #enqueue() - why is checksumError check in synchronized block. It can be outside right?
+, > The exception caught is not used below. ...
+
+Let's also change "boolean checksumError" to "IOException checksumException" so that it can record the actual exception.  We should also log it., The new patch addresses the review comments. {{checksumError}} is no more! Instead, exceptions are thrown and logged. So {{receivePacket()}} does not return -1 anymore on checksum error. The change in enqueue() has been removed since more ACKs won't be sent anyways when the threads are shutting down.
+
+Ran all HDFS tests with one failure in TestEditLog#testFuzzSequences, which is being fixed in HDFS-4282., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12559661/hdfs-3875.trunk.patch.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestStandbyCheckpoints
+                  org.apache.hadoop.hdfs.server.namenode.TestEditLog
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/3616//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/3616//console
+
+This message is automatically generated., Test failures are not caused by this patch. HDFS-4282, HDFS-3806, Attaching a slightly improved/simplified patch. , {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12560280/hdfs-3875.trunk.patch.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestStandbyCheckpoints
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithNodeGroup
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/3630//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/3630//console
+
+This message is automatically generated., Any update on this? Thanks., Kihwal? Todd?, Arun, I will review this in next two days., Thanks [~sureshms]! I'm looking to wrap up 2.0.3-alpha asap., Arun, I am removing the Blocker based on the input from Todd and Nicholas in the above comments. However, I have started reviewing this - so lets try to get this in 2.0.3-alpha., Kihwal, here is how I understand the new behavior. Correct me if I am wrong. In the following scenarios, client is writing in a pipeline to datanodes d1, d2 and d3. At each point in the pipeline the data is marked as corrupt or not.
+
+client(not corrupt) d1(not corrupt) d2(not corrupt) d3(corrupt)
+* d3 detects corrupt and reports CHECKSUM_ERROR ACK to d2
+* d2 does not verify checksum and hence status is SUCCESS, but receives CHECKSUM_ERROR and shutsdown
+* d1 does not verify checksum. Its status is SUCCESS + MIRROR_ERROR.
+
+Only d1 is considered to be valid copy even though d2 may not be corrupt.
+
+client(not corrupt) d1(not corrupt) d2(corrupt) d3(corrupt)
+* d3 detects corrupt and reports CHECKSUM_ERROR ACK to d2
+* d2 does not verify checksum and hence status is SUCCESS, but receives CHECKSUM_ERROR and shutsdown
+* d1 does not verify checksum. Its status is SUCCESS + MIRROR_ERROR.
+
+Only d1 is considered to be valid copy.
+
+client(not corrupt) d1(corrupt) d2(corrupt) d3(corrupt)
+* d3 detects corrupt and reports CHECKSUM_ERROR ACK to d2
+* d2 does not verify checksum and hence status is SUCCESS, but receives CHECKSUM_ERROR and shutsdown
+* _d1 does not verify checksum. Its status is SUCCESS + MIRROR_ERROR._
+
+d1 is still considered a valid coyp. Is this correct?
+
+client(corrupt) d1(corrupt) d2(corrupt) d3(corrupt)
+* d3 detects corrupt and reports CHECKSUM_ERROR ACK to d2
+* d2 does not verify checksum and hence status is SUCCESS, but receives CHECKSUM_ERROR and shutsdown
+* d1 does not verify checksum. Its status is SUCCESS + MIRROR_ERROR.
+
+d1 is still considered a valid copy.
+
+In all the above cases whether a node detects checksum error or the downstream detects checksum error the results appears the same to the upstream nodes (as mirror error). Is that what you intended?
+, Had an offline conversation with Kihwal. Here is one of the above scenarios in more detail (thanks Kihwal for explaining the current behavior).
+
+Client(not corrupt) d1(not corrupt) d2(not corrupt) d3(corrupt), where d3 for some reason sees only corrupt data.
+* d3 detects corruption and reports CHECKSUM_ERROR ACK to d2. Packet is not written to the disk on d3.
+* d2 does not verify checksum and hence status is SUCCESS, but receives CHECKSUM_ERROR and shutsdown
+* d1 does not verify checksum. Its status is {SUCCESS, MIRROR_ERROR}
+* client establishes the pipeline with d1 and d3 and sends the packet again.
+* d3 detects corruption again and reports CHECKSUM_ERROR ACK to d1. Packet is not written to the disk on d3.
+* d1 does not verify checksum and hence status is SUCCESS, but receives CHECKSUM_ERROR and shutsdown
+* client establishes the pipeline with d3 and sends the packet again.
+* d3 detects corruption again and reports CHECKSUM_ERROR ACK to d1. Packet is not written to the disk on d3.
+* Client fails to write the packet and abandons writing the file? 
+
+The current behavior picks the node that sees corruption (or is corrupting the data) repeatedly in pipeline recovery (d3 above). Also the node that did not see corruption gets dropped from the pipeline. If a datanode performs checksum verification when it gets a down stream datanode reporting checksum error should avoid this. With this, new recovered pipleline will recover the pipeline up to the point of corruption in the pipeline.
+
+Kihwal, add comments if I missed some thing., Sorry for getting back to this so late and thank you Suresh for the feedback.
+
+It made me think more about the non-leaf nodes in a pipeline. If the leaf node disappears from the pipeline before reporting checksum error and recoverRbw() is done, we can end up with latent checksum error in the block. This is because datanodes won't discard already written data on pipeline recovery.  It looks like we have to make recoverRbw() to truncate blocks to the acked size to be really safe.
+
+Also, client should give up after certain number of pipeline reconstructions for the same block., The new patch forces datanodes to truncate the block being recovered to the acked length.  Since the nodes in the middle of write pipeline does not perform checksum verification and writes data to disk before getting ack back from downstream, the unacked portion can contain corrupt data. If the last node simply disappears before reporting a checksum error up, the current pipeline recovery mechanism can overlook the corruption in written data.
+
+Since this truncation discards potentially corrupt portion of block, we do not need any explicit checksum re-verification on checksum error.
+
+Another new feature added to the latest patch is to terminate hdfs client when pipeline recovery is attempted for more than 5 times while writing the same data packet. This likely indicates the source data is corrupt.  In a very small cluster, clients may run out of datanodes and fail before retrying 5 times., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12572398/hdfs-3875.patch.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 tests included appear to have a timeout.{color}
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4044//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4044//console
+
+This message is automatically generated., Could this be targeted for 2.0.5 release? We are seeing this exact same issue on one of our clusters. We are running hadoop-2.0.3-alpha release. , Suresh, Todd,  Any comments on the latest patch?  I am hoping to get this committed soon for 23.8, Sorry, I have been meaning to look at this. But have not been able to spend time. Will review before the end of the day. 
+
+
+, [~kihwal] the new solutions looks much better. Nice work!
+
+Some minor comments. +1 with those addressed:
+# DFSOutputStream.java
+#* Initialize lastAckedSeqnoBeforeFailure to appropriate value. lastAckedSeqNo is initialized to -1.
+#* Change info log, print warn? Instead of "Already tried 5 times" -> "Already retried 5 times", given total attempts are 6 and retries are 5.
+# DFSClientFaultInjecto#uncorruptPacket() - does it need to throw IOException?
+, Thanks for the review, Suresh. The latest patch addresses all review comments., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12583835/hdfs-3875.patch.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4416//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4416//console
+
+This message is automatically generated., +1 for the patch
+
+
+, Sorry it took me some time to get to this. A couple small questions below:
+
+{code}
++              // Wait until the responder sends back the response
++              // and interrupt this thread.
++              Thread.sleep(3000);
+{code}
+Can you explain this sleep here a little further? The assumption is that the responder will come back and interrupt the streamer? Why do we need to wait instead of just bailing out immediately with the IOE? Will this cause a 3-second delay in re-establishing the pipeline again?
+
+----
+{code}
++        // If the mirror has reported that it received a corrupt packet,
++        // do self-destruct to mark myself bad, instead of making the 
++        // mirror node bad. The mirror is guaranteed to be good without
++        // corrupt data on disk.
+{code}
+
+What if the issue is on the receiving NIC of the downstream node? In this case, it would be kept around in the next pipeline and likely cause an exception again, right?
+
+----
+{code}
++      // corrupt the date for testing.
+{code}
+typo: date, bq. Can you explain this sleep here a little further? The assumption is that the responder will come back and interrupt the streamer? Why do we need to wait instead of just bailing out immediately with the IOE? Will this cause a 3-second delay in re-establishing the pipeline again?
+
+This gives the responder time to send the checksum error back upstream, so that the upstream node can blow up and exclude itself from the pipeline. This may not be always ideal since there can be many different failure modes, but if anything needs to be eliminated without knowing the cause, the source seems to be a better candidate than the sink who actually verifies checksum.
+
+Unless there is network issue in sending ACKs, responder will immediately terminate and interrupt the main writer thread, so the thread won't stay up. Even if the thread stays up for some reason, recoverRbw() during pipeline recovery will interrupt the thread, so there won't be 3 second delay.
+
+If the last node in a pipeline has a faulty NIC, two upstream nodes will be eliminated (in 3 replica case) and after adding a new dn to the end of pipeline, the faulty node will be removed. Issues on intermediate nodes will be handled in less number of iterations and the worst case will be when data is corrupt in DFSOutputStream, which will be detected after hitting the maximum number of retries. There will be no recovery in this case., The BlockReceiver in branch-2 seems to be in between 0.23 and trunk. Adding patch for branch-2 as well.  The new trunk patch corrects the typo in the comment., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12583880/hdfs-3875.patch.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4417//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4417//console
+
+This message is automatically generated., OK, thanks for the explanations. +1 from me., I've committed this to trunk, branch-2 and branch-0.23.
+Thanks everybody for the reviews., Integrated in Hadoop-trunk-Commit #3771 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/3771/])
+    HDFS-3875. Issue handling checksum errors in write pipeline. Contributed by Kihwal Lee. (Revision 1484808)
+
+     Result = SUCCESS
+kihwal : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1484808
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestCrcCorruption.java
+, Integrated in Hadoop-Yarn-trunk #217 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/217/])
+    HDFS-3875. Issue handling checksum errors in write pipeline. Contributed by Kihwal Lee. (Revision 1484808)
+
+     Result = FAILURE
+kihwal : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1484808
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestCrcCorruption.java
+, Integrated in Hadoop-Hdfs-0.23-Build #615 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/615/])
+    HDFS-3875. Issue handling checksum errors in write pipeline. Contributed by Kihwal Lee. (Revision 1484811)
+
+     Result = SUCCESS
+kihwal : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1484811
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/FSDataset.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestCrcCorruption.java
+, Integrated in Hadoop-Hdfs-trunk #1406 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1406/])
+    HDFS-3875. Issue handling checksum errors in write pipeline. Contributed by Kihwal Lee. (Revision 1484808)
+
+     Result = FAILURE
+kihwal : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1484808
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestCrcCorruption.java
+, Integrated in Hadoop-Mapreduce-trunk #1433 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1433/])
+    HDFS-3875. Issue handling checksum errors in write pipeline. Contributed by Kihwal Lee. (Revision 1484808)
+
+     Result = SUCCESS
+kihwal : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1484808
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClientFaultInjector.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestCrcCorruption.java
+, HI [~kihwal],
+
+Thanks for your earlier work for this issue. We are seeing a similar problem like this though we have this patch. One question about this patch:
+
+Assuming we have a pipeline of three DNs, DN1, DN2, and DN3. DN3 detects a checksum error, and reports back to  DN2. DN2 decided to truncate its replica to the acknowledged size by calling {{static private void truncateBlock(File blockFile, File metaFile,}} which reads the data from the local replica file, calculate the checksum for the length to be truncated to, and write the checksum back to the meta file. 
+
+My question is, when writing back the checksum to the meta file, this method doesn't check against an already computed checksum to see if it matches. However, DN3 does check its computed checksum against the checksum sent from upstream of the pipeline when reporting the checksum mismatch. If DN2 got something wrong in the truncateBlock method (say, for some reason the existing data is corrupted), then DN2 has incorrect cheksum and it's not aware of it. Then later when we try to recover the pipeline, and use DN2 replica as the source, the new DN that receives data from the DN2 will always find checksum error.
+
+This is my speculation so far. Do you think this is a possibility? 
+
+Thanks a lot.
+
+, Hi [~kihwal], I filed HDFS-6937 to track the similar issue I'm seeing, so we can continue the discussion there. Thanks.
+
+
+]

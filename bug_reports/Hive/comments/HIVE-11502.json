@@ -1,0 +1,192 @@
+[It is a regression, I ran the query in 0.13.1 version with hive.map.aggr is true, it finished in 20 seconds.
+In the master branch, the major time spend in following stack.
+{noformat}
+HashMap<K,V>.getEntry(Object) line: 465	
+HashMap<K,V>.get(Object) line: 417	
+PrimitiveObjectInspectorUtils.getTypeEntryFromTypeName(String) line: 373	
+PrimitiveTypeInfo.getPrimitiveTypeEntry() line: 85	
+PrimitiveTypeInfo.getPrimitiveCategory() line: 63	
+WritableDoubleObjectInspector(AbstractPrimitiveObjectInspector).getPrimitiveCategory() line: 58	
+ObjectInspectorUtils.compare(Object, ObjectInspector, Object, ObjectInspector, MapEqualComparer) line: 694	
+ObjectInspectorUtils.compare(Object, ObjectInspector, Object, ObjectInspector) line: 668	
+ListObjectsEqualComparer$FieldComparer.areEqual(Object, Object) line: 127	
+ListObjectsEqualComparer.areEqual(Object[], Object[]) line: 172	
+KeyWrapperFactory$ListKeyWrapper.equals(Object) line: 101	
+HashMap<K,V>.getEntry(Object) line: 467	
+HashMap<K,V>.get(Object) line: 417	
+GroupByOperator.processHashAggr(Object, ObjectInspector, KeyWrapper) line: 777	
+GroupByOperator.processKey(Object, ObjectInspector) line: 693	
+GroupByOperator.process(Object, int) line: 761	
+SelectOperator(Operator<T>).forward(Object, ObjectInspector) line: 837	
+SelectOperator.process(Object, int) line: 88	
+TableScanOperator(Operator<T>).forward(Object, ObjectInspector) line: 837	
+TableScanOperator.process(Object, int) line: 97	
+MapOperator$MapOpCtx.forward(Object) line: 162	
+MapOperator.process(Writable) line: 508	
+ExecMapper.map(Object, Object, OutputCollector, Reporter) line: 163	
+{noformat}
+It seems that heavily used PrimitiveObjectInspectorUtils.getTypeEntryFromTypeName(String) slows down the query. So I change the code to store the PrimitiveTypeEntry as instance variable in PrimitiveTypeInfo. This does improve  the performance a lot, now the query can finish in 1 hour. But it is still very slow.
+I checked 0.13.1 code, it uses Hashmap too, but much much faster. 
+I do not know why the HashMap search is so slow in master branch(and 1.1 or later version). 
+, Seems like that the new version of Hive introduced KeyWrapperFactory which wraps keys for HashMap so that all kinds of objects can be used as HashMap keys.  This should not be necessary if the key objects are already capable of being HashMap keys (like Java Primitive Objects and Writable Objects) where hashVode() and equals() are well , Confirmed that only double type has regression.  For other types (such as int, bigint, float) used as group by column, there is no performance regression in map side aggregation.  , [~ychena]: I've linked the issue to the known issue in HADOOP-12217
+
+Is it possible that you're testing hive against different versions of Hadoop between 0.13 vs 1.2.?, [~gopalv], I checked the related hadoop code between two versions used by 0.13 and 1.2, there is no change in hadoop side for DoubleWritable. 
+I think the regression may relate to HIVE-7041 which switch from using hive's own DoubleWritable to hadoop's . But just revert the change cause exceptions, I am still looking at it. , A custom hashcode can be used internal to Hive (i.e group-by etc), but not externally to hive (bucketing into HDFS, results of hash() functions).
+
+Because that would break external assumptions in a non-backwards-compatible way.
+
+The reason shuffle + merge is more uniform is because it starts using [murmur hashes|https://github.com/apache/hive/blob/master/ql/src/java/org/apache/hadoop/hive/ql/exec/ReduceSinkOperator.java#L366] for UNIFORM trait RS instead of the builtin writable hash funcs (which are skewed).
+
+You will probably notice that using a vectorized input format like ORC would not have the issue you're hitting, since the vector transform inside the operator pipeline gives hive the opportunity to use per-operator specific optimizations., [~gopalv], I have confirmed that HIVE-7041 caused the regression. Because the hadoop bug is there for a long time, after hive switch to use hadoop's hashcode, we got hadoop's bug. Thanks for find the root cause by pointing the hadoop bug.
+
+After I add code in serde/src/java/org/apache/hadoop/hive/serde2/io/DoubleWritable.java
+{noformat}
+   @Override
+   public int hashCode() {
+     long v = Double.doubleToLongBits(super.get());
+     return (int) (v ^ (v >>> 32));
+   }
+{noformat}
+The group by query can finish in 15 seconds. 
+
+So next step is, how do we fix the issue now? 
+, bq. So next step is, how do we fix the issue now?
+
+Easiest would be to use vectorization, which doesn't need any Writables in the inner loop.
+
+The vector hashcode for doubles would automatically be very similar to your impl (from Arrays.hashCode(double[]))
+
+{code}
+....
+        for (double element : a) {
+            long bits = Double.doubleToLongBits(element);
+            result = 31 * result + (int)(bits ^ (bits >>> 32));
+        }
+        return result;
+{code}, [~gopalv], thanks for the workaround. But I am afraid some users do not want to change their input format. And this HashMap may affect mapjoin too. We help a user workaround this map side aggregation issue by set hive.map.aggr = false; After that, the simple group test case has very good performance, but a more complicated join query with group by as subquery stuck on mapjoin. So we have to let the user turn off mapjoin by set hive.auto.convert.join=false;  The performance hit by this bug is really outstanding. Without workaround, none of the query can finish in several hours. So I think we have to fix it. , Could we tell when it is for internal use? Could we assume such class as LazyDouble used only in internal hive?  Attach a test patch to see what the side-effect it is. , 
+
+{color:red}Overall{color}: -1 at least one tests failed
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12749876/HIVE-11502.1.patch
+
+{color:red}ERROR:{color} -1 due to 1 failed/errored test(s), 9348 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hive.hcatalog.streaming.TestStreaming.testTransactionBatchEmptyCommit
+{noformat}
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/4925/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/4925/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-TRUNK-Build-4925/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 1 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12749876 - PreCommit-HIVE-TRUNK-Build, The failure is not related:
+org.apache.hive.hcatalog.streaming.TestStreaming.testTransactionBatchEmptyCommit
+Table/View 'TXNS' already exists in Schema 'APP'
+
+[~gopalv], could you review the patch and check if the change is safe to use? 
+
+, The basic idea of the fix is in LazyDouble, I separate hashcode for internal use from hashcode for hdfs.
+The aggregation hashmap use LazyDouble, and I think hadoop use the value by DoubleWritable object which is an instance variable in
+LazyDouble (data). The change let LazyDouble calculate its own hashcode instead of blindly use data's. 
+I do not see risk here. You can assume the LazyDouble as a vectorized object which only has one element in it.
+Please correct me, if you find anything is not right. 
+Thanks, bq. I do not see risk here. You can assume the LazyDouble as a vectorized object which only has one element in it.
+
+Changing a hashcode of an actual type breaks bucketed joins - the lhs & rhs of the join has to use the exact same hashcode.
+
+Vectorization overrides that inside VectorHashKeyWrapper, which serves as a model for this fix.
+
+The new hash computation needs to only go in place of the Arrays.hashCode() in the ListKeyWrapper - so that the only exposure to the uniform hashCode is within map-side aggregation., [~gopalv], thanks for your advice. Attach second patch. , 
+
+{color:red}Overall{color}: -1 at least one tests failed
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12750428/HIVE-11502.2.patch
+
+{color:red}ERROR:{color} -1 due to 1 failed/errored test(s), 9357 tests executed
+*Failed tests:*
+{noformat}
+TestDummy - did not produce a TEST-*.xml file
+{noformat}
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/4962/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/4962/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-TRUNK-Build-4962/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 1 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12750428 - PreCommit-HIVE-TRUNK-Build, The TestDummy failure is not related:
+
+It failed because of FileNotFoundException:    
+[exec] + javac -cp /home/hiveptest/54.147.251.176-hiveptest-2/maven/org/apache/hive/hive-exec/2.0.0-SNAPSHOT/hive-exec-2.0.0-SNAPSHOT.jar /tmp/UDFExampleAdd.java -d /tmp
+     [exec] + jar -cf /tmp/udfexampleadd-1.0.jar -C /tmp UDFExampleAdd.class
+     [exec] java.io.FileNotFoundException: /tmp/UDFExampleAdd.class (No such file or directory)
+     [exec] 	at java.io.FileInputStream.open(Native Method)
+     [exec] 	at java.io.FileInputStream.<init>(FileInputStream.java:146)
+     [exec] 	at sun.tools.jar.Main.copy(Main.java:791)
+     [exec] 	at sun.tools.jar.Main.addFile(Main.java:740)
+     [exec] 	at sun.tools.jar.Main.create(Main.java:491)
+     [exec] 	at sun.tools.jar.Main.run(Main.java:201)
+     [exec] 	at sun.tools.jar.Main.main(Main.java:1177)
+, LGTM +1.
+Can you remove the extra line in the else branch? We don't need to rerun the test for this change., Thanks [~csun] for reviewing the change, I attached patch 3 to remove the extra line. , 
+
+{color:red}Overall{color}: -1 at least one tests failed
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12751070/HIVE-11502.3.patch
+
+{color:red}ERROR:{color} -1 due to 1 failed/errored test(s), 9370 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver_vectorized_parquet_types
+{noformat}
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/5002/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/5002/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-TRUNK-Build-5002/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 1 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12751070 - PreCommit-HIVE-TRUNK-Build, The vectorized_parquet_types failure is not related.
+It is just random failure caused by data precision. 
+
+< 1	121	1	8	1.1749999970197678	2.062159062730128	90.33
+---
+> 1	121	1	8	1.1749999970197678	2.0621590627301285	90.33
+378c378
+< 3	120	1	7	1.171428578240531	1.8	90.21
+---
+> 3	120	1	7	1.171428578240531	1.7999999999999996	90.21
+
+Same test passed on my local machine.
+
+
+, For my understanding, it's interesting to know why changing in ListKeyWrapper's hashcode solves the problem. I originally thought the problem is with hashcode for DoubleWritable. Any explanation would be appreciated., [~xuefuz], for GroupBy's aggregate hashmap uses ListKeyWrapper as key, so it uses the ListKey's hashcode. The HashMap does not directly use DoubleWritable's hashcode, so we can play in between. And it is safe too: The ListKeyWrapper is only used by groupby, so it is only used  internal to hive. , Committed to master and branch-1. Thanks Yongzhi!]

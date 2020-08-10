@@ -1,0 +1,111 @@
+[Reproduce the issue in CDH by canceling a query after compile query and acquire locks and just before the job is really submitted to yarn. 
+
+Fix it by:
+1. Try to cancel query gracefully by removing some interrupting threads code. 
+2. When thread is interrupted when releasing locks, it will retry once. , 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12855667/HIVE-15997.1.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 10 failed/errored test(s), 10281 tests executed
+*Failed tests:*
+{noformat}
+TestCommandProcessorFactory - did not produce a TEST-*.xml file (likely timed out) (batchId=272)
+TestDbTxnManager - did not produce a TEST-*.xml file (likely timed out) (batchId=272)
+TestDummyTxnManager - did not produce a TEST-*.xml file (likely timed out) (batchId=272)
+TestHiveInputSplitComparator - did not produce a TEST-*.xml file (likely timed out) (batchId=272)
+TestIndexType - did not produce a TEST-*.xml file (likely timed out) (batchId=272)
+TestSplitFilter - did not produce a TEST-*.xml file (likely timed out) (batchId=272)
+org.apache.hadoop.hive.cli.TestBeeLineDriver.testCliDriver[escape_comments] (batchId=229)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[schema_evol_text_vec_table] (batchId=147)
+org.apache.hadoop.hive.cli.TestSparkCliDriver.testCliDriver[vector_between_in] (batchId=119)
+org.apache.hadoop.hive.cli.TestSparkNegativeCliDriver.org.apache.hadoop.hive.cli.TestSparkNegativeCliDriver (batchId=231)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/3899/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/3899/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-3899/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 10 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12855667 - PreCommit-HIVE-Build, The failures are not related.
+[~ctang.ma], could you review the change?  Thanks, Will TezTask be affected as well? Also I am not quite sure about this, for the code like this:
+{code}      
+try {
+        curatorFramework.delete().forPath(zLock.getPath());
+      } catch (InterruptedException ie) {
+        curatorFramework.delete().forPath(zLock.getPath());
+      }
+{code}
+catching InterruptedException will guarantee to clear the interrupted flag in the thread and calling the method second time will guarantee to succeed?
+, [~ctang.ma]
+Remove Thread.currentThread().interrupt(); from isInterrupted()  is just to avoid setting the interrupted flag too early and many times. The Tasks will be stopped by DriverContext's shutdown() method.  The method will call  thread.interrupt();  So TezTask will not affect by the change, and the queries use the TezTask can benefit with the change. 
+Other changes in ExecDriver may speed up query response time for cancelling when running with MR. 
+
+For ZooKeeper catch InterruptedException:
+When the InterruptedException is thrown, the thread is already interrupted. It should not be interrupted again. As to my tests, the second time succeed. That mean, when the InterruptedExcetion is thrown for this zookeeper case, the interrupted status is cleared. 
+
+
+
+, LGTM, +1, Push the fix into master. Thanks [~ctang.ma] for reviewing the code. , Hi [~ychena]/[~ctang.ma], Thanks for looking into this. I'm trying to understand the patch, as I'm reviewing HIVE-16552, which refers to this JIRA. Specifically, I don't quite understand the following code addtion:
+{code}
+       rj = jc.submitJob(job);
++
++      if (driverContext.isShutdown()) {
++        LOG.warn("Task was cancelled");
++        if (rj != null) {
++          rj.killJob();
++          rj = null;
++        }
++        return 5;
++      }
++
+       this.jobID = rj.getJobID();
+{code}
+I understand we are checking if query is cancelled right after submission. However, my question is whether this check is necessary or complete as right after this check the query can become cancelled, which the check will not capture. If such cancellation is captured later in other code path, then the check here seems not necessary. Otherwise, this check will not capture all scenarios.
+
+Did I miss anything? Thanks., The shutdown will check the running list and shutdown each task in the list, shutdown on the task will stop the query because of failed task. But there are some chances the task is removed from the list(finished for example) when the shutdown happens. Add the if (driverContext.isShutdown()) may help this scenario. Even if later we can catch the cancel, it is the most prompt one. And if (driverContext.isShutdown()) check is not expensive call, so I think it is OK to have the check. 
+{noformat}
+ /**
+   * Cleans up remaining tasks in case of failure
+   */
+  public synchronized void shutdown() {
+    LOG.debug("Shutting down query " + ctx.getCmd());
+    shutdown = true;
+    for (TaskRunner runner : running) {
+      if (runner.isRunning()) {
+        Task<?> task = runner.getTask();
+        LOG.warn("Shutting down task : " + task);
+        try {
+          task.shutdown();
+        } catch (Exception e) {
+          console.printError("Exception on shutting down task " + task.getId() + ": " + e);
+        }
+        Thread thread = runner.getRunner();
+        if (thread != null) {
+          thread.interrupt();
+        }
+      }
+    }
+    running.clear();
+  }
+{noformat}, [~ychena], Thanks for the explanation. I wasn't questioning the code change. Rather, I was trying to understand whether the solution is complete. That is, is it possible to leak resources with the patch when a query is cancelled. You seemed suggesting the second check is nice to have, but I really like to know what part of code change fixed the root cause of the resource leak problem. Any further thoughts? Thanks., 657	      if (lDrvState.driverState == DriverState.INTERRUPT) {	657	      if (lDrvState.driverState == DriverState.INTERRUPT) {
+658	        Thread.currentThread().interrupt();		
+659	        return true;	658	        return true;
+
+Remove Thread.currentThread().interrupt();	 // can solve some of the resource leaks (depend on the cancel time), it let the query closed gracefully instead of being interrupted during files clean up. 
+And 
+The fixes in zookeeper code can fix the lock leaks in my test case. 
+
+, Thanks for the explanation, [~ychena]. One more question: which part of the code was handling the InterruptedException that Thread.currentThread().interrupt() throws? I was wondering if there is any side-effect after the thrower is removed. Thanks., This interrupt() in our code can cause InterruptedException when the code is doing(or is scheduled to do) hdfs file operations or zookeeper lock operations. For we do not have many long single file operations or long single lock operations, but we do have many fast operations, the performance of cancel operation will not affect by adding checkpoints . I found that the thread interrupt() has no effect for some running operations: for example I tried to interrupt HMS client who is waiting for a response of a long running API (for example ListPartitions), the interrupt can not stop the waiting at all. And the interrupt has some "delay effect", it causes InterruptedException later (for example when the cleanup folder operations happen.) So we should not put the Thread.currentThread().interrupt() in the heavily used method isInterrupted().  if, in the future, we find the place the interrupt() is really needed, we can just add the code there. ]

@@ -1,0 +1,1653 @@
+[[~leftnoteasy], Request you to share your thoughts and comments on a possible fix., Thanks [~kshukla] reporting this issue.
+
+I think this problem could be resolved if preemption is enabled. For clusters disabled preemption, I think maybe relax the check of parent queue's max capacity is one solution. Currently reservation happens only if parentQueue.used + reserved <= parentQueue.max. We can relax this check to: parentQueue.used < parentQueue.max. However, this could have other impacts such as total-reserved + total-allocated > total-used., I also thought originally that relaxing the queue max cap check could resolve the problem, but that can also create new ones besides the reserved+allocated > total issue.  The problem is that reservations are intended to become actual containers.  If the resources to satisfy the reservation come from the queue where the reservation took place then we're fine.  However if the resources to satisfy the reservation came from a peer queue then suddenly we're running the queue over max capacity and violating constraints even without any outstanding reservations at that point., Thanks for sharing thoughts, [~jlowe]. Agree, and this requires to do resource limit check for reserved container also, and CS may need to allocate reserved container from top to bottom instead of going to leaf queue directly. I'm fine with this approach. Any suggestions?, It's a sticky problem.  The problem with doing the resource check is that it can prevent the reservation from being fulfilled indefinitely.  For example, consider a situation like this:
+* root queue (near 100% utilization)
+** parent queue P (near max capacity)
+*** leaf queue A (well under capacity)
+*** leaf queue B (almost all of P's utilization)
+** leaf queue C (the remainder of root - P)
+
+We have an application X in queue A that needs a large resource.  If we do a limit check against P's max capacity or the root's max capacity, it won't fit.  If we don't make the reservation, then the app in A could be indefinitely postponed.  So let's say we go ahead and let the reservation occur.  If the resource to fill that reservation was freed from within the P queue hierarchy then we're OK.  If it's not, then we cannot fulfill the reservation otherwise we run over P's max capacity.  So in the latter case, do we leave the reservation?  Does this in turn prevent apps in C from making progress because app X's reservations start locking down the cluster, waiting for the apps in queue B to free up resources?
+
+Offhand I don't have a great answer for how to tackle the problem.  Seems like either we need to start locking down parts of the cluster and potentially leave resources fallow, even for other queues outside of P, to make sure app X will eventually get something or we keep app X from reserving and leave it vulnerable to indefinite postponement despite containers churning in queue B.  It's like we need to make a reservation _within_ the P queue hierarchy for this scenario, to make sure queue B isn't allowed to grab more resources while app X is waiting, but not sure that's right either.
+, [~jlowe], agree, this is a hard problem to solve, allowing reservation beyond queue's max capacity may bring more problems. As I mentioned above, maybe preemption is one solution, preemption's target is to make under utilized queue can eventually get something. We can minimize its side effect by tuning its parameters. (Such as reduce number of containers preempted each round, and disable preemption for some critical queues, etc.), I'm not thrilled with the idea of preemption to solve this issue.  Nothing should have to be shot (i.e.: work lost) to solve this problem.  The real issue is that we are _not_ placing a reservation and allowing further containers to be allocated.
+
+To really solve it without resorting to shooting containers we need to allow reservations to exceed the cluster or queue capacity.  As a user I should be able to reserve up to my user limit, which already happens today as long as the queue/cluster limit isn't hit.  If we just allowed a reservation of at least one container beyond the cluster/queue limit (as long as it's below the user-limit) then the application would make progress and it should solve this particular issue.  Yes, this would mean that used + reserved could be > total capacity, but without it we are allowing apps to starve indefinitely., [~jlowe],
+
+Agree, and actually even after enable preemption, sometimes reservation cannot happen because of this issue:
+
+For example.
+- At time T1, if scheduler selects two containers (c1, c2) from Q1 to be preempted, which will be preempted at T1 + 10secs (assume kill-wait is 10 sec).
+- At time T1 + 5 sec, AM releases C2 itself, and scheduler allocate the resource to Q1.
+- At the same time (T1 + 5 sec), preemption policy selects new set of containers to be preempt, assume they’re c1 and c3, C1 will be preempted at T1 + 10 sec (not changed), and C3 will be preempt at T1 + 15 sec.
+- At time T1 + 10 sec, scheduler kill C1, and it allocates the resource back to Q1.
+- At the same time (T1 + 10 sec), preemption policy selects new set of containers to be preempt, assume they’re c3 and c4, c3 will be preempted at T1 + 15 sec, and c4 will be preempted at T1 + 20 sec.
+- Scheduler could repeat preempting containers, but all of preempted resources come back to Q1 because of YARN-4280.
+
+I have considered solving this issue for a while. The problem of allowing one container reserved exceed queue's max capacity is: in a small cluster, one single large container could mean a large proportion of the cluster. And queue's maximum capacity will be exceeded a lot.
+
+I like the idea you mentioned at comment: https://issues.apache.org/jira/browse/YARN-4280?focusedCommentId=14971154&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14971154
+If we can introduce a "pre-reservation" state, which is waiting for queue has enough headroom respect maximum-capacity. And during the wait, some queues in the hierarchy will be locked. However it seems implementation could be tricky, I don't have good idea to implement it cleanly., bq. The problem of allowing one container reserved exceed queue's max capacity is: in a small cluster, one single large container could mean a large proportion of the cluster. And queue's maximum capacity will be exceeded a lot.
+
+Agreed, we don't want to let a thousand users in a relatively small queue lock down the entire cluster with reservations.
+
+I think the algorithm needs to work something like this:
+- If a user would normally need to make a reservation and is within its user limits but the queue absolute capacity would be exceeded then that queue is locked down for further container allocations until any of the following are true:
+-- the container can be allocated
+-- the reservation can be placed
+-- the user limit is lowered and the reservation would no longer fit within the user limit
+-- the container request is cancelled
+-- a higher priority allocation comes along that can fit
+- If a user would normally need to make a reservation and is within both its user limits and leaf queue absolute capacity _but_ a parent queue's capacity would be exceeded then _all_ queues within that parent queue's hierarchy are locked down from further allocations until any of the following are true:
+-- the container can be allocated
+-- the reservation can be placed
+-- the user limit is lowered and the reservation would no longer fit within the user limit
+-- the container request is cancelled
+-- a higher priority allocation (e.g.: from a more underserved queue within the hierarchy) comes along that can fit
+
+The leaf queue case seems pretty straightforward -- we simply early-out of the assignment loop if we need to make a reservation but cannot due to the queue's limits.  Then only higher-priority allocations will be allowed to be made until we can place that reservation.
+
+The parent queue case is more complicated, but I think it can be accomplished in a similar manner.  When the parent-queue limit is detected by the leaf queue assignment method, it returns with a result that indicates to the parent queue(s) that no further allocations can be made due to parent queue limits, and all queues up to the parent queue that also hit that limit return early from the assignment due to that condition.  Then only higher-priority allocations (i.e.: from either a more underserved queue in the hierarchy or higher-priority app within the leaf queue) could potentially get more containers until the pertinent container request can be addressed either by reservation or allocation.
+, Clarification: I meant to say "absolute max capacity" above whenever I said "absolute capacity.", I will try to code up a prototype for this asap. Thank you all., Thanks [~jlowe], your comments are all make sense to me.
+
+[~kshukla], some thoughts (majorly brain dump) might help your prototype:
+
+- Existing reserved container allocation is go to leaf queue directly, which assumes no more checks required in parent queues), probably we should add some fields to parent queues (like which leaf queue has reserved resources) and do allocation from top to bottom for reserved containers.
+- If we allows reserve resource beyond queue's max capacity, we should consider how to show that to users as well. Because user could ask questions like (why my queue can use more than total of cluster/queue-max resource).
+- To solve above issue, a different approach is gradually reserve resource, IAW, adding a "Reserving" state to container. For example, if a request needs 2G, and only 1G available in the cluster, it will reserve 1G first, and after a while, another 1G resource available, scheduler can finally set container state from reserving to reserved.
+, The proposed algorithm does not change how reserved containers work -- I'm not proposing to add a reserved container where one does not exist today.  The algorithm also does not allocate a reserved container beyond the queue max cap, so there should be no extra issues there.
+
+There will be cases where resources can appear to be free but won't be allocated due to the "lockdown" of one ore more queues.  We could do something like the proposed increasing reservation container to take up the extra resources so they don't appear to be free, but I think that will significantly complicate things.  We already have the free-but-unused problem today with existing reservations that cannot be applied beyond the queue max cap if no other app comes along to use the small leftovers.  I think we should get the proposed algorithm prototyped and focus on getting that in.  That would be a significant, incremental improvement over what we have today when a queue gets close to full.  We can then focus on how to better represent the behavior in the UI in a followup JIRA., [~jlowe], thanks for sharing your thoughts, agree with your plan about this., A preliminary patch that adds 'blocked' resource to assignments and queue usage. It is set when a given under-served queue cannot fit the request  and is used for any further assignments to be limited based on used and blocked resources on that queue. A parent queue's blocked-resource is updated based on the children assignments' blocked-resource  value. The patch may not fully address the increaseContainer scenarios. I am looking into adding a test for that. , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 21s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 23s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 35s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 13s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 57s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red} 0m 29s {color} | {color:red} hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager generated 2 new + 4 unchanged - 0 fixed = 6 total (was 4) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 22s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 22 new + 360 unchanged - 0 fixed = 382 total (was 360) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 12s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 3s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 35m 7s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 49m 28s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Timed out junit tests | org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.TestNodeLabelContainerAllocation |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:e2f6409 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12811171/YARN-4280.001.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux e5feebfa47df 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 4aefe11 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/12043/artifact/patchprocess/diff-compile-javac-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12043/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12043/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12043/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12043/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12043/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Updated patch for failing test which was due to my patch using addTo() to Resources.none(). Fixed checkstyles/javac warnings., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 27s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 23s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 24s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 34s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 56s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 19s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 23s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 2 new + 360 unchanged - 0 fixed = 362 total (was 360) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 33s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 11s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 0s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 19s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 36m 27s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 19s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 50m 40s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRestart |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:e2f6409 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12811402/YARN-4280.002.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux faebb8943c74 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / c35fa4a |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12063/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12063/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12063/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12063/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12063/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, TestAMRestart passes locally with the patch. The checkstyle issue is minor and I will address it for my next patch. To get some ideas/comments on the approach asking [~jlowe], [~leftnoteasy] for their kind review. Thanks a lot!, Thanks [~kshukla] for working on this patch.
+
+My understanding of how this patch works, please correct me if I'm wrong:
+
+When allocating:
+- For application: if an app has pending resources, and don't have enough headroom, app returns CSAssignment with blockedResource > 0
+- For leaf queue: if a leaf queue gets CSAssignment with blockedRsource > 0, it set queue.blockedResource accordingly.
+- For parent queue: blocks same amount of leaf queue when used + blocked > limit
+
+When releasing:
+- For queues: blockedResource will be deducted when release of container happens.
+
+Problems that I can see from the patch:
+- Entire queue will be skipped when it has an application fails the checkHeadroom:
+{code}
+    if (!checkHeadroom(clusterResource, resourceLimits, required, node)) {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("cannot allocate required resource=" + required
+            + " because of headroom");
+      }
+      return new ContainerAllocation(null, null, required,
+          AllocationState.QUEUE_SKIPPED);
+    }
+{code}
+- Resources are blocked without checking if the container could be allocated. (For example, request hard locality, which relaxLocality set to false, and the host is invalid)
+- Leaf queue can block resource to more than its maximum capacity. (A queue has max = 100%, used = 95%, it can block 10% more resource).
+- Queue's blocked resource will not be updated after application finished.
+- Blocked resource will be cleared if the first app doesn't need blocked resource.
+{code}
+      Resource blkedResource = assignment.getBlockedRequestResource();
+      if(blkedResource !=null) {
+        // ...
+      } else {
+        assignment.setBlockedRequestResource(null);
+        queueUsage.setBlocked(node.getPartition(), Resources.none());
+      }
+{code}
+- Ordering of queues should be updated after resource blocked (In PartitionedQueueComparator)
+
+I would suggest to at least handle following cases in the patch:
+1. Only block resources when allocation finishes: leaf-queue.used < max and any of its parents > max.
+2. Do not block resources unless the resource can be used by app (Counter example is hard locality case I mentioned above)
+3. Blocked resources will be cleared properly after completion of application or updating of resource request
+4. Updating of blocked resources should reflect to ordering of queues.
+
+Considering issues in the patch, instead of adding the new blocked resource to queue, I think you could reconsider to leverage reserved container mechanism. We may need add some extra logic to check if a reserved container has guaranteed resource (i.e allocate the reserved container when parent queues max resource will not be violated). But all the other stuffs should be kept to same., I haven't had a chance to look at the patch yet, but I'm not thrilled with the thought of storing this state somewhere beyond the allocate call or using the existing reserved container logic for this.  I think it's going to add special-case logic to the handling of reserved containers in all sorts of places.  In addition if we cannot really do the reservation if the parent queue max resource will be violated then that doesn't solve the original problem.  We need the parent queue to completely stop assigning to other leaf queues if the only reason we cannot reserve is because we would exceed the max capacity of our parent when we did the reservation.
+
+My thinking of the algorithm implementation would have no extra state being stored with a queue.  As soon as we do that we will have all sorts of cleanup cases that have to be handled, like the app finished case Wangda mentioned above, etc.  I see the same issue if we go with actual reserved containers, since we need to make sure those get cleaned up in similar situations otherwise we will "leak" reservations.  For example, another app in the leaf queue could become higher priority or a higher-priority app that wasn't asking starts asking again.   If we made the "semi-reserved" container from a previous call, we would need to release that container to allow the new, higher-priority app to get its resource.  In short, I think it will be messy to get it to work correctly in all cases.
+
+Instead I saw the algorithm as simply having the leaf queue returning the amount of space it is trying to consume when this situation occurs, capped by its max capacity.  The parent queue would deduct that amount from its local variable tracking the parent queue's current capability limits that it passes to the child queues.  If after deducting the limit is non-zero then the parent can continue calling other child queues with the reduced parent limit (to keep other children from eating into the higher-priority queue that is trying to fulfil a reservation).  If after deducting the limit is zero then the parent can return early to its parent with a similar deduction, etc.  The amount we're holding back trying to fulfil the reservation is only ever stored in local variables, so it never persists beyond the current scheduler allocate call.  Therefore there's nothing to clean up -- it automatically cleans up on the next scheduler allocate call if we are either able to finally allocate/reserve a real container or some higher-priority app starts asking or the app terminates, etc.
+, Thank you so much [~leftnoteasy], [~jlowe]. I am updating the patch to not add a new type of ResourceUsage and subtract "blockedResourceLimit" (which is updated based on assignment's returned "blockedResource" value), from the childLimits. Will update and post the patch asap.
+ , Attaching a patch that does not add 'blocked' resource to QueueResourceUsage. Instead, {{childLimits}} are decremented each time by the received {{blockedResource}} of the assignment. In total a parent would then return the sum of all of the blockedResources from the children as its blockedResource for the assignment., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 25s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 26s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 30s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 24s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 34s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 53s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 20s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 27s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 27s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 21s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 5 new + 326 unchanged - 1 fixed = 331 total (was 327) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 11s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 57s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 16s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 35m 51s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 49m 43s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRestart |
+|   | hadoop.yarn.server.resourcemanager.TestRMAdminService |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:e2f6409 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12812383/YARN-4280.003.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 2120b28fc93a 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / d433b16 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12102/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12102/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12102/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12102/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12102/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Updated ParentQueue to use summed up blockedLimits across its child queues to subtract from childLimits and fixed checkstyle issues., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 29s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 23s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 23s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 34s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 54s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 19s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 27s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 27s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 20s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 326 unchanged - 1 fixed = 327 total (was 327) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 10s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 59s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 17s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 35m 37s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 16s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 49m 34s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:e2f6409 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12812489/YARN-4280.004.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 731601b35c75 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 4ee3543 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12106/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12106/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12106/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks [~kshukla] for the patch and its an interesting problem.
+
+I have one doubt here.
+One queue is under served and it has  a single pending demand for 8GB (but there is no headroom). If this request is served, then this queue will no longer be underserved. There are other queues and has pending demands for 2GB. With this approach, I think allocations will be skipped for other queues untill this 8GB is served. I might be missing something here, pls help to correct me if I m wrong., Thanks for updating the patch, Kuhu!
+
+I'm confused by the nullAssigment changes, especially in LeafQueue.  NULL_ASSIGNMENT was replaced with an explicit object creation but otherwise is the same.  NULL_ASSIGNMENT should continue to be used for the early-out cases and normal non-assignments to avoid unnecessary object creation.  It will also make the patch substantially smaller.  If we're creating one because the blocked resource might be set on it then we should only create the object when we need to set the blocked resource.  If we're creating it because the caller might modify the returned assignment then the caller needs to be fixed to make a copy, since a constant assignment object can be returned sometimes.
+
+Does this need to be using Resources.componentwiseMax instead of Resources.max?
+{code}
+      childLimits.setLimit(Resources.max(
+          resourceCalculator,cluster, Resources.subtract(childLimits.getLimit(),
+              finalBlockedLimits.getLimit()), Resources.none()));
+{code}
+
+Rather than subtracting the blocked resources from each result of getResourceLimitsOfChild, I think it would be better to adjust the parent limits that are already passed to getResourceLimitsOfChild if a child reports blocked resources.
+
+finalBlockedLimits should just be a Resource instead of a ResourceLimit.  It only ever uses the Resource within the ResourceLimit in practice, and it is just a Resource total anyway.
+
+Some debug logs when we're asking for blocked resources in the assignment or applying them to parent limits would be helpful for analysis and debugging.
+
+I'm confused why we're checking the headroom to determine the amount of blocked resources.  IIRC the headroom is a combination of the user limits and the queue limits.  We only want to report blocked resources when we are blocked by the queue limits.  If the user cannot make a reservation only due to the user's own limits then we don't want to report any blocked resources.  We only want to report resources when we would have either allocated or made a reservation but the queue's limits prevent the full allocation.  Then, and only then, we want to report the blocked resources as the amount remaining available in the queue so those resources are reserved relative to other queues until we are able to make the full allocation or reservation.
+
+On a related note, I'm confused on why LeafQueue is subtracting the headroom from the blocked resources.  What does this represent?  Seems like this could report more blocked resources than the queue has available, which would allow the queue to influence more capacity than its configured max.  
+
+
+bq. With this approach, I think allocations will be skipped for other queues untill this 8GB is served.
+
+If I understand Sunil's question properly, then yes it will block other queues under the parent queue until that 8GB is served, and that is exactly what is needed to solve the problem.  Let me restate the scenario to make sure I am understanding it properly.  By "One queue is under served and it has a single pending demand for 8GB" then I assume you mean a leaf queue that wants to allocate 8GB, and the leaf queue would normally be able to allocate it but the usage of the parent is such that there's less than 8GB available in the parent.   In other words, this is a failure to reserve due to parental limits.  In this case, if we fail to block the other sibling queues from allocating their smaller 2GB requests then we have the same type of scenario as in the JIRA description -- a higher priority queue that is indefinitely starved by lower priority queues because it can't reserve the remaining resources.  So yes, we need the other queues to stop allocating until the higher-priority queue's allocation is satisfied or we have a priority inversion and indefinite postponement issues., bq.  IIRC the headroom is a combination of the user limits and the queue limits.
+
+OK  it looks like this has changed a bit since I last got deep into it.  I think the headroom is the queue headroom with no user-specific stuff in it, so I think we're OK there.  Thinking about this more, I believe we can simplify the blockedResource field added to CSAssignment and instead just track this with a boolean flag or expand the existing CSAssignent skipped boolean to be an enumeration of skipped types.  When we flag the assignment as "queue-limit-skipped" then the parent queue can know that the allocation/reservation wasn't made solely due to insufficient free resources in the child queue's limits. Then it can lower its own limits by the child's limits to effectively block other sibling queues from using the remaining resources for that child queue until the allocation can be made, the ask is removed, a higher priority app starts asking, queues are resorted, etc. etc., bq.So yes, we need the other queues to stop allocating until the higher-priority queue's allocation is satisfied or we have a priority inversion and indefinite postponement issues.
+
+Thanks [~jlowe] for restating the problem. Yes, I think i got the intention correctly. This is a case to handle.
+
+bq.expand the existing CSAssignent skipped boolean to be an enumeration of skipped types.
+Recently for a YARN-4091 POC work, I was looking into various enums returned from allocation call flow. Yes, Its better if we add this flags like  "queue-limit-skipped" to CSAssignment as an enum instead of "skipped" boolean. It can help to propagate the real reason to queue level.
+
+, Revised patch to address comments by Jason. This approach eliminates the need to store blockedResource and instead uses childLimits.headroom when a QUEUE_SKIPPED allocation state is received, for determining what resource limit should be passed down to the next childQueue. Also, the 'skipped' boolean is extended in CSAssignment into an enum reflecting the skippedType which would be OTHER_SKIPPED for legacy skipped=true, QUEUE_LIMIT_SKIPPED for our 'blocked' case, NO_SKIPPED otherwise., Attaching the intended patch., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 31s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 9m 11s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 47s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 27s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 11s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 21s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 326 unchanged - 1 fixed = 327 total (was 327) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 42s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 15s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 27s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 23s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 32m 51s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 17s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 51m 28s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:85209cc |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12812489/YARN-4280.004.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 419630b61738 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / e98c0c7 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12121/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12121/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12121/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 11m 37s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 2s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 30s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 24s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 36s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 13s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 55s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 19s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 20s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 4 new + 307 unchanged - 2 fixed = 311 total (was 309) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 33s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 11s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 2s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 17s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 32m 35s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 16s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 58m 24s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRestart |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:85209cc |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12812937/YARN-4280.005.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 7ff43e94c3c0 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / dca298d |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12122/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12122/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12122/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12122/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12122/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Fixing checkstyle issues, unsure about the last one for method length. 
+
+The test failure seems related to YARN-5023 and fails without the patch locally intermittently. Looking into it and will wait for precommit in the mean time., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 25s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 10s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 30s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 23s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 33s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 52s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 20s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 26s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 26s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 20s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 306 unchanged - 2 fixed = 307 total (was 308) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 11s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 59s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 17s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 34m 53s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 48m 27s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:85209cc |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12812982/YARN-4280.006.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 0668fd0a9829 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 0b9edf6 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12124/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12124/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12124/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Requesting [~jlowe], [~leftnoteasy], [~sunilg] for more comments/review. Thanks a lot., If I understand correctly, current logic is:
+For Application, if it fails because of headroom, QUEUE_SKIPPED will be returned
+For ParentQueue, when any of child queue returns QUEUE_SKIPPED, it deducts queue limit and returns QUEUE_SKIPPED when any of its children returns QUEUE_SKIPPED:
+
+There’re two potential issues I can see:
+1) Headroom of child could be negative since we have continuous reservation logic, so we need to deduct parentLimit by max(child.headroom, none()).
+
+2) It doesn’t work properly when we have nested queue hierarchy like:
+{code}
+    root
+    /   \
+   a    b
+ /  \
+a1  a2
+{code}
+
+Assume all queue’s max capacity is 100, if we have capacities:
+{code}
+  a.configured = 50
+  a.used = 48
+     a1.configured = 25
+     a1.used = 24
+     a2.configured = 25
+     a2.used = 24
+  b.configured = 50
+  b.used = 50
+
+  Total available resource of cluster = 2.
+{code}
+
+- Let’s say a node with 2 available resource heartbeat, it goes to root->a->a1, the resource  of pending request of a1 is 10, so it cannot allocate and returns QUEUE_SKIPPED to queue-a.
+- queue-a deducts its limit by 1, and set limit of a2 to 25.
+- Assume resource of pending request in a2 is 1, so a2 allocates 1 resource.
+- Back to queue-a, it gets a >0 allocation, it enters:
+{code}
+      if (Resources.greaterThan(
+              resourceCalculator, cluster,
+              assignment.getResource(), Resources.none())) {
+         ...
+      }
+{code}
+So it will not enter:
+{code}
+      if (assignment.getSkippedType()
+            == CSAssignment.SkippedType.QUEUE_LIMIT_SKIPPED) {
+          skippedType = CSAssignment.SkippedType.QUEUE_LIMIT_SKIPPED;
+{code}
+Because of this, skippedType is still NO_SKIPPED in queue-a, so it returns NO_SKIPPED to root.
+- Root then goes to b, assume resource of pending request in b is 1, so b gets 1 resource.
+
+When this happens, the large container request in queue-a can still be starved.
+
+Probably even if child queue allocate something, we still need to deduct limits of parentQueue if skipType of child-queue is QUEUE_SKIPPED., Thank you so much [~leftnoteasy] for the detailed review and offline explanation. I have rectified the patch for Point#1, which subtracts max(child.headroom,none()) from parentLimits if QUEUE_SKIPPED is received.
+
+For point 2. I think it would still work as follows:
+
+Given the queue configuration in the above example with all queues max-capacity=100%, when the first QUEUE_SKIPPED is received from a1 to a, the parent limit for a will be set to (50-2) since childlimits.getHeadroom will be 2. Now when {{getResourceLimitsOfChild}} is called with parentLimits=48, the value of {{parentMaxAvailableResource}} will be zero and the childLimit for a2 will be (0+24) which would inhibit a2 to go through with assignment request of 1. 
+
+Let me know your thoughts/concerns regarding this. Thanks a lot!
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 23s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 14s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 23s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 34s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 53s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 19s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 27s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 27s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 20s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 306 unchanged - 2 fixed = 307 total (was 308) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 11s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 0s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 17s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 34m 44s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 48m 19s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.TestRMRestart |
+|   | hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRestart |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12816445/YARN-4280.007.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 430b651f1b44 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / d792a90 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12199/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12199/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12199/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12199/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12199/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, {{TestRMRestart.testQueueMetricsOnRMRestart}} is tracked through YARN-5037 and fails irrespective of the patch. 
+{{TestAMRestart.testRMAppAttemptFailuresValidityInterval}} is tracked through YARN-5043 and fails irrespective of the patch. 
+Below checkstyle issue may be ignored.
+{noformat}
+IncreaseContainerAllocator.java:173:  @Override:3: Method length is 191 lines (max allowed is 150).
+{noformat}
+
+Requesting [~leftnoteasy], [~jlowe] for review/comments. Thanks again for all the help., Looks good to me, thanks [~kshukla].
+
+The patch needs a minor rebase to trunk, mind to update?
+
+And it's better to kick Jenkins to run against branch-2 / branch-2.8 branch as well.
+
+I can commit the patch once Jenkins gets back., Thank you [~leftnoteasy] .Updating trunk patch with removed fuzz in MockNodes. Other version patches to follow., Attaching patch for version 2.8., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 31s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 8s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 33s {color} | {color:green} branch-2.8 passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 33s {color} | {color:green} branch-2.8 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 19s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 41s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 18s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 10s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 23s {color} | {color:green} branch-2.8 passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 24s {color} | {color:green} branch-2.8 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 26s {color} | {color:green} the patch passed with JDK v1.8.0_91 {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red} 0m 26s {color} | {color:red} hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_91 with JDK v1.8.0_91 generated 1 new + 2 unchanged - 0 fixed = 3 total (was 2) {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 30s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red} 0m 30s {color} | {color:red} hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101 with JDK v1.7.0_101 generated 1 new + 2 unchanged - 0 fixed = 3 total (was 2) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 17s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 111 unchanged - 1 fixed = 112 total (was 112) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 15s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 22s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 19s {color} | {color:green} the patch passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 23s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 71m 16s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_91. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 16m 48s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_101. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 19s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 106m 8s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_91 Failed junit tests | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+|   | hadoop.yarn.server.resourcemanager.recovery.TestFSRMStateStore |
+|   | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestWorkPreservingRMRestart |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12819447/YARN-4280-branch-2.8.001.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 60b4246e9b7f 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / 3dcbd2d |
+| Default Java | 1.7.0_101 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_91 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_101 |
+| findbugs | v3.0.0 |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/12447/artifact/patchprocess/diff-compile-javac-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_91.txt |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/12447/artifact/patchprocess/diff-compile-javac-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12447/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12447/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_91.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12447/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12447/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_91.txt |
+| JDK v1.7.0_101  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12447/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12447/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Test failures seem unrelated for the 2.8 patch precommit. TestFSRMStateStore fails irrespective of the patch. Others locally pass.
+I am unable to view the precommit logs for checkstyle etc. Also the trunk patch Precommit did not come back. Would we want to kick one off to get some more results? CC: [~jlowe], [~leftnoteasy]., Thanks [~kshukla], rekicked both., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 16s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 10s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 34s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 24s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 40s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 18s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 59s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 32s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red} 0m 31s {color} | {color:red} hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager generated 1 new + 3 unchanged - 0 fixed = 4 total (was 3) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 22s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 306 unchanged - 2 fixed = 307 total (was 308) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 15s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 7s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 33m 9s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 48m 25s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12819746/YARN-4280.008_.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 07b541be8b98 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / c6e3a00 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/12471/artifact/patchprocess/diff-compile-javac-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12471/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12471/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12471/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 27s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 39s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 24s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 57s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 20s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 32s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red} 0m 29s {color} | {color:red} hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager generated 1 new + 3 unchanged - 0 fixed = 4 total (was 3) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 22s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 307 unchanged - 2 fixed = 308 total (was 309) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 2s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 33m 46s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 48m 26s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12819746/YARN-4280.008_.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 9662e2840b17 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / c6e3a00 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/12472/artifact/patchprocess/diff-compile-javac-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12472/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12472/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12472/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 18m 30s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red} 0m 9s {color} | {color:red} root in trunk failed. {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 38s {color} | {color:green} trunk passed with JDK v1.8.0_101 {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red} 0m 9s {color} | {color:red} hadoop-yarn-server-resourcemanager in trunk failed with JDK v1.7.0_101. {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 25s {color} | {color:green} trunk passed {color} |
+| {color:red}-1{color} | {color:red} mvnsite {color} | {color:red} 0m 12s {color} | {color:red} hadoop-yarn-server-resourcemanager in trunk failed. {color} |
+| {color:red}-1{color} | {color:red} mvneclipse {color} | {color:red} 0m 10s {color} | {color:red} hadoop-yarn-server-resourcemanager in trunk failed. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red} 0m 10s {color} | {color:red} hadoop-yarn-server-resourcemanager in trunk failed. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 22s {color} | {color:green} trunk passed with JDK v1.8.0_101 {color} |
+| {color:red}-1{color} | {color:red} javadoc {color} | {color:red} 0m 10s {color} | {color:red} hadoop-yarn-server-resourcemanager in trunk failed with JDK v1.7.0_101. {color} |
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red} 0m 10s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 37s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red} 0m 37s {color} | {color:red} hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101 with JDK v1.8.0_101 generated 1 new + 3 unchanged - 0 fixed = 4 total (was 3) {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red} 0m 10s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_101. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red} 0m 10s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_101. {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 24s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 306 unchanged - 2 fixed = 307 total (was 308) {color} |
+| {color:red}-1{color} | {color:red} mvnsite {color} | {color:red} 0m 12s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} mvneclipse {color} | {color:red} 0m 11s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red} 0m 9s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 3m 38s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:red}-1{color} | {color:red} javadoc {color} | {color:red} 4m 36s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_101. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 41m 13s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed with JDK v1.8.0_101. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 0m 10s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_101. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 24s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 74m 9s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12819746/YARN-4280.008_.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 9892c8647b59 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / c6e3a00 |
+| Default Java | 1.7.0_101 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_101 |
+| mvninstall | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/branch-mvninstall-root.txt |
+| compile | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/branch-compile-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| mvnsite | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/branch-mvnsite-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| mvneclipse | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/branch-mvneclipse-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/branch-findbugs-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| javadoc | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/branch-javadoc-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| mvninstall | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/patch-mvninstall-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/diff-compile-javac-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt |
+| compile | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/patch-compile-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/patch-compile-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| mvnsite | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/patch-mvnsite-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| mvneclipse | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/patch-mvneclipse-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/patch-findbugs-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| javadoc | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/patch-javadoc-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12470/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| JDK v1.7.0_101  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12470/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12470/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 29s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 9m 24s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 35s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 25s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 39s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 0s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 32s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red} 0m 32s {color} | {color:red} hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager generated 1 new + 3 unchanged - 0 fixed = 4 total (was 3) {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 20s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 306 unchanged - 2 fixed = 307 total (was 308) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 13s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 1s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 59s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 36m 33s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 54m 9s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12819746/YARN-4280.008_.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux e178403f3cf1 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / be9e46b |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/12479/artifact/patchprocess/diff-compile-javac-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12479/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12479/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12479/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Trunk patch with small change in MockNodes to not use setMemory but setMemorySize. This patch applies to branch-2 as well., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 16s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 47s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 24s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 56s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 20s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 33s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 22s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 306 unchanged - 2 fixed = 307 total (was 308) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 59s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 36m 31s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 51m 8s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12819970/YARN-4280.009.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux cd1b79da1adb 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 86ae218 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12480/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12480/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12480/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, [~leftnoteasy], [~jlowe], Precommit for trunk looks fine now. Thanks.
+Request for review/comments., Thanks [~kshukla], patch LGTM. But it seems the patch doesn't apply to branch-2.8, could you double check.
+
+Just manually submitted a patch to trigger branch-2 build., Thanks a lot [~leftnoteasy]. The branch 2.8 patch is attached as : YARN-4280-branch-2.8.001.patch. The precommit for it doesn't show the exact issues. I will attach the 2.8 version again just to trigger a precommit once the branch-2 patch precommit comes back, just to keep the precommits clean., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 13m 36s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 20s {color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 28s {color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} branch-2 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 26s {color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 36s {color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 8s {color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 20s {color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 23s {color} | {color:green} branch-2 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 25s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 25s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 23s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 306 unchanged - 2 fixed = 307 total (was 308) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 33s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 19s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 17s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 20s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 32m 14s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_101. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 33m 41s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_101. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 16s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 95m 49s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_101 Failed junit tests | hadoop.yarn.server.resourcemanager.recovery.TestFSRMStateStore |
+| JDK v1.7.0_101 Failed junit tests | hadoop.yarn.server.resourcemanager.recovery.TestFSRMStateStore |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12819988/YARN-4280-branch-2.009.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 1ec0b4e016da 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / b757eff |
+| Default Java | 1.7.0_101 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12484/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12484/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12484/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12484/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt https://builds.apache.org/job/PreCommit-YARN-Build/12484/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| JDK v1.7.0_101  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12484/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12484/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 17m 17s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 9m 56s {color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} branch-2 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 26s {color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 40s {color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 20s {color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 16s {color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 22s {color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 25s {color} | {color:green} branch-2 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 33s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 27s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 27s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 30s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 22s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 306 unchanged - 2 fixed = 307 total (was 308) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 15s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 19s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 40m 49s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_101. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 41m 47s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_101. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 24s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 120m 29s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_101 Failed junit tests | hadoop.yarn.server.resourcemanager.recovery.TestFSRMStateStore |
+| JDK v1.7.0_101 Failed junit tests | hadoop.yarn.server.resourcemanager.recovery.TestFSRMStateStore |
+|   | hadoop.yarn.server.resourcemanager.security.TestDelegationTokenRenewer |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12819988/YARN-4280-branch-2.009.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 3fa7a17821a4 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / b757eff |
+| Default Java | 1.7.0_101 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12483/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12483/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12483/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12483/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt https://builds.apache.org/job/PreCommit-YARN-Build/12483/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| JDK v1.7.0_101  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12483/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12483/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Attaching branch-2.8 latest version of the patch. 
+
+branch-2 version test failures seem unrelated and checkstyle issue is known., Not sure why the Precommit didn't pick the 2.8 patch. Attaching again., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 13m 39s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 10m 29s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 30s {color} | {color:green} branch-2.8 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} branch-2.8 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 22s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 42s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 23s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 24s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} branch-2.8 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 22s {color} | {color:green} branch-2.8 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 27s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 27s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 17s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 111 unchanged - 1 fixed = 112 total (was 112) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 23s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 20s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 22s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 70m 43s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_101. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 70m 27s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_101. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 18s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 175m 51s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_101 Failed junit tests | hadoop.yarn.server.resourcemanager.recovery.TestFSRMStateStore |
+|   | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+| JDK v1.7.0_101 Failed junit tests | hadoop.yarn.server.resourcemanager.recovery.TestFSRMStateStore |
+|   | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12820012/YARN-4280-branch-2.8.002.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux fae835adce94 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / e098a73 |
+| Default Java | 1.7.0_101 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12488/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12488/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12488/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12488/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt https://builds.apache.org/job/PreCommit-YARN-Build/12488/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| JDK v1.7.0_101  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12488/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12488/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Test failures are known and unrelated. Checkstyle warning is about method length and can be ignored. [~leftnoteasy], [~jlowe] requesting for your review/comments. Thanks a lot for the help., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 20s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 11m 42s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 36s {color} | {color:green} branch-2.8 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 37s {color} | {color:green} branch-2.8 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 26s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 47s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 26s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 27s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 26s {color} | {color:green} branch-2.8 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 27s {color} | {color:green} branch-2.8 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 33s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 33s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 34s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 34s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 19s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 111 unchanged - 1 fixed = 112 total (was 112) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 42s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 16s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 25s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 25s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 76m 47s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_101. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 77m 57s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_101. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 21s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 178m 59s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_101 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+|   | hadoop.yarn.server.resourcemanager.recovery.TestFSRMStateStore |
+| JDK v1.7.0_101 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+|   | hadoop.yarn.server.resourcemanager.recovery.TestFSRMStateStore |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12820066/YARN-4280-branch-2.8.003.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux ebd9e9d0f2b5 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / e098a73 |
+| Default Java | 1.7.0_101 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12497/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12497/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12497/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12497/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt https://builds.apache.org/job/PreCommit-YARN-Build/12497/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| JDK v1.7.0_101  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12497/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12497/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Test failures are known and unrelated. Checkstyle warning is about method length and can be ignored. Wangda Tan, Jason Lowe requesting for your review/comments. Thanks a lot for the help., Thanks for updating the patch, Kuhu!
+
+The copy constructor for ResourceLimits doesn't copy all of the fields, specifically allowPreempt is missing.  Intentional?  If so, maybe an alternate method that generates a new ResourceLimit should be used rather than what looks like a copy constructor?  Otherwise it's going to be confusing to others that assume it really is a full-blown copy of all fields or whether or not the copy constructor should be updated when a new field is added to the class.
+
+Nit: Adding a "_SKIPPED" suffix to every enum is somewhat redundant when the enum type is SkippedType.  These could be simplified to NONE, QUEUE_LIMIT, and OTHER.
+
+Similar copy constructor comment for CSAssignment since increaseAllocation and containersToKill are not copied.
+
+The debug log statement in ParentQueue needs to be wrapped with a log debug check otherwise we'll always do the expensive string construction even when we won't log it.
+
+Do we realy want the folllowing to execute when the assignments skipped type is OTHER_SKIPPED or the assignment is not the null assigment?  Seems like if there is a real assignment of resources we should return it without overriding the skip type.  Or am I missing a scenario where we need to set QUEUE_LIMIT_SKIPPED even when there's a real assignment in a sibling queue?
+{code}
+    if(!skippedType.equals(assignment.getSkippedType())) {
+      //Make a copy of the assignment to avoid changing when
+      // returned assignment == NULL_ASSIGNMENT
+      CSAssignment csAssignment = new CSAssignment(assignment);
+      csAssignment.setSkippedType(skippedType);
+      return csAssignment;
+    }
+{code}
+
+Why does MockNodes have a new static method that creates a Resource?  Seems to have nothing to do with the rest of the class and creates a maintenance burden when the Resource class gets updated in the future. Anyone who needs a Resource should be calling Resource.newInstance.
+
+
+, Thanks a lot [~jlowe] for the review. I have updated the patch to address the comments. This patch removes the change to ResourceLimits. The if block in ParentQueue was incorrect and has been removed now to cover cases where all child assignments are NULL_ASSIGNMENT(s) with the first(or any one but the last)  assignments being a QUEUE_LIMIT skipped case. Will wait for precommit and update other  version patches soon., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 14s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 58s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 24s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 56s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 22s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 2 new + 289 unchanged - 4 fixed = 291 total (was 293) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 38s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 13s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 1s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 19s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 37m 30s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 19s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 52m 18s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.TestResourceManager |
+|   | hadoop.yarn.server.resourcemanager.scheduler.TestSchedulerHealth |
+|   | hadoop.yarn.server.resourcemanager.scheduler.fifo.TestFifoScheduler |
+|   | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestCapacityScheduler |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12820596/YARN-4280.010.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 9abc3f7185b9 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / b43de80 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12532/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12532/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12532/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12532/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12532/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Sigh. Fixing the extra check-style issue. Test failures are tracked through YARN-5441 and are unrelated., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 13s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 54s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 24s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 55s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 20s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 21s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 2 new + 288 unchanged - 5 fixed = 290 total (was 293) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 34s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 4s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 33m 15s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 16s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 47m 52s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12820629/YARN-4280.011.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 48ac6db4aa53 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 8d06bda |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12534/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12534/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12534/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 15s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 46s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 23s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 38s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 56s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 21s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 288 unchanged - 5 fixed = 289 total (was 293) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 13s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 1s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 36m 15s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 16s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 50m 45s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12820703/YARN-4280.012.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 1cc216bc07d8 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 414fbfa |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12537/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12537/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12537/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 14s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 41s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 23s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 39s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 54s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 32s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 21s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 288 unchanged - 5 fixed = 289 total (was 293) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 34s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 1s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 36m 4s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 50m 28s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12820706/YARN-4280.013.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux b2d838038988 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 7f3c306 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12538/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12538/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12538/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, [~jlowe], Request for comments on latest patch. Thanks a lot!, Thanks for updating the patch!  The parent queue code is now significantly cleaner.
+
+The new CSAssignment copy constructor is no longer used, which made me wonder if we missed a case.  Consider a scenario where a parent queue has at least two child queues. Trying to assign to one queue returns an amount to be blocked, so the parent limits are adjusted.  Then trying to subsequently assign to another child queue returns yet another blocked result, but we will end up returning the second child queue's blocked amount to the parent's parent, which ignores the amount needed by the first (and higher priority at the moment) child queue.
+, You are right [~jlowe]. This patch is an attempt to address that with an additional if check to update the assignment value only for the first QUEUE_LIMIT received. Does that seem reasonable?
+
+Appreciate any comments/corrections. Thank you so much., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 15s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 40s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 23s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 38s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 56s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 20s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 21s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 288 unchanged - 5 fixed = 289 total (was 293) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 1s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 36m 24s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 16s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 50m 48s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12820864/YARN-4280.014.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux c4924b124011 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 8ebf2e9 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12558/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12558/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12558/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, +1 for the latest patch.  I'll commit this sometime next week unless there are further comments that need to be addressed., Attaching updated branch-2.8 version of the patch., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 18m 27s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 9m 42s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 28s {color} | {color:green} branch-2.8 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} branch-2.8 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 22s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 39s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 20s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 14s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} branch-2.8 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 23s {color} | {color:green} branch-2.8 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 25s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 25s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 28s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 17s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 104 unchanged - 4 fixed = 105 total (was 108) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 16s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 1 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 20s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 19s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 75m 22s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_101. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 74m 40s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_101. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 17s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 188m 25s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_101 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+| JDK v1.7.0_101 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12821330/YARN-4280-branch-2.8.004.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux c0bd7e037c75 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / fa0b6ff |
+| Default Java | 1.7.0_101 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12586/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/12586/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12586/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12586/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12586/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt https://builds.apache.org/job/PreCommit-YARN-Build/12586/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| JDK v1.7.0_101  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12586/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12586/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Updated branch-2.8 version to remove extra whitespace. Test failures are known, unrelated and pass locally. Checkstyle issue is known and should be ignored., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 15m 1s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 9m 9s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 26s {color} | {color:green} branch-2.8 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} branch-2.8 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 21s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 38s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 21s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 12s {color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} branch-2.8 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 23s {color} | {color:green} branch-2.8 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 25s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 25s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 16s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 105 unchanged - 4 fixed = 106 total (was 109) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 34s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 16s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 17s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 69m 37s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_101. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 70m 23s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_101. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 18s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 174m 5s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_101 Failed junit tests | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+|   | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+| JDK v1.7.0_101 Failed junit tests | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+|   | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12821425/YARN-4280-branch-2.8.005.patch |
+| JIRA Issue | YARN-4280 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux b162d743b315 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / ecb143e |
+| Default Java | 1.7.0_101 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/12597/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12597/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/12597/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/12597/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_101.txt https://builds.apache.org/job/PreCommit-YARN-Build/12597/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_101.txt |
+| JDK v1.7.0_101  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/12597/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12597/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, +1 for the branch-2.8 patch as well.  Committing this., Thanks to [~kshukla] for the contribution and to [~leftnoteasy] and [~sunilg] for additional review!  I committed this to trunk, branch-2, and branch-2.8., Thank you all for the detailed reviews., SUCCESS: Integrated in Hadoop-trunk-Commit #10205 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/10205/])
+YARN-4280. CapacityScheduler reservations may not prevent indefinite (jlowe: rev 4d92aefd35d4517d9435d81bafdec0d77905a7a0)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/allocator/IncreaseContainerAllocator.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/allocator/AbstractContainerAllocator.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CSAssignment.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/ParentQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
+]

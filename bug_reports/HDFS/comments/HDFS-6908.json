@@ -1,0 +1,262 @@
+[The problem is when deleting snapshot, hdfs will clean Inode that not in any snapshot any more. however, the logic is a bit wrong.
+if an inode is directory, it calls destroyCreatedList() to put created children inodes(created between prior snapshot and the deleting one) to removedINodes list, but also clear the createdList. this breaks the create/delete pair operation. so later, when combine the diff with prior diff, the delete operation stays.
+I think instead of calling destroyCreatedList(), it should just do dir.removeChild(c), and let the file diff does cleanup for files.
+, Thanks for working on this, [~jyu@cloudera.com]! Actually this is a case the current code fails to cover. Your analysis makes sense to me.
+
+However, for the fix, if we only call dir.removeChild, the inodes that were created between prior snapshot and the deleting one will still be kept in the created list, thus can cause leaking. Maybe a better way to fix is to call {{cleanSubtreeRecursively}} before {{cleanDeletedINode}}:
+{code}
+diff --git a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hado
+index 9893bba..a4f69f0 100644
+--- a/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java
++++ b/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/DirectoryWithSnapshotFeature.java
+@@ -722,6 +722,8 @@ boolean computeDiffBetweenSnapshots(Snapshot fromSnapshot,
+         counts.add(lastDiff.diff.destroyCreatedList(currentINode,
+             collectedBlocks, removedINodes));
+       }
++      counts.add(currentINode.cleanSubtreeRecursively(snapshot, prior,
++          collectedBlocks, removedINodes, priorDeleted, countDiffChange));
+     } else {
+       // update prior
+       prior = getDiffs().updatePrior(snapshot, prior);
+@@ -739,7 +741,10 @@ boolean computeDiffBetweenSnapshots(Snapshot fromSnapshot,
+       
+       counts.add(getDiffs().deleteSnapshotDiff(snapshot, prior,
+           currentINode, collectedBlocks, removedINodes, countDiffChange));
+-      
++
++      counts.add(currentINode.cleanSubtreeRecursively(snapshot, prior,
++          collectedBlocks, removedINodes, priorDeleted, countDiffChange));
++
+       // check priorDiff again since it may be created during the diff deletion
+       if (prior != Snapshot.NO_SNAPSHOT_ID) {
+         DirectoryDiff priorDiff = this.getDiffs().getDiffById(prior);
+@@ -778,9 +783,7 @@ boolean computeDiffBetweenSnapshots(Snapshot fromSnapshot,
+         }
+       }
+     }
+-    counts.add(currentINode.cleanSubtreeRecursively(snapshot, prior,
+-        collectedBlocks, removedINodes, priorDeleted, countDiffChange));
+-    
++
+     if (currentINode.isQuotaSet()) {
+       currentINode.getDirectoryWithQuotaFeature().addSpaceConsumed2Cache(
+           -counts.get(Quota.NAMESPACE), -counts.get(Quota.DISKSPACE));
+{code}, For the current patch, another comment is that we can move the new unit test to TestSnapshotDeletion.java, and call {{hdfs.delete(file1, true);}} instead of {{hdfs.delete(file1);}}., Thanks [~jingzhao].
+because the directory is deleted, it means the file created between prior snapshot and the deleting one must be deleted as well. so there are create/delete pair operations for those files. the file diff processing part will add the file to removedINodes list. when I debug the fix, I saw the inode for the file are deleted correctly, no leak. and the intermediate create/delete file change is cleaned after combining the diff with prior one as well.
+
+{code}
+} else if (topNode.isFile() && topNode.asFile().isWithSnapshot()) {
+        INodeFile file = topNode.asFile();
+        counts.add(file.getDiffs().deleteSnapshotDiff(post, prior, file,
+            collectedBlocks, removedINodes, countDiffChange));
+{code}, Thanks for the response, [~jyu@cloudera.com].
+
+bq. so there are create/delete pair operations for those files.
+
+The challenge here is that we cannot guarantee we always have the create/delete pair. Imagine the deletion happens on the directory while the creation happens on a file under the directory. Then we cannot depend on the snapshot diff combination to clean the file. The following unit test (based on your original test case) demos the scenario (but with your patch the following test will hit another exception before the leaking check):
+{code}
+  @Test (timeout=60000)
+  public void testDeleteSnapshot() throws Exception {
+    final Path root = new Path("/");
+
+    Path dir = new Path("/dir1");
+    Path file1 = new Path(dir, "file1");
+    DFSTestUtil.createFile(hdfs, file1, BLOCKSIZE, REPLICATION, seed);
+
+    hdfs.allowSnapshot(root);
+    hdfs.createSnapshot(root, "s1");
+
+    Path file2 = new Path(dir, "file2");
+    DFSTestUtil.createFile(hdfs, file2, BLOCKSIZE, REPLICATION, seed);
+    INodeFile file2Node = fsdir.getINode(file2.toString()).asFile();
+    long file2NodeId = file2Node.getId();
+
+    hdfs.createSnapshot(root, "s2");
+
+    // delete directory
+    assertTrue(hdfs.delete(dir, true));
+    assertNotNull(fsdir.getInode(file2NodeId));
+
+    // delete second snapshot
+    hdfs.deleteSnapshot(root, "s2");
+    assertTrue(fsdir.getInode(file2NodeId) == null);
+
+    NameNodeAdapter.enterSafeMode(cluster.getNameNode(), false);
+    NameNodeAdapter.saveNamespace(cluster.getNameNode());
+
+    // restart NN
+    cluster.restartNameNodes();
+  }
+{code}
+, [~jingzhao]] Thanks for the new unit test and explain the difference.
+I assumed when deleting a directory recursively, all children will be added to the diff list. but that's not how the implementation is done. snapshot diff only record directory deletion. so the fix you suggested is better.
+One more question, I think what's really needed is to  call {{cleanSubtreeRecursively}} before {{destroyCreatedList}}, isn't it?
+{code}
++      counts.add(currentINode.cleanSubtreeRecursively(snapshot, prior,
++          collectedBlocks, removedINodes, priorDeleted, countDiffChange));
+      // delete everything in created list
+      DirectoryDiff lastDiff = diffs.getLast();
+      if (lastDiff != null) {
+         counts.add(lastDiff.diff.destroyCreatedList(currentINode,
+             collectedBlocks, removedINodes));
+       }
+     } else {
+       // update prior
+       prior = getDiffs().updatePrior(snapshot, prior);
+@@ -739,7 +741,10 @@ boolean computeDiffBetweenSnapshots(Snapshot fromSnapshot,
+       
+       counts.add(getDiffs().deleteSnapshotDiff(snapshot, prior,
+           currentINode, collectedBlocks, removedINodes, countDiffChange));
+-      
++
++      counts.add(currentINode.cleanSubtreeRecursively(snapshot, prior,
++          collectedBlocks, removedINodes, priorDeleted, countDiffChange));
++
+       // check priorDiff again since it may be created during the diff deletion
+       if (prior != Snapshot.NO_SNAPSHOT_ID) {
+         DirectoryDiff priorDiff = this.getDiffs().getDiffById(prior);
+@@ -778,9 +783,7 @@ boolean computeDiffBetweenSnapshots(Snapshot fromSnapshot,
+         }
+       }
+     }
+-    counts.add(currentINode.cleanSubtreeRecursively(snapshot, prior,
+-        collectedBlocks, removedINodes, priorDeleted, countDiffChange));
+-    
++
+     if (currentINode.isQuotaSet()) {
+       currentINode.getDirectoryWithQuotaFeature().addSpaceConsumed2Cache(
+           -counts.get(Quota.NAMESPACE), -counts.get(Quota.DISKSPACE));
+{code}, Yeah, I think that is necessary when deleting a snapshot. But when deleting a dir/file from the current fsdir, I guess it should be ok to place {{cleanSubtreeRecursively}} in the end., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12663603/HDFS-6908.002.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.security.TestRefreshUserMappings
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestBlockTokenWithDFS
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/7732//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/7732//console
+
+This message is automatically generated., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12663603/HDFS-6908.002.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.TestEncryptionZones
+                  org.apache.hadoop.hdfs.TestDistributedFileSystem
+                  org.apache.hadoop.hdfs.TestFileAppend4
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/7735//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/7735//console
+
+This message is automatically generated., Actually when deleting a directory from the current namespace, it may be better to call {{destroyCreated}} before calling {{cleanSubtreeRecursively}}. This is because:
+# The current bug only exists in snapshot deletion scenario (when deleting a directory, there is no snapshot combination logic involved).
+# {{cleanSubtreeRecursively}} goes through the complete children list of the current directory, where the children that are contained in the created list anyway should be completely removed. We can avoid processing these files/directories in {{cleanSubtreeRecursively}} if we call {{destroyCreated}} first., Thanks [~jingzhao] for reviewing. revised the patch.
+, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12663979/HDFS-6908.003.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.TestFileAppend
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestBlockTokenWithDFS
+                  org.apache.hadoop.hdfs.web.TestWebHdfsFileSystemContract
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/7744//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/7744//console
+
+This message is automatically generated., I don't think the failed tests are related to this patch., +1 for the latest patch. Thanks for the fix, [~jyu@cloudera.com]! I will commit it later today., [~jingzhao]] Thanks for reviewing patch and the discussion., I've committed this to trunk and branch-2. Thanks [~jyu@cloudera.com] for the contribution!, We have an HDFS installation in production where we ran into this problem.  Since the fsimage is corrupt, namenode fails to come up, leaving the system unusable.  We suspect that the problem was triggered in our case by deletion of one of the existing snapshots of a large directory containing several sub-directories and files.
+
+While the proposed fix above is definitely useful to prevent this issue going forward, is there any recommendation for how to fix an fsimage which was already corrupted by this bug?
+
+We temporarily put in the following hack in FSImageFormatPBSnapshot.java to mask this problem.  The risk with this hack is that it can mask other bugs/corruptions, and since it doesn't fix the corrupt fsimage on disk, the hack will always be needed to make the namenode work.
+
+{noformat}
++++ b/hadoop/hadoop-2.5.1-src/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/snapshot/FSImageFormatPBSnapshot.java
+@@ -34,6 +34,8 @@
+ import java.util.List;
+ import java.util.Map;
+ 
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.fs.permission.PermissionStatus;
+ import org.apache.hadoop.hdfs.server.namenode.AclFeature;
+@@ -73,6 +75,9 @@
+ 
+ @InterfaceAudience.Private
+ public class FSImageFormatPBSnapshot {
++  public static final Log LOG = LogFactory.getLog(FSImageFormatPBSnapshot.class);
++
++
+   /**
+    * Loading snapshot related information from protobuf based FSImage
+    */
+@@ -267,8 +272,12 @@ private void addToDeletedList(INode dnode, INodeDirectory parent) {
+       // load non-reference inodes
+       for (long deletedId : deletedNodes) {
+         INode deleted = fsDir.getInode(deletedId);
+-        dlist.add(deleted);
+-        addToDeletedList(deleted, dir);
++        if (deleted != null) {
++          dlist.add(deleted);
++          addToDeletedList(deleted, dir);
++        } else {
++          LOG.error("Could not find inode " + deletedId + " from deleted-list of directory: " + dir.toDetailString());
++        }
+{noformat}, bq. and since it doesn't fix the corrupt fsimage on disk, the hack will always be needed to make the namenode work.
+
+When the NN comes up (ensure you also have this bugfix patched on), you can then invoke a {{dfsadmin -saveNamespace}} to recreate a new, good image., Thanks Harsh, that sounds reasonable.  It gives us a way to avoid having to live with the FSImageFormatPBSnapshot hack longer term once the proper fix for this bug is applied.
+
+Thanks]

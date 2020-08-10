@@ -1,0 +1,143 @@
+[To resolve this, we need to port the branch-1-win MapReduce change shown in HADOOP-8899 to YARN.
+, The attached patch is a port of the strategy used for branch-1-win MapReduce in HADOOP-8899.  On Windows, we build a temporary jar that contains only a manifest.  The manifest's Class-Path attribute references all of the classpath entries.  The Class-Path attribute is not subject to the Windows command line length limitation, so it can grow as large as needed.
+
+Within the Class-Path attribute, environment variables are not expanded automatically and wildcards are not supported.  The patch includes code to evaluate environment variables and resolve wildcard patterns before writing the Class-Path attribute, so Windows can still use classpath entries like %HADOOP_HOME%/share/hadoop/common/*.
+
+While working on this, I discovered a few related problems for Windows compatibility.  {{RawLocalFileSystem#setPermission}} used an extra leading '0' in a chmod command.  This was harmless on Linux, bu winutils rejects it, so I removed it.  Several lines of code in {{DefaultContainerExecutor}} and {{ContainerLaunch}} called {{Path.toUri().getPath()}} instead of {{Path.toString()}}.  {{Path.toString()}} is needed to get the expected behavior for handling a Windows path with a drive spec: it removes the leading '/' before the drive spec.
+
+I also discovered a problem across the YARN test suites on Windows.  The tests tend to create very long container working directories deep in the Maven build hierarchy.  cmd.exe cannot execute a script at an absolute path longer than 260 characters.  This was causing numerous tests to fail while trying to run default_container_executor.cmd.  To resolve this, I shortened the directories by switching calls to {{Class#getName}} to {{Class#getSimpleName}}.  Then, I created a symlink at a shorter path in temporary storage, targeting the full path to the working directory.  Tests then access the working directory through the short symlink to avoid hitting the path length limitation.  (See changes in {{MiniMRClientClusterFactory}} and {{MiniYARNCluster}}.)
+
+{{org.apache.hadoop.mapred.TestClusterMapReduceTestCase}} is an example of a test suite that was failing on Windows, but it passes now with this patch.
+, I'm uploading version 2 of the patch to correct a problem with an assertion in {{TestFileUtil#testCreateJarWithClassPath}}., Chris, do you see any reason why the Class-Path manifest approach could not used for all OSes? Regarding the extra leading '0' removal in setPermissions, just make sure this leading zero is not used to force an octal interpretation of the mask., {quote}
+Chris, do you see any reason why the Class-Path manifest approach could not used for all OSes?
+{quote}
+
+I initially tested the Class-Path manifest change on Mac without the {{if (Shell.WINDOWS)}} guard, so this approach definitely can work across platforms.  Comments in HADOOP-8899, which was a similar change for branch-1-win MapReduce, give the rationale for limiting the change to Windows: platforms that don't have the command line length limitation don't need to suffer the small performance hit of creating the extra jar.
+
+It's a very small performance hit though, and it's a one-time initialization cost, so long-running jobs will notice it less than short jobs.  If we'd prefer to keep the approach consistent, then we can do that.  What do you think?
+
+{quote}
+Regarding the extra leading '0' removal in setPermissions, just make sure this leading zero is not used to force an octal interpretation of the mask.
+{quote}
+
+I think we're OK on this.  The 'o' in the format string (not the length of the zero-padding) gives us octal formatting of the string prior to calling chmod or winutils.  Neither chmod nor winutils need a leading zero on the input.  They always interpret the input as an octal mode.  I ran the full test suite after this change, and it didn't cause any test failures.
+, On the 1st, agree, and i don't think the perf hit will be noticeable, the most a a few of millisecs. On the 2nd, thx for checking., If its not too much work, could you try using http://commons.apache.org/lang/api-release/org/apache/commons/lang3/text/StrSubstitutor.html instead of writing a custom string substitutor. Dont bother if its going to be a lot of effort.
+
+What prompted this change in MiniYarnCluster?
+{code}
+             + "-" + dirType + "Dir-nm-" + index + "_" + i);
+-        dirs[i].mkdir();
++        dirs[i].mkdirs();
+{code}
+
+Do we still need to use SimpleNames after using symlink?
+
+Is there a JIRA to make the env substitution work for branch-1-win when creating the classpath manifest? What about * expansion?, Alejandro and Bikas, thanks for the feedback.  I'm working on a new patch, but here are a few quick replies first:
+
+{quote}
+On the 1st, agree, and i don't think the perf hit will be noticeable, the most a a few of millisecs.
+{quote}
+
+The next version of the patch will bundle the classpath into a temp jar on all platforms, not just Windows.
+
+{quote}
+If its not too much work, could you try using http://commons.apache.org/lang/api-release/org/apache/commons/lang3/text/StrSubstitutor.html instead of writing a custom string substitutor. Dont bother if its going to be a lot of effort.
+{quote}
+
+I had looked at StrSubstitutor earlier, but there were some things that make it awkward to use for this logic.
+
+If the variable is undefined, then the StrSubstitutor will leave the variable name in place instead of the more traditional shell behavior of replacing it with empty string.  For example, consider "$FOO_$BAR_$BAZ" and an environment consisting of FOO=one and BAZ=two (BAR is undefined).  StrSubstitutor returns "one_$BAR_two" instead of "one__two", which is what we expect from shell.  To work around this, we'd need to wrap the environment map in a custom map that returns default values (i.e. Guava MapMaker) or subclass StrLookup: http://commons.apache.org/lang/api-2.5/org/apache/commons/lang/text/StrLookup.html.
+
+The other problem is that StrSubstitutor works best for matching variable names that have a static prefix and suffix.  This works great for Windows ("%VAR%/foo"), but now that we're going to do the same thing for non-Windows, we also need to handle shell variable names ("$VAR/foo").  We need to parse $, followed by multiple legal variable name characters, terminated by any non-legal variable name character.  That can't be expressed with a static suffix, but it's easily expressed with a regex.  Another alternative is to subclass StrMatcher: http://commons.apache.org/lang/api-2.5/org/apache/commons/lang/text/StrMatcher.html.
+
+It's definitely possible to make StrSubstitutor behave the way we need, but all things considered, it would probably take at least double the code compared to {{StringUtils#replaceTokens}}.  I'm not planning on switching to StrSubstitutor in the next patch, but if you disagree, please let me know.
+
+{quote}
+What prompted this change in MiniYarnCluster?
+{quote}
+
+I forgot to mention this part.  At this point in the code, it's trying to create a directory at a deeply nested path, and the parent path doesn't exist yet.  mkdir() was returning false.  This wasn't causing test failures on Linux, because the directory was still getting created later during container initialization.  However, it is a problem on Windows with the temp test directory symlink, because winutils symlink currently requires that the target already exists.  (See HADOOP-9043.)  I switched this to mkdirs() so that it would recursively create the full path.
+
+{quote}
+Do we still need to use SimpleNames after using symlink?
+{quote}
+
+Yes, unfortunately, the symlink alone isn't sufficient.  Here is an example of the kind of test working directory it was using before my patch (390 characters):
+
+C:/hdc/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/target/org.apache.hadoop.mapred.ClusterMapReduceTestCaseConfigurableMiniMRCluster/org.apache.hadoop.mapred.ClusterMapReduceTestCaseConfigurableMiniMRCluster-localDir-nm-1_1/usercache/cnauroth/appcache/application_1358229151479_0001/container_1358229151479_0001_01_000001/default_container_executor.cmd
+
+Using the temp symlink, that turns into this path (270 characters, still over the limit of 260):
+
+C:\Users\cnauroth\AppData\Local\Temp\1358803955776\org.apache.hadoop.mapred.ClusterMapReduceTestCaseConfigurableMiniMRCluster-localDir-nm-1_1\usercache\cnauroth\appcache\application_1358229151479_0001\container_1358229151479_0001_01_000001\default_container_executor.cmd
+
+Then, with the switch to simple class name, it fits (244 characters, bringing us under the limit of 260):
+
+C:\Users\cnauroth\AppData\Local\Temp\1358803955776\ClusterMapReduceTestCaseConfigurableMiniMRCluster-localDir-nm-1_1\usercache\cnauroth\appcache\application_1358229151479_0001\container_1358229151479_0001_01_000001\default_container_executor.cmd
+
+{quote}
+Is there a JIRA to make the env substitution work for branch-1-win when creating the classpath manifest? What about * expansion?
+{quote}
+
+Thank you for the reminder.  I just filed MAPREDUCE-4959 to backport this logic to branch-1-win.  In my next version of this patch, I'm also going to try to refactor more of the logic currently in {{ContainerLaunch}} to {{FileUtil#createJarWithClassPath}}.  I expect that will make the code easier to backport to branch-1-win, because we'll have most of the logic in hadoop-common, and then it's just a matter of different call sites in MapReduce v1 vs. YARN.
+, I am in favor of keeping a windows specific path for classpath jar now and definitely open a jira to merge the code paths later on. I would be wary of destabilizing the linux path while edge cases and other bugs gets ironed out on windows. The perf needs to be measured. The branch-1-win jira should have some discussion on perf tests conducted to measure the difference. We might need to redo them for trunk because the code is different and perf results might be different.
+Please ignore strsubstitutor. Doesnt seem worth the effort.
+So even the simple class name and symlink are just about working for the current set of test case names. We might need another fix for this down the road., {quote}
+I am in favor of keeping a windows specific path for classpath jar now and definitely open a jira to merge the code paths later on.
+{quote}
+
+Yes, that does sound like the safer approach.  I have filed YARN-358 for this.
+
+{quote}
+So even the simple class name and symlink are just about working for the current set of test case names. We might need another fix for this down the road.
+{quote}
+
+This is true.  Do you think it would be valuable to add a check in {{DefaultContainerExecutor#launchContainer}} to see if the path to the container launch script is > 260 characters, and if so, fail fast with a descriptive error message?  This could be helpful even for the main product code, in case someone deploys on Windows with a path configured in yarn.nodemanager.local-dirs that is too long.  I'll see if I can incorporate this in my next version of this patch.
+, I'm attaching version 3 of the patch to incorporate the feedback.
+
+The jar bundling logic is still behind a check for Windows as a safety net.  I did test on Mac with that check removed, and it worked.  Hopefully that means we're set up well for YARN-358 to be an easy change in the future.
+
+I did add a check in {{DefaultContainerExecutor}} to fail fast if the launch script would fail due to the Windows path length limitation.
+, We could mention the jira number here
+{code}
++    // TODO: Remove Windows check and use this approach on all platforms after
++    // additional testing.
+{code}
+
+Who is taking care of cleaning up the contents actual testWorkDir to which this symlink points to?
+{code}
++      if (Shell.WINDOWS) {
++        // On Windows, clean up the short temporary symlink that was created to
++        // work around path length limitation.
++        String testWorkDirPath = testWorkDir.getAbsolutePath();
++        try {
++          FileContext.getLocalFSFileContext().delete(new Path(testWorkDirPath),
++            true);
++        } catch (IOException e) {
++          LOG.warn("could not cleanup symlink: " +
++            testWorkDir.getAbsolutePath());
++        }
++      }
+{code}
+
+Would be good to test for glob expansion code in testCreateJarWithClassPath()., I'm uploading version 4 of the patch.
+
+{quote}
+We could mention the jira number here
+{quote}
+
+Done.
+
+{quote}
+Who is taking care of cleaning up the contents actual testWorkDir to which this symlink points to?
+{quote}
+
+The test working directory only gets deleted if the dev runs "mvn clean" or at the start of a new test run to clear out old state.  See the first few lines of the {{MiniYARNCluster}} constructor.  There is nothing currently that cleans up this directory at the end of a test run, aside from container cleanup activities like deleting the launch scripts.  This is the same behavior as trunk, and this patch doesn't change it.
+
+{quote}
+Would be good to test for glob expansion code in testCreateJarWithClassPath().
+{quote}
+
+Good catch.  Thank you.  I've updated the test to check that it picks up jar files (and leaves behind non-jar files) that match the wildcard.
+, +1. This ends up checking for existence of wildcard jars while non-wildcard jars in the classpath are still not checked for existence as before., Removing 3.0.0 from target versions, because this change is dependent on code that only exists in branch-trunk-win right now., Thank you [~bikassaha] for the review.
+
+I committed the patch to branch-trunk-win. Thank you Chris!]

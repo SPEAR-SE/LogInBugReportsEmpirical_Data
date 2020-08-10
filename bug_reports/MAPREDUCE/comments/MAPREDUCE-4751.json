@@ -1,0 +1,158 @@
+[We should backport MAPREDUCE-3353 to 0.23. That automatically fixes this issue in that AM acts on lost nodes and kills the corresponding TaskAttempts which in turn will avoid Job getting stuck in KILL_WAIT state.
+
+Will do the backport., This is my best guess for what is happening. Imagine a job is running, and we send it the KILL signal. The job transitions from RUNNING to KILL_WAIT. The task transitions from RUNNING to KILL_WAIT. However, some task attempts may be in COMMIT_PENDING state. Pasting state graph here for reference 
+!TaskAttemptStateGraph.jpg!
+
+If the TA_DONE event is queued in the event queue before the TA_KILL event, then the task attempt is transitioned from COMMIT_PENDING to SUCCESS_CONTAINER_CLEANUP (which we would think should've transitioned to KILL_CONTAINER_CLEANUP, because hey, we sent it TA_KILL and it was in COMMIT_PENDING). Afterwards, the Task Attempt transitions from SUCCESS_CONTAINER_CLEANUP to SUCCEEDED. In either of these states TA_KILL is ignored. So the Task stays in KILL_WAIT and consequently the Job too., I am rather nervous about back porting MAPREDUCE-3353.  It is a major feature that has a significant footprint and was not all that stable when it first went in.  I know that it has since stabilized but I am still nervous about such a large change. It seems like it would be simpler to handle the KILL events in the states that missed it., bq. Afterwards, the Task Attempt transitions from SUCCESS_CONTAINER_CLEANUP to SUCCEEDED. In either of these states TA_KILL is ignored. So the Task stays in KILL_WAIT and consequently the Job too.
+This is fine. Job waits for all tasks and taskAttempts to 'finish', not just killed. In this case, TA will succeed and inform the job about the same, so that the job doesn't wait for this task anymore.
+
+bq. I am rather nervous about back porting MAPREDUCE-3353. It is a major feature that has a significant footprint and was not all that stable when it first went in. I know that it has since stabilized but I am still nervous about such a large change.
+Understand that it is a big change, but if we want to address this issue, we need that patch. Given MAPREDUCE-3353 is hardened on trunk, we should considering pulling it in into 0.23. 
+
+bq. It seems like it would be simpler to handle the KILL events in the states that missed it.
+There isn't anything like a missed state that is causing this issue if I understand Ravi's issue description correctly., bq. There isn't anything like a missed state that is causing this issue if I understand Ravi's issue description correctly.
+Obviously, this could be wrong.
+
+Ravi, if you have one of these stuck AMs lying around, can you take a thread dump please?, I am still nervous about pulling in a big change like MAPREDUCE-3353 just to fix a Major bug.  I am not going to block this going in if you come up with a patch, but I really want to beat on the patch before we pull it into 0.23.  I just want to be sure that it fixes the issue, and does not destabilize anything. This is only a Major bug because the only time the job gets stuck is when a user sends it a kill command, so the user already wants the job to go away.  The job's tasks do go away, but the AM gets stuck and is taking up a small amount of resources on the queue, which is bad, but not the end of the world.
+
+bq. {quote}There isn't anything like a missed state that is causing this issue if I understand Ravi's issue description correctly. {quote}
+bq. Obviously, this could be wrong.
+
+You are correct that the task attempt's state machine cannot really fix this unless it lies, which would be an ugly hack, but it seems that it is not the Task Attempt that is getting stuck.  I was thinking that KILL_WAIT is waiting for the wrong things.  In TaskImpl KILL_WAIT ignores T_ATTEMPT_FAILED and T_ATTEMPT_SUCCEEDED, when it should actually be keeping track of all pending attempts and exit KILL_WAIT when all pending attempts have exited, either with a kill, success or failure.  It is a bug for TaskImpl to assume that as soon as it sends a KILL to the task attempt that it will beat out all other events and kill the attempt.  JobImpl's state machine appears to do something like this already.
+, bq. This is fine. Job waits for all tasks and taskAttempts to 'finish', not just killed. In this case, TA will succeed and inform the job about the same, so that the job doesn't wait for this task anymore.
+
+Vinod! I'm sorry I might not be understanding how this happens. In TaskImpl : 
+{noformat}
+    // Ignore-able transitions.
+    .addTransition(
+        TaskStateInternal.KILL_WAIT,
+        TaskStateInternal.KILL_WAIT,
+        EnumSet.of(TaskEventType.T_KILL,
+            TaskEventType.T_ATTEMPT_LAUNCHED,
+            TaskEventType.T_ATTEMPT_COMMIT_PENDING,
+            TaskEventType.T_ATTEMPT_FAILED,
+            TaskEventType.T_ATTEMPT_SUCCEEDED,
+            TaskEventType.T_ADD_SPEC_ATTEMPT))
+{noformat}
+So when the TaskAttemptImpl does indeed send T_ATTEMPT_SUCCEEDED, it is ignored by the TaskImpl, and its state stays KILL_WAIT. Am I missing something? Can you please point me to the code path?, Looking at the UI for one of the jobs that is stuck in this state and a heap dump for that AM, I can see that the JOB is in KILL_WAIT and so are many of its tasks.  But for all of the tasks in KILL_WAIT that I looked at the task attempts are all in FAILED, and none of them failed because of a node that disappeared.  It looks very much like TaskImpl just need to be able to handle T_ATTEMPT_FAILED and T_ATTEMPT_SUCCEEDED in the KILL_WAIT state, instead of ignoring them.  I will look to see if this also exists in 2.0.  I think all we need to do to reproduce this is to launch a large job that will have most of its tasks fail, and then try to kill it before the job fails on its own.
+
+This particular job had 2645 map tasks, 634 of them got stuck in KILL_WAIT, 1347 of them were successfully killed and 623 of the tasks finished with a SUCCESS. This was running on a 2,000 node cluster.  The failed tasks appeared to take about 20 seconds before they failed, but the last attempts to fail all ended within a second of each other., Yes it looks very much like this can also happen in branch-2, and trunk.  I also wanted to mention that the stack traces showed more or less nothing.  All of the threads were waiting on I/O or event queues. Nothing was actually processing any data or deadlocked holding some locks., Here's a first attempt for the patch. Very raw, no tests yet. Want to be sure that I am understanding your comments correctly.
+
+Bobby/Ravi/Jason, can you please have a quick look at it please? Tx.
+
+I get a feeling we need to do something similar in Job also. Even though it will not be the current bug assuming TaskImpl itself is stuck today., I have been doing a quick once over on this, and I have a few comments.
+
+# I think it would be cleaner for KillWaitAttemptKilledTransition to have a constructor that takes a TaskAttemptCompletionEventStatus, instead of having the subclasses set it directly themselves.
+# Remove the commented out if statement.
+# I am not sure if HashSet is the correct data type for success, failed, etc.  They are likely to be sparse arrays with small amounts of data in them.  Probably not very important, but if there are thousands of tasks it starts to add up.
+
+Over all it looks OK.  I would like to see more tests though., Part of the issue is that the job is hanging around waiting for all tasks to be killed rather than just exiting and letting YARN shoot any straggling containers.  I think it would be simpler/safer for the AM to just write out the final state stuff and exit, much like it does for the FAILED state.  If job's KILL_WAIT really is necessary then we'd need a corresponding FAILED_WAIT state to handle waiting for task cleanup when a job fails.
+
+If we don't need the job's KILL_WAIT state then similarly we can probably ditch the task KILL_WAIT state -- it could just send off kills to all the corresponding task attempts and sit in the KILLED state.  Does it really need to wait?
+
+Removing KILL_WAIT is quite a bit bigger change than the current one. as it would break a lot of tests that know and expect the KILL_WAIT state.  However I think it would be more robust in the long-term, as KILL_WAIT seems like a state primed for hanging if we don't really need it.  Since we're eager to get a fix for this in soon we could address that in a followup JIRA., Yes I think that would be better.  But that is a much larger change that would need more tests.  Perhaps we do that in a follow on JIRA., Address Bobby's comments on my earlier patch.
+
+ - Agree about Hashset. Started doing bitmaps, but it made code unreadable. Keeping HashSet but with an explicit initial capacity of 2 instead of the default 16. Could've been 1, but HashSet/HashMap immediately resizes it to two.
+ - Addressed other changes.
+ - Wrote up a test which passes with the changes and fails without. Had to spend a lot of time to get it right., bq. Part of the issue is that the job is hanging around waiting for all tasks to be killed rather than just exiting and letting YARN shoot any straggling containers. I think it would be simpler/safer for the AM to just write out the final state stuff and exit, much like it does for the FAILED state. If job's KILL_WAIT really is necessary then we'd need a corresponding FAILED_WAIT state to handle waiting for task cleanup when a job fails.
+I agree. Sharad/I debated this for a while when we wrote this initially. We let it be like it is now, just to be sure that AM's sanely exit, but we can change it. The only catch I can think of is, while the AM tries to do the remaining cleanup work (jobhistory etc), tasks will keep on bombarding AM with more updates.
+
+Didn't realize that we don't have fail_wait state.
+
+The change isn't much bigger but it can break tests. Let's pursue that separately.
+
+The current bug is caused by Tasks waiting on TAs which should be fixed by my patch. Of course, it then opens up the job bug, let's fix that separately.
+
+Regarding doing away with Task's kill_wait, I disagree. Tasks can get kill signal during the AM is running, so we should handle it explicitly by killing and waiting for all attempts, otherwise we run the risk of dangling JVMs doing nothing but occupying slots till AM exits., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12552951/MAPREDUCE-4751-20121109.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3007//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3007//console
+
+This message is automatically generated., The patch looks OK to me.  It does pass all of the tests so I am +1 on it.  We may be able to make things simpler like was stated, but for the time being I think this is OK., Integrated in Hadoop-trunk-Commit #2999 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/2999/])
+    MAPREDUCE-4751. AM stuck in KILL_WAIT for days (vinodkv via bobby) (Revision 1408314)
+
+     Result = SUCCESS
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1408314
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/JobImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestKill.java
+, I merged the patch to trunk, and branch-2 with no problems, but branch-0.23 has a few merge conflicts.  I think I have resolved all of the conflicts correctly, but I would like another pair of eye to confirm that.
+
+I am running unit tests and so far they all look OK., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12553129/MR-4751-branch-0.23.txt
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3013//console
+
+This message is automatically generated., The patch for branch-0.23 looks like a good port to me, +1., Thanks Vinod,
+
+I put this into trunk, branch-2, and branch-0.23, Thanks for all the help, Bobby and Jason!, Integrated in Hadoop-Yarn-trunk #35 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/35/])
+    MAPREDUCE-4751. AM stuck in KILL_WAIT for days (vinodkv via bobby) (Revision 1408314)
+
+     Result = SUCCESS
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1408314
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/JobImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestKill.java
+, Integrated in Hadoop-Hdfs-0.23-Build #434 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/434/])
+    svn merge -c 1408314 FIXES: MAPREDUCE-4751. AM stuck in KILL_WAIT for days (vinodkv via bobby) (Revision 1408349)
+
+     Result = SUCCESS
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1408349
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/JobImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestKill.java
+, Integrated in Hadoop-Hdfs-trunk #1225 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1225/])
+    MAPREDUCE-4751. AM stuck in KILL_WAIT for days (vinodkv via bobby) (Revision 1408314)
+
+     Result = SUCCESS
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1408314
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/JobImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestKill.java
+, Integrated in Hadoop-Mapreduce-trunk #1256 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1256/])
+    MAPREDUCE-4751. AM stuck in KILL_WAIT for days (vinodkv via bobby) (Revision 1408314)
+
+     Result = SUCCESS
+bobby : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1408314
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/JobImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestKill.java
+]

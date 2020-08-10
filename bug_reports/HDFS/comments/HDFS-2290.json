@@ -1,0 +1,280 @@
+[h3. Steps to reproduce:
+- Start a cluster with 3 DataNodes. I run it on one box, and I accelerate block reports, so that each DN sends them every 3 minutes. 
+- Create several files.
+- Open data-node storage directory {{data/current/finalised}}, which holds block files and remove file blk_*.meta for one of the blocks.
+- The block will be reported to the NameNode as corrupt.
+- Run fsck or -metasave to see the block is under-replicated. And this never changes. , *The correct behavior* should be that NN replicates the block using one of the good replica, and then deletes the corrupt replica. So there are 2 steps:
+# replicating a good replica
+# deleting the corrupt replica when the block is fully replicated
+
+Replication is handled by ReplicationMonitor, which replicates blocks from {{neededReplications}} list. It seems that while processing corrupt replicas we somehow miss to put them into {{neededReplications}}., Hasn't this always been the case, that if there's a machine with a corrupt replica, it shouldn't be a target for the new replica? That is to say, the DN can't accept a new replica of the same block before it has deleted the old one?
+
+If you start a 4th DN in the cluster, does replication proceed?, Good point. Let me try that., Two things.
+# Setting replication to 2 for the corrupt file on 3-node cluster in a hope that the corrupt replica will be removed and I'll set replication back to 3. fsck shows healthy file, but NN does not even try to delete the corrupt replica. The DN keeps reporting the corrupt replica, and when I set replication back to 3, I end up where I started. 
+The general problem seems to be that NN does not schedule deletion of corrupt replicas when you lower the replication of the block.
+# Starting 4th DN. Replication is triggered as expected, and then removal of the corrupt replica is scheduled, but the latter fails with the following exception:
+{code}
+11/08/26 16:19:38 WARN datanode.DataNode: Unexpected error trying to delete block blk_-4767793772698703708_1816. BlockInfo not found in volumeMap.
+11/08/26 16:19:38 WARN datanode.DataNode: Error processing datanode Command
+java.io.IOException: Error in deleting blocks.
+	at org.apache.hadoop.hdfs.server.datanode.FSDataset.invalidate(FSDataset.java:1681)
+	at org.apache.hadoop.hdfs.server.datanode.DataNode.processCommand(DataNode.java:1021)
+	at org.apache.hadoop.hdfs.server.datanode.DataNode.processCommand(DataNode.java:983)
+	at org.apache.hadoop.hdfs.server.datanode.DataNode.offerService(DataNode.java:920)
+	at org.apache.hadoop.hdfs.server.datanode.DataNode.run(DataNode.java:1439)
+	at java.lang.Thread.run(Unknown Source){code}
+{code}
+I think DN can ignore the absence of metadata file if it is deleting it anyways., Actually, in case (2) it does not get to deletion of meta-file. The block is not in the volume map, but it is still reported by DN on block reports., Bumping this to blocker. Nice find - I'm surprised we don't have more tests for this., There is a bug in BlockManager (NameNode) which prevents the namenode from adding the corrupt block to the list of blocks of be invalidated. 
+
+The following snippet is from BlockManager.markBlockAsCorrupt () 
+
+   if (countNodes(storedBlock).liveReplicas() > inode.getReplication()) { 
+      // the block is over-replicated so invalidate the replicas immediately 
+      invalidateBlock(storedBlock, node); 
+    } else { 
+      // add the block to neededReplication 
+      updateNeededReplications(storedBlock, -1, 0); 
+    } 
+
+If the replication factor for the file is 2 and the number of good replicas is 2, the above condition still will NOT invalidate the block. This condition should be changed to 
+
+ if (countNodes(storedBlock).liveReplicas() >= inode.getReplication()) { , Once the above change is made, the NN will replicate the block and if the block is replicated, then DN will get the command to delete the corrupt replica. The Deletion by DN will still fail with the exception specified in the previous comments. This is because the generationstamp of the block is 0 on datanode and will be different from the generationstamp send by the NN. 
+
+One way to fix will be to NOT compare the generationstamp since the block is corrupt anyway., Even if  BlockManager.markBlockAsCorrupt () is fixed in the way mentioned above,  there is still a special case in which the NN will not invalidate the block.
+
+To reproduce this, 
+set the replication factor for the file to 2. 
+corrupt the block by removing metafile from one of DNs. The block will not be removed since number of good replicas is less than the replication factor.
+set the replication factor for the file to 1. 
+The block is still not removed. 
+
+This bug is caused by the following statement in BlockManager.invalidateBlock()
+
+   // Check how many copies we have of the block. If we have at least one
+    // copy on a live node, then we can delete it.
+    int count = countNodes(blk).liveReplicas();
+    if (count > 1) {
+      addToInvalidates(blk, dn);
+
+The bug can be fixed by changing the condition to (count >= 1)., Patch for the bug, The patch contains the Fixes to BlockManager as mentioned in the comments. The bug is reproduced in a slightly different way in which the block is corrupted by changing the contents and not by deleting the meta file.  This way of corruption allows the datanode to remove the corrupt block when asked by the namenode. 
+The patch also contains a a test class which 4 unit tests testing the various scenarios for handling corrupt replicas., The patch looks good. Couple things on the test
+# Hould be jnuit 4 format
+# Please use DFSConfigKeys constants instead of direct config names., Converted test to junit 4 format
+Uses DFSConfigKeys instead of constants, +1 looks good. Could you please run test-patch and test targets and post the results here., Attached the new patch with the correct naming conventions. 
+
+Ran the test-patch. The result is below:
+
+     [exec] +1 overall.  
+     [exec] 
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+     [exec] 
+     [exec]     +1 tests included.  The patch appears to include 2 new or modified tests.
+     [exec] 
+     [exec]     +1 javadoc.  The javadoc tool did not generate any warning messages.
+     [exec] 
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+     [exec] 
+     [exec]     +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+     [exec] 
+     [exec]     +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+     [exec] 
+     [exec]     +1 system test framework.  The patch passed system test framework compile., I just committed this to 0.22 branch. Thank you Benoy.
+Need to check if we have the same problem with trunk., Integrated in Hadoop-Hdfs-22-branch #88 (See [https://builds.apache.org/job/Hadoop-Hdfs-22-branch/88/])
+    HDFS-2290. Block with corrupt replica is not getting replicated. Contributed by Benoy Antony.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1173324
+Files : 
+* /hadoop/common/branches/branch-0.22/hdfs/CHANGES.txt
+* /hadoop/common/branches/branch-0.22/hdfs/src/java/org/apache/hadoop/hdfs/server/namenode/BlockManager.java
+* /hadoop/common/branches/branch-0.22/hdfs/src/test/hdfs/org/apache/hadoop/hdfs/server/namenode/TestProcessCorruptBlocks.java
+, Unblocking for 0.22, It doesn't seem like we should be able to commit bugfixes to a branch without going through trunk first, unless there's justification that the implementation in trunk. Given that the replication code is basically the same, I think this requires further investigation to prevent trunk being a regression from 0.22., bq. unless there's justification that the implementation in trunk
+er... "that the implementation in trunk is different enough to avoid the bug", I can see this issue exists in trunk as well.
+
+I just rebased the patch to trunk and verified.
+
+Following test-cases (provided in patch) are failing without the fix.
+{code}
+testWhenDecreasingReplication
+testWithReplicationFactorAsOne
+{code}
+
+After fix, all the test-cases are passing. So IMO this issue needs to be fixed in trunk as well.
+
+This is just an attempt to fix the issue in trunk as well. Thanks to Binoy and Konstantin for the patch. I can upload the patch for trunk if it is fine with you., I can see one minor problem with testcode.
+
+Always we are trying to restart datanode-0 only.
+
+{code}
++  private void corruptBlock(MiniDFSCluster cluster, FileSystem fs,
++      final Path fileName, int dnIndex, Block block) throws IOException {
++    // corrupt the block on datanode dnIndex
++    // the indexes change once the nodes are restarted.
++    // But the datadirectory will not change
++    assertTrue(cluster.corruptReplica(block.getBlockName(), dnIndex));
++
++    DataNodeProperties dnProps = cluster.stopDataNode(0);
+{code}
+
+*Should it be*
+{code}
++    DataNodeProperties dnProps = cluster.stopDataNode(dnIndex);
+{code}
+, Updated the patch for trunk.
+
+Changes
+=======
+1) Rebased the patch to trunk.
+2) Corrected one test method as mentioned in my previous comments., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12496065/HDFS-2290_trunk.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.hdfs.TestDfsOverAvroRpc
+                  org.apache.hadoop.hdfs.server.namenode.TestProcessCorruptBlocks
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestHost2NodesMap
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/1278//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1278//console
+
+This message is automatically generated., TestHost2NodesMap failures - I will correct as part of HDFS-2346.
+TestDfsOverAvroRpc - failures are irrelavant to the current issue. Will be fixed as part of HDFS-2298.
+
+TestProcessCorruptBlocks - I am analyzing the failure., TestProcessCorruptBlocks - Failure seems to be a timing issue.
+We are trying to restart the Datanode and expecting the block reporting to complete in 3 seconds. This may not succeed all the times.
+
+This test is always passing in local dev env. I'm able to recur the failures in local environment with less sleep time (1 second).
+
+Any suggestion to improve the test-case apart from increasing the sleep time., What one of the other tests does is to sleep in a while loop for about 20 times, each time "sleeping" for a second and checking if it got the expected results. This way, the test was not sleeping for more time than necessary. If there is a better way, I am all ears as well...
+{code}
++      while (tries++ < 20) {
++        try {
++          Thread.sleep(1000);
++          if (checkFile(fileSys, file1, replicas, null, numDatanodes) == null) {
++            break;
++          }
++        } catch (InterruptedException ie) {
++        }
++      }
++      cleanupFile(fileSys, file1);
++      assertTrue("Checked if node was recommissioned " + tries + " times.",
++         tries < 20);
+{code}, Regarding the change in test :
+
+  // corrupt the block on datanode dnIndex
++    // the indexes change once the nodes are restarted.
++    // But the datadirectory will not change
++    assertTrue(cluster.corruptReplica(block.getBlockName(), dnIndex));
++
++    DataNodeProperties dnProps = cluster.stopDataNode(0);
+
+This is correct since   cluster.stopDataNode(0);  removes the first node so that the node at index 1 moves to index 0.
+cluster.restartDataNode ()   adds the new node (previously 0th node)  at the end of the list.
+
+I also indicated this in the comments. ("the indexes change once the nodes are restarted. But the datadirectory will not change") But looks like , they were not clear.
+
+This could be the reason for failure in trunk.  John's suggestion seems to be better than  sleeping hard for 3 seconds.
+, {quote}
+This is correct since cluster.stopDataNode(0); removes the first node so that the node at index 1 moves to index 0.
+cluster.restartDataNode () adds the new node (previously 0th node) at the end of the list.
+{quote}
+
+Sorry for my misinterpretation. I will correct it., Uploading the corrected patch for the trunk. 
+The change was to stop the 0th datanode., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12496300/HDFS-2290_trunk.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.hdfs.TestDfsOverAvroRpc
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestHost2NodesMap
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/1284//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1284//console
+
+This message is automatically generated., Test failures are irrelevant to this patch as mentioned in my earlier comments.
+
+TestHost2NodesMap failures - Will be corrected as part of HDFS-2346. Patch already available.
+TestDfsOverAvroRpc - Will be fixed as part of HDFS-2298., Integrated in Hadoop-Common-trunk-Commit #947 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/947/])
+    HDFS-2290. Block with corrupt replica is not getting replicated. Contributed by Benoy Antony.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1175175
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestProcessCorruptBlocks.java
+, Integrated in Hadoop-Hdfs-trunk-Commit #1025 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/1025/])
+    HDFS-2290. Block with corrupt replica is not getting replicated. Contributed by Benoy Antony.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1175175
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestProcessCorruptBlocks.java
+, I just committed this. Thank you Benoy and Laxman., Integrated in Hadoop-Mapreduce-trunk-Commit #965 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Commit/965/])
+    HDFS-2290. Block with corrupt replica is not getting replicated. Contributed by Benoy Antony.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1175175
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestProcessCorruptBlocks.java
+, Integrated in Hadoop-Hdfs-0.23-Build #20 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/20/])
+    HDFS-2290. Block with corrupt replica is not getting replicated. Contributed by Benoy Antony.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1175176
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestProcessCorruptBlocks.java
+, Integrated in Hadoop-Mapreduce-0.23-Build #25 (See [https://builds.apache.org/job/Hadoop-Mapreduce-0.23-Build/25/])
+    HDFS-2290. Block with corrupt replica is not getting replicated. Contributed by Benoy Antony.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1175176
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestProcessCorruptBlocks.java
+, Integrated in Hadoop-Mapreduce-trunk #841 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/841/])
+    HDFS-2290. Block with corrupt replica is not getting replicated. Contributed by Benoy Antony.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1175175
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestProcessCorruptBlocks.java
+, Integrated in Hadoop-Hdfs-trunk #811 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/811/])
+    HDFS-2290. Block with corrupt replica is not getting replicated. Contributed by Benoy Antony.
+
+shv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1175175
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestProcessCorruptBlocks.java
+]

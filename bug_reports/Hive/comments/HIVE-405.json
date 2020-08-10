@@ -1,0 +1,140 @@
+[This will also fix another bug: Currently UNION operator will merge the 2 streams of row objects, even if their ObjectInspectors are different. This will definitely create problems since a lot of code in Hive assumes the ObjectInspector will never change.
+, As part of the fix, ExprNodeEvaluator will have the following signature:
+
+{code}
+public abstract class ExprNodeEvaluator {
+
+  /**
+   * Initialize should be called once and only once.
+   * Return the ObjectInspector for the return value, given the rowInspector.
+   */
+  public abstract ObjectInspector initialize(ObjectInspector rowInspector) throws HiveException;
+
+  /**
+   * Evaluate the expression given the row.
+   * This method should use the rowInspector passed in from initialize to 
+   * inspect the row object.
+   * The return value will be inspected by the return value of initialize. 
+   */
+  public abstract Object evaluate(Object row) throws HiveException;
+}
+{code}
+, It is my understanding that this will also fix the problem of joining on map-type columns.
+
+Ex.
+
+SELECT foobar.foo,
+foobar.mapcolumn['bar']
+
+FROM foobar
+JOIN barfoo ON ( foobar.mapcolumn['bar'] = barfoo.bleh )
+
+Will result the following exception thrown in the reduce phase:
+
+java.io.IOException: org.apache.hadoop.hive.ql.metadata.HiveException: java.lang.RuntimeException: Hive 2 Internal error: cannot evaluate index expression on string
+       at org.apache.hadoop.hive.ql.exec.ExecReducer.reduce(ExecReducer.java:169)
+       at org.apache.hadoop.mapred.ReduceTask.run(ReduceTask.java:430)
+       at org.apache.hadoop.mapred.Child.main(Child.java:155)
+Caused by: org.apache.hadoop.hive.ql.metadata.HiveException: java.lang.RuntimeException: Hive 2 Internal error: cannot evaluate index expression on string
+       at org.apache.hadoop.hive.ql.exec.GroupByOperator.process(GroupByOperator.java:451)
+       at org.apache.hadoop.hive.ql.exec.Operator.forward(Operator.java:315)
+       at org.apache.hadoop.hive.ql.exec.JoinOperator.createForwardJoinObject(JoinOperator.java:259)
+       at org.apache.hadoop.hive.ql.exec.JoinOperator.genObject(JoinOperator.java:502)
+       at org.apache.hadoop.hive.ql.exec.JoinOperator.genObject(JoinOperator.java:491)
+       at org.apache.hadoop.hive.ql.exec.JoinOperator.genObject(JoinOperator.java:491)
+       at org.apache.hadoop.hive.ql.exec.JoinOperator.genObject(JoinOperator.java:491)
+       at org.apache.hadoop.hive.ql.exec.JoinOperator.checkAndGenObject(JoinOperator.java:532)
+       at org.apache.hadoop.hive.ql.exec.JoinOperator.endGroup(JoinOperator.java:514)
+       at org.apache.hadoop.hive.ql.exec.ExecReducer.reduce(ExecReducer.java:140)
+       ... 2 more
+Caused by: java.lang.RuntimeException: Hive 2 Internal error: cannot evaluate index expression on string
+       at org.apache.hadoop.hive.ql.exec.ExprNodeIndexEvaluator.evaluate(ExprNodeIndexEvaluator.java:64)
+       at org.apache.hadoop.hive.ql.exec.ExprNodeFuncEvaluator.evaluate(ExprNodeFuncEvaluator.java:72)
+       at org.apache.hadoop.hive.ql.exec.ExprNodeFuncEvaluator.evaluate(ExprNodeFuncEvaluator.java:72)
+       at org.apache.hadoop.hive.ql.exec.ExprNodeFuncEvaluator.evaluate(ExprNodeFuncEvaluator.java:72)
+       at org.apache.hadoop.hive.ql.exec.GroupByOperator.updateAggregations(GroupByOperator.java:370)
+       at org.apache.hadoop.hive.ql.exec.GroupByOperator.processHashAggr(GroupByOperator.java:470)
+       at org.apache.hadoop.hive.ql.exec.GroupByOperator.process(GroupByOperator.java:445)
+       ... 11 more
+, @Steve: Yes, @hive-405.patch:
+
+Please use "parentsObjectInspector" instead of adding "inputObjectInspectors" to Operator.java.
+
+, why? the name of the argument to initialize() uses input. isn't input same as parents?, I think Operator.inputObjectInspectors and Operator.parentsObjectInspector contain the same information.
+So we don't need to add inputObjectInspectors to Operator.
+, are you sure about it? that doesn't seem to be correct. parentsObjectInspector doesn't seem to have been set in some cases, especially for TableScan (or topOps), currently the operator graph is walked multiple times setting one field each time (output collector, mapredwork, alias, joinalias). actually joinalias doesn't seem to be called from anywhere. i will try to refactor few other things as well., this refactors operator initialization
+
+1) removes ObjectInspector arg from Operator.process()
+2) eliminates one of the 4 operator initialization functions
+3) simplified and moved most of MapOperator.initiaizeOp() to a specific function since it modifies operator graph while initializing it. this move eliminates some of the work arounds put in initialization code.
+4) moved initialization of operators to ExecMapper/ExceReducer.configure() from map() and reducer().
+
+ , I will take a look and get back to you., Can you regenerate the patch - there are some conflicts, resolved conflicts with GroupByOperator.java and UnionOperator.java. I am testing the later conflict but uploaded latest patch., Does initializeOp() even need to call initializeChildren() ?
+
+This can be removed from all implementations of initializeOp() and can be added to Operator.initialize() after initializeOp(), Thinking about it more, you should add a outputObjectInspector to Operator, which can be defaulted to inputObjectInspector[0], but can be overridden by
+specific initializeOp() - for example, groupBy.
+
+This way, initializeChildren() in Operator need not be called with inputObjectInspector[0], but it can be called with outputObjectInspector
+, Other than that, it looks good, you dont need to set 
+state = State.INIT in initializeChildren()
+
+
+the operator.initialize() will look like:
+
+...
+
+initializeOp()
+state = INIT
+initializeChildren()
+..
+
+
+initializechildren() can be a private method which no one else should call
+
+
+, i thought about it but didn't do it for two reasons
+
+1) any operator can choose not to call initializeChildren. eg. MapOperator does not call initializeChildren() directly but calls initialize() on children directly with different ObjectInspector object for each child.
+
+2) ScriptOperator.initializeOp() seems to do some more stuff after calling initializeChildren() which is different from calling initiaizeChildren() after calling initializeOp()
+
+Even if 2) doesn't matter, I don't see how we can get around 1) in the scheme you suggested
+
+If you agree then I am going to upload a new patch which fixes TestOperators (which was failing after merging with trunk)., As you said 2. does not matter - I dont think if we move initializeChildren() to the end, anything will change
+
+1. is needed - MapOperator is an exception, and it needs a different walker - it can override initializeChildren() to do nothing.
+In some sense, it has more than one outputObjectInspectors, which is not true for any other operator - ExecMapper and ExecReducer are
+different.
+
+I still think we should do 1. - and treat MapOperator as a exception
+, Are you suggesting that we keep initializeChildren() method and override in MapOperator()? I think the current initialization methods has distinct functionalities
+
+1) Operator.initialize() -- makes sure that all parents are initialized before the operator is initialized. this also initializes common structures needed for all operators. this the only public initialization method.
+2) Operator.initializeOp() -- does operator specific initialization including initialization of children. It is up to the operator in what order child operators need to be initialized. the base implementation will just call initializeChildren() with the output ObjectInspector. this is a protected method.
+3) Operator.initializeChildren() -- calls initialize() on all children. this is a protected method.
+
+I think what we have here and you are proposing are pretty similar except that MapOperator() become more customized.
+
+But I agree that there should be an OutputObjectInspector field in Operator.java and that should be used while calling initialize() on children in Operator.java. I will make that change., >> Are you suggesting that we keep initializeChildren() method and override in MapOperator()?
+yes
+
+
+Yes, MapOperator() becomes more customized, but all other operators become simplified
+initializeOp() just calls operator specific initialization, if any.
+By default, all children are initialized after that, with the outputObjectInspector (assuming there is only one).
+
+MapOperator overrides this behavior -- 
+
+If we want to make it more general, we can have an array of outputObjectInspectors, one for each child - they will be the same except for MapOperator,
+but then mapOperator can also fit in this framework - I dont think it is worth it to generalize at that level.
+
+
+
+, Talked with Prasad on this offline.
+
+Since we already have an example of initializing children before we can finish all the initializations (ScriptOperator kicking off the thread that gets data from the script), I think it makes sense to keep the "initializeChildren" call inside the customized initializeOp().
+
+Another way to do this is to add a post-order intialize recursive call to the Operator. That is probably the cleanest approach - we will first do pre-order initialization, and then post-order initialization.
+, for now i will leave the initializeChildren() inside initializeOp(). what do you guys say?, i dont like it - but it is a minor issue and can be done later
+so fine
+, Committed. Thanks Prasad.]

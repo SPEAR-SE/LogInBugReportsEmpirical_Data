@@ -1,0 +1,173 @@
+[It seems to me there are two issues with this problem:
+1. If a datanode gets an error receiving a block, it should not simply stop itself. Instead, it should send a failure ack back.
+2. The datanode should also identify the source of the error, whether it is caused by itself or the other datanodes in the pipeline, and then report the correct information back., This is not an easy problem to solve. I created HDFS-793 as the first step towards the solution. I will elaborate my plan here while working on HDFS-793., Is this the same as HDFS-795?, > Is this the same as HDFS-795? 
+Yes, the only difference is that HDFS-795 describes the problem in a more general way., Assume that there is a pipeline consisting of DN0,  ..., DNi, ..., where DN0 is the closest to the client, here is the plan for handling errors detected by DNi:
+1. If the error occurs when communicating with DNi+1, send an ack indicating that DNi+1 failed and then shut down both block receiver and ack responder.
+2. If the error is caused by DNi itself, simply shut down both block receiver and ack responder. Shutting down the block receiver causes the connections to DNi-1 to be closed, therefore DNi-1 will detect that DNi is failed immediately.
+3. If the error is caused by DNi-1, handle it the same as 2.
+
+Errors may be detected by either the block receiver or the ack responder. No matter who detects it, it needs to notify the other one of the error so the other one will stop and shut down itself., That plan sounds entirely reasonable. I'm adding 0.20.1 as an "affects version" since I can reproduce this in that version. Feel free to let me know if there's anything I can do to help., > here is the plan for handling errors detected by DNi
+This was the approach I took in HDFS-564. However, the problem reported in this JIRA was still seen even after I made the change in h564-24.patch. I suspect the key problem here is the following (as described in the description) and it's orthogonal to how a DN reports its downstream errors.
+  - When the first datanode closes its socket from DFSClient, DFSClient should properly read all the data left in the socket.. Also, DataNode's closing of the socket should not result in a TCP reset, otherwise I think DFSClient will not be able to read from the socket., > When the first datanode closes its socket from DFSClient, DFSClient should properly read all the data left in the socket..
+Kan, thanks for pointing this out, which is a very valid point. I think this applies to data nodes in pipeline as well., Would this work? When DNi detects an error when communicating with DNi+1, it sends an ack indicating that DNi+1 failed and continue to run until DNi-1 or the client closes the connection., To be more specific, if the block receiver gets an error sending a packet to DNi+1, it still queue the packet to the ack queue, but with a flag "mirrorError" set to be true indicating that the packet has an error mirroring to DNi+1. The block receiver continues to write the packet to disk and then handle the next packet. A packet responder does not exit when detecting DNi+1 has an error.
+
+, > continue to run until DNi-1 or the client closes the connection.
+You may not want to make the server (DN) depend on the behavior of the client (DFSClient)., When I thought more about it, it may make sense to let the client decide how to handle the case when DNi has communication problem with DNi+1 because the client is the one who decides the pipeline recovery policy. DNi itself has no problem receiving packets and storing it to the disk except that it can not talk to DNi+1. I think in this case it is OK that we let DNi continue to run. , A patch for review. This patch does not include any test. I will post the tests at HDFS-564., Hi Hairong,
+
+Do you anticipate that this will also solve HDFS-795? If so I'll try the patch on my test cluster tomorrow., The answer is yes. Thanks for your help testing it, Todd., Any chance that you have a patch available for branch-20 as well? The cluster where I can reliably reproduce this is running 0.20.1, so would like to test there as well as looking at it on trunk., This is a patch for 0.20. 0.20 seems to differ from 0.21/trunk quite a bit. This patch also includes the fix to HDFS-637. I have not tested this patch on 0.20 yet since we do not the fault injection framework in 0.20. It would be great if Todd could test it in your cluster. Thanks a lot., An updated patch for the trunk., Hi Hairong,
+
+This doesn't seem to fix the issue for me. Here's the test setup:
+
+- Cluster is with 3 DNs, running on EC2.
+- On DN at 10.251.43.82, I have dfs.data.dir pointing at two volumes. One has 150M remaining. On the other nodes, there is plenty of disk space. I've set dfs.du.reserved to 0 on the small-disk volume.
+- From a separate node, I try to upload a 100M file. As soon as it starts uploading, I issue a "dd" command on 10.251.43.82 to fill up the small volume (causing the disk to fill up while the local DN is writing to that volume)
+- If this patch works correctly, it should figure out that .82 is the problem node, and recover the pipeline to the other two nodes in the cluster. It should never eject a different node from the pipeline.
+
+Although the write did succeed, it incorrectly decided .148 was the bad datanode even though .82 experienced the failure. I've attached the logs from the perspective of the writer as well as the 3 DNs in the pipeline.
+
+Although it didn't show up in this particular capture, I also saw the following exception in a few tests:
+
+2009-12-17 18:36:31,622 WARN org.apache.hadoop.hdfs.DFSClient: DFSOutputStream ResponseProcessor exception  for block blk_6564765548548790058_1354java.util.NoSuchElementException
+        at java.util.LinkedList.remove(LinkedList.java:788)
+        at java.util.LinkedList.removeFirst(LinkedList.java:134)
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream$ResponseProcessor.run(DFSClient.java:2435)
+
+
+I'll make a local edit to fix the log message for "Expecting seqno" to actually print the expected seqno, and try to rerun the tests, as that might help figure out the issue., Looking at the patch, I'm confused by the logic in handleMirrorOutError. It seems to me that the if statement there checking for a non-empty clientName should actually be checking whether it's the last node in the pipeline. If it's the first node in the pipeline, shouldn't it propagate the error backward just as if it received the error while receiving an ack?, Come to think of it, it can never be the last node in the pipeline inside handleMirrorOutError, since there's no mirror out to have errors (duh!). But, not sure why that if statement exists at all, then. An error writing to the mirror indicates a problem with the mirror more than a problem with yourself., I just tried changing that if statement to == 0 instead of > 0, and it seems to have fixed the bug for me. I reran the above test and it successfully ejected the full node:
+
+09/12/17 19:59:21 WARN hdfs.DFSClient: DFSOutputStream ResponseProcessor exception  for block blk_-1132852588861426806_1405java.io.IOException: Bad response 1 for block blk_-1132852588861426806_1405 from datanode 10.251.43.82:50010
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream$ResponseProcessor.run(DFSClient.java:2427)
+
+09/12/17 19:59:21 WARN hdfs.DFSClient: Error Recovery for block blk_-1132852588861426806_1405 bad datanode[1] 10.251.43.82:50010
+09/12/17 19:59:21 WARN hdfs.DFSClient: Error Recovery for block blk_-1132852588861426806_1405 in pipeline 10.250.7.148:50010, 10.251.43.82:50010, 10.251.66.212:50010: bad datanode 10.251.43.82:50010
+
+Is it possible that clientName.length() would ever be equal to t0 in handleMirrorOutError? I'm new to this area of the code, so I may be missing something, but as I understand it, clientName.length() is 0 only for inter-datanode replication requests. For those writes, I didn't think any pipelining was done., OK. Here is the new patch. The previous patch should not throw any exception on mirror error. 
+
+clientName.len == 0 means that this is a block copy for replication. It has nothing to do if this is the last DN in pipeline or not.
+
+I have not gotten time to set up a test yet. So Todd, please try it one more time. Thanks a lot., As a second test of the above modification, I started uploading a 1G file, then forceably killed the DN on 10.250.7.148:
+
+09/12/17 20:14:53 WARN hdfs.DFSClient: DFSOutputStream ResponseProcessor exception  for block blk_-8026763677133524198_1407java.io.IOException: Bad response 1 for block blk_-8026763677133524198_1407 from datanode 10.251.66.212:50010
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream$ResponseProcessor.run(DFSClient.java:2427)
+
+09/12/17 20:14:53 WARN hdfs.DFSClient: Error Recovery for block blk_-8026763677133524198_1407 bad datanode[2] 10.251.66.212:50010
+09/12/17 20:14:53 WARN hdfs.DFSClient: Error Recovery for block blk_-8026763677133524198_1407 in pipeline 10.250.7.148:50010, 10.251.43.82:50010, 10.251.66.212:50010: bad datanode 10.251.66.212:50010
+09/12/17 20:14:54 INFO hdfs.DFSClient: Exception in createBlockOutputStream java.io.IOException: Bad connect ack with firstBadLink 10.251.66.212:50010
+09/12/17 20:14:54 INFO hdfs.DFSClient: Abandoning block blk_-3750676278765626865_1408
+09/12/17 20:15:00 INFO hdfs.DFSClient: Exception in createBlockOutputStream java.io.IOException: Bad connect ack with firstBadLink 10.251.66.212:50010
+09/12/17 20:15:00 INFO hdfs.DFSClient: Abandoning block blk_7561780221358446528_1408
+09/12/17 20:15:06 INFO hdfs.DFSClient: Exception in createBlockOutputStream java.io.IOException: Bad connect ack with firstBadLink 10.251.66.212:50010
+09/12/17 20:15:06 INFO hdfs.DFSClient: Abandoning block blk_-8059177057921476468_1408
+09/12/17 20:15:12 INFO hdfs.DFSClient: Exception in createBlockOutputStream java.net.ConnectException: Connection refused
+09/12/17 20:15:12 INFO hdfs.DFSClient: Abandoning block blk_-8264633252613228869_1408
+09/12/17 20:15:18 WARN hdfs.DFSClient: DataStreamer Exception: java.io.IOException: Unable to create new block.
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream.nextBlockOutputStream(DFSClient.java:2818)
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream.access$2000(DFSClient.java:2078)
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream$DataStreamer.run(DFSClient.java:2264)
+
+09/12/17 20:15:18 WARN hdfs.DFSClient: Error Recovery for block blk_-8264633252613228869_1408 bad datanode[0] nodes == null
+09/12/17 20:15:18 WARN hdfs.DFSClient: Could not get block locations. Source file "/user/root/1261098884" - Aborting...
+put: Connection refused
+09/12/17 20:15:18 ERROR hdfs.DFSClient: Exception closing file /user/root/1261098884 : java.net.ConnectException: Connection refused
+java.net.ConnectException: Connection refused
+        at sun.nio.ch.SocketChannelImpl.checkConnect(Native Method)
+        at sun.nio.ch.SocketChannelImpl.finishConnect(SocketChannelImpl.java:574)
+        at org.apache.hadoop.net.SocketIOWithTimeout.connect(SocketIOWithTimeout.java:206)
+        at org.apache.hadoop.net.NetUtils.connect(NetUtils.java:404)
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream.createBlockOutputStream(DFSClient.java:2843)
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream.nextBlockOutputStream(DFSClient.java:2799)
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream.access$2000(DFSClient.java:2078)
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream$DataStreamer.run(DFSClient.java:2264)
+
+As you can see above, it correctly detected the down DN. But the second block of the file failed to write (the file left on HDFS at the end was exactly 128M). fsck -openforwrite shows that the file is still open:
+
+OPENFORWRITE: ........./user/root/1261098884 134217728 bytes, 1 block(s), OPENFORWRITE: 
+/user/root/1261098884:  Under replicated blk_-8026763677133524198_1408. Target Replicas is 3 but found 2 replica(s).
+, err, sorry, correction to above. I forcibly killed the DN on *10.251.66.212*. So the detection of down node was correct, it was just failure recovery that was problematic. This might be related to HDFS-630., Just applied https://issues.apache.org/jira/secure/attachment/12428383/detectDownDN1-0.20.patch and tested on the cluster. I think the other error I mentioned above is just HDFS-630, since I'm testing on 0.20 on a 3-node cluster, so +1 on this patch.
+
+bq. clientName.len == 0 means that this is a block copy for replication. It has nothing to do if this is the last DN in pipeline or not.
+
+Right, but my question is whether clientName.len can ever be 0 when there's a mirror. My belief is no. Perhaps it's worth an assert there (since we're now cool with assertions in HDFS), -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12428366/detectDownDN1.patch
+  against trunk revision 891593.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/150/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/150/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/150/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/150/console
+
+This message is automatically generated., I am looking at the patch too. Looks good at first sight.
+
+> clientName.len == 0 means that this is a block copy for replication. It has nothing to do if this is the last DN in pipeline or not.
+
+I agree. To elaborate,  replication request always have a  pipeline of size 1. That means that isn't any mirror in this case., Todd and Dhruba, thanks a lot for your testing and review.
+
+> replication request always have a pipeline of size 1.
+I do not think this is true. A replication pipeline could have a size which is greater than 1. So it is possible that client length == 0 but mirror != null.
+, Ah, I never realized that transferBlocks could take multiple targets.
+
+Do you know of a good way to manually trigger this? Would be good to verify that it's still working well in branch-20 after this patch, if it's not too hard. (or, is it covered by unit tests?), you are right. transferBlocks could take multiple targets. That means clientName.len could be zero while at the same time mirror can be non-null. , > Do you know of a good way to manually trigger this?
+Increase a file's replication factor from 1 to 3 will trigger this. But I do not think my patch changes any replication behavior because IOException is not thrown in case of block replication., +1 Code looks good. The unit test will be difficult to write. I will look at the unit test when you post it., Thanks Dhruba for your review. I am updating the patches with slight changes that make sure that interruption gets handled correctly., Hi Todd, thank you for testing it.  Could you post the log of DN .82 which shows the DiskOutOfSpaceException stack trace in [your test cases|https://issues.apache.org/jira/browse/HDFS-101?focusedCommentId=12792245&page=com.atlassian.jira.plugin.system.issuetabpanels%3Acomment-tabpanel#action_12792245]?  We may add new unit tests for your test cases., Integrated in Hadoop-Hdfs-trunk-Commit #152 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Hdfs-trunk-Commit/152/])
+    . DFS write pipeline: DFSClient sometimes does not detect second datanode failure. Contributed by Hairong Kuang.
+, Integrated in Hdfs-Patch-h5.grid.sp2.yahoo.net #159 (See [http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/159/])
+    , Integrated in Hadoop-Hdfs-trunk #182 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Hdfs-trunk/182/])
+    , Integrated in Hdfs-Patch-h2.grid.sp2.yahoo.net #94 (See [http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h2.grid.sp2.yahoo.net/94/])
+    , I will be out of the office Thursday, 1/7, through Wednesday, 1/13,
+back in the office Thursday, 1/14.  I will be checking email fairly
+consistently in the evenings.
+
+Please contact Christophe Bisciglia (christophe@cloudera.com) with any
+support or training emergencies.  Otherwise, you'll hear from me soon.
+
+Thanks,
+
+Alex
+, Integrated in Hadoop-Hdfs-trunk-Commit #172 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Hdfs-trunk-Commit/172/])
+    Move the change logs of HDFS-793 and  from 0.20 section to 0.21 section
+, Integrated in Hadoop-Hdfs-trunk #202 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Hdfs-trunk/202/])
+    Move the change logs of HDFS-793 and  from 0.20 section to 0.21 section
+, Integrated in Hdfs-Patch-h2.grid.sp2.yahoo.net #99 (See [http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h2.grid.sp2.yahoo.net/99/])
+    Move the change logs of HDFS-793 and  from 0.20 section to 0.21 section
+, Hairong's patch also fixed HDFS-700., Integrated in Hdfs-Patch-h5.grid.sp2.yahoo.net #196 (See [http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/196/])
+    , 0.20 version of the patch that merges the latest 0.20 changes., Here is the patch for yahoo 0.20 branch., This patch fixes a bug of incorrect handle of pipeline heartbeat in yahoo's hadoop security branch 0.20., Hey Hairong - is this latest patch applicable for branch-20 as well or is it unique to the way that HDFS-101 made it into ydist? (I haven't had the time to look at it in detail), This patch fixes a space problem in the previous patch., > is this latest patch applicable for branch-20 as well
+I do not think that it applies to 0.20. I opened a different jira for committing HDFS-101 to 0.20. I will work on it when I have time., This should be pulled into the branch-0.20-append branch. , Version of HDFS-101 for the 0.20-append branch.  Adds getNumOfReplies() to the DNProtocol, which was present in HDFS-793, but not in HDFS-872.  However, HDFS-793 should no longer be necessary for 0.20-append branch (double-check, Todd), therefore we won't have to bump RPC version numbers., Hey Nicolas. Can you clarify what you mean that HDFS-793 should no longer be necessary? You mean that it's not necessary since we already have HDFS-872 applied to branch? I agree with that. Also, agree that we maintain wire compat with these patches., Todd, you're assumption is correct.  I needed a couple small things from the HDFS-793 patch (namely, getNumOfReplies) to make HDFS-101 compatible with HDFS-872., Hey Nicolas,
+
+I just compared our two patches side by side. The one I've been testing with (and made a noticeable improvement in recovery detecting the correct down node in cluster failure testing) is attached. Here are a few differences I noticed (though maybe because the diffs are against different trees):
+
+- Looks like your patch doesn't maintain wire compat when mirrorError is true, since it constructs a "replies" list with only 2 elements (not based on the number of downstream nodes)
+- When receiving packets in BlockReceiver, I am explicitly forwarding HEART_BEAT packets where it looks like you're not checking for them. Have you verified by leaving a connection open with no data flowing that heartbeats are handled properly in BlockReceiver?, The committed patch made significant improvement of the pipeline recovery but there are still some cases that the pipeline recovery does not work.  See HDFS-1595., TestFileAppend4 is failing randomnly even with this patch in 20-append branch .. 
+
+We start 3 dns in the MiniDfsCluster . When the second datanode is killed , the first datanode correctly sends the ack as SUCCESS(for itself) FAILED(2nd dn) to the client .. But client is getting an EOFException while reading this ack from the first dn and hence incorrectly assumes the first dn as bad .. As a result , first dn (which is fine) is removed from the pipeline and eventually 2nd dn ll also be removed during recovery . now only 1 replica (3rd dn) is remaining for the block and the assertion fails .. 
+
+While the 1st dn is fine and is sending ack correctly to the client , it is not clear why he is getting EOFException . Is this normal ?? 
+
+The relevant part of the log is : 
+"..........................
+11-04-27 14:48:16,796 DEBUG hdfs.DFSClient (DFSClient.java:run(2445)) - DataStreamer block blk_-1353652352417823279_1001 wrote packet seqno:-1 size:25 offsetInBlock:0 lastPacketInBlock:false
+2011-04-27 14:48:16,796 DEBUG datanode.DataNode (BlockReceiver.java:run(891)) - PacketResponder 2 for block blk_-1353652352417823279_1001 responded an ack: Replies for seqno -1 are SUCCESS FAILED
+2011-04-27 14:48:16,796 WARN  hdfs.DFSClient (DFSClient.java:run(2596)) - DFSOutputStream ResponseProcessor exception  for block blk_-1353652352417823279_1001java.io.EOFException
+	at java.io.DataInputStream.readShort(Unknown Source)
+	at org.apache.hadoop.hdfs.protocol.DataTransferProtocol$PipelineAck.readFields(DataTransferProtocol.java:125)
+	at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream$ResponseProcessor.run(DFSClient.java:2548)
+
+2011-04-27 14:48:16,796 DEBUG datanode.DataNode (BlockReceiver.java:run(789)) - PacketResponder 2 seqno = -2 for block blk_-1353652352417823279_1001 waiting for local datanode to finish write.
+2011-04-27 14:48:16,796 WARN  hdfs.DFSClient (DFSClient.java:processDatanodeError(2632)) - Error Recovery for block blk_-1353652352417823279_1001 bad datanode[0] 127.0.0.1:4956
+", By simply looking at your client-side log, it seems to me that the datanode sent an ack with two fields but the client expects an ack with 3 fields. Could you please create a jira and post logs there? Thanks!, Yes , that seems to be the problem . the client expects 3 replies in readfields while datanode is sending only 2 .. It is fixed in .21 .. , Do we know what issue fixed this failing test?  We should backport it to branch-0.20-append branch.  Thanks.]

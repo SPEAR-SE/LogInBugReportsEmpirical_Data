@@ -1,0 +1,84 @@
+[Submitted 4 sleep jobs with different user -:
+
+Job J1, User1, maps=208, reduces=0, sleeptime=120000 milliseconds.
+Job J2, User2, maps=208, reduces=0, sleeptime=120000 milliseconds.
+Job J3, User3, maps=104, reduces=0, sleeptime=124000 milliseconds.
+Job J4, User4, maps=104, reduces=0, sleeptime=124000 milliseconds.
+
+When all job starts running, the status from Jobtacker UI is -:
+Cluster Summary: Nodes=104, Maps=208, Reduces=0, Map_Capacity=208, Reduce_Capacity=208, Avg. Task/Node=4.00
+Queue: Name=default, running_maps=207, waiting_maps=423
+J1 having pending_maps=159, running_maps=52
+J2 having pending_maps=159, running-maps=52
+J3 having pending_maps=52,  running_maps=52
+J4 having pending_maps=52,  running_maps=52
+
+
+When J3 and J4 finish, status from Jobtacker UI is -:
+Cluster Summary: Nodes=104, Maps=208, Reduces=0, Map_Capacity=208, Reduce_Capacity=208, Avg. Task/Node=4.00
+Queues: Name=default, running_maps=207, waiting_maps=34
+
+J1 having pending_maps=0,  running_maps=104
+J2 having pending_maps=33, running_maps=71
+ 
+
+
+Observation -:
+1. J2 should also be using 104 as its user-limit should expand back to 50% like J1 whereas it is using 71 slots.
+2. Actually running_maps=J1+j2=175, pending_maps=J1+j2=33, where as cluster status and queue information shows maps=208 (running), where slots 33 went.
+
+Note -: speculative execution was true.
+, Looking at the logs, it seems that there are 2 problems
+- when job3 finishes (pending = 0), it takes some time for it to exit the scheduler. While job3 from user3 is actually done (doesnt require any scheduling cycles), user3 is still counted as a valid user and thus affects the _limit_ computation
+- Since the limit computation is slow in catching up, job1 always has the benefit and schedules more tasks. The problem is that it sometimes goes ahead and schedules speculative tasks even when  job2 has genuine tasks to run.
+
+limit computation works as follows :
+{code}
+cap = min (running_tasks + 1, guaranteed_cap)
+limit = max( cap/num_users, cap*ulimit)
+{code}
+
+I think whatever is extra should always be equally given back to all the contenders. This can be achieved if we update _limits_ immediately based on how many users actually require slots rather than waiting for the user to be removed from the scheduler. Also we should make sure that speculative tasks should be run last else we will end up wasting resources.
+
+new limit computation :
+{code}
+cap = min (running_tasks, guaranteed_cap)
+num_actual_users = users with slot requirements // avoids users from jobs that are done with their scheduling
+limit = max( cap/num_actual_users, cap*ulimit)
+{code}, Here is the scenario
+
+_Setup :_
+j1 and j2 are 2 jobs submitted by user user1 and user2 resp and  run for longer time.
+j3 and j4 are 2 jobs submitted by user user3 and user4 resp and run for less time .
+Only "default" queue is used.
+
+_Analysis :_
+
+||jobs||num-running-tasks||limit||who will schedule||comment||
+|j1, j2, j3, j4|25, 25, 25, 25| 25| j1 |everyone is over limit|
+|j1, j2, j3*, j4|40, 25, 10, 25| 25| j1 |everyone is over limit and job3 is finishing off|
+|j1, j2, j4|50, 25, 25| 33| j2 |only user1 is over limit as limit is re-defined|
+|j1, j2, j4*|50, 33, 17| 33| j1 |everyone is over limit and job4 is finishing off|
+|j1, j2|67, 33| 50| j2 |user1 is over limit as limits is redefined|
+
+Note that j1 might actually have 50 maps to run but then is can run 67 with this setup. So it can go ahead an run 17 speculative tasks instead of job2 running its 17 genuine tasks.
+
+With the proposed change
+||jobs||num-running-tasks||limit||who will schedule||comment||
+|j1, j2, j3, j4|25, 25, 25, 25| 25| j1 |everyone is over limit|
+|j1, j2, j3*, j4|33, 25, 17, 25| 33| j2|user1 is over limit as limit is redefined and job3 is finishing off, slots will be equally divided|
+|j1, j2, j3*, j4|33, 33, 9, 25| 33| j1 |everyone is overlimit and job3 is finishing off|
+|j1, j2, j4|42, 33, 25| 33| j1 |everyone is overlimit|
+|j1, j2, j4*|50, 33, 17| 50| j2 |as user1 is over limit as limit are redefined and job4 is finishing off|
+|j1, j2|50, 50| 50| j1 |as everyone is overlimit|
+, There are a couple of things going on here. 
+
+The scheduler is notified by the JT when a job is considered 'done' (see HADOOP-4053). At that point, we recompute the number of users who have submitted jobs in the queue. If this notification is coming in late, you need to see why. But the scheduler's behavior is right in terms of computing the user limit. The scheduler doesn't decide when a job is 'done'. The JT does. And that, IMO,is correct behavior. 
+
+Secondly, if we walk through the entire queue and no job can accept a slot (likely because, as in this case, either jobs are over capacity or don't have tasks to run) and there are no waiting tasks, we still want the slot to be used by the queue, so we walk through the queue again, this tiem without considering user limits. Likely, the first job will start getting a bunch of slots. This is by design, as it's really hard to argue what is fair in this case. Taking one of your examples, suppose the queue capacity is 100 and we have four jobs from four different users. Each is using 25 slots. J3 starts finishing up, and at some point, is only running, say, 5 tasks. Also assume there are no waiting jobs. Now, what's the right behavior? WHo should get the slot? J1, right? Who gets the next slot? You can argue that you want to redistribute J3's 20 unused slots among J1, J2, and J4, but this recomputation gets really complicated. So, we took a simpler approach by saying that free slots are offered to jobs in order. So J1 will get a bunch of free slots, which will let it finish fast. Eventually J3 finishes, is taken out of the queue, and user limits are recomputed. We couldn't think of a simple and more fair approach here. Note that this situation is a bit rare. On a regular, well-utilized cluster, you'll have a bunch of waiting jobs and they will start running. J3's user's first waiting job will start running, which is the right thing. 
+
+So, in summary, I'd say this is expected behavior. 
+
+As for your comment on speculative tasks being run by J1 - that's really a different call. J1 runs a speculative task if it legitimately has a speculate task to run, not because there's a slot free. J1 can come back and say it doesn't have any task to run, in which case J2 is looked at next. If J1 is running 17 speculative tasks, they're as genuine, and higher priority, than J2's tasks, so I'd say that's still the right behavior. 
+
+, Capacity scheduler has changed quite a bit since then so closing as stale.]

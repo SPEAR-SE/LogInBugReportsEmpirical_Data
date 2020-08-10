@@ -1,0 +1,376 @@
+[Thanks for [~yeshavora] reported this issue.
+
+Looked at this issue with [~jianhe]/[~vinodkv], root cause of this problem is:
+- After YARN-3535, all containers transition from ALLOCATED to KILLED state will be re-added to scheduler. And such resource request will be added to *current* scheduler application attempt.
+- If some containers are in ALLOCATED state and AM crashes, resource requests of these containers could be added to *new* scheduler application attempt.
+- When the new application attempt request AM container, it calls
+{code}
+        // AM resource has been checked when submission
+        Allocation amContainerAllocation =
+            appAttempt.scheduler.allocate(appAttempt.applicationAttemptId,
+                Collections.singletonList(appAttempt.amReq),
+                EMPTY_CONTAINER_RELEASE_LIST, null, null);
+        if (amContainerAllocation != null
+            && amContainerAllocation.getContainers() != null) {
+          assert (amContainerAllocation.getContainers().size() == 0);
+        }
+{code}
+Some containers could be allocated of this scheduler.allocate call, these container will be ignored because the following *assert* is not enabled in production environment.
+- So this results to some container could be possibly leaked when we allocating retried AM containers.
+
+*Possible fixes*:
+1) Release all allocated container of {{amContainerAllocation.getContainers()}}
+OR
+2) Instead of using {{getCurrentAttemptForContainer}} in {{AbstractYarnScheduler#recoverResourceRequestForContainer}}, we should only recover ResourceRequest to the attempt which includes the container., [~leftnoteasy], I started writing a test for this assuming the previous hypothesis, and it doesn't add up.
+bq. After YARN-3535, all containers transition from ALLOCATED to KILLED state will be re-added to scheduler. And such resource request will be added to current scheduler application attempt.
+Two cases here
+ # If the container (in allocated state) got killed before the AM crash, it will get added to the app-attempt #1, so this bug won't happen
+ # An allocated container simply doesn't survive AM crash (both when keepContainerAcrossApplicationAttempt is on and off) - scheduler itself kills all allocated containers right after AM crashes as part of {{doneApplicationAtttempt()}}. And these killed containers also get added to the app-attempt #1 because current-app-attempt is not switched till {{addApplicationAttempt()}} comes in for the new app-attempt.
+
+So, it doesn't look like our previous analysis is right. /cc [~jianhe]
+
+[~yeshavora], do you have the RM logs?, Hi [~vinodkv],
+
+My understanding this could happen when:
+- CS calls doneApplicationAttempt
+- Which causes Containers are killed when they're at allocated state
+- ContainerRescheduledEvent added to event queue
+{code}
+  private static final class ContainerRescheduledTransition extends
+      FinishedTransition {
+
+    @Override
+    public void transition(RMContainerImpl container, RMContainerEvent event) {
+      // Tell scheduler to recover request of this container to app
+      container.eventHandler.handle(new ContainerRescheduledEvent(container));
+      super.transition(container, event);
+    }
+  }
+{code}
+- If add-application-attempt-event sent to scheduler before container-rescheduled-event arrives, application attempt will be replaced so resource request will be restored to next attempt.
+
+Thoughts?, bq. If add-application-attempt-event sent to scheduler before container-rescheduled-event arrives, application attempt will be replaced so resource request will be restored to next attempt.
+Seemed like a wild theory on first look, but it isn't and you are right! Because the current flow is {{ContainerRescheduledTransition -> RM level event handler + queue -> Scheduler event handler + queue}}, it is actually very likely for this to happen.
+
+Once we remove this flow and let scheduler do the {{kill-container + recover-requests}} in one shot, none of the routing-to-the wrong attempt will happen anymore.
+
+Let me take a crack at this, assigning this to myself.
+
+Side issue discovered: While the app-attempt finish is in the process of saving to state-store, the scheduler can happily go around allocating more and more containers for the (finishing) app-attempt!, Here's a patch fixing this.
+
+The core fix is relatively concentrated. We now perform kill-container and recover-requests in one shot without all the events (which was broken anyways). 
+
+Much of the remaining changes are for test-cases and a bit of renames and refactors.
+
+Summary of the changes:
+
+ - AbstractYarnScheduler: Renamed existing completedContainer() method to be {{completedContainerInternal()}} and added a new {{completedContainer()}} which wraps around completedContainerInternal(), does common null-checks and also recovers ResourceRequests as needed
+ - SchedulerEventType.KILL_CONTAINER ->SchedulerEventType.KILL_PREEMPTED_CONTAINER and DROP_RESERVATION -> KILL_RESERVED_CONTAINER
+ - Got rid of ContainerRescheduledTransition completely. No need for container to send an event to the scheduler. Once this is removed, got rid of ContainerRescheduledEvent too.
+ - Moved ContainerPreemptEvent from org.apache.hadoop.yarn.server.resourcemanager.scheduler package into org.apache.hadoop.yarn.server.resourcemanager.scheduler.event. That is where it belongs.
+ - PreemptableResourceScheduler: Renamed APIs dropContainerReservation -> killReservedContainer and killContainer -> killPreemptedContainer
+ - FiCaSchedulerApp.addPreemptContainer -> preemptContainer, Actually I think the refactor I did seems like the original aim of YARN-2143., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:blue}0{color} | {color:blue} patch {color} | {color:blue} 0m 7s {color} | {color:blue} The patch file was not named according to hadoop's naming conventions. Please see https://wiki.apache.org/hadoop/HowToContribute for instructions. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 8 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 8m 10s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 8m 54s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 9m 33s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 10s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 3s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 29s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 55s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 38s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 45s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 52s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 9m 18s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 9m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 9m 32s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 9m 32s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 1m 13s {color} | {color:red} Patch generated 6 new checkstyle issues in root (total was 550, now 546). {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 3s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 2 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 2m 32s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 50s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 55s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 64m 47s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 3s {color} | {color:green} hadoop-sls in the patch passed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 64m 21s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 4s {color} | {color:green} hadoop-sls in the patch passed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 26s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 192m 45s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+|   | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+| JDK v1.7.0_91 Failed junit tests | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+|   | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12781979/YARN-4502-20160212.txt |
+| JIRA Issue | YARN-4502 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux ebc634e59bf5 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / fbb5868 |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/10260/artifact/patchprocess/diff-checkstyle-root.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/10260/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/10260/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/10260/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/10260/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-YARN-Build/10260/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_91.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/10260/testReport/ |
+| modules | C: hadoop-tools/hadoop-sls hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: . |
+| Max memory used | 76MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/10260/console |
+
+
+This message was automatically generated.
+
+, Thanks [~vinodkv], patch looks very good to me, only one minor comment:
+
+Do you think is it better to rename PREEMPT_CONTAINER/preemptContainer in CapacityScheduler to something like add_preemption_candidate or mark-container-for-preemption? Preempt-container looks very similar to kill-preempted-container. Similarily, FiCaSchedulerApp#preemptContainer.
+, Tx for the review, [~leftnoteasy]
+
+bq. Do you think is it better to rename PREEMPT_CONTAINER/preemptContainer in CapacityScheduler to something like add_preemption_candidate or mark-container-for-preemption? Preempt-container looks very similar to kill-preempted-container. Similarily, FiCaSchedulerApp#preemptContainer.
+Makes sense, that is what I was thinking before too but didn't make the change.
+
+Uploading a new patch with that comment addressed. Also fixed whitespace and checkstyle issue. Cannot address the too-long-file warning., Both the tests failed on a host-name related problem on unrelated test-cases  TestAMAuthorization and TestClientRMTokens both of which pass for me.
+
+Submitting updated patch., Looks good to me, +1. Pending Jenkins., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:blue}0{color} | {color:blue} patch {color} | {color:blue} 0m 8s {color} | {color:blue} The patch file was not named according to hadoop's naming conventions. Please see https://wiki.apache.org/hadoop/HowToContribute for instructions. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 8 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 41s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 39s {color} | {color:green} trunk passed {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red} 4m 47s {color} | {color:red} root in trunk failed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red} 5m 25s {color} | {color:red} root in trunk failed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 7s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 58s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 28s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 43s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 35s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 42s {color} | {color:green} trunk passed with JDK v1.7.0_91 {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 17s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 47s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red} 0m 34s {color} | {color:red} root in the patch failed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red} 0m 34s {color} | {color:red} root in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 6m 48s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red} 8m 26s {color} | {color:red} root-jdk1.7.0_91 with JDK v1.7.0_91 generated 156 new issues (was 570, now 726). {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 6m 48s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 1m 6s {color} | {color:red} Patch generated 2 new checkstyle issues in root (total was 548, now 540). {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 58s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 58s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 34s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 42s {color} | {color:green} the patch passed with JDK v1.7.0_91 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 60m 55s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_66. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 56s {color} | {color:green} hadoop-sls in the patch passed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 61m 34s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 56s {color} | {color:green} hadoop-sls in the patch passed with JDK v1.7.0_91. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 24s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 164m 30s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+| JDK v1.7.0_91 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12782446/YARN-4502-20160114.txt |
+| JIRA Issue | YARN-4502 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 92979c749a7e 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 1da762c |
+| Default Java | 1.7.0_91 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_91 |
+| compile | https://builds.apache.org/job/PreCommit-YARN-Build/10296/artifact/patchprocess/branch-compile-root-jdk1.8.0_66.txt |
+| compile | https://builds.apache.org/job/PreCommit-YARN-Build/10296/artifact/patchprocess/branch-compile-root-jdk1.7.0_91.txt |
+| findbugs | v3.0.0 |
+| compile | https://builds.apache.org/job/PreCommit-YARN-Build/10296/artifact/patchprocess/patch-compile-root-jdk1.8.0_66.txt |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/10296/artifact/patchprocess/patch-compile-root-jdk1.8.0_66.txt |
+| javac | root-jdk1.7.0_91: https://builds.apache.org/job/PreCommit-YARN-Build/10296/artifact/patchprocess/diff-compile-javac-root-jdk1.7.0_91.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/10296/artifact/patchprocess/diff-checkstyle-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/10296/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/10296/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_91.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/10296/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-YARN-Build/10296/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_91.txt |
+| JDK v1.7.0_91  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/10296/testReport/ |
+| modules | C:  hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager   hadoop-tools/hadoop-sls  U: . |
+| Max memory used | 76MB |
+| Powered by | Apache Yetus 0.2.0-SNAPSHOT   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/10296/console |
+
+
+This message was automatically generated.
+
+, FAILURE: Integrated in Hadoop-trunk-Commit #9129 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/9129/])
+YARN-4502. Fix two AM containers get allocated when AM restart. (Vinod (wangda: rev 805a9ed85eb34c8125cfb7d26d07cdfac12b3579)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestApplicationPriority.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerRescheduledEvent.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/PreemptableResourceScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/ProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerApplicationAttempt.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMDispatcher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/SchedulerEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicy.java
+* hadoop-tools/hadoop-sls/src/main/java/org/apache/hadoop/yarn/sls/scheduler/ResourceSchedulerWrapper.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerPreemptEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ContainerPreemptEvent.java
+, Committed to trunk/branch-2, thanks [~vinodkv] and analysis from [~yeshavora]/[~jianhe].
+
+Trying to committed to branch-2.8 but it has some conflicts, I would prefer to commit YARN-4524 to branch-2.8 first to resolve conflicts. YARN-4524 is a cleanup patch and it looks safe to me. We can have a cleaner code base and avoid some future merge conflicts with it.
+
+Thoughts? [~kasha]/[~vinodkv]., I tried backporting YARN-4524 to branch-2.8. Unfortunately, branch-2.8 compilation is broken. 
+
+[~leftnoteasy] - mind cherry-picking it to 2.8 once the compilation is fixed. , [~kasha],
+
+Thanks for reply,
+I tried to compile branch-2.8, I didn't see any compilation issue, I just pushed it to 2.8., FAILURE: Integrated in Hadoop-trunk-Commit #9130 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/9130/])
+Revert "YARN-4502. Fix two AM containers get allocated when AM restart. (wangda: rev adf260a728df427eb729abe8fb9ad7248991ea54)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerApplicationAttempt.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java
+* hadoop-tools/hadoop-sls/src/main/java/org/apache/hadoop/yarn/sls/scheduler/ResourceSchedulerWrapper.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/SchedulerEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestApplicationPriority.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerRescheduledEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/ProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/PreemptableResourceScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMDispatcher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ContainerPreemptEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerPreemptEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java
+YARN-4502. Fix two AM containers get allocated when AM restart. (Vinod (wangda: rev 3fe57285635e8058c34aa40a103845b49ca7d6ff)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/ProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerApplicationAttempt.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestApplicationPriority.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/SchedulerEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerPreemptEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ContainerPreemptEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMDispatcher.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerRescheduledEvent.java
+* hadoop-tools/hadoop-sls/src/main/java/org/apache/hadoop/yarn/sls/scheduler/ResourceSchedulerWrapper.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/PreemptableResourceScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+, branch-2/branch-2.8 was broken by YARN-4265, uploaded addendum patch and committed it. 
+Most probably, guessing in your case that compilation is done for trunk first where in 3.0.0.SNAPSHOT jar has got published to local repository. And later trying to compile in branch-2/branch-2.8 fetches jars from local repository., [~leftnoteasy], looks like you committed the wrong patch, likely because of the wrong names I gave to the patch. You should look at YARN-4502-20160114.txt as the final patch.
+
+I'll let you fix this as there seem to be other things you did on other branches, reopening it for now., Thanks [~vinodkv], just reverted & committed it to branch-2/2.8/trunk., FAILURE: Integrated in Hadoop-trunk-Commit #9134 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/9134/])
+Revert "YARN-4502. Fix two AM containers get allocated when AM restart. (wangda: rev 150f5ae0343e872ee8bef39c57008c1389f0ba9e)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestApplicationPriority.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ContainerPreemptEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/SchedulerEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/ProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMDispatcher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerApplicationAttempt.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerRescheduledEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java
+* hadoop-tools/hadoop-sls/src/main/java/org/apache/hadoop/yarn/sls/scheduler/ResourceSchedulerWrapper.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerPreemptEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/PreemptableResourceScheduler.java
+YARN-4502. Fix two AM containers get allocated when AM restart. (Vinod (wangda: rev a44ce3f14fd940601f984fbf7980aa6fdc8f23b7)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestCapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMDispatcher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/common/fica/FiCaSchedulerApp.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/ProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerPreemptEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ContainerPreemptEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerRescheduledEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/PreemptableResourceScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/SchedulerApplicationAttempt.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestApplicationPriority.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/AppSchedulingInfo.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java
+* hadoop-tools/hadoop-sls/src/main/java/org/apache/hadoop/yarn/sls/scheduler/ResourceSchedulerWrapper.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/SchedulerEventType.java
+, Since YARN-3535 gone in 2.7.2 and 2.6.4, should this JIRA need to be back ported to branch-2.7 and branch-2.6? 
+Any thoughts?, +1 on backport to maintenance branches. , +1 also. This patch also covers the case when a container receives RMContainerEventType.EXPIRE event at state RMContainerState.ALLOCATED, which was not covered by YARN-3535.
+Based on the original suggestion by [~leftnoteasy], It looks like the implementation for {{AbstractYarnScheduler#getApplicationAttempt(ApplicationAttemptId applicationAttemptId)}} is also confusing. It always returns the current application attempt even the current application attempt doesn't match the given {{applicationAttemptId}}.
+In contrast, {{RMAppImpl#getRMAppAttempt(ApplicationAttemptId appAttemptId)}} always returns the matched {{RMAppAttempt}}.
+Should we fix it in a follow-up JIRA?, Nice catch, [~zxu]! Given SchedulerApplication only stores current attempt (and only current attempt matters), may be we can just simply rename {{getApplicationAttempt()}} to {{getApplicationCurrentAttempt()}}?
+Try to cherry-pick the patch to branch-2.6 but involve many conflicts. Will defer it to 2.6.5 given 2.6.4 should be shortly out., [~zxu] / [~djp]
+bq. It looks like the implementation for AbstractYarnScheduler#getApplicationAttempt(ApplicationAttemptId applicationAttemptId) is also confusing.
+This is by design - see YARN-1041 - we want to route all the events destined for AppAttempt *only* to the current attempt. We should just document this and move on.]

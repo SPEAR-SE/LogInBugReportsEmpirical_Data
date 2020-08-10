@@ -1,0 +1,71 @@
+[This patch doesn't fix the bug.
+It includes a unit test only., Hi [~kazuakibanzai],
+
+I took some time to dig this problem and I *guess* I've found the root cause. *Disclaimer: I can be totally wrong on my assumptions, so would love to hear from some ZK committers as to deny or confirm my idea (and took the liberty of marking them on this message, sorry guys).* /cc [~fpj], [~breed], [~phunt]
+
+First and foremost, *huge thanks* for the patch to simulate the bug, it helped a lot. Well, let's start: in a nutshell, the server side ZK is an ordered processing pipeline of RequestProcessors, where each processor is handled by a different Thread. The one that is interesting to this particular case looks like this (I am a newbie, so I may get something wrong):
+
+{code}
+request ---------->  PrepRequestProcessor --------> SyncRequestsProcessor  ----------> FinalRequestProcessor ------> [request applied and committed]
+{code}
+
+*KEEP THIS IN MIND:* A request is committed to ZK database as well as having the logs and snapshots updated if it arrives at the {{FinalRequestProcessor}} without any exception.
+
+a. One request can be currently being processed at {{PrepRequestProcessor}} while another one is either {{SyncRequestsProcessor}} or {{FinalRequestsProcessor}}. In fact, I guess that we can have three requests, one in each step of the pipeline under high load, for example.
+
+b. At {{PrepRequestProcessor}} ZK checks if the znode path of the request is well formed as well as authorization and ACL permissions (it makes sense as SyncRequestProcessor, among other things, saves the log file and we wouldn't want to record an invalid request on command log, right?). *KEEP THIS IN MIND TOO:* ACL checks are done at the first stage of the pipeline.
+
+
+*_So, the problem you described can be summarised as such:_*
+
+1. a setACL request that removes access to '/' (let's call it REQ1) is sent asynchronously, followed by a create a znode under '/a' request (let's call it REQ2). Both are enqueued in order and arrive in this order on the server side.
+
+2. REQ1 passes {{PrepRequestProcessor}}.
+
+3. While REQ1 is at {{SyncRequestsProcessor}}, REQ 2 arrives at {{PrepRequestProcessor}}. {{PrepRequestProcessor}} checks ZK DB and see that REQ2 has the ACL rights to create the node, because REQ1 was not committed to ZK DB yet (it's in the middle of the pipeline).
+
+4. When REQ1 is finally committed on ZK DB, REQ1 is just behind it in the pipeline, so it also gets committed to the ZK DB even tough REQ1 would prevent REQ2 from being applied! Remember the permission was check on {{PrepRequestProcessor}}, the first stage of the pipeline, when REQ1 was still ongoing.
+
+*_Now let's see why some scenarios that explain your unit test:_*
+
+Case 1: The sync ACL call is, well, synchronous so, it wait for a response before sending the next command (createNode). Therefore, REQ1 completes the pipeline before REQ2 even reaches the it and the createNode is rejected as expected.
+
+Case 2. If you put a sleep between async setACL and createNode then you gave some time to REQ1 finish the pipeline because REQ2 will be inserted into the client outgoing queue after the sleep time. Again, this succeeds by rejecting the createNode command.
+
+Case 3. If you insert async or sync setACL commands before the createNode you are "stuffing" additional commands between setACL and createNode. Again giving a chance of setACL finishes before the createdNode reaches the first stage of the pipeline. Then again, it works as expected (the createNode is rejected).
+
+Finally, another conjecture I have is that this setACL/createNode behavior could happen if with synchronous setACL. If we had two clients, the first one could issue a sync setACL and the second one a createNode, and with the right timing they would be enqueued as explained above.
+
+Does it make sense?
+
+
+
+, I am attaching a crude and possible buggy stab at a solution.
+
+My idea with this patch is just to *bootstrap* the discussion about possible fixes, so *don't rely on it for being complete (what about multiop?), correct or comprehensive*, but it passed the {{AsyncSetACLTest}} that Kazuaki kindly provided, for what's worth. :)
+
+PS: TBH, I *don't* like the idea of 'throttling' the pipeline until setACL completes, so I am more than open to hear what you have to say., Should we check ACL in FinalRequestProcessor? Because of total ordering guarantee, proposal on changing ACL should be committed when FinalRequestProcessor is processing the create node proposal - note we already check ACL in FinalRequestProcessor ([example|https://github.com/apache/zookeeper/blob/master/src/java/main/org/apache/zookeeper/server/FinalRequestProcessor.java#L320]) for some ops, but not all, not sure why. , Hi [~hanm]!
+
+{quote}
+Should we check ACL in FinalRequestProcessor?
+{quote}
+
+I hope so! :) I considered this solution too, but sidetracked because I am unsure about transactional guarantees, particularly the _*sync request to disk*_ performed by {{SyncRequestProcessor}}.
+
+Note: by the way, my stab at a solution (just a sketch, really) most probably breaks on parallel unit test running due to the use of static mutable fields.
+
+{quote}
+note we already check ACL in FinalRequestProcessor (example) for some ops, but not all, not sure why.
+{quote}
+
+The *non state changing* operations (exists, getData, getChildren, etc) follow a slightly different, more straightforward, path down the processing pipeline while transactional, *state changing*, operations (setData, delete, setACL, etc) perform a series of extra operations, as expected. Therefore, it looks like {{FinalRequestProcessor}} is currently checking the ACL permissions for non transactional check/read operations (even tough _exists()_ operation is lacking ACL check, a bug, imho) while the transactional operations are handled by {{PrepRequestProcessor.pRequest2Txn}} nowadays.
+, I think the idea of "throttling" as such is good, but if it has a timeout, then the same bug may reappear, just much more rarely.
+
+If {{SyncRequestsProcessor}} propagates changes to other servers, I think it may be better to check access permission at the earliest stage. Otherwise it may become necessary to undo changes.
+
+From that point of view, throttling pending requests of the /same/ session until all other pending ACL operations are done, seems inevitable. Requests of /other/ sessions do not have to be throttled as it does not really matter if other requests "win" because of a faster network or because of thread scheduling.
+
+If throttled requests originate from the same client session as pending ACL requests, a timeout seems unnecessary. Furthermore, the use of static variables looks very dangerous to me, as this may mix up multiple unrelated ACL requests (from different sessions).
+
+If we throttle only requests of the same session, aren't those using the same instance of {{PrepRequestProcessor}}? That would make static fields (and timeouts) unnecessary.
+]

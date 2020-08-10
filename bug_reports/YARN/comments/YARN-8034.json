@@ -1,0 +1,66 @@
+[If you need a specific host then set relaxLocality=false.  Otherwise there's no guarantee the request will be assigned to the requested host.  The host could be down, full of other containers, unhealthy, etc.  When relaxLocality=true then the RM assumes the application would prefer a container in a somewhat timely manner somewhere else rather than waiting indefinitely for a full node to free up space.  The node locality delay gives admins some control over how patiently the RM will wait for locality.
+
+bq. The behavior I want from Yarn is "Honor locality to the best possible extent and only return a container on an arbitrary host if the requested host is down". Is there a way to accomplish this?
+
+Yes, although it will require some work on the Samza AM's part.  Samza's AM can make requests for specific nodes with relaxLocality=false, but it also should monitor the updatedNodes field of each AllocateResponse.  The RM will notify applications in that response when a node becomes unusable or becomes usable again.  The Samza AM can cancel and resubmit a request (either for a different host or with relaxLocality=true) when a node trying to be allocated becomes unusable.
+, Thank you [~jlowe] for your recommendations. Very useful. 
+
+>> The host could be down, full of other containers, unhealthy, etc.
+
+I did have some follow-up questions so that I understand the behavior of this config better. 
+
+- I setup an experiment with the Samza AM to request 1 container (with 1G memory and 1 vcore, host = our-preferred-host, relaxLocality = true and rack = null.)
+- I observed that the Yarn RM immediately returns a container on a different host in the next second after the request was made.
+- I am able to repro' this 100% of the time across multiple runs (and across multiple hosts in our cluster) which makes me wonder if the preferredHost is ignored if we set relaxLocality = true? I did verify that all nodes were healthy in the cluster. 
+- For more context, I'm able to observe this behavior with both the fair-scheduler and the capacity-scheduler with "continuous scheduling" enabled in both cases. So, I'm not sure if that matters. 
+
+FWIW, with relaxLocality = false, the RM returns containers on the exact hosts that we requested them on. I'm happy to submit a documentation patch to Hadoop so that we make everyone's life better when using Yarn for stateful apps :-) 
+
+>> The node locality delay gives admins some control over how patiently the RM will wait for locality.
+
+Our node locality delay is configured to the number of nodes in the cluster. I did try increasing it to an arbitrary high number and it did not seem to affect the results of the above experiment. Are there other knobs at play I'm missing?
+
+>> Yes, although it will require some work on the Samza AM's part. Samza's AM can make requests for specific nodes with relaxLocality=false, but it also should monitor the updatedNodes field of each AllocateResponse. The RM will notify applications in that response when a node becomes unusable or becomes usable again. The Samza AM can cancel and resubmit a request (either for a different host or with relaxLocality=true) when a node trying to be allocated becomes unusable.
+
+Our original approach was for the Samza AM re-submit the request with relaxedLocality = true after waiting for some timeout. Thank you for your helpful recommendations.  , {quote}I observed that the Yarn RM immediately returns a container on a different host in the next second after the request was made.
+{quote}
+I believe something like YARN-6344 is relevant here even though that fix is specific to the CapacittyScheduler. The schedulers have a heuristic where it assumes making a small number of requests relative to the size of the cluster should bias towards responsiveness rather than locality. It's been there a long time. I don't know the full history behind it, but I suspect it derives from assuming a small request is for a small job and interactivity is more important than waiting for locality (since we are allowed to relax). See org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FSAppAttempt#getLocalityWaitFactor for the equivalent place in the FairScheduler for what is being discussed in YARN-6344.
+{quote}The Samza AM can cancel and resubmit a request (either for a different host or with relaxLocality=true) when a node trying to be allocated becomes unusable.
+{quote}
+You will want to keep that logic even after updating the AM to monitor the node updates. That will cover the case where the desired node is completely full with long-running containers., Hi [~jagadish1989@gmail.com],
+
+As [~jlowe] mentioned, this is very related to YARN-6344 for the capacity scheduler. What you should look at is the "yarn.scheduler.capacity.rack-locality-additional-delay" parameter.
+
+Since you have only one (or very few) container requests, the current logic (if you let the above parameter to its default value) will lead to relaxing locality almost immediately. If you set that parameter to a positive value, you should achieve your desired behavior., Hey [~jlowe] and [~kkaranasos]:
+
+Thanks for the pointers. It helped me dive-deep into the internals of how the Capacity Scheduler actually works. Currently, our YARN clusters are on version 2.7 - So, we cannot leverage YARN-6344 just yet. Hence, we'll stick to making our app-master request resources with strict locality (by setting relaxLocality = false).
+
+While the "localityWaitFactor" is certainly at play when used with the CapacityScheduler, I'd like to understand how it affects the FairScheduler. The code you pointed out: FsAppAttempt#getLocalityWaitFactor appears to be un-used in the 2.7 branch of Hadoop. There's however, FicaSchedulerApp#getLocalityWaitFactor but its usage seems restricted to the capacity scheduler though. Is there something else I am missing?
+
+Here's the setup: 
+We have FairScheduler with "continuous scheduling" turned on, with a node-locality delay = 5s, rack-locality-delay = 5s, node-locality-threshold = -1 and rack-locality-threshold = -1.
+I requested one container on a preferred host with relaxLocality = true but Yarn appears to return a container on an arbitrary host instantly. Is there some other scheduler tunable I'm missing? Any pointers to the source code are greatly appreciated!
+
+Thanks [~jlowe] and [~kkaranasos] , {quote}The code you pointed out: FsAppAttempt#getLocalityWaitFactor appears to be un-used in the 2.7 branch of Hadoop.
+{quote}
+My apologies, I'm not that familiar with the fair scheduler or its continuous scheduling behavior. I just know how small allocations behave in the capacity scheduler and assumed the fair scheduler copied that same logic. Apparently it's different there in practice. To get to the bottom of this, I'd probably have to find some way to reproduce it and step through the scheduler to figure out why it's deciding to allocate when it does. Unfortunately that's time I simply don't have right now.
+
+I see FsAppAttempt#getAllowedLocalityLevel and FsAppAttempt#getAllowedLocalityLevelByTime are probably more relevant for the fair scheduler. Off the top of my head, I'm wondering about this logic:
+{code:java}
+    // check waiting time
+    long waitTime = currentTimeMs;
+    if (lastScheduledContainer.containsKey(priority)) {
+      waitTime -= lastScheduledContainer.get(priority);
+    } else {
+      waitTime -= getStartTime();
+    }
+
+    long thresholdTime = allowed.equals(NodeType.NODE_LOCAL) ?
+            nodeLocalityDelayMs : rackLocalityDelayMs;
+
+    if (waitTime > thresholdTime) {
+ {code}
+If lastScheduledContainer isn't reset when the new, single container request arrives it will be the last time the app scheduled a container at that priority (which may be a long time ago). In that case it would essentially teleport from NODE_LOCAL to RACK_LOCAL locality, although I would expect it to remain in rack-locality for another 5 seconds based on the configs and code. But again, I'm far from a fair scheduler expert.
+{quote}There's however, FicaSchedulerApp#getLocalityWaitFactor but its usage seems restricted to the capacity scheduler though. Is there something else I am missing?
+{quote}
+FicaSchedulerApp is specific to the FIFO and CapacityScheduler (hence the prefix "Fica" for Fifo + capacity scheduler).]

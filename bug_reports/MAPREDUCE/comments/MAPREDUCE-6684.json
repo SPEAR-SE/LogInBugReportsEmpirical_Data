@@ -1,0 +1,250 @@
+[Attaching the jstack logs, Most web API calls tend to invoke HistoryFileManager.getFileInfo(JobId) that looks up the job history files in the intermediate directory first before in the done directory. If jobs are already in done directory in most cases, we could scan the done directory first then intermediate directory and therefore reduce the contention on the intermediate user directories., Was looking into this along with [~haibochen]. The two tarballs of jstacks attached here correspond to a monitoring process turned on/off; the monitoring process has threads connecting to the JHS and asking for details about a job. We have seen a few problems:
+# JHS continues to process a request (scan directories and fetch file) even after the requesting connection has terminated. 
+# As Haibo mentioned, each thread scans the intermediate directory (and moves any available files to done dir). This scan is protected by a lock on the intermediate directory. When there are multiple threads, all threads but one are blocked. Couple of problems with this:
+## Threads that are trying to load a file that is already in the done_dir also seem to be blocked on scanning the intermediate dir
+## Even though a thread with the lock might process files required by other threads, those threads redo the scan (potentially moving other files they don't need) leading to longer turn-around-time per thread and maxing out the number of threads (default of 256). , Is it okay to scan the done directory first as Haibo suggested? 
+
+In addition to that, I wonder if there should be a single thread (with sleeps) moving files from intermediate to done. Other threads needing a particular job's jhist file could wake this moving thread and register for updates for that file. Once a file is moved, the moving thread could notify these other waiting threads. That way, we ensure serving threads wait only as long as required. 
+
+[~jlowe], [~revans2] - what do you think? , It has been a while since I did anything with this (2013 from the edit logs).  As such I don't remember too much about the code so feel free to take my advice or leave it, as I could be wrong.  Now that I finished with the all the disclaimers I believe that the reason we scan the intermediate directory first is to not drop any files that might be in the middle of being moved from intermediate_done to done.  So if you look in the older directory first you might miss some files that are in the middle of being moved, and then when you scan intermediate_done you wouldn't see those files because they have already been moved.  So if you think there is a high probability that you will find the files you want in the done dir then you would need to 
+
+scan the done dir
+if not found scan intermediate_done
+//Because something might have been in flight
+if still not found scan the done dir again.
+
+From our experience the majority of the hits to the history server for a job/application happen right after the application finishes.  So at least for our usage pattern this would not help much, and would probably add a lot more load to the namenode, something that we are much more concerned about.
+
+Having the scanner be on a background thread would help, but you would need some synchronization that is a bit more complex then just a waking the thread up and then waiting for a notification that it was done.  From the clients perspective if a history file was placed in the intermediate_done dir and then they made a call to the history server it had better pick up that file and return a result.  So we need to be sure that the waiting thread will only be woken up in the case where nothing was found if the scan started after the request was made., Thanks a lot for your insight on why intermediated directory is scanned before done directory and potential name node issue, [~revans2]. That makes a lot of sense. Per offline discussion with [~karthik.jayaprakasham@ldc.lu.se], we'd like to propose three approaches. 
+
+1. For web API requests for individual jobs, the intermediate directory is still scanned first, but inside scanIntermediateDir(), we could add checking of existence of the jhst files of the associated job (), and only when the files do exist do we move files in intermediate directory to done directory. The assumption is that file existence is not expensive, and if the files do not exist in intermediate directory, we only acquire the lock on the user directory for a short period of time.
+
+2. For web API requests of individual jobs, when intermediate directory is scanned, check the existence of the job files, and only files of the job associated with the request are moved from intermediate directory to done directory.  This reduces the time for which each job web request thread blocks, but may have much smaller overall throughput  that the previous approach when file moving is done in batch.
+
+3. Have a dedicated thread to scan the intermediate directory and other threads to wait on a monitor associated with a particular job. When the dedicated thread finishes, threads waiting on the monitors will be notified. By having a single writer, the contention on the user directory lock can be reduced. But it does have the problem of conflicting with clients' expectation as [~revans2] pointed out in previous comment.
+
+Can you please share some of your thoughts on them, [~revans2], [~jlowe]?, We need to get to the bottom of why the lock is being held so long. The move itself is done via an executor pool so that shouldn't be slow.
+
+According to the jstacks, every single one has this stacktrace for the thread that has the lock on the user's intermediate directory:
+{noformat}
+   java.lang.Thread.State: BLOCKED (on object monitor)
+        at org.apache.hadoop.mapreduce.v2.hs.HistoryFileManager$HistoryFileInfo.didMoveFail(HistoryFileManager.java:356)
+        - waiting to lock <0x000000056106dd80> (a org.apache.hadoop.mapreduce.v2.hs.HistoryFileManager$HistoryFileInfo)
+        at org.apache.hadoop.mapreduce.v2.hs.HistoryFileManager.scanIntermediateDirectory(HistoryFileManager.java:873)
+        at org.apache.hadoop.mapreduce.v2.hs.HistoryFileManager.access$200(HistoryFileManager.java:82)
+        at org.apache.hadoop.mapreduce.v2.hs.HistoryFileManager$UserLogDir.scanIfNeeded(HistoryFileManager.java:315)
+        - locked <0x00000004fae96ee0> (a org.apache.hadoop.mapreduce.v2.hs.HistoryFileManager$UserLogDir)
+        at org.apache.hadoop.mapreduce.v2.hs.HistoryFileManager.scanIntermediateDirectory(HistoryFileManager.java:839)
+        at org.apache.hadoop.mapreduce.v2.hs.HistoryFileManager.getFileInfo(HistoryFileManager.java:978)
+        at org.apache.hadoop.mapreduce.v2.hs.CachedHistoryStorage.loadJob(CachedHistoryStorage.java:174)
+[...]
+{noformat}
+
+So the thread has the lock, but it's waiting a long time on some other thread which isn't ideal.  Every jstack shows the other thread doing this:
+{noformat}
+"473394034@qtp-1617102129-245" daemon prio=10 tid=0x00007f66c8185000 nid=0x6437 runnable [0x00007f6693b6c000]
+   java.lang.Thread.State: RUNNABLE
+      at java.util.HashMap.put(HashMap.java:494)
+      at org.apache.avro.util.WeakIdentityHashMap.put(WeakIdentityHashMap.java:108)
+      at org.apache.avro.LogicalTypes.fromSchemaIgnoreInvalid(LogicalTypes.java:62)
+      at org.apache.avro.Schema.parse(Schema.java:1318)
+      at org.apache.avro.Schema.parse(Schema.java:1260)
+      at org.apache.avro.Schema.parse(Schema.java:1331)
+      at org.apache.avro.Schema.parse(Schema.java:1260)
+      at org.apache.avro.Schema$Parser.parse(Schema.java:1024)
+      at org.apache.avro.Schema$Parser.parse(Schema.java:1012)
+      at org.apache.avro.Schema.parse(Schema.java:1064)
+      at org.apache.hadoop.mapreduce.jobhistory.EventReader.<init>(EventReader.java:71)
+      at org.apache.hadoop.mapreduce.jobhistory.JobHistoryParser.parse(JobHistoryParser.java:139)
+      - locked <0x00000005a05fd4e8> (a org.apache.hadoop.mapreduce.jobhistory.JobHistoryParser)
+      at org.apache.hadoop.mapreduce.v2.hs.CompletedJob.loadFullHistoryData(CompletedJob.java:339)
+      - locked <0x0000000577bd9b98> (a org.apache.hadoop.mapreduce.v2.hs.CompletedJob)
+      at org.apache.hadoop.mapreduce.v2.hs.CompletedJob.<init>(CompletedJob.java:101)
+      at org.apache.hadoop.mapreduce.v2.hs.HistoryFileManager$HistoryFileInfo.loadJob(HistoryFileManager.java:451)
+      - locked <0x000000056106dd80> (a org.apache.hadoop.mapreduce.v2.hs.HistoryFileManager$HistoryFileInfo)
+[...]
+{noformat}
+
+So I don't think any of the above three proposals will fix the issue completely.  The core issue is the scan being held up for an arbitrarily long jhist parse.  I suspect things will get a _lot_ better if we can decouple these two processes.  I haven't gone through all the race conditions, but I'm wondering if we can simply make the state field volatile and allow the didMoveFail and isMovePending methods to avoid grabbing the lock., [~jlowe] - thanks for the suggestion, looks like that should do the trick and is definitely a lot simpler and less risky than the options proposed earlier. 
+
+[~revans2] - thanks for pointing out the load on NN, we hadn't considered that either. 
+
+Unrelated, the code surrounding moving the files is pretty complex. Do you think there is any value in cleaning it up at all? The code seems to work fine. And, if we are going to make any changes, I guess we would probably just want to use ATS v2 when that is ready. , Yes, the move logic is not ideal, and it would be nice if it were cleaner.  Because it is complex with lots of race conditions to work through I worry we can introduce new subtle bugs when it's rewritten.  If ATSv2 is going to completely replace the JHS in a reasonable timeframe then I'm thinking it's probably not worth the rewrite.  However if the JHS is going to live for quite a while longer then it could be a worthwhile effort if done carefully., I agree with Jason.  The code is complex and there are a lot of races in there.  Making the code simpler and still solving the problem would be great.  But I think a lot of the races are inherent in the problem, some users are trying to read data and get a consistent view of it while at the same time the data is moving from one place to another.  In many cases making something have less lock contention inherently makes the code more complex.  Although I am happy to be proven wrong so if you have some specific suggestions on what and how to clean it up that would be helpful in understanding if it is worth the risk., bq. If ATSv2 is going to completely replace the JHS
+While the need for writing out and copying/parsing jhist files might be replaced by accesses to ATS, I would think the JHS itself would stick around to provide MR-specific UI it does today. Not sure if ATS would be able to expose the right abstractions for each framework to plugin the appropriate UI. 
+
+bq. Because it is complex with lots of race conditions to work through I worry we can introduce new subtle bugs when it's rewritten.
+bq. But I think a lot of the races are inherent in the problem, some users are trying to read data and get a consistent view of it while at the same time the data is moving from one place to another. 
+Agree with you both. Given it is mostly stable barring the occasional inefficiency, we should probably just leave it alone. If we run into more issues around this, may be we could revisit cleaning it up. 
+
+In terms of potential cleanups:
+# When fetching information regarding one job, we scan the entire intermediate directory potentially triggering other moves. Instead, it would be nice if it looks only for that specific job. And, if that very file is being moved, wait for the move to complete. That way, we don't have to think about a read thread accessing files corresponding to other jobs. 
+# HistoryFileManager is rather long - moving out some of the inner classes might make for cleaner abstractions and more explicit locking where needed for readability. 
+# I keep thinking about doing the move in a separate class/thread and some way for the read threads to communicate with this move thread, but that might just result in more complicated code. I will have to poke around to figure out which way is simpler; don't think I can get it to anytime soon though. , Thanks a lot for you all's comments. Uploading a patch according to the solution suggested by Jason. Will come to this discussion if future improvement of HistoryFileManager is necessarily needed., | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 10s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 1s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 17s {color} | {color:green} trunk passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 17s {color} | {color:green} trunk passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 14s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 23s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 12s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 33s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 14s {color} | {color:green} trunk passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 15s {color} | {color:green} trunk passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 15s {color} | {color:green} the patch passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 15s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 16s {color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 16s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 11s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 21s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 11s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 41s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 10s {color} | {color:green} the patch passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 12s {color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 5m 52s {color} | {color:green} hadoop-mapreduce-client-hs in the patch passed with JDK v1.8.0_91. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 6m 9s {color} | {color:green} hadoop-mapreduce-client-hs in the patch passed with JDK v1.7.0_95. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 19s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 25m 28s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:cf2ee45 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12801818/mapreduce6684.001.patch |
+| JIRA Issue | MAPREDUCE-6684 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 4ccdab9d0c8d 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 9e8411d |
+| Default Java | 1.7.0_95 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_91 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_95 |
+| findbugs | v3.0.0 |
+| JDK v1.7.0_95  Test Results | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/6479/testReport/ |
+| modules | C: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs U: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs |
+| Console output | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/6479/console |
+| Powered by | Apache Yetus 0.2.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks for the patch, Haibo!  Looks good to me other than one nit: createMove2DoneThreadPool is inconsistent with the rest of the code.  We should be consistent with 'moveToDone' vs. 'move2Done'.
+, Thanks a lot for your review, Jason!  Patch updated according to your comments., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 17s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 8m 39s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 21s {color} | {color:green} trunk passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 20s {color} | {color:green} trunk passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 18s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 28s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 15s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 40s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 17s {color} | {color:green} trunk passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 19s {color} | {color:green} trunk passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 22s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 19s {color} | {color:green} the patch passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 19s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 19s {color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 19s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 15s {color} | {color:red} hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs: patch generated 10 new + 16 unchanged - 0 fixed = 26 total (was 16) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 25s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 13s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 52s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 15s {color} | {color:green} the patch passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 16s {color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 6m 48s {color} | {color:green} hadoop-mapreduce-client-hs in the patch passed with JDK v1.8.0_91. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 6m 51s {color} | {color:green} hadoop-mapreduce-client-hs in the patch passed with JDK v1.7.0_95. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 22s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 30m 22s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:cf2ee45 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12803018/mapreduce6684.002.patch |
+| JIRA Issue | MAPREDUCE-6684 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 9a2156e55760 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 411fb4b |
+| Default Java | 1.7.0_95 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_91 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_95 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/6486/artifact/patchprocess/diff-checkstyle-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-hs.txt |
+| JDK v1.7.0_95  Test Results | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/6486/testReport/ |
+| modules | C: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs U: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs |
+| Console output | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/6486/console |
+| Powered by | Apache Yetus 0.2.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Updated the patch to fix checkstyle issues. Not sure why Jenkin did not catch this in this first run., | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 13s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 57s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 15s {color} | {color:green} trunk passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 17s {color} | {color:green} trunk passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 13s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 22s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 13s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 33s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 14s {color} | {color:green} trunk passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 15s {color} | {color:green} trunk passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 13s {color} | {color:green} the patch passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 13s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 15s {color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 15s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 12s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 22s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 10s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 43s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 12s {color} | {color:green} the patch passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 13s {color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 5m 50s {color} | {color:green} hadoop-mapreduce-client-hs in the patch passed with JDK v1.8.0_91. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 6m 9s {color} | {color:green} hadoop-mapreduce-client-hs in the patch passed with JDK v1.7.0_95. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 19s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 25m 26s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:cf2ee45 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12803034/mapreduce6684.003.patch |
+| JIRA Issue | MAPREDUCE-6684 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 0dc6564cc107 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 411fb4b |
+| Default Java | 1.7.0_95 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_91 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_95 |
+| findbugs | v3.0.0 |
+| JDK v1.7.0_95  Test Results | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/6488/testReport/ |
+| modules | C: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs U: hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs |
+| Console output | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/6488/console |
+| Powered by | Apache Yetus 0.2.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, +1 lgtm.  Committing this., Thanks, [~haibochen]!  I committed this to trunk, branch-2, and branch-2.8., FAILURE: Integrated in Hadoop-trunk-Commit #9739 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/9739/])
+MAPREDUCE-6684. High contention on scanning of user directory under (jlowe: rev 5ffb54694b52657f3b7de4560474ab740734e1b2)
+* hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/test/java/org/apache/hadoop/mapreduce/v2/hs/TestUnnecessaryBlockingOnHistoryFileInfo.java
+* hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-hs/src/main/java/org/apache/hadoop/mapreduce/v2/hs/HistoryFileManager.java
+]

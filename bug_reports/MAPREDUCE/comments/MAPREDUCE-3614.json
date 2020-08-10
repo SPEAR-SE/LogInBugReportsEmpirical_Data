@@ -1,0 +1,470 @@
+[The client would fail with this exception 
+
+{noformat}
+RemoteTrace: 
+ at Local Trace: 
+        org.apache.hadoop.yarn.exceptions.impl.pb.YarnRemoteExceptionPBImpl: Unknown job job_1326140392720_0001
+        at org.apache.hadoop.yarn.ipc.ProtoOverHadoopRpcEngine$Invoker.invoke(ProtoOverHadoopRpcEngine.java:151)
+        at $Proxy8.getTaskAttemptCompletionEvents(Unknown Source)
+        at org.apache.hadoop.mapreduce.v2.api.impl.pb.client.MRClientProtocolPBClientImpl.getTaskAttemptCompletionEvents(MRClientProtocolPBClientImpl.java:172)
+        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:39)
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)
+        at java.lang.reflect.Method.invoke(Method.java:597)
+        at org.apache.hadoop.mapred.ClientServiceDelegate.invoke(ClientServiceDelegate.java:328)
+        at org.apache.hadoop.mapred.ClientServiceDelegate.getTaskCompletionEvents(ClientServiceDelegate.java:372)
+        at org.apache.hadoop.mapred.YARNRunner.getTaskCompletionEvents(YARNRunner.java:438)
+        at org.apache.hadoop.mapreduce.Job$5.run(Job.java:656)
+        at org.apache.hadoop.mapreduce.Job$5.run(Job.java:653)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:396)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1157)
+        at org.apache.hadoop.mapreduce.Job.getTaskCompletionEvents(Job.java:653)
+        at org.apache.hadoop.mapreduce.Job.monitorAndPrintJob(Job.java:1295)
+        at org.apache.hadoop.mapreduce.Job.waitForCompletion(Job.java:1235)
+        at org.apache.hadoop.examples.WordCount.main(WordCount.java:84)
+        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:39)
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)
+        at java.lang.reflect.Method.invoke(Method.java:597)
+        at org.apache.hadoop.util.ProgramDriver$ProgramDescription.invoke(ProgramDriver.java:72)
+        at org.apache.hadoop.util.ProgramDriver.driver(ProgramDriver.java:144)
+        at org.apache.hadoop.examples.ExampleDriver.main(ExampleDriver.java:68)
+        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:39)
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)
+        at java.lang.reflect.Method.invoke(Method.java:597)
+        at org.apache.hadoop.util.RunJar.main(RunJar.java:200)
+{noformat}
+
+, I identified the problem to RMCommunicator.java:unregister() . The call
+
+{noformat}
+scheduler.finishApplicationMaster(request);
+{noformat}
+is what is throwing the Exception. I'm attaching a patch which prevents the exception from being thrown and the output on the UI and everywhere else seems to be what is desired, but the approach to me seems to be dicey. I'm essentially not making the call when finishState == JobState.FAILED. I doubt that is the right approach. I'll dig deeper into code to see what the right approach would be
+, Hmm... Who knew, but the world is more complicated than what I first thought. I think in the AM shutdown hook
+{noformat}
+      Runtime.getRuntime().addShutdownHook(
+          new CompositeServiceShutdownHook(appMaster));
+{noformat}
+we need a more elaborate shutdown hook. It should send a JobFinishEvent for the AM to handle so that the normal course of a job finish is followed, albeit for a failed job. That way, the history server should also get to know about this job. Currently, the HS has no knowledge of jobs killed using SIGTERM / SIGKILL. SIGKILL terminated jobs will continue to not be picked by the HS, but atleast SIGTERM we can include. 
+
+If anybody has useful input on this design, please let me know, For the job history related changes - do we want SIGTERM jobs to show up as KILLED ? In that case the proposed change to the shutdown hook will be required.
+Otherwise another possibility would be to ensure JobHistoryEventHandler.stop() calls / has already called closeEventWriter() - which is what takes care of moving the history file to the correct location., Thanks for the pointer Sidd! :) I was running around in circles :(
+
+Currently, if SIGKILL the application it shows up as State:FAILED & FinalStatus:FAILED.
+on SIGTERM, its State:FINISHED & FinalStatus:UNDEFINED.
+
+Here's the ideal behavior in my mind:
+1. I think a SIGTERM'd AM should lead to a State: FAILED & FinalStatus:FAILED job (if this was the last AM attempt)
+2. The history logs should be copied over to the HS every time (even if this is NOT the last AM attempt). The Tracking UI should be active.
+3. The diagnostic message which shows up in the "Note" coloumn should mention that the AM was SIGTERMED or something to that effect.
+
+Would you agree? 
+, Apologies for the late reply.
+
+bq.
+Currently, if SIGKILL the application it shows up as State:FAILED & FinalStatus:FAILED.
+on SIGTERM, its State:FINISHED & FinalStatus:UNDEFINED.
+Is it the other way around ? SIGKILL -> Container may be retried. SIGTERM -> Marked as FAILED.
+
+The RM may decide to kill an application - in which case the NodeManager kills the container. The NM sends a SIGTERM, and a delayed SIGKILL in case the container does not exit.
+If the RM requests the kill - we should make sure the App isn't retried.
+
+In the case of a SIGKILL, nothing much can be done (easily). For a SIGTERM - like you've mentioned before, the history file can be moved over to the correct location - and a useful diagnostic message. (possibly a change to a history event).
+
+Other than this scenario - we probably do not need to worry a lot about a container receiving a SIGKILL / SIGTERM., No problem. Thanks for the reply!
+
+{quote}Currently, if SIGKILL the application it shows up as State:FAILED & FinalStatus:FAILED.
+on SIGTERM, its State:FINISHED & FinalStatus:UNDEFINED.
+Is it the other way around ? SIGKILL -> Container may be retried. SIGTERM -> Marked as FAILED.{quote}
+On a SIGKILL, the AM is indeed retried (if yarn.resourcemanager.am.max-retries > 1). If I SIGKILL it every time / yarn.resourcemanager.am.max-retries==1, thats when it shows up as FAILED.
+
+{quote}The RM may decide to kill an application - in which case the NodeManager kills the container. The NM sends a SIGTERM, and a delayed SIGKILL in case the container does not exit.
+If the RM requests the kill - we should make sure the App isn't retried.{quote}
+Aaah! I did not know about this use case. So a SIGTERM should not lead to retries. Cool.
+
+{quote}In the case of a SIGKILL, nothing much can be done (easily). For a SIGTERM - like you've mentioned before, the history file can be moved over to the correct location - and a useful diagnostic message. (possibly a change to a history event).
+
+Other than this scenario - we probably do not need to worry a lot about a container receiving a SIGKILL / SIGTERM.{quote}
+Agreed. Awesome. 
+
+I've been banging my head against this problem but soon as 
+{noformat}scheduler.finishApplicationMaster(request);{noformat} 
+is called in RMCommunicator.java, the MRAppMaster and the Client exit with the Exception I pasted in Comment #1 . I'm trying to make it not do that. Any help will be appreciated. 
+, I just IMd with Vinod. Here's the lowdown:
+In the JobHistoryEventHandler
+1. We can't take a long time in the shutdown hook. So we cannot drain the entire event queue. The size of the queue might be proportional to the job (which might be big)
+2. In case of SIGTERM, we can throw away all the events, process a single job finish event, move the history files to the done location and then exit.
+
+Also, originally the plan was to have multiple jobs per AM, but that got deprioritized, so if we can prevent storing the JobIds, that'd be good, but if no other alternative is present, then it is fine., Oops! I'm sorry! It seems my random comment generator malfunctioned :D Apologies. Thanks Hitesh!
+
+I'm uploading this patch which addresses our issues. I'll be adding unit tests to this, but in the meantime could some committer please bless it?, Discussed with Vinod and he told me that we should not drain the event queue in case of a SIGTERM in stop(). So I created a new shutdownhook that notifies the JHEH that SIGTERM had been called. 
+
+I forgot to mention but thanks go to [~daryn] for helping me figure out a way to keep FileSystem objects open. :) , This ought to do it. Contains unit tests and fixes the issue. Can someone please review the patch?, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12515964/MAPREDUCE-3614.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 5 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    -1 findbugs.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.mapreduce.v2.app.TestRecovery
+                  org.apache.hadoop.mapreduce.jobhistory.TestJobHistoryEventHandler
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1926//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1926//artifact/trunk/hadoop-mapreduce-project/patchprocess/newPatchFindbugsWarningshadoop-mapreduce-client-app.html
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1926//console
+
+This message is automatically generated., Hmm... HadoopQA's findings seem valid. I'll take another look
+, Fixed the unit test failures and the findbugs warning., There's some issues with the filesystem handling.  It's creating a filesystem to get the fs scheme so it can create the same filesystem again.
+
+The code is a bit misleading about only running when a SIGTERM hits.  Unless something unregisters the shutdown hook, it runs on a clean exit too.  You have to make sure that none of the changes are going to be detrimental to a normal shutdown., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12515982/MAPREDUCE-3614.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    -1 findbugs.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1933//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1933//artifact/trunk/hadoop-mapreduce-project/patchprocess/newPatchFindbugsWarningshadoop-mapreduce-client-app.html
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1933//console
+
+This message is automatically generated., Is there a compelling need to maintain a parallel set of JobIds?  Why not check the {{fileMap}} values to see if the writer is open?  The event construction looks a bit odd, but I don't know much about event injection.
+
+I'd suggest reverting all the fs manipulation code, and try this:
+{code}
+
+       Runtime.getRuntime().addShutdownHook(
+-          new CompositeServiceShutdownHook(appMaster));
++          new CompositeServiceShutdownHook(appMaster) {
++            @Override
++            public void run() {
++              super.run();
++              try {
++                FileSystem.closeAll();
++              } catch (IOException e) {
++                // ignore?
++              }
++            }
++          });
+       YarnConfiguration conf = new YarnConfiguration(new JobConf());
+       conf.addResource(new Path(MRJobConfig.JOB_CONF_FILE));
+       String jobUserName = System
+           .getenv(ApplicationConstants.Environment.USER.name());
+       conf.set(MRJobConfig.USER_NAME, jobUserName);
++      conf.setBoolean("fs.automatic.close", false);
+       initAndStartAppMaster(appMaster, conf, jobUserName);
+{code}
+
+Maybe you already tried this, but it prevents {{FileSystem}} from closing the fs objects automatically.  Then you do the {{FS.closeAll()}} in your shutdown handler.,  - FindBugs warning is still not fixed as Jenkins reports.
+ - Not sure why you need all the magic with the FileSystem objects, can you explain?
+ - You can make {{MRAppMaster.MRAppMasterShutdownHook}} extend {{CompositeServiceShutdownHook}}
+ - RMCommunicator: It seems unnatural to set killed final state if the job was running. I think you should set a flag with RMCommunicator similar to JobHistoryEventHandler.
+
+JobHistoryEventHandler (JHEH):
+ - Trivial: {{isSigTermed == false}} can be written as {{!isSigTermed}}
+ - Again trivial: The sigterm flag will never go back to false from true. So the code snippet "while (isSigTermed && jobIt.hasNext()) .." can be rewritten as "if (isSigTermed) { while .. }"
+ - For the same snippet, can you simply add a comment saying, we are doing this so as to drain everything and only write finish-events to shutdown as fast as possible.
+
+The test seems very wired into the code. Can we instead do something like this:
+ - Send 4 history events to JHEH and properly shutdown it and verify that 4 events are logged.
+ - Send 4 history events to JHEH and shut it down via SIGTERM and verify that only 1 job-finish event is logged.
+
+bq. Is there a compelling need to maintain a parallel set of JobIds? Why not check the fileMap values to see if the writer is open?
++1., Thanks Daryn and Vinod for your careful reviews. Attaching a patch addressing comments from them.
+
+Here are some clarifications
+@Daryn:
+bq. There's some issues with the filesystem handling. It's creating a filesystem to get the fs scheme so it can create the same filesystem again.
+I chose not to modify the code which had already been checked in. For myself I'm now getting the schema directly from the config.
+
+bq. The code is a bit misleading about only running when a SIGTERM hits. Unless something unregisters the shutdown hook, it runs on a clean exit too. You have to make sure that none of the changes are going to be detrimental to a normal shutdown.
+You are right! I have renamed the variables to more accurately say isSignalled etc. I reviewed the code and it will run fine in case of a normal shutdown too and ran it on my 1 node cluster a few times and checked the logs. For JHEH, all jobIds should have been closed in case of a normal shutdown, so nothing will be different. In RMCommunicator there is the stopped variable which makes sure it isn't run on stopped objects.
+
+bq. Is there a compelling need to maintain a parallel set of JobIds? Why not check the fileMap values to see if the writer is open? The event construction looks a bit odd, but I don't know much about event injection.
+You are right! Again! :) I'm checking for open eventWriters in fileMap now. I had to modify EventWriter for that. But I like it better.
+
+bq. I'd suggest reverting all the fs manipulation code, and try this:
+I had already tried that approach. And failed :( The problem with using "fs.automatic.close" was that a FileSystem object had already been opened with that parameter set to true. If you see FileSystem.java:2080, it doesn't overwrite that value. As a result on SIGTERM, the FileSystem object was being closed.
+
+@Vinod
+bq. FindBugs warning is still not fixed as Jenkins reports.
+Sorry about that. Should be fixed now.
+bq. Not sure why you need all the magic with the FileSystem objects, can you explain?
+FileSystem registers its own Runtime shutdownhook (FileSystem.java:2076) This closes all instances of FileSystem objects without the "magic". :( So when JHEH wants to write the JobUnsuccessfulCompletionEvent to HDFS / move the files to done_intermediate, it would throw an IOException.
+bq. You can make MRAppMaster.MRAppMasterShutdownHook extend CompositeServiceShutdownHook
+Daryn pointed out I'd made another boo boo here =D I should not have been starting off another thread in MRAppMasterShutdownHook for CompositeServiceShutdownHook. I just needed to call stop() so there was no need for extending anymore
+bq. RMCommunicator: It seems unnatural to set killed final state if the job was running. I think you should set a flag with RMCommunicator similar to JobHistoryEventHandler.
+Thanks for the suggestion. Done! :) 
+
+bq. Trivial: isSigTermed == false can be written as !isSigTermed
+Done!
+bq. Again trivial: The sigterm flag will never go back to false from true. So the code snippet "while (isSigTermed && jobIt.hasNext()) .." can be rewritten as "if (isSigTermed) { while .. }"
+Done
+bq. For the same snippet, can you simply add a comment saying, we are doing this so as to drain everything and only write finish-events to shutdown as fast as possible.
+Done!
+bq. The test seems very wired into the code. Can we instead do something like this:
+Done! I've tried being as close as possible to the SIGTERM without the test becoming too onerous. Please let me know if it needs some change still.
+
+, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12516250/MAPREDUCE-3614.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.mapreduce.v2.app.TestKill
+                  org.apache.hadoop.mapreduce.v2.app.TestRMContainerAllocator
+                  org.apache.hadoop.mapreduce.v2.app.launcher.TestContainerLauncher
+                  org.apache.hadoop.mapreduce.v2.app.TestFail
+                  org.apache.hadoop.mapreduce.v2.app.job.impl.TestTaskAttempt
+                  org.apache.hadoop.mapreduce.v2.app.TestFetchFailure
+                  org.apache.hadoop.mapreduce.v2.app.TestMRClientService
+                  org.apache.hadoop.mapreduce.v2.app.job.impl.TestMapReduceChildJVM
+                  org.apache.hadoop.mapreduce.v2.app.TestMRApp
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1944//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1944//console
+
+This message is automatically generated., The unit test failures seem valid. I'll fix them. Strangely I ran testPatch.sh on my dev box and no unit test failures showed up. Something's weird., Fixed the unit test failures. I ran the tests which had failed again.
+I noticed test-patch.sh in branch-0.23.1 didn't give me a +1 for core tests. Are they not being run? Meehhhh... that's for another JIRA., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12516357/MAPREDUCE-3614.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1948//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1948//console
+
+This message is automatically generated., Incorporated more comments from Daryn. Can someone please review and commit?, +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12516519/MAPREDUCE-3614.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1962//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1962//console
+
+This message is automatically generated., This one is looking better now.
+
+I had a chat with Sid and it looks like draining the events is not costly, so let's put it back to be consistent with usual shut-down.
+
+Also, I missed one thing in the review of the earlier patch, the isSignalled variables have to be volatile as the signaling happens in a separate thread.
+
+Canceling the patch. Will upload the updated patch myself to avoid more iterations., Updated patch with above changes., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12516967/MAPREDUCE-3614-20120303.txt
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1993//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1993//console
+
+This message is automatically generated., I just committed this to trunk, branch-0.23 and branch-0.23.2. Thanks Ravi Prakash!, Integrated in Hadoop-Hdfs-0.23-Commit #622 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Commit/622/])
+    MAPREDUCE-3614. Fixed MR AM to close history file quickly and send a correct final state to the RM when it is killed. Contributed by Ravi Prakash.
+svn merge --ignore-ancestry -c 1296747 ../../trunk/ (Revision 1296748)
+
+     Result = SUCCESS
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1296748
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/jobhistory/JobHistoryEventHandler.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/jobhistory/TestJobHistoryEventHandler.java
+, Integrated in Hadoop-Hdfs-trunk-Commit #1901 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/1901/])
+    MAPREDUCE-3614. Fixed MR AM to close history file quickly and send a correct final state to the RM when it is killed. Contributed by Ravi Prakash. (Revision 1296747)
+
+     Result = SUCCESS
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1296747
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/jobhistory/JobHistoryEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/jobhistory/TestJobHistoryEventHandler.java
+, Integrated in Hadoop-Common-0.23-Commit #633 (See [https://builds.apache.org/job/Hadoop-Common-0.23-Commit/633/])
+    MAPREDUCE-3614. Fixed MR AM to close history file quickly and send a correct final state to the RM when it is killed. Contributed by Ravi Prakash.
+svn merge --ignore-ancestry -c 1296747 ../../trunk/ (Revision 1296748)
+
+     Result = SUCCESS
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1296748
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/jobhistory/JobHistoryEventHandler.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/jobhistory/TestJobHistoryEventHandler.java
+, Integrated in Hadoop-Common-trunk-Commit #1827 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/1827/])
+    MAPREDUCE-3614. Fixed MR AM to close history file quickly and send a correct final state to the RM when it is killed. Contributed by Ravi Prakash. (Revision 1296747)
+
+     Result = SUCCESS
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1296747
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/jobhistory/JobHistoryEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/jobhistory/TestJobHistoryEventHandler.java
+, Integrated in Hadoop-Mapreduce-0.23-Commit #632 (See [https://builds.apache.org/job/Hadoop-Mapreduce-0.23-Commit/632/])
+    MAPREDUCE-3614. Fixed MR AM to close history file quickly and send a correct final state to the RM when it is killed. Contributed by Ravi Prakash.
+svn merge --ignore-ancestry -c 1296747 ../../trunk/ (Revision 1296748)
+
+     Result = ABORTED
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1296748
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/jobhistory/JobHistoryEventHandler.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/jobhistory/TestJobHistoryEventHandler.java
+, Integrated in Hadoop-Mapreduce-trunk-Commit #1834 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Commit/1834/])
+    MAPREDUCE-3614. Fixed MR AM to close history file quickly and send a correct final state to the RM when it is killed. Contributed by Ravi Prakash. (Revision 1296747)
+
+     Result = ABORTED
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1296747
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/jobhistory/JobHistoryEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/jobhistory/TestJobHistoryEventHandler.java
+, Integrated in Hadoop-Hdfs-trunk #974 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/974/])
+    MAPREDUCE-3614. Fixed MR AM to close history file quickly and send a correct final state to the RM when it is killed. Contributed by Ravi Prakash. (Revision 1296747)
+
+     Result = SUCCESS
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1296747
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/jobhistory/JobHistoryEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/jobhistory/TestJobHistoryEventHandler.java
+, Integrated in Hadoop-Hdfs-0.23-Build #187 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/187/])
+    MAPREDUCE-3614. Fixed MR AM to close history file quickly and send a correct final state to the RM when it is killed. Contributed by Ravi Prakash.
+svn merge --ignore-ancestry -c 1296747 ../../trunk/ (Revision 1296748)
+
+     Result = SUCCESS
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1296748
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/jobhistory/JobHistoryEventHandler.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/jobhistory/TestJobHistoryEventHandler.java
+, Integrated in Hadoop-Mapreduce-0.23-Build #215 (See [https://builds.apache.org/job/Hadoop-Mapreduce-0.23-Build/215/])
+    MAPREDUCE-3614. Fixed MR AM to close history file quickly and send a correct final state to the RM when it is killed. Contributed by Ravi Prakash.
+svn merge --ignore-ancestry -c 1296747 ../../trunk/ (Revision 1296748)
+
+     Result = FAILURE
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1296748
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/jobhistory/JobHistoryEventHandler.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/jobhistory/TestJobHistoryEventHandler.java
+, Integrated in Hadoop-Mapreduce-trunk #1009 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1009/])
+    MAPREDUCE-3614. Fixed MR AM to close history file quickly and send a correct final state to the RM when it is killed. Contributed by Ravi Prakash. (Revision 1296747)
+
+     Result = SUCCESS
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1296747
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/jobhistory/JobHistoryEventHandler.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/jobhistory/TestJobHistoryEventHandler.java
+]

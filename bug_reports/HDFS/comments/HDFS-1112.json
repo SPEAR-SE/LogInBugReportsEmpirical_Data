@@ -1,0 +1,109 @@
+[We need to be a little bit careful of this, since we've made assumptions in some places that logSync() won't be called while the NN is in safe mode.
+
+Dhruba, do you have an opinion on this? I know the contracts regarding safemode are important for your HA work., The best bet is that the Nn should not allow any transactions while in safemode. This means that any operation that needs to do transactions should fail if the namenode is in safemode. Hairong is already proposing changing fsck to not update access times via HDFS-1104.
+
+I think we should also try to solve the general case where the NN does not update access time of files if the NN is in safemode.  Do you agree?
+
+, I think so... it's just sort of strange semantics to say that access times are enabled but don't get updated if the NN is in safe mode. It's almost as if safemode should be called "recovery mode" or "readonly mode" where these ideas would be more explicit., > I think we should also try to solve the general case where the NN does not update access time of files if the NN is in safemode. Do you agree?
+
+It may update the access times. It should not persist them though., If access time is enabled, open should not be allowed in safemode. Safemode is really a "readonly mode"., Here is the proposal:
+# Add a method getUnflushedDataLen() to EditLogOutputStream that returns the length of buffered edit logs that need to be flushed.
+# After each edit log entry is written (FSEditLog#logEdit), check the length of the unflushed edit logs. If it is bigger than or equal to the initial buffer size, which is 512K for now, all edit log streams are automatically flushed and synced to disks.
+
+This proposal does allow edit log buffer to grow beyond the initial buffer size, but the max buffer size is really bounded the max length of an edit log entry. In most cases, I believe that the buffer can grow up to 1M bytes. The advantage of not shrinking the edit log buffer is that it won't cause frequent buffer allocations & deallocations, so avoiding frequent GCs if a large amount of open hits NameNode in a short time., sounds like the best approach!, It turns out that the edit output stream for backup NN does not serialize edit logs when an edit log entry is written. So there is no way to implement getUnflushedDataLen(). Here is a minor change to the proposal. Instead, add a method boolean isTimeToSync() to EditLogOutputStream. isTimeToSync() allows each edit stream to implement its own automatic sync policy, either by size or by time. By default, no automatic sync is supported. EditLogOutputStream returns true when the buffered data length is greater than the initial size., Here is a patch for review. It's tricky to get the synchronization right. In the patch, a flag isAutoSyncScheduled is introduced to make sure that no one can write the edit log buffer once it is determined that an automatic sync should be done and before double buffer is swapped, , Some comments:
+- timeToSync() method name implies that it's a time based condition, perhaps better to rename to something like isBufferFull() since that's the policy currently implemented. Or more generically shouldForceSync()
+- why the notifyAll calls inside logSync, since that's done already inside doneWithAutoSyncScheduling?
+- the changes to add IOException thrown seems messy - isn't our contract always that failing to append to the edit log is a fatal error for the NN and thus a checked exception won't be thrown?
+- the patch doesn't apply to trunk anymore
+
+Aside from that, think this looks good. I edited TestFSEditLogRace to run for a couple minutes with 16 threads making edits simultaneously, and no deadlocks or anything., Thank Todd for reviewing and testing the patch. This patch addresses your comments except for IOException. I agree that IOException change is messy. But unfortunately logSync throws IOException so now logEdit has to throw IOException., A couple of somments.
+#  {{FSEditLog.isTimeToSync()}} should be {{shouldForceSync()}} with reversed boolean return value, to make it consistent with the EditLogOutputStream method.
+# Is it possible to reuse the flag {{isSyncRunning}} instead of new {{isAutoSyncScheduled}}? The problem is that we {{waitForSyncToFinish()}} in many operations, which makes sure that {{isSyncRunning == false}}. We should probably do the same with {{isAutoSyncScheduled}} if there is no way to use one flag for both conditions.
+# This is the main concern. If {{logSync()}} fails, then {{isAutoSyncScheduled}} will remain set. Nobody will be able to unset it, and everybody will be waiting for the sync to finish when nobody is syncing.
+# I see you had to add throwing IOException in a bunch of methods. The reason is that {{logSync()}} throws IOEception, and therefore now the {{logEdit()}} should do it too. I think we should fix {{logSync()}}, because it should not throw IOException. The only reason {{logSync()}} throws is {{setReadyToFlush()}}. But call to {{setReadyToFlush()}} should be treated the same way as the call to {{flush()}}, that is it should catch the exception and {{processIOError()}}. I think current treatment of {{setReadyToFlush()}} is incorrect.
+, Konstantin, I really like your comment 4. This patch makes sure that the errors occurred during setReadyFlush are handled the same as the ones during the sync phase. So logSync does not throw IOException. This eliminate many unnecessary IOException related changes and also makes comment 3 no longer a concern. This patch also incorporates comment 1. But comment 2 is not able to be addressed., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12444964/editLogBuf2.patch
+  against trunk revision 944566.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/369/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/369/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/369/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/369/console
+
+This message is automatically generated., Hairong, the patch looks good. Two more things
+# You should not remove the large try {} finally section. This prevents from other runtime exception blocking syncing by not resetting isSyncRunning flag. This was discussed in HDFS-119.
+# With respect to my previous comment 2. I understand it is impossible to join the two variables. But do we still need to add the condition on {{isAutoSyncScheduled}} in {{waitForSyncToFinish()}}?
+{code}
+- while (isSyncRunning) {
++ while (isSyncRunning && isAutoSyncScheduled) {
+{code}, This patch addresses Konstantin's comment 1. I do not think that we need comment 2., Per discussion with Hairong, since logEdits() happens under FSNamesystem lock, isAutoSyncScheduled should be set and reset by the same thread within one name-node operation, therefore other threads do not need to wait on isAutoSyncScheduled  as they will wait on FSNamesystem lock.
+
++1 code looks good., Resubmitting just in case., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12445114/editLogBuf3.patch
+  against trunk revision 946488.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/372/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/372/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/372/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h5.grid.sp2.yahoo.net/372/console
+
+This message is automatically generated., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12445114/editLogBuf3.patch
+  against trunk revision 946488.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h2.grid.sp2.yahoo.net/179/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h2.grid.sp2.yahoo.net/179/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h2.grid.sp2.yahoo.net/179/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hdfs-Patch-h2.grid.sp2.yahoo.net/179/console
+
+This message is automatically generated., The failed test was caused by a known bug: HDFS-1164., I've just committed this!, Integrated in Hadoop-Hdfs-trunk-Commit #278 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Hdfs-trunk-Commit/278/])
+    HDFS-1112. Edit log buffer should not grow unboundedly. Contributed by Hairong Kuang.
+, The patch committed here seems to be incorrect. See HDFS-3020]

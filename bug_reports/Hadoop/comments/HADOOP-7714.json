@@ -1,0 +1,91 @@
+[here's a rough patch that I've been playing with over the weekend. With this patch on, and configured, it noticeably decreases the cache churn for workloads like teragen or teravalidate. (terasort still churns cache due to the shuffle, but it wouldn't be too hard to improve the shuffle to drop map output out of cache once it has been fetched by a reducer), Why is the change across the entire datanode?  And why are we trying to guess the usage pattern of the data based off of a hard coded read size of 256k?
+
+It seems to me that there are other HDFS use cases that are not random reads of < 256K, like the distributed cache or who knows what in the future with MRV2 where we want to keep the data cached in memory on the data node if possible.
+
+I would much rather see an optional parameter to the open API for flags like O_DIRECT.  Then when HDFS talks to the data node it can also pass that information off to it when initiating a block read.  That way the application can indicate how it expects to use the data.  MAPREDCUE can say this is a streaming read where we will probably never reread the data again and it can also say this is reading a file from the distributed cache and 900 others are going to read this same file so keep it in memory if possible., I agree with all of the above - I did the lame 256KB heuristic here because adding an open API flag would be impossible while keeping it protocol compatible. In 0.23 we use protobufs for the xceiver protocol so it would be easy to add such a flag in a non-breaking manner.
+
+(to be clear, the patch here is not for commit - it's just a rough patch to illustrate the idea and start validating some assumptions about how buffer cache management affects things like hbase, block report speed, disk seeks incurred in the shuffle, etc), Great.  Then on that note I think the concept is wonderful.  There is no reason to keep a bunch of data in memory that is unlikely to ever be re-read.  So is the plan then to run some benchmarks with the patch enabled and disabled and post the results?, yea, I'd like to sprinkle some fadvises into the shuffle, too, and then do some terasorts, etc, to see if there's any appreciable speedup., I got started with some testing today and can definitely see the effect of the fadvise on the page cache, however, in my tests I was still seeing about 8MB in the page cache belonging to a 64MB block for which fadvise calls were being issued (I checked this with strace). I looked into the BlockSender code and there seems to be an error in the fadvise call:
+
+NativeIO.posixFadviseIfPossible(blockInFd, lastCacheDropOffset, offset - 1024, NativeIO.POSIX_FADV_DONTNEED);
+
+should be
+
+NativeIO.posixFadviseIfPossible(blockInFd, lastCacheDropOffset, offset - lastCacheDropOffset, NativeIO.POSIX_FADV_DONTNEED);
+
+I am not sure what the "- 1024" is for, but in any case that parameter should be the length instead of an offset. Having said that, this is not what is causing the 8MB to stay in the page cache. I tried changing the fadvise call to:
+
+NativeIO.posixFadviseIfPossible(blockInFd, 0, offset, NativeIO.POSIX_FADV_DONTNEED); // Yes, I know, this is redundant since it is being called frequently
+
+and that reduced the number of pages in the cache from 8MB to a varying value between 0-2MB.
+
+I looked into what pages were remaining in the cache and it seems that a few random pages are staying every time, plus some pages at the end.
+
+Nathan (Roberts) and I looked through this issue and thought the kernel's read ahead mechanism may be preventing some pages from being removed from the page cache so we changed the POSIX_FADV_SEQUENTIAL to POSIX_FADV_RANDOM and that seemed to make things better in the sense that now I am only seeing very little pages staying around (around 4-8 4KB pages in the latests tests I ran today). Having said that, POSIX_FADV_SEQUENTIAL is of course what we should be using. Any ideas on how to make all the fadvised (DONT_NEED) pages to go away? We are puzzled on why those last few pages seem to hang around, specially since I modified the fadvise calls to go from offset 0 every time; in other words, we are repeatedly telling the kernel to remove those pages and still a few manage to stay around. I'll keep looking into this issue and will try to get some performance numbers but would love to have the code working as expected before doing the tests.
+
+BTW, I did not look into the BlockReceiver code; once BlockSender is working as expected I'll look into it.
+
+I hope that what I wrote makes sense; if something is not clear I'll be happy to explain the issue in more detail., Thanks for the comments. I'm doing some more refactoring of the readahead code, and integrating it into parts of the shuffle as well as an experiment. Running a terasort, my current iteration of the patch slowed down the map phase by a few percent, but really improved speed of the reduce phase (I'm running untuned settings so the reduce phase has lots of IFile merges, which I've plugged readahead into). The good news is the total runtime for my terasort went from 40m13s to 33m7s (near 20% speedup). The reduce phase (counting from when mapper output read 100% on my console) went from about 19 minutes down to 9 minutes.
+
+It might be that the map phase slowed down due to the bug you found above. Let me look into that and run some more experiments - then I'll post another patch., Yep, that was it - fixing that brought terasort time down to about 25 minutes. Map slot seconds reduced by about 22%, reduce slot millis reduced by about 35%.
+
+Of course we need to reproduce this a bunch of times to be sure I'm not seeing things, but I think we're onto something good! I'll upload an updated patch soon., Congratulations 20% wall time speed up and a 35%/22% CPU time improvement is huge.  Do you have any metrics on what the OS is doing during the terrasort both before and after your change?  I want to understand a little bit better what exactly is causing the speedup.  I suspect that we were seeing a lot of churn in the pages and the OS was dropping lots of pages that it then need causing the disk to seek slowing down everything.  I would love to see disk IO usage and page churn data., Yes nice improvement. Seems like it's probably the intermediate files staying resident but yes it would be good to know. Maybe we could add some mincore() metrics somewhere that would help shed some light. Each time we open a file, we use mincore to tell us what percentage of that file is resident. 
+
+As Cristina mentioned, we'll continue looking into why fadvise isn't clearing up everything. I think it's racing with readahead and the search for dirty pages to writeback. One thing I asked Cristina to try was to issue the fadvise exactly once, just before close to see which pages remain in core. , I'll try to prepare some graphs of node metrics with/without the patches. What I was seeing last night was that, with the fadvises in, the CPU and network graphs were a lot "smoother" - ie the nodes were kept pretty constant at 95-100% utilization, and the ratio of CPU to sys to iowait was very smooth and constant within each phase of the terasort. Without fadvise, the graph is very "jagged". I think we suffer from a lot of "hurry up and wait" - the threads run for a little bit, then hit a read that isn't in cache, and stall for hundreds of milliseconds. During that time, other disks might have excess IO capacity and end up sitting idle.
+
+I have a talk on performance at Hadoop World, so I'll definitely be preparing more graphs and explanations of these effects before then :), Nice ! This was a question I had asked on twitter on June 13, 2011: 
+"Anyone tried using fadvise with FADV_SEQUENTIAL and FADV_NOREUSE for Hadoop FS ?"
+
+Good to see the answer. Great work Todd., I've been meaning to do this since '09: http://comments.gmane.org/gmane.comp.jakarta.lucene.hadoop.user/16219  - just took me 2 years to get around to it :), I'm just curious if you have tested this approach with and without the read-ahead?  The kernel's fs scheduler is already performing read-ahead, so my expectation would be the improvement is largely or entirely due to the fadvise to drop pages.  I've only skimmed the code, so perhaps your read-ahead is doing something extra clever?, Our tests were without the read ahead, using only the kernel read ahead. I did not get job performance numbers, but the effect in the page cache churn is very noticeable. I would also be interested in what percentage of the improvement comes from the fadvise to drop pages and what comes from the added read-ahead., Todd, you may already be well aware of this, but just in case...
+
+Patterns like the one below don't usually do what one would expect, especially if the data has to go over a wire. I believe the reason is due to the way the socket buffers inside the kernel keep track of the data that needs to be sent. It's basically just a reference to the page cache page. Therefore, if the data has not actually left the box when the fadvise is called, the references are still there so the pages cannot  be invalidated. I tried this with a small native app and a 128MB file, and sure enough everything except for the first few pages stayed in the page cache. 
+
+I can't immediately think of a surefire way around this. We could just call fadvise once at close and just live with the fact that everything still buffered at the time won't be affected. We could do what Cristina was doing and always call fadvise with offset of 0 so that we try to invalidate pages multiple times. We could call the fadvise asynchronously after a second or so. Delaying a bit might help us deal with hot blocks better as well. 
+sendfile(4, 5, [131072000], 65536)      = 65536
+sendfile(4, 5, [131137536], 65536)      = 65536
+sendfile(4, 5, [131203072], 65536)      = 65536
+sendfile(4, 5, [131268608], 65536)      = 65536
+sendfile(4, 5, [131334144], 65536)      = 65536
+sendfile(4, 5, [131399680], 65536)      = 65536
+sendfile(4, 5, [131465216], 65536)      = 65536
+sendfile(4, 5, [131530752], 65536)      = 65536
+sendfile(4, 5, [131596288], 65536)      = 65536
+sendfile(4, 5, [131661824], 65536)      = 65536
+sendfile(4, 5, [131727360], 65536)      = 65536
+sendfile(4, 5, [131792896], 65536)      = 65536
+sendfile(4, 5, [131858432], 65536)      = 65536
+sendfile(4, 5, [131923968], 65536)      = 65536
+sendfile(4, 5, [131989504], 65536)      = 65536
+sendfile(4, 5, [132055040], 65536)      = 65536
+fadvise64(5, 131072000, 1048576, POSIX_FADV_DONTNEED) = 0
+, That's a good point, Nathan. That was the original thinking behind the "offset - 1024" - but probably better to actually do "offset - CACHE_DROP_LAG", setting CACHE_DROP_LAG to a couple of MB.
+
+The readahead certainly makes a big difference in the shuffle. I haven't run comparisons with each change on/off yet, but will be interesting to see. I think the issue is that Linux's native readahead is not very aggressive, and based on some heuristics which don't necessarily kick in immediately. Another thing which might be kicking in here is that in mm/readahead.c:page_cache_async_readahead, it checks {{bdi_read_congested}} on the backing device for the file before reading ahead. if it detects that the block device is congested (as it will be during MR), readahead is disabled at least in this code path (thus making the problem worse, not better!), the congestion flag for a block device seems to be flagged when the IO queue reaches 7/8 full, and flagged off at 13/16 full. see {{get_request}} in {{block/blk-core.c}}), here are some ganglia graphs showing how the patch makes things run "smoother", CACHE_DROP_LAG seems like a good approach. Lag of 2MB did pretty well for me but of course it all depends on socket buffer configurations. Any ideas on how to deal with the last bit of data?  In my test, the last 1.6MB doesn't get invalidated because there is no lag for the last fadvise which is done immediately prior to close., Try using {{fdatasync}} prior to the last {{fadvise}}., I elected to use sync_data_range instead of fdatasync, since I think fdatasync will enqueue the writes as synchronous operations in the block device's IO queue, causing them to get pushed to the front. sync_data_range just triggers the dirty page writeback path, which is in the async queue. This means the IO scheduler has more time to reorder them, etc, since no one is waiting on the result. I agree fdatasync would give you better cache cleanliness, but I imagine it will hurt performance a bit., I was referring to the read side, therefore I don't believe fdatasync() has any effect., Yes, for the sending side, you can't flush a socket (that I'm aware of).  Although {{SO_LINGER}} causes a blocking close or shutdown, so the pages should be ready for fadvise when close returns., Oh, I didn't notice {{synce_data_range}} in the patch.  Since I favor portability, it would be interesting to see the performance difference between the posix {{fdatasync}} and linux-only {{sync_data_range}}.  A two minute search turned up old discussions where there was little to no difference.  If nothing else, you might consider adding an ifdef to control which is used.  Just ideas., Rather than adding the portable approach myself, without a non-Linux test environment to experiment on, I figured I would make the whole feature auto-disable when not available. The next iteration of the patch does a manual syscall so it works on RHEL5 now as well, though it seems to have actually harmed terasort performance by 10% or so in its current form.
+
+I fully support someone who has a non-Linux system doing the experiments with fdatasync though :), updated patch on 20-sec.
+
+In order to get the fadvises into the shuffle, I had to do some totally ugly things to the FSDataInputStream, etc, classes. If someone has a more elegant approach, please post a patch :), {quote}I think the issue is that Linux's native readahead is not very aggressive,
+{quote}
+
+I have been tuning my systems for quite a while with aggressive OS readahead.  The default is 128K, but it can be upped significantly which helps quite a bit on sequential reads to SATA drives.  Additionally, the 'deadline' scheduler is better at sequential throughput under contention.  I wonder how much of your manual read-ahead is just compensating for the poor OS defaults?  In other applications, I maximized read speeds (and reduced CPU use) by using small read buffers in Java (32KB) and large Linux read-ahead settings.
+
+Additionaly, I always set up a separate file system for M/R temp space away from HDFS.  The HDFS one is tuned for sequential reads and fast flush from OS buffers to disk, with the deadline scheduler.  The temp space is tuned to delay flush to disk for up to 60 seconds (small jobs don't even make it to disk this way), and uses the CFQ scheduler.
+
+This combination reduced the time of many of our jobs significantly (CDH2 and CDH3) -- especially job chains with many small tasks mixed in.
+
+The Linux tuning parameters that have a big effect on disk performance and pagecache behavior are:
+vm.dirty_ratio
+vm.dirty_background_ratio
+swappiness
+readahead (e.g. blockdev --setra 4096 /dev/sda)
+ext4 also has inode_readahead_blks=n and commit=nrsec
+
+, Scott, I too suspect that linux fs parameter tuning may yield a large(r) boost.  It would be nice if the distribution included some example tuning scripts that sites could elect to use.
+
+Todd, you may want to investigate {{O_STREAMING}} for sending of files.  You may also look into using {{mincore}} in conjuction with {{fadvise}}., Modifying description so this can act as an umbrella for cross-project changes., This issue is 95% of the way toward a tuning guide for HDFS installs. Perhaps the remaining 5%? @Scott?, Yeah, 31 watchers is a good sign, @Scott! :)
+, Have you considered using posix_fallocate()?  When used with O_DIRECT, this'll reduce fragmentation., I looked at fallocate a while back - it wasn't "hooked up" to any of the filesystems except for XFS at that time. Is it now actually hooked up to ext4? Most users don't run on XFS in my experience., Yes, ext4 supports posix_fallocate() now.  Do you have any idea how many of the users run on ext2, ext3, ext4, and XFS?, I've never seen ext2 in production. ext3 is most common, with ext4 becoming more common now that RHEL6 is released and starting to get adoption. XFS less common though it has some nice benefits at high utilization. If you want to take a whack at an fallocate patch, I can run some benchmarks., With ext3 I have seen horrible fragmentation.  For instance, on one of our machines (nearly empty drive), when I created a 128MB file, I ended up with 80 fragments.  (I used filefrag to get this info).  I have used XFS and it has worked out a LOT better.
+
+Will do, I'll get you an fallocate patch., Updated patch that calls posix_fallocate when creating a block on the datanode., Hey Sriram. Mind adding a new HDFS subtask for this improvement? The idea is to keep this as an umbrella for all of the improvements in the area.
+
+Did you have any chance to test this out on a cluster and measure fragmentation with/without?, Hey Todd, The subtask thing is done.  For whatever reason, the subtask got created twice and I resolved the second one as a duplicate.
+
+Yes, I tested it out on a cluster with ext4.  I see little fragementation.  This is partly because ext4 does delayed allocation.  ]

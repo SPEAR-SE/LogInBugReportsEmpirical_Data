@@ -1,0 +1,745 @@
+[This is related to HDFS-9701, which created {TestFsDatasetImpl#testRemoveVolumeBeingWritten}. 
+
+The NPE is caused by accessing a volume after it is removed in the test. So the test case should be improved, and FsDatasetImpl should also be improved to handle a potential NPE., Thanks for creating this [~jojochuang].
+
+The 'A failed test' link is no longer valid. :( But I've managed to reproduce this in about 1% frequency. I think there're 2 problems here:
+# Test timeout without obvious information (so that people have to see the code to know why it timed out).
+# NPE
+
+Patch 1 is attached to address them:
+# Adds more information to the test, and also waits for BR to be received before releasing the reference. BTW, the test doesn't care whether a exception is thrown, so IMO no {{assertExceptionContains}} is needed.
+# This is from the changes in HDFS-9701: during {{wait}}, the thread is put on hold and other thread may proceed (getBlockReport, in this case). Since the {{volumeMap}} is not yet cleared it's possible for the BR thread to get a null volume. Eddy and I discussed this in HDFS-9701, but at that time I was using {{Thread.sleep}} which holds the lock. A later findbugs warning made me to switch to {{wait}} (which IMO is the right thing to do), but then the sequence should've be modified to make sure internal states such as {{volumeMap}} is safe.
+
+[~eddyxu], could you please review? Thanks., [~xiaochen] Thanks for taking time to reproduce the issue.
+This issue is pretty frequently reproducible on my machine. The timeout is directly due to NPE: the main threads waits for {{BlockReportThread}} to count down {{brReceivedLatch}}, but due to the NPE, the control jumps out of the block and never count down the latch.
+
+In {{FsDatasetImpl.getBlockReports()}}, b.getVolume().getStorageID() returns a storage id, but for some reason builders (which is a {{Map}}) can't find the key, and therefore returned a NPE., Chatted with [~jojochuang] offline, the test timeouts because of the NPE and the new patch should fix the NPE. It may be more understandable to add a try-catch in the {{BlockReportThread}} in the test, so that it can fail with a more explicit message instead of timeout.
+I'll wait for Eddy's comments before next rev. :), Hey, [~xiaochen] and [~jojochuang] Thanks a lot for working this.
+
+I have some concerns about the {{FsDatasetImpl#removeVolumes()}} change.
+Assuming that there is actively writer on the volume being removed, after you fix, the {{ReplicaInfo}}s are removed from memory. When this writer finishes writing data and tries to finalized the replica, the {{ReplicaInfo}} has been purged already, which might be problematic. What do you guys think? , Hi [~xiaochen] and [~jojochuang], 
+
+I encountered this test case failing and when I tried to understand the reason, I realized this might be a general problem (not particular to this test) due to the way {{FsDatasetImpl#getBlockReports()}} and {{FsDatasetImpl#removeVolumes()}} inconsistently handle {{volumeMap}} and {{volumes}} under the {{FsDatasetImpl}} instance lock. {{FsDatasetImpl#removeVolumes()}} refers to both the objects under the lock. {{FsDatasetImpl#getBlockReports()}} calls {{volumes.getVolumes()}} without the lock but refers to {{volumeMap}} with the lock. I think this is what is causing the NPE problem due to the following sequence of events: 
+
+# {{volumes.removeVolume()}} is called in {{FsDatasetImpl#removeVolumes()}}. Suppose this removes Volume A.
+# {{volumes.getVolumes()}} is called in {{FsDatasetImpl#getBlockReports()}}. This would return all volumes except Volume A.
+# {{volumes.waitVolumeRemoved()}} (added as part of HDFS-9701) is called in {{FsDatasetImpl#removeVolumes()}} which releases the lock. 
+# The for loop {{volumeMap.replicas(bpid)}} in {{FsDatasetImpl#getBlockReports()}} starts running. This would return {{ReplicaInfo}} s that are stored on Volume A as  {{FsDatasetImpl#removeVolumes()}} did not still delete them. 
+
+If I understand correctly, {{volumes.waitVolumeRemoved()}} was added in HDFS-9701 to avoid the deadlock issue being addressed. 
+
+One way to fix this might be to call {{volumes.waitVolumeRemoved()}} before {{volumes.removeVolume()}} in {{FsDatasetImpl#removeVolumes()}} and make {{FsDatasetImpl#getBlockReports()}} hold the lock while it is referring to both {{volumes}} and {{volumeMap}} i.e., move {{synchronized(this)}} before {{volumes.getVolumes()}}. , Yes, in {{FsDatasetImpl#getBlockReports()}}, this chunk:
+{code}
+    List<FsVolumeImpl> curVolumes = volumes.getVolumes();
+    for (FsVolumeSpi v : curVolumes) {
+      builders.put(v.getStorageID(), BlockListAsLongs.builder(maxDataLength));
+    }
+{code}
+
+Should be moved into the synchronized block.  I thought I had fixed this...., Ref: {noformat}
+  @Override
+  public Map<DatanodeStorage, BlockListAsLongs> getBlockReports(String bpid) {
+    Map<DatanodeStorage, BlockListAsLongs> blockReportsMap =
+        new HashMap<DatanodeStorage, BlockListAsLongs>();
+
+    Map<String, BlockListAsLongs.Builder> builders =
+        new HashMap<String, BlockListAsLongs.Builder>();
+
+    List<FsVolumeImpl> curVolumes = volumes.getVolumes();
+    for (FsVolumeSpi v : curVolumes) {
+        builders.put(v.getStorageID(), BlockListAsLongs.builder(maxDataLength));
+    }
+
+    try (AutoCloseableLock lock = datasetLock.acquire()) {
+      for (ReplicaInfo b : volumeMap.replicas(bpid)) {
+        switch(b.getState()) {
+          case FINALIZED:
+          case RBW:
+          case RWR:
+            builders.get(b.getVolume().getStorageID()).add(b);   <=== NPE
+            break;
+          case RUR:
+{noformat}
+
+[~virajith],
+
+{quote}
+One way to fix this might be to call volumes.waitVolumeRemoved() before volumes.removeVolume() in FsDatasetImpl#removeVolumes()
+{quote}
+* {noformat}
+          LOG.info("Removing " + absRoot + " from FsDataset.");
+          // Disable the volume from the service.
+          asyncDiskService.removeVolume(sd.getCurrentDir());
+          volumes.removeVolume(absRoot, clearFailure);
+          volumes.waitVolumeRemoved(5000, this);
+{noformat}
+
+* I believe, {{volumes.waitVolumeRemoved(5000, this)}} cannot be moved before {{volumes.removeVolume(absRoot, clearFailure);}} as the waitVolumesRemoved() is dependent on the volumesBeingRemoved queue which is filled in by the removeVolume(). 
+* Also, the intention of waitVolumesRemoved() is to wait for the removed volume's reference to go to zero.
+
+
+[~daryn], [~virajith],
+
+{quote}
+make FsDatasetImpl#getBlockReports() hold the lock while it is referring to both volumes and volumeMap i.e., move synchronized(this) before volumes.getVolumes().
+{quote}
+
+* I guess your proposal here is is something like below. (in the latest code base, i am assuming datasetLock as the synchronized block you were referring)
+** {noformat}
+try (AutoCloseableLock lock = datasetLock.acquire()) {
+      curVolumes = volumes.getVolumes();
+      for (FsVolumeSpi v : curVolumes) {
+        builders.put(v.getStorageID(), BlockListAsLongs.builder(maxDataLength));
+} {noformat}
+
+* IMHO, moving volumes.getVolumes() alone inside the lock will not solve the problem, particularly the NPE we are seeing in TestDataNodeHotSwapVolumes. Because, the NPE is happening when doing add after builders.get(<storageID>). Which means, builders map doesn't have the storageID being passed in. 
+* That is,
+** {{curVolumes}} list is not the problem here. This list has the right set of volumes after the previous volume removal operation.
+** Its the {{ReplicaInfo}} from {{volumeMap.replicas(bpid)}} which has the reference to the removed volume
+** But, {{builders}} map doesn't have the removed volume 
+** So, {{builders.get(b.getVolume().getStorageID()).add(b);}}  will turn to *null.add(b)* and so the NPE.
+
+Please let me know if my understanding is wrong.
+, Ref:
+{code:title=FsDatasetImpl.java|borderStyle=solid}
+  @Override
+  public void removeVolumes(Set<File> volumesToRemove, boolean clearFailure) {
+    ..
+    ..
+    try (AutoCloseableLock lock = datasetLock.acquire()) {              <== LOCK acquire datasetLock
+      for (int idx = 0; idx < dataStorage.getNumStorageDirs(); idx++) {
+          .. .. ..
+          asyncDiskService.removeVolume(sd.getCurrentDir());            <== volume SD1 remove
+          volumes.removeVolume(absRoot, clearFailure);
+          volumes.waitVolumeRemoved(5000, this);                        <== WAIT on "this" ?? But, we haven't locked it yet.
+                                                                                 This will cause IllegalMonitorStateException
+                                                                                 and crash getBlockReports()/FBR thread!
+
+          for (String bpid : volumeMap.getBlockPoolList()) {
+            List<ReplicaInfo> blocks = new ArrayList<>();
+            for (Iterator<ReplicaInfo> it = volumeMap.replicas(bpid).iterator();
+                 it.hasNext(); ) {
+                .. .. ..
+                it.remove();                                           <== volumeMap removal
+              }
+            blkToInvalidate.put(bpid, blocks);
+          }
+         .. ..
+    }                                                                  <== LOCK release datasetLock
+
+    // Call this outside the lock.
+    for (Map.Entry<String, List<ReplicaInfo>> entry :
+        blkToInvalidate.entrySet()) {
+      ..
+      for (ReplicaInfo block : blocks) {
+        invalidate(bpid, block);                                       <== Notify NN of Block removal
+      }
+    }
+{code}
+
+
+* NPE is because of the the contending operations in {{FsDataSetImpl}} between {{getBlockReports()}} and {{removeVolumes()}}
+
+* Thread 1: {{removeVolumes()}}
+** LOCK datasetLock
+** remove volume from {{FsVolumeList}} volumes
+** wait for volume references to go to zero
+*** But, volumes.waitVolumesRemoved() is waiting on "this" monitor which this thread hasn't grabbed at all. This will cause IllegalMonitorStateException and crash the whole thread! 
+*** I am assuming the intention here is to either wait on datasetLock OR lock + wait on "this" lock. And for 5 seconds max!
+** queue the block from removed volume to an invalidation map 
+** remove block pool mapping from {{ReplicaMap}} volumeMap for the removed volume
+** UNLOCK datasetLock
+* continue with block invalidation
+
+
+* Thread 2: {{getBlockReports()}}
+** Get current volumes from {{FsVolumeList}} and intialize the FBR map 
+** LOCK datasetLock
+** Get all {{ReplicaInfo}} from {{ReplicaMap}} for the given block pool id
+** Transfer ReplicaInfo to a respective volume entry in FBR map 
+** UNLOCK datasetLock
+
+* Because of the wait() (assuming the monitor object is fixed) in {{removeVolumes()}}, both operations cannot be totally exclusive of each other!
+* So, what is the expected behavior of FBR when there is volume remove in progress ??
+** (A) Should it include replica info even for the volumes being removed ?
+** (B) Or, should it include replica info only the live volumes ?
+I am inclined on (B).
+
+So, my proposal here is
+1. Fix {{getBlockReports()}} as in (B) -- to ignore the unavailable volumes from the {{ReplicaMap}} as its mappings are not removed right away and could involve a wait() inbetween. // as part of this bug 
+2. Fix {{removeVolumes()}} volumes.waitVolumesRemoved() either to carry the right monitor object or take added locks for the new monitors. // this bug or new bug ??
+
+[~eddyxu], [~xiaochen], [~virajith], [~daryn],  Please let me know your thoughts on above., Filed HDFS-10830 to track IllegalMonitorStateException issue in {{FsDatasetImpl#removeVolumes()}}. Will use this bug to track NPE issue HDFS-9781 in {{FsDatasetImpl#getBlockReports()}}, 
+1. Attaching the patch to ignore unavailable volumes seen in ReplicaMap entries. Those missing volumes are because of recently removed volumes and for which block invalidations are happening asynchronously. 
+
+2. Updated the test {{TestFsDatasetImpl#testRemoveVolumeBeingWritten}} to recreate both this issue (HDFS-9781)  and IllegalMonitorStateException issue in removeVolumes (HDFS-10830). With the attached fix, NPE doesn't happen any more.  HDFS-10830 is not fixed yet and the fix for that bug will take care removing the test workaround put for IllegalMonitorStateException issue.
+
+[~eddyxu], [~xiaochen] and others, Please review the patch and let me know your comments.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  8s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m  4s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 52s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 47s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 47s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m  9s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 49s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 58m 35s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 77m 49s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestFileChecksum |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HDFS-9781 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12826728/HDFS-9781.002.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 16ca2c24abe8 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 0690f09 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/16611/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16611/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16611/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, TestFileChecksum unit test failure is not related to the patch.
+
+Problem binding to [localhost:51944] java.net.BindException: Address already in use; For more details see:  http://wiki.apache.org/hadoop/BindException, Sorry for my epic slow response on this one.... And thanks all for commenting!
+
+I think Manoj's analysis is correct, and (B) seems to make sense. Would like to hear others' thoughts on this too. Patch 2 looks good. Thanks for reproducing this in the unit test, Manoj.
+
+The only comment I have is in the warning log, maybe we can combine the space with the next sentence. Also we should either add the new jira in the TODO comment, or commit that before this., [~xiaochen], Thanks for the review. Sure, will prune the comment and include HDFS-10830 in the TODO note. Will wait for other reviews and club all comments into the next patch., Hi [~manojg] and thanks everyone here for comments. When I opened this issue I did not understand the code inside FsDatasetImpl well enough, but now that I understand the code better, the bug itself does look like potentially impactful, especially during a hotswap operation, I suppose?
+
+[~manojg] I took a quick look at the patch and which looks good to me in general. Can you also print the block id when printing the warning log in addition to the volume? This will help debugging for supporters if something similar happens.
+{code}
+LOG.warn("Replica volume: " + b.getVolume().getStorageID() + " " +
+              "missing. Probably being removed!");
+{code}
+
+Also here in the test
+{code}
+// Slow down while we're holding the reference to the volume.
+          // As we finalize a block, the volume is removed in parallel.
+          // Ignore any interrupts coming out of volume shutdown.
+          try {
+            Thread.sleep(1000);
+          } catch (Throwable t) {
+            // ignore
+          }
+{code}
+Please catch InterruptedException here instead of Throwable. Not a good idea to catch a Throwable and ignore it.
+
+Thanks!, Thanks for the review [~jojochuang].
+
+* sure, will add more details like block id to the log. Thinking more about this, I wonder if there will be a ton of log emitted by this as the volume being removed can hold a lot. So, should I also change this to a debug only logging? Please advice.
+
+* sure, will catch the expected InterruptedException only and not all. This way we will not ignore other issues. thanks., Attaching v003 patch with review comments incorporated., | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 13s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  1s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 26s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 60m 24s{color} | {color:green} hadoop-hdfs in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 19s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 80m 34s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HDFS-9781 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12826921/HDFS-9781.003.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 6286d41afc65 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 378f624 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16621/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16621/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Patch 3 LGTM, +1. Will wait to see if any comments from others., [~jojochuang] ping'ed me offline saying this looks fine to him too.
+I'll commit this shortly. Will comment on HDFS-10830 in the mean time., I have committed this to trunk.
+
+There are some minor conflicts backporting to branch-2, also I think the workaround of HDFS-10830 can be removed since we don't have that issue in branch-2. Could you post a branch-2 patch, [~manojg]?, SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #10394 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/10394/])
+HDFS-9781. FsDatasetImpl#getBlockReports can occasionally throw (xiao: rev 07650bc37a3c78ecc6566d813778d0954d0b06b0)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+, Attaching branch2 patch. 
+
+Removed the test workaround as branch2 is not affected by HDFS-10830, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  5s{color} | {color:red} HDFS-9781 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HDFS-9781 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12826944/HDFS-9781-branch2.001.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16624/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Branch-2 patch looks good too, committing shortly., Hm, when I locally ran the test it actually timed out.
+Attaching a renamed branch-2 patch to trigger jenkins., Discussed this offline with Manoj.
+
+This jira fixes the NPE, and also enhanced the test to expose the locking problem when block report and remove volume happen at the same time.
+
+HDFS-10830 is fixing the locking problem, so we should bring them together to branch-2, to have a passing unit test. Linked HDFS-10830 here.
+
+Thanks for the good work, Manoj!, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 13m  8s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 42s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 43s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 43s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 29s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 53s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  2m  0s{color} | {color:red} hadoop-hdfs-project/hadoop-hdfs in branch-2 has 1 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 57s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 38s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 39s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 43s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 53s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 35s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 50m 51s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_111. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 20s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}144m 30s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_101 Failed junit tests | hadoop.hdfs.server.blockmanagement.TestPendingInvalidateBlock |
+|   | hadoop.hdfs.server.namenode.ha.TestDFSUpgradeWithHA |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestFsDatasetImpl |
+| JDK v1.7.0_111 Failed junit tests | hadoop.hdfs.TestSecureEncryptionZoneWithKMS |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestFsDatasetImpl |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HDFS-9781 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12826947/HDFS-9781.branch-2.001.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux b094142ee2a5 3.13.0-92-generic #139-Ubuntu SMP Tue Jun 28 20:42:26 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / a5748ee |
+| Default Java | 1.7.0_111 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_111 |
+| findbugs | v3.0.0 |
+| findbugs | https://builds.apache.org/job/PreCommit-HDFS-Build/16625/artifact/patchprocess/branch-findbugs-hadoop-hdfs-project_hadoop-hdfs-warnings.html |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/16625/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_111.txt |
+| JDK v1.7.0_111  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16625/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16625/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, As [~xiaochen] mentioned, the updated test case TestFsDatasetImpl#testRemoveVolumeBeingWritten is failing as HDFS-10830 is not fixed yet.
+* {code}
+java.lang.Exception: test timed out after 30000 milliseconds
+	at java.lang.Object.wait(Native Method)
+	at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsVolumeList.waitVolumeRemoved(FsVolumeList.java:280)
+	at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl.removeVolumes(FsDatasetImpl.java:506)
+{code}
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  7m 19s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 59s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 42s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 44s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 28s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 54s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 57s{color} | {color:red} hadoop-hdfs-project/hadoop-hdfs in branch-2 has 1 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 57s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 36s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 40s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 43s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 15s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 59s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 41s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 50m 23s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_111. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 20s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}139m 15s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_101 Failed junit tests | hadoop.hdfs.server.datanode.fsdataset.impl.TestFsDatasetImpl |
+| JDK v1.7.0_111 Failed junit tests | hadoop.hdfs.server.datanode.fsdataset.impl.TestFsDatasetImpl |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HDFS-9781 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12826947/HDFS-9781.branch-2.001.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux c2a854651d40 3.13.0-92-generic #139-Ubuntu SMP Tue Jun 28 20:42:26 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / a5748ee |
+| Default Java | 1.7.0_111 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_111 |
+| findbugs | v3.0.0 |
+| findbugs | https://builds.apache.org/job/PreCommit-HDFS-Build/16626/artifact/patchprocess/branch-findbugs-hadoop-hdfs-project_hadoop-hdfs-warnings.html |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/16626/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_111.txt |
+| JDK v1.7.0_111  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16626/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16626/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Findbugs warning is due to HDFS-10745, I left a comment on that jira., bq. As Xiao Chen mentioned, the updated test case TestFsDatasetImpl#testRemoveVolumeBeingWritten is failing as HDFS-10830 is not fixed yet.
+Hi [~manojg], I don't think the test timeout is due to HDFS-10830. I backed out both HDFS-10773 and HDFS-10682 and the test still fails with timeout. It seems to be caused by this fix in trunk., [~arpitagarwal], Thanks for looking at test failures. would like to understand more on these test failure signatures. 
+
+The fix in this bug HDFS-9781 does the following
+1. fixes NPE issue in getBlockReports()
+2. test case TestFsDatasetImpl#testRemoveVolumeBeingWritten() updated to verify both HDFS-9781 (NPE) and HDFS-10830 (IllegalMonitorStateException) issues 
+
+So I believe, even if you back out HDFS-9781 NPE fix, you will continue to see the other problem exposed from the updated testcase, until the wait in removeVolumes() is fixed. 
+
+Can you please tell me how the test case fails when you backed out all other issues. Is that only by IllegalMonitorStateException or by other errors., Hi [~manojg], the wait issue in removeVolumes (HDFS-10830) causes the IllegalMonitorException. If the test case still hangs after fixing that I am not sure how it could be at fault., [~arpitagarwal], I agree. The patch you shared solves IllegalMonitorException issue.  But, I believe we have more than one issue here and so the test is failing even after your latest fix. Or May be the test has an issue. I am trying to root cause it.
+
+After applying the latest fix patch, though I don't see any IllegalMonitorStateException, but await() wakes up continuously because of interrupt exception and the while block around it waitVolumesRemoved() behaves like a infinite loop causing the caller removeVolume() hang. Are you see this same new problem ? Looks like an old issue just getting unearthed because of latest fix and test. Your thoughts please ?, Hi [~manojg], there's no one explicitly signaling the condition so they may be due to spurious wakeups.
+
+bq.  Looks like an old issue just getting unearthed because of latest fix and test. 
+Pretty sure it's one of these two since the test times out even after backing out the recent locking fixes., [~arpitagarwal], 
+Given that FsDataSetImpl#removeVolumes() behavior is going to continue as a indefinite wait until all references are released, let me tune the test expectation accordingly. Hopefully this should solve the problem. Will update you., Attaching updated testcase TestFsDatasetImpl#testRemoveVolumeBeingWritten: 
+-- Test verifies NPE not thrown when doing getBlockReports()
+-- Also, test verifies FsDatasetImpl#removeVolumes() succeeds when there is an read/write operation in-progress (HDFS-10830 fix patch will take care of removing one workaround added for IllegalMonitorStateException)
+
+-- Test as-is passes through on trunk
+-- Applied HDFS-10830 fix patch v02, removed the workaround in TestFsDatasetImpl#testRemoveVolumeBeingWritten and the test passes
+
+
+[~xiaochen], [~arpitagarwal], can you please take a look at v004 patch ?
+, Attaching the fix v002 for branch-2
+-- Includes the fix for NPE during getBlockReports
+-- Includes test TestFsDatasetImpl#testRemoveVolumeBeingWritten
+-- Since branch-2 doesn't have removeVolume() isssue, workaround is not added in the testcase
+
+[~xiaochen], can you please review the patch for branch-2 ?, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 11s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 35s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 25s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 51s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 53s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 47s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m  9s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 57m 36s{color} | {color:green} hadoop-hdfs in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 76m  0s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HDFS-9781 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12827480/HDFS-9781.004.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 437761a0ff1d 3.13.0-93-generic #140-Ubuntu SMP Mon Jul 18 21:21:05 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / d355573 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16666/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16666/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 13m 44s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 34s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 50s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 49s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 33s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  2s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 17s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 11s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  1s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 41s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 44s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 46s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 28s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  1s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 42s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 48m 15s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_111. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}143m 58s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.7.0_111 Failed junit tests | hadoop.hdfs.TestRenameWhileOpen |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HDFS-9781 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12827482/HDFS-9781-branch-2.002.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux ba09a9463c7d 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 5f8b6f0 |
+| Default Java | 1.7.0_111 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_111 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/16667/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_111.txt |
+| JDK v1.7.0_111  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16667/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16667/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Talked with [~manojg] offline. The test failure is because we didn't simulate a practical scenario where volume removal is on another thread. The updated test simulates the scenario correctly and LGTM. +1 on the 004 patch. A minor comment is please use HDFS-9781-addendumxx.patch as the name in the future, for better clarity. Will commit this shortly.
+
+For the branch-2 patch, 
+{code}
+        try {
+          volumesToRemove.add(StorageLocation.parse(
+                  dataset.getVolume(eb).getBasePath()).getFile());
+        } catch (Exception e) {
+          //
+        }
+{code}
+Let's not swallow an unexpected exception. We can log this exception and fail the test if this happens.
+
+Thanks for continuing the work on this, Manoj., Committed the addendum patch (#4) to trunk., Thanks [~xiaochen] for the review and commit help. Will upload the branch-2 patch with review comments incorporated soon., SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #10419 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/10419/])
+ Addendum patch for HDFS-9781. FsDatasetImpl#getBlockReports can (xiao: rev a0b0383677c037d4492907e5f119eb0e72390faf)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+, Attaching v003 patch for branch-2.
+* v002 + Log and return on StorageLocation.parse() so that test can fail
+
+[~xiaochen], can you please take a look ?, {code}
+// lets return without volRemoveCompletedLatch
+// count down, so that test can fail.
+return;
+{code}
+Thanks for the new rev Manoj. How do you feel about just {{Assert.fail("Exception in remove volume thread, check log for details.")}} here?, Sure [~xiaochen], that will make the test fail with right error message instead of a Timeout. Added v004., +1 pending jenkins. Thanks, Manoj!, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 18s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  8m  0s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 53s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 50s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 33s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 58s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 17s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  8s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  1s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 42s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 46s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 50s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 57s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 38s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 52m 56s{color} | {color:green} hadoop-hdfs in the patch passed with JDK v1.7.0_111. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 21s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}137m 13s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_101 Failed junit tests | hadoop.hdfs.server.blockmanagement.TestPendingInvalidateBlock |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HDFS-9781 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12827830/HDFS-9781-branch-2.003.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux d0886ceaadb8 3.13.0-92-generic #139-Ubuntu SMP Tue Jun 28 20:42:26 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / f448ce2 |
+| Default Java | 1.7.0_111 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_111 |
+| findbugs | v3.0.0 |
+| JDK v1.7.0_111  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16691/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16691/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 23s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 44s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 57s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 51s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 39s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  7s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 20s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 17s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 10s{color} | {color:green} branch-2 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 45s{color} | {color:green} branch-2 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 43s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 46s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  1s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 43s{color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 64m 30s{color} | {color:green} hadoop-hdfs in the patch passed with JDK v1.7.0_111. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 21s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}162m  8s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_101 Failed junit tests | hadoop.hdfs.server.namenode.TestNameNodeMetadataConsistency |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | HDFS-9781 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12827841/HDFS-9781-branch-2.004.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 9bdbfe61e846 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / f448ce2 |
+| Default Java | 1.7.0_111 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_111 |
+| findbugs | v3.0.0 |
+| JDK v1.7.0_111  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16696/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16696/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Committed the latest patch to branch-2. Thanks again, Manoj!, I've backported this to branch-2.8 too, after the other fixes Arpit did.
+The conflict is trivial, verified test to pass before pushing.]

@@ -1,0 +1,568 @@
+[Does anyone have a clever idea of how to take a snapshot of a running, very active, and very large, NameNode? Without things timing out like crazy? We're ok with the idea of just stopping everything once in a while and restarting the namenode. Still.... , It looks as if this is on a back burner. I would like to raise the issue again, because the edits file can become large very quickly depending on the frequency of file operations. I generate an edits file of more than 2.5Gb every 24 hours. Of course, the namenode server could be restarted periodically (this what I have to do right now), but this is rather interruptive to clients. What about rotating the edits file periodically and resolving the older edits file with the image file in a separate thread? , Proposal for Checkpointing the Namesystem State in DFS
+------------------------------------------------------
+
+Currently, the namesystem state in memory consists of a tree
+where the leaf nodes are files and internal nodes are directories.
+This is serialized onto a disk file once when the namenode starts
+up. During the namenode operation, the state changes are made in
+memory, but the on-disk copy of the image is not modified. Instead,
+a transaction log (called edits log) for the namesystem changes
+is stored on the disk. When the namenode starts up again, it merges
+the on-disk image and the edits log, and writes out the updated image.
+
+While the namenode is in operation, the edits log keeps on growing,
+irrespective of the size of the namesystem. For example, if a single file
+is constantly created and deleted, the namesystem state will be of
+constant size, however, the edits log will keep on growing.
+
+Therefore it is necessary to periodically checkpoint the current state
+of the namesystem, and to purge the edits log.
+
+Image File Format on Disk
+-------------------------
+
+The image on the disk consists of a header followed by a list of
+path entries, followed by known datanode entries. The header consists
+of DFS version number, namespace ID, and number of path entries.
+Each path entry corresponds to either a file or a directory. A file entry
+contains the full path of the file, it's replication factor, number of
+blocks, and a list of block-entries for blocks belonging to that file.
+Each block entry consists of blockID and length of the block.
+A directory entry consists of full path of the directory, replication
+factor (which, for a directory is always 0), followed by 0. This last
+0 distinguishes between files and directories.
+The datanodes section of the image begins with number of known datanodes
+from the datanode map that the FSNameSystem maintains, followed by
+serialized form of each DatanodeDescriptor in that map.
+
+Edits Log File Format on Disk
+-----------------------------
+
+The edits log contains a list of namespace transactions. Each transaction
+begins with a transaction op-code that signifies type of the transaction.
+There are seven types of transactions, and each type contains different
+properties associated with it. These types of transactions and their
+associated properties are listed
+below:
+
+1. Add File : Full path of the file, replication factor, list of blocks
+2. Rename : Old path of the file, new path of the file
+3. Delete : Path of the file deleted
+4. Make Directory : Path of the created directory
+5. Set Replication : Path of the file, new replication factor
+6. Add Datanode : datanode descriptor of the node
+7. Remove Datanode : datanode ID of the node
+
+When should we Checkpoint ?
+---------------------------
+
+Checkpointing decision could be based on elapsed time (e.g. every hour)
+or based on number of transactions (e.g. every 100,000 changes to the
+namesystem). Since the later is approximately reflected in the size of
+the edits log, this decision could also be based on the size of the
+edits log. This is preferred since, the cpu and/or memory requirements
+of checkpointing are determined by the size of the image as well as
+size of the edits log. Also, this choice ensures that an idle
+namenode is not checkpointed unnecessarily based on elapsed time.
+
+How should we Checkpoint ?
+--------------------------
+
+There are a number of choices here. We describe each choice, and its pros
+and cons below.
+
+1. Lock the entire namespace in the main namenode thread, while we save
+the entire image on disk.
+
+This would disable all namenode operations while we are checkpointing
+the image. That would include processing of heartbeats also, and would
+cause datanodes to consider namenode to be dead, and cause cascading
+DFS crash.
+
+2. While saving an INode (i.e. path), only lock those nodes in the tree
+from root to that node.
+
+This would require extensive changes in the simple locking model used
+in the namenode. Currently all the operations that the namenode
+performs are fairly inexpensive. Therefore the simple locking model
+that locks the entire namespace durung the transaction suffices. With
+the new fine-grained locking model, one would need to acquire multiple
+locks for each namspace operation, thus incurring additional overhead
+for normal operations, which is the common case.
+
+3. Lock the entire namespace while we make an in-memory copy of the
+namespace. Hand the copy over to a checkpointing thread, unlock the
+namespace.
+
+This would certainly be faster that option 1, since it does not involve
+writing the namespace to disk while it is locked. However, it would
+require double the amount of virtual memory to hold the namespace
+while checkpointing is in progress.
+
+4. Lock the namespace. Rename the edits log. Start a new edits log.
+Unlock the namespace. Fork off a separate process, which loads old image
+and old edits log, and saves new image.
+
+This method suffers from the same problem of requiring double the virtual
+memory as does option 3. In addition, the forked process doubles the
+system resources such as open files and sockets.
+
+5. Lock the namespace. Rename the edits log. Start a new edits log.
+Unlock the namespace. Start a new thread, which merges old image on disk
+with old edits log on disk to create a new image.
+
+One observation that makes this proposal attractive is that the current
+in-memory image of the namesystem can be recreated by merging the old
+image on the disk with the current edits log. On the face of it, this
+method would also suffer from extensive virtual memory requirements,
+having to load an entire disk image into memory. However, upon closer
+inspection, merging an on-disk image with on-disk edits log can be
+achieved with very small memory footprint, if we change the way the image
+is stored on disk. These changes and their rationale is explained below.
+
+Each entry in the on-disk image corresponds to a path. The only
+requirement on the order of these entries for successfully loading
+the image is that the entries corresponding to directories be before
+the entries for files within those directories.
+
+If we store the image where entries are sorted by their 'path' field,
+clearly entries for directories would be earlier than entries for files
+within them. With the sorted image, checkpointing process would involve
+in-memory sorting of edit log on the 'path' field, and then merging
+the path-related ttransaction one path at a time before writing the
+final path record on the new disk image.
+
+Almost all the path-related transactions in the edits log correspond to
+a single path. The only exception to this is the 'rename' transaction,
+which corresponds to two paths, one old and one new. For files, this
+transaction could be split into a pair of transactions that corresponds
+to one path each. 'rename old-path new-path' can be split into
+'delete old-path' and 'create new-path' for the sake of transaction
+logging. Even for directories that are empty, one can do a similar
+split. However, for directories that contains files and/or subdirectories
+it becomes complicated, because each file/subdirectory under the
+renamed directory needs to have a pair of log-entries corresponding
+to a 'delete' and 'create'. This will increase the edits log size
+by a factor proportional to the number of files in the renamed directory.
+
+One approach to handle the directory rename operation while periodically
+checkpointing, is to apply the rename operations both on the on-disk
+image, and on the edits log entries previous to the rename operation.
+After renaming, though, the image will need to be sorted again according
+to the path names. This could be very expensive, since the on-disk image
+of a large filesystem (>1PB) could be a few GB.
+
+The edits log would typically be a few Megabytes at the time of
+periodic checkpointing, typically much smaller than the image. We take
+advantage of this size difference, and an observation about the directory
+rename operation, to propose a solution to this problem.
+
+A rename operation "rename srcPath dstPath" in the edits log can be
+moved to the end of the edits log, by applying other rename operations
+on the edits log entries timestamped after the rename entry. That is,
+
+rename srcPath dstPath
+
+operation can be removed, and 
+
+rename srcPath dstPath
+rename tmpPath srcPath
+
+can be appended at the end of the edits log, if we apply the following
+rename operations to all edits log entries that occur after the rename
+directory operations:
+
+rename srcPath tmpPath
+rename dstPath srcPath
+
+This way, we can manipulate the edits log, so that all the rename
+directory transactions are moved to the end. Then, we remove these
+rename operations into a separate file called the rename-table.
+
+We change the definition of the on-disk image, so that it consists not
+only of the sorted list of all paths in the namesystem, but also this
+rename-table. When the namenode starts up, it loads the list of paths
+into memory to form a filesystem tree, and the applies the rename
+operations from the rename-table, to get the final image.
+
+With this modification for handling directory-renames, our periodic
+checkpointing algorithm becomes:
+
+Id = On disk image
+Rd = Rename table on the disk
+Ed = Edits log on the disk
+
+1. Load Ed into memory as a list of edits entries
+2. Scan from the end of the edits log in order to find a directory rename
+   By applying the transformation described above, move these renames
+   towards the end. Do this for all directory renames.
+3. Append these rename operation to Rd.
+4. Sort the remaining edits log in memory.
+5. Merge Id (which is sorted), and sorted Ed, to get a new Id.
+
+The namenode startup procedure is also modified, to be:
+
+1. Load Id, form a root directory tree.
+2. For each entry in Rd, apply rename operations on the image.
+3. Merge edits log, if exists.
+4. Store back the image as a sorted list of paths.
+5. Delete renames-table, and edits log.
+, A checkpointing approach you don't seem to evaluate is making it very cheap to clone the in-memory  tree, specifically, by always copying nodes between the root and each edit.  That way one can checkpoint by just grabbing the pointer to the root, and then writing the shadow tree in the background.  No merging required, no complex re-sorting of operations, etc., Well, the sort-merge approach does not seem performant anyway if the number of renames is large. So, I am adding the copy-on-write (Dhruba's comment on HADOOP-334) to the proposal. This proposal suggests adding a clone member to every node. While checkpointing is in progress, change to a node is instead made to a clone. When periodic checkpointing is finished, the checkpointer resets the clones by making them actual nodes. I will write up a better description and post as RFC soon.
+, Complex rename relocation stuff could be avoided if we used (unique) files ids to identify files.
+In this case file name is just an attribute of the file. Renaming does not change the file id.
+File hierarchy is based on ids rather than file names.
+And if we need to sort, we sort by file ids rather than their names.
+
+I like the merging approach. It is simple in general (not in details though) and does not
+involve introducing additional structures in the name-node, which will be hard to support,
+especially if we plan to replace global locking by something more elaborate.
+And best of all it can work as a separate component., Proposal for Copy-On-Write FileSystem Tree For Periodic Checkpointing
+
+We propose that the hadoop namenode image be checkpointed to disk after
+every fixed (configurable) number of transactions.
+
+The checkpointing method we propose:
+
+1. Does not introduce extensive changes in the simple locking model
+   currently used in the namesystem (FSNamesystem).
+2. Does not fork a heavyweight process to perform checkpointing.
+3. Does not lock the entire namesystem during checkpointing.
+4. Does not change the image or transaction log format in any way.
+5. Does not significantly increase garbage collection activity.
+
+This proposal is based on making the filesystem tree copy-on-write
+*only during checkpointing*. We keep track of the number of outstanding
+transactions in the main namenode thread. When this number reaches the
+configured (dfs.checkpoint.interval) number (say 10 million), the
+namenode thread that was performing the transaction (in a synchronized
+method) performs the following actions:
+
+1. Close the transaction log 'edits.N', where N is the current
+   generation number. (Current fsedits is considered equivalent to
+   'edits.0', and current fsimage is considered to be 'fsimage.0').
+3. Creates a new transaction log 'edits.<N+1>'.
+4. Wakes up a checkpointing thread to dump a new image.
+5. Release namesystem lock.
+
+This checkpointing thread:
+
+1. Acquires global namesystem lock.
+2. Sets a namenode-global boolean volatile variable
+'checkpointingInProgress' to true.
+3. Releases global lock.
+4. Starts traversing the filesystem tree in breadth-first manner, and
+writing it to the disk in a file called 'fsimage.<N+1>' and removes
+fsimage.N, and edits.N.
+5. After writing the image, reacquires the global namesystem lock.
+6. Applies the changes on the shadow nodes to actual nodes.
+7. Set checkpointingInProgress to false.
+8. Releases the global namesystem lock.
+9. Sleep waiting for notification to do checkpointing again. 
+
+Step 6 operation will become clear, when we describe how the namenode
+server threads change the namesystem tree *while* checkpointing is in
+progress.
+
+Namenode server threads always acquire the global namesystem lock
+before making any changes to the filesystem tree. Therefore all the
+steps described below occur in critical-section.
+
+1. Check if checkpointingInProgress is false.
+2. If it is false, perform the requested namesystem changes, exactly as
+they are performed currently.
+3. If it is true, locate the node of the filesystem tree that needs to
+   be changed.
+  3.1 If its member named 'shadow' of type 'Inode' is non-null,
+      perform the requested changes to that node.
+  3.2 Otherwise, create a new shadow Inode, clone all the fields from
+      original Inode there, assign it to the 'shadow' field of original
+      Inode. And perform the requested changes to the shadow Inode.
+      Append the original node in a list called 'changedNodes'.
+      
+Step 6 of the checkpointing node consists of traversing the
+'changedNodes' list, and replacing the fields of original node, with
+it's shadow node, and resetting the shadow reference to null.
+
+With this checkpointing scheme, the namenode startup procedure remains
+unchanged, except that now the namenode looks for a valid image.N with
+maximum N in the dfs.name.dir(s).
+, Minor correction:
+
+In the comment above, instead of
+
+Step 6 of the checkpointing *node* consists of 
+
+Please read:
+
+Step 6 of the checkpointing *thread* consists of 
+
+, The design looks pretty simple and clean.
+I still like the merging approach better. It is stand-alone!
+There is no need to change anything in the name-node code.
+It is useful as a maintenance utility for merging edits and images externally.
+Does not lock name-node.
+At some point the name-node data structures should be revised substantially
+and this copy-on-write effort will most probably be a wasted effort.
+Does it make sense to invest more effort in designing a simpler merge algorithm?
+
+If we still choose to do that:
+- Should we use "standard name" for current image and edits files (without .N)?
+Meaning before checkpointing edits is renamed to edits.N and new edits is re-created.
+- Do we need to keep all old images? Looks like just the last one is required.
+This is periodic checkpointing, not a backup procedure.
+- If the node crashes in the middle of the checkpoint it is left with the old image,
+old edits, and new edits files. Are we going to apply both old and new edits during startup?, Merging of fsimage with the edits can be done using O(sqrt( number of files )) memory.
+
+Suppose the number of files in fsimage (sorted by path name) is N.
+I divide fsimage into blocks so that each block has B=sqrt(N) namespace entries.
+The number of such blocks will be also M=sqrt(N).
+For each block we store in memory the path name of the first entry of the block, and the block offset.
+I then start reading the edits file. For every operation in edits I read an appropriate block from
+fsimage using the table in-memory, look for the appropriate entry, and perform operation on the 
+corresponding file. Update operations are performed in place, remove just leaves the free space 
+in the block. When a new entry needs to be added current block is split into two new blocks each 
+containing half of the records of the original block, and is stored in the end of the fsimage file.
+The in-memory table is also updated to reflect new keys and new block offsets.
+This algorithm needs to keep in memory the table of size M and one block of size B.
+The total size of memory used is M + B = O(sqrt(N)).
+
+If we need to tighten the memory requirement then we can divide N into smaller number 
+of blocks (reduce M) and read a part of the block each time (reduce B).
+The price is more disk IOs, which seems acceptable, for the name-node disk usage is not critical.
+, Sounds a lot like a BTree and comes with all of the issues.  Lots of IO and complexity.  Reimplementing that seems like a bad idea.  perhaps you can find a good java BTree, but this seems like a big, heavy piece of code.
+
+Why do we  need to do this?, Here is a patch on the current Hadoop trunk .
+
+This patch do automatic checkpoints without locking the filesystem.
+
+When it is time to do a checkpoint, edit logs stream are closed and new edit logs are opened, a thread is created that create a fake FSNamesystem that will merge previously written logs into fsimage. At the end, new edit logs are renamed to their old names.
+
+It  will consume as much memory during the chekpointing as the current running instance of the FSNamesystem.
+
+The auto checkpointing feature is disabled by default. So applying the patch "as is" is almost safe. (It does not break current image and logs format and loading philosophy) 
+
+Nonetheless, I can understand that you, the Hadoop dev team,  does not want to integrate this huge hacky patch as a part of the hadoop distribution...
+, Right patch with a right name for the unit test case, Ouch ! I'm tired today sorry, here is the right patch !, Thanks Philippe, this is a refined effort that uses just the existing code to upload the image and merge it with the edits.
+Unfortunately, it doubles the memory consumption during checkpointing, which is what this issue all about imo.
+
+> Sounds a lot like a BTree and comes with all of the issues.
+It's not a tree, there is no balancing, and I didn't mentioned trees even once.
+The only issue I can associate with BTrees is splitting the block into 2.
+
+> Why do we need to do this?
+I am advocating to revive Milind's proposal #5 of the initial design.
+Our goal is to minimize memory overhead used for checkpointing and to provide uninterrupted access to the name-node during checkpointing.
+We are not considering blocking approaches here so far, which makes minimizing memory our main requirement.
+
+The copy-on-write approach potentially leads to a linear memory increase and requires additional name-node data structures.
+Proposal #5 is an attempt to separate checkpointing from the name-node regular operation process.
+It takes the image file and the edits file and merges them whether the name-node is present or not.
+It does it with lots of IOs BUT in constant space.
+
+I was trying to come up with a simpler algorithm for the stand-alone checkpointing.
+It uses more space but does not require external sorting or unintuitive file entry renaming (as #5).
+And it can be adapted to use constant space for the price of more ios.
+Giving up IOs imo is the right tradeoff here, since disk is not used by the name-node and as mostly idle during its regular operation., The Backup Namenode Proposal
+--------------------------------------------
+The idea is to create a backup namenode, download the fsimage and the edits file
+to the backup namenode, merge them into a single image and then upload the newly
+created image into the primary namenode.
+
+This approach has the following advantages:
+    1. No additional memory or CPU requirement for the primary namenode.
+    2. Good scalability, backup namenodes can be plugged into the network
+       on demand.
+    3. Address space separation of primary namenode and backup namenode, thus
+       better fault tolerance.
+
+The namenode when invoked with the "-backupmode" command line option functions as the backup namenode. No additional scripts needed. One can run the backup namenode and the primary namenode on the same physical machine.
+
+The backup namenode downloads the fsimage and the edits from the primary namenode through a http-get message. The primary namenode rolls the edit file on disk, send starts logging new transactions into the new editlog file. The backup namenode merges the downloaded fsimage and edit into a new image file. It then uploads the new image file to the primary namenode. The primary namenode replaces the old fsimage and the old editlog with the new uploaded fsimage.
+, I like this proposal. It is simple, clean, reliable.
+We need a backup namenode anyway for a production deployment.
+, I like this proposal too :)
+
+Much cleaner that my hacky patch !, Here is a much detailed writeup on the Backup NameNode proposal. "Secondary NameNode" and "Backup NameNode" refer to the same node in this writeup. Please review and comment.
+
+Configuration
+-------------
+There will be an additional file named "masters" in the configuration directory (similar to the "slaves" file) that will list the node names where Secondary NameNode should be run. The start-dfs.sh script will start the Secondary-NameNode appropriately.
+
+The configuration file will have a the following new definitions:
+    * fs.checkpoint.dir      : Location where the Secondary NameNode can download the
+                                        fsImage and edits file.
+    * fs.checkpoint.period   : Time (in seconds) between two checkpoints.
+    * fs.checkpoint.size     : Size (in MB) of edit log that triggers a checkpoint.
+
+The Secondary NameNode will use "org.apache.hadoop.dfs.NameNode.Alternate" property to log its debug and informational messages.
+
+Primary NameNode
+--------------------------
+The Primary NameNode will add the following new RPCs to the ClientProtocol:
+
+    * getEditLogSize()
+        This call returns the size of the current edit log file. This call fails
+        if the NameNode is in SafeMode or there are more than one edit log file.
+
+    * rollEditLog()
+        This call closes the current edit log and opens a new edit log file.
+        The names of the edit files are either "edits" or "edits.new". To keep
+        complexity to a minimum, there will be a max of two edit log
+        files "edits" and "edits.1".
+        This call returns an error if any of the following conditions occur:
+        - NameNode is in SafeMode
+        - Both "edits" and 'edits.new" are already pre-existing
+
+    * rollFsImage()
+        This call does the following steps (atomically):
+        - removes fsImage
+        - copies fsImage.tmp to fsImage
+        - removes edits
+        - moves edit.new to edits
+        This call fails if any of the files fsImage, fsImage.new or edits
+        does not exist. It also fails if the dfs is in SafeMode.
+
+The NameNode will have two additional servlets:
+    * putFsImage.class
+        This servlet causes all the incoming data to be stored in a file
+        named fsImage.tmp in the dfs.name.dir directory. If this file already
+        exists, then this call returns error.
+
+    * getFile.class?param=pathname
+        This servlet retrieves the contents of the specified file.
+
+The Primary NameNode at startup time deletes fsImage.tmp (if it exists). The NameNode loads the fsImage, then loads the edits and then loads edits.1.  Then it writes the merged fsImage, deletes edits and edits.1.
+
+
+Secondary NameNode
+-------------------------------
+The Secondary NameNode periodically pings the NameNode with the getCurrentEditLogSize() RPC. This call returns the size of the current edit log. The Secondary NameNode initiates a checkpoint if either the size of the edit log exceeds the size specified in the fs.checkpoint.size or if the time since last checkpoint completion has exceeded fs.checkpoint.period.
+
+The Secondary NameNode issues the rollEditLog() RPC to instruct the Primary NameNode to start logging edits into edits.1.  The Secondary NameNode then uses the getFile servlet to fetch the contents of fsImage and edits. It puts them in the fs.checkpoint.dir and, reads them into memory, merges them and writes it back to fsImage.tmp. The Secondary NameNode than uploads the fsImage.tmp file to the Primary NameNode using the putFsImage servlet.
+
+Once the above steps are successful, the Secondary NameNode issues the rollFsImage() RPC. A checkpoint is complete when this RPC completes successfully.
+
+If any of the RPC calls returns an error, the Secondary NameNode discards all processing that it might have done, logs an error message, and waits for the normal trigger to start the next checkpoint.
+
+Issues
+------
+1. The emphasis is on simplicity. For this reason, the NameNode restricts that there can be only two outstanding edits file at any time: edits and edits.1. This ensures that there cannot be more than one Secondary NameNode for a Primary NameNode.
+
+2. The fact that rollFsImage() fails if either edits or edits.1 are non-existent means that the system is protected against spurious checkpoint if the NameNode restarts when the Secondary NameNode was doing a merge. This check can be made more explicit by returning a cookie with the rollEditLog() command and enforcing that rollFsImage() supplies the same cookie. (The Primary NameNode resets the cookie if it restarts).
+
+
+, >    * fs.checkpoint.period : Time (in seconds) between two checkpoints.
+This is the maximal time between the checkpoints, right?
+
+We should introduce new NamenodeProtocol for primary to secondary name-node communication.
+
+I'd go in the other direction: the primary node checks the edits log size each time it adds an entry.
+When it reaches the checkpoint.size or if the checkpoint was not done longer than checkpoint.period
+the primary rolls the edits log and sends a command to the secondary node to create a new checkpoint.
+
+I think we should think about supporting multiple secondary nodes at least at the design stage.
+In that case we will need to further propagate the checkpoints.
+Or do we just write the latest image into hdfs?
+, I agree that we can introduce a new Protocol called the SecondaryNamenodeProcotol. 
+
+I would still persist with the proposal that the primary namenode is just a "slave" as far as periodic checkpointing is concerned. All the "intelligence" of when to create the checkpoint, how to create it, etc.etc remains with the SecondaryNamenode. In the case when we support multiple Secondary namenodes doing their own periodic checkpointing according to their own schedules, the primary Namenode would otherwise have to do lots of schedule management for each of these periodic-checkpointers.
+
+, An addition to the above proposal. There will be an additional parameter named dfs.namenode.secondary.configfile that contains the absolute pathname of the "masters" file.
+
+The namenode will allow SecondaryNamenodeProcotol connections only from nodes listed in the "masters' file. Also, the webUI can query the namenode to list the identities of the Secondary Namenodes., My idea of supporting multiple secondary nodes was that the primary node always deals with ONE secondary node, which in turn
+becomes the "primary" node for next secondary node, and so on. The order of the nodes is defined by how the secondary nodes
+are listed in the config file. That way each name-node need to know and speak to only one secondary, which substantially
+simplifies the logic. The primary decides when the new check point should be created and initiates the chain of checkpoints.
+I think we want to avoid heartbeat processing from secondary nodes and minimize inter-name-node communication traffic.
+
+I'd prefer to have all configuration in config file rather than configurable paths to other files, containing edditional configuration parameters.
+Don't like the last proposal linking "masters" in the config. This will make configration even more complicated., Konstantin proposal is essentially a push model where the primary Namenode drives the scehduling policies of the periodic checkpointing. Also, he mentioned about supporting cascading secondaries.
+
+I am going ahead the pull model: the Namenode is a very passive entity as far as periodic checkpointing is concerned. The scheduling policies are maintained only by the secondary namenode. The secondary namenode polls the primary periodically (say every 5 minutes) to determine the size of the current edit log.
+
+The secondary would use HTTP-GET method to transfer fsmage and edits. Al alternative that was discussed was to use HDFS itself to transfer the image. However using HDFS has the disadvantage that the secondary would have to poll the primary to determine when the upload to HDFS was complete (HDFS does not have streaming RPC and has a fixed timeout for an RPC)., First draft of periodic chekpointing code. Code review comments appreciated., The second draft of the periodic checkpointing code. This includes a unit test case to test checkpointing as part of nightly test run., Comments on Periodic Checkpointing Patch - v2
+----------------------------------------
+
+fs.checkpoint.period should be in seconds, not milliseconds.
+Code still contains debugging printfs. Log messages are not descriptive
+enough.
+TransferFsImage.java has windows-style crlf line-endings.
+TestCheckpoint does not test periodic checkpointing. Instead it does the
+same thing as TestRestartDFS.
+Newly added methods in namesystem should not be public.
+FSImage.java has several whitespace-only-changes.
+In FSEditLog.java, getEditLogSize checks to see if all edit logs have the same
+length. However, this may not be true. If one of the local or remote fs which
+stores edits is full (or has exceeded quotas), the edits log will be of
+different sizes. In that case getEditLogSize should return maximum
+among all edits.
+SecondaryNamenode.java does not use Logging to print errors, instead
+uses System.err.
+printUsage is called once with an empty string.
+printUsage prints [report] instead of [-geteditsize].
+It should be possible to run the checkpointer as a cron job. There is
+no option for the secondaryNamenode to exit after finishing checkpointing.
+default masters files is not added. It should contain localhost.
+hadoop-daemons.sh usage contains [--file configfile]. It should be
+called [--hosts hostlistfile].
+, I am trying to come up with the default values for the following configurable parameters:
+
+1.	The size of the edit log that can cause the next checkpoint.
+2.	The time period from one checkpoint to the other.
+
+The next periodic checkpoint occurs whenever at least one of the above conditions are met.
+
+Assuming that a transaction takes 200 bytes in the edits log and the rate of 100 transactions per second, the edit log will increase at the rate of about 70MB per hour. Thus I am proposing that the default values for periodic checkpoints be 
+1.	edit log size = 64KB
+2.	time = 1hour
+
+Comments appreciated.
+
+, 64KB seems aggressive, it only allows about 300 transactions before a checkpoint happens. Checkpointing should be frequent enough that when the namenode restarts it should be able to merge the edits into the namespace in a fairly short period of time (10-15 seconds perhaps?).
+
+It might be useful to monitor how many edits can be merged into the image in 10 seconds (on a 2Ghz CPU say) and use something around that as the default., Sorry, a typo. My earlier calculations should have resulted in:
+
+1. edit log size = 64MB (not KB)
+2. time = 1 hour, My theory is that a checkpoint time is actually dominated by the time to read and write the image to disk and the time to transfer the the image back and forth between the namenode and the secondary namenode. The actual CPU time needed to do the merge of the edit log with the fsimage may be relatively small.
+
+My back-of-the-envelope calculation shows that sequential disk IO rates are at best  2GB per minute. Assuming a 2 GB image:
+
+1. NameNode reads image  = 1min
+2. Secondary NameNode stores image = 1 min (maybe in parallel with Step 1)
+3. Secondary NameNode stores new image = 1min
+4. NameNode stores image = 1 min
+
+Thus a total of 3 to 4 minutes can be used to do a checkpoint (ignoring network issues)., 
+Is it possible to eleminate 1. and 2. above? Since secondary holds the new image from the last checkpoint, at the start of checkpoint secondary can exchange a token with the primary to confirm its image is the latest and merge with that image.
+, Yes, it is possible to optimize. But it will not be part of my current implementation., This incorporates most review comments.
+
+The main changes in this round of changes were in the following areas:
+
+1. Handle error cases when one namedir is bad.
+2. Use the fstime file to locate the latest and greatest edits file and image file 
+3. Change the saveFSImage() function to use the code from periodic checkpoint. This reduces code   complexity because two different code paths need not be maintained. 
+4. Uses Enums for image file names.
+5. "format"ing creates an image and an empty editslog.
+6. The TestCheckpoint simulates various namenode failure cases.
+, 
+regd 64MB default size, It need not be tailored so that it takes one hour to reach the limit.. there is already other variable to do checkpoints every one hour.  As Sameer pointed out its size could be determined by how it affects NameNode start up time. Since namenode start time depends more on the image size, edits log size could be larger. A small value could have more burden on NameNodes that are already busy.  In a big deployment, default many not matter at all since it will be manually set.
+, Are you saying that the default editlogsize should be 128MB or so?, 
+How much time does it take to merge 512MB? I think as long as time to merge edit.log is in the order of 30-60 sec, that should be fine. That way if a node is lightly loaded it will checkpoint every hour and edit.log would still be much smaller and if it busy, we won't add extra checkpointing load.
+
+Another thing, to implement 'image file token' to avoid steps 1. and 2. above, we don't need to store any extra state on disk. This would just be a runtime property. Every time primary gets a new image from secondary, it also exchanges a 'token/etag'. If primary restarts, first check point will have steps 1. and 2.
+
+, The namenode is typically bottlenecked on CPU whereas a new checkpoint-upload is IO bound. A periodic checkpoint acquires the fsnamesystem lock and switches/renames files. The overhead of doing this operation once every 360000 namenode transactions (in our hour) should be minimal. I would like to make 64MB the default editlogsize and once deployed, I will observe a real life cluster and then determine if we need to change the default size.
+
+Reagrding the optimization of 'image token': I would defer it till I see measureable difference in performance on a real cluster. My goal is to keep the periodic checkpoint "as-simple-as-possible" while achieving the goal of making the "namenode-restart faster"., 
+Yes, the optimization should be/should be done later.
+, This has been merged with the latest trunk. Please review., This is the final patch for periodic checkpointing. Review comments from Milind that were incorporated here were:
+
+[Minor] hadoop-config.sh added export command wrongly indented
+
+[Reconsider Design] Why do we prevent periodic checkpointing if the namenode is in safemode ? Periodic checkpointing does not alter namespace, so should be allowed in safemode.
+
+[Minor] Clearly mark ErrorSimulation functions in SecondaryNamenode.java as used only from the testcase, so as to avoid confusion while reading code.
+
+, Please incorporate periodiccheckpoint6.patch. Thanks., +1, because http://issues.apache.org/jira/secure/attachment/12349479/periodiccheckpoint6.patch applied and successfully tested against trunk revision r499156., +1 code reviewed., bin/slaves.sh caused secondary namenodes to start on all datanodes (only if HADOOP_SLAVES defined in hadoop-env.sh), +1
+
+I've run sort, smalljobs, nnbench, and dfsio benchmarks with this patch.  All pass., I just committed this.  Thanks, Dhruba!]

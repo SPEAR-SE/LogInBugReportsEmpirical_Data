@@ -1,0 +1,158 @@
+[The code corresponding to the exception:
+{code}
+2012:    Collection<Node> nodesAtMaxLevel = jobtracker.getNodesAtMaxLevel();
+2013:
+2014:    // get the node parent at max level
+2015:    Node nodeParentAtMaxLevel = 
+2016:     (node == null) ? null : JobTracker.getParentNode(node, maxLevel - 1);
+2017:   
+2018:    for (Node parent : nodesAtMaxLevel) {
+2019:
+{code}
+
+Add to nodesAtMaxLevel Map happens from two methods: JobTracker.addNewTracker()(with JobTracker lock) and JobInProgress.createCache (with JobInProgress lock).
+
+Solution is to make JobTracker.nodesAtMaxLevel a SynchronizedMap and add synchronization for the iterations. Thoughts?, Sigh, this is a *bad* one.
+
+Unfortunately call heirarchy of JobTracker.addHostToNodeMapping locks JIP in one code path and JT in another while JobInProgress.findNewMapTask locks both JT and JIP (in that order) ..., I guess making nodesAtMaxLevel a synchronized Set and then locking nodesAtMaxLevel in findNewTask is an option since the locking order will be JT, JIP, nodesAtMaxLevel in one path and JIP, nodesAtMaxLevel in the other - but really ugly.
+
+Another option is to make nodesAtMaxLevel a synchronized ArrayList and then use ArrayList.get rather than iterate over it in JIP.findNewTask i.e. 
+
+{noformat}
+JIP.findNewTask:
+
+  int size = JobTracker.getNumNodesAtMaxLevel();
+  for (int i = 0; i < size; ++i) {
+    Node n = JobTracker.getNthNodeAtMaxLevel(i);
+    // ...
+    // do something with n
+    // ...
+  }
+{noformat}
+
+However, we'll need to ensure JobTracker.nodesAtMaxLevel doesn't contain dups - something which is currently ensure by having nodesAtMaxLevel be a Set.
+, When we hit this, that task never get scheduled and job would stuck forever., Why didn't findbugs find this?  Or did it?, I don't believe findbugs ever found this., Ok, being awake while debugging synchronization errors is (kinda) useful, so here goes:
+
+The primary cause for this bug is that we are resolving nodes (adding them to nodesAtMaxLevel) during job initialization - during which we cannot lock up the JobTracker. 
+
+A reasonable fix is to queue the resolutions and resolve them under the JobTracker lock in a separate thread... this has the added benefit that we resolve more of the hosts simultaneously, there-by decreasing the number of forks we make via the usual ScriptBasedMapping. This actually needs a bit more work, we'll need the JIP to call 'wait' on itself while the hosts are being resolved and then the thread doing the resolutions will have to signal the JIP to continue. This is necessary since the JIP needs all nodes to be resolved to build up all it's cache tables for scheduling. Sigh.
+
+Thoughts?, It's a hackish fix, but using the [keySet|http://java.sun.com/javase/6/docs/api/java/util/concurrent/ConcurrentHashMap.html#keySet()] in a ConcurrentHashMap allows the collection to be iterated over while another thread is modifying it., Could nodesAtMaxLevel be made a CopyOnWriteArraySet? This is less efficient for mutations, but mutations are rare once the cache has been set up, and it avoids the CME possibility since iterators are safe and fast., bq. Could nodesAtMaxLevel be made a CopyOnWriteArraySet?
+
+The cache includes hosts for remote clusters, as well; it may be fairly large and not necessarily stable. The O\(n) cost of adding entries is also not encouraging, particularly since it creates a copy of the array as it's searching for a match on every insertion. Why there isn't an equivalent ConcurrentHashSet in the platform- as with HashSet/HashMap- is a mystery to me.
+
+Arun's sounds like the correct fix; decreasing the number of forks at the JobTracker is always a good idea. Verifying its correctness may be harder than changing the data structure, though., Maybe I misunderstood Arun's idea, but it sounded to me like it added a lot of complexity. This JIRA indicates this bug exists in 0.20.1 - do we anticipate fixing it for branch-20, or only for 21? If for branch-20, I think the COWArraySet is safer, no?
+
+bq. Why there isn't an equivalent ConcurrentHashSet in the platform- as with HashSet/HashMap- is a mystery to me.
+
+What about ConcurrentSkipListSet? It's logarithmic and has weakly consistent iteration., bq. Maybe I misunderstood Arun's idea, but it sounded to me like it added a lot of complexity. This JIRA indicates this bug exists in 0.20.1 - do we anticipate fixing it for branch-20, or only for 21? If for branch-20, I think the COWArraySet is safer, no?
+
+Arun's idea is more complex, but it also addresses related problems. Different fixes for 0.20/0.21/0.22 may make sense. A COWArraySet probably isn't the right data structure per the preceding, but another of the concurrent collections would be fine.
+
+bq. What about ConcurrentSkipListSet? It's logarithmic and has weakly consistent iteration.
+
+Sure, that'd work. Again, it's backed by a map, just as HashSet and the current patch's pseudo-ConcurrentHashSet. ConcurrentHashMap doesn't mention its contains/insertion complexity in the javadoc, but debating its superiority to log\(n) seems pointless for a degenerate case of tens of thousands of elements. Since the type doesn't leak, being consistent with it doesn't make much difference, either., Todd - we have a serious synchronization problem in the JobTracker we can't _really_ fix without inverting locking order between JobTracker and JobInProgress. I'd rather do the right fix, given that the right fix doesn't take the order of man-months and has other attendant benefits (i.e. reducing forks)., Absolutely agree that we should do the right fix. My only concern was with the right fix being put on branch-20., bq. This actually needs a bit more work, we'll need the JIP to call 'wait' on itself while the hosts are being resolved and then the thread doing the resolutions will have to signal the JIP to continue.
+Node resolution through heartbeat(JT.addNewTracker) also need to wait for the thread, right?
+
+Earlier node resolution was done by a thread, but is removed through HADOOP-3780 and HADOOP-3620.
+, Also the following code in addHostToNodeMapping (called with two different locks) needs to be atomic.
+{code}
+    if ((node = clusterMap.getNode(networkLoc+"/"+host)) == null) {
+      node = new NodeBase(host, networkLoc);
+      clusterMap.add(node);
+      .....
+      hostnameToNodeMap.put(host, node);
+      nodesAtMaxLevel.add(getParentNode(node, getNumTaskCacheLevels() - 1));
+    }
+{code}, Good point! I'm thinking we can use hostnameToNodeMap as the gating lock in JobTracker.addHostToNodeMapping, thoughts?, Actually, come to think of it, we can probably make JobTracker.resolveAndAddToTopology a synchronized method once we introduce the new thread I alluded to... ditto with JobTracker.addHostToNodeMapping. , bq. Actually, come to think of it, we can probably make JobTracker.resolveAndAddToTopology a synchronized method once we introduce the new thread I alluded to... ditto with JobTracker.addHostToNodeMapping.
+
+I thought it's useful to point out that one of two callers to JobTracker.resolveAndAddToTopology is already a synchronized JobTracker method, hence my previous comment: 
+JobTracker.resolveAndAddToTopology
+  -> JobTracker.addNewTracker
+    -> JobTracker.processHeartbeat
+  -> JobInProgress.createCache, bq. Node resolution through heartbeat(JT.addNewTracker) also need to wait for the thread, right?
+
+Discussed this with Arun. We can have node resolution through heartbeat inline (as it is now). Make node resolution for JobInProgress go thru the Thread., Same idea as the previous patch, but using {{Collections::newSetFromMap}}, Thanks Chris.
+
+----
+
+I started working on the 'right' fix and I'm concerned it's ballooning into a major one.
+
+I had a discussion with Chris and I think he/Todd have convinced me that we can do the 'hack' of using a weakly consistent iteratrion for  branch-0.20 and the 'right' fix for hadoop-0.21/trunk. Thoughts?, Updated Chris's patch to fix the other synchronization bug in JobTracker.addHostToNodeMapping., JobTracker.addHostToNodeMapping() doesnt need any synchronization because the first call it makes is to NetworkTopology.getNode() which is synchonized internally.  JobTracker.hostnameToNodeMap (which gets modified in JobTracker.addHostToNodeMapping()) is synchronized collection and hence it doesnt need any explicit synchronization. Hence I think the [patch|https://issues.apache.org/jira/secure/attachment/12430341/M1372-1.patch] Chris uploaded should suffice., Amar, as Amarsri explained [here|http://tinyurl.com/yevslg7] JobTracker.addHostToNodeMapping needs 'transaction' semantics..., Ok. the patch looks fine to me., I tested the use of Collections.newSetFromMap with the testcase attached and here are the results 
+
+Pre patch
+||num items||avg time to scan in ms||
+|1000|0|
+|10000|9|
+|100000|13|
+|1000000|56|
+|10000000|424|
+
+Post patch
+||num items||avg time to scan in ms||
+|1000|0|
+|10000|7|
+|100000|21|
+|1000000|124|
+|10000000|1175|
+
+Using the command 
+{code}
+java ReadOnly -correctness pre|post
+{code}
+ the bug can be verified. The bug can be reproduced by using the _pre_ switch and the fix can be verified by switching to _post_. With _pre_, a HashMap is used while with _post_ a Collections.newSetFromMap is used. The test is simple. It simply starts 2 threads, one adding to the set while the other scans it.
+
+Using the command 
+{code}
+java ReadOnly -performance pre|post X Y
+{code}
+ the proposed change can be benchmarked. The benchmark simply adds to a set (determined by pre/post switch)  X elements and scanning it Y times, averaging it over runs., I looked at the patch too, and it looks good to me., Submitting for hudson, Attaching the same patch again for hudson to pickup correct file, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12430691/M1372-2.patch
+  against trunk revision 900159.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/275/console
+
+This message is automatically generated., For trunk/branch-0.21 we should do the *right* fix, the hack is appropriate for branch-0.20., bq. For trunk/branch-0.21 we should do the right  fix, the hack is appropriate for branch-0.20. 
+
+I'd like to see this get in for the upcoming freeze for 0.21. Given those time constraints I'd like to propose we do the 'hack' for 0.21 and do the re-work for 0.22. Is that reasonable?, +1 Sounds reasonable., That sounds reasonable.
+
+Committing the current fix to 0.20-0.22 and opening a separate issue for the more involved fix would probably be easiest for tracking., Thanks Tom & Chris, I've opened MAPREDUCE-1717 to track the larger fix., This patch is the port to Trunk.
+
+In the regressions, it fails {{TestTaskTrackerLocalization}} -- as does an unpatched trunk.
+
+The {{test-patch}} regime will complain about lack of a test case, but nothing else.  I do not add a test case.  It's hard to see how to test, since this patch fixes a rare race condition that rarely occurs and that only has an opportunity to occur in one flurry when a cluster is initialized.  , -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12444125/mapreduce-1372--2010-05-08.patch
+  against trunk revision 942764.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h4.grid.sp2.yahoo.net/178/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h4.grid.sp2.yahoo.net/178/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h4.grid.sp2.yahoo.net/178/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h4.grid.sp2.yahoo.net/178/console
+
+This message is automatically generated., Patch for trunk/0.21 :   mapreduce-1372--2010-05-08.patch looks good to me., I've just committed this. Thanks Dick and Amareshwari!]

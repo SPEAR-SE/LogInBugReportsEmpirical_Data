@@ -1,0 +1,141 @@
+[Ok, I propose that we unify the heartbeats with the messages requesting work:
+
+In InterTrackerProtocol:
+
+TaskTrackerTask[] updateStatus(TaskTrackerStatus status) throws IOException;
+
+replacing emitHeartbeat, pollForNewTask, and pollForTaskWithClosedJob.
+
+The TaskTrackerTask includes:
+  new task -- run a new task
+  kill task -- stop a currently running task and clean up
+  cleanup job -- clean up the map outputs from a given job
+
+The TaskTrackerStatus would gain:
+  a counter of the number of TaskTrackerTask lists processed
+  amount of free disk space in transient storage
+
+The counter would be used to make sure the last set of commands were received. Thus, it could replace both the init task timeouts and fix this bug., The right fix for HADOOP-737 is to use the kill task to kill off the redundant speculative reduces., Ok, while we continue to track the *metrics* part of TaskTrackerStatus via HADOOP-657 I propose we move forward on the 'lost messages' part over here...
+
+Here are some thoughts (with due credits to Owen):
+
+Define new classes:
+
+TaskTrackerAction implements Writable {
+  byte actionId = 0;
+  // ...
+}
+
+KillJobAction extends TaskTrackerAction {
+  byte actionId = 1;
+  // ...
+}
+KillTaskAction extends TaskTrackerAction {
+  byte actionId = 2;
+  // ...
+}
+StartTaskAction extends TaskTrackerAction {
+  byte actionId = 3;
+  // ...
+}
+
+The distinction between the KillTaskAction & KillJobAction is done to fix HADOOP-737 ... 
+
+Another class:
+class JTResponse {
+  long seqNo;                  // explained below
+  List<TaskTrackerAction> actions;
+}
+
+The new api replacing
+  int emitHeartbeat(TaskTrackerStatus status, boolean initialContact) throws IOException;
+  Task pollForNewTask(String trackerName) throws IOException;
+  String[] pollForTaskWithClosedJob(String trackerName) throws IOException;
+is:
+
+  * JTResponse updateStatus(TaskTrackerStatus status, long ackNo) throws IOException; *
+
+Details about the seqNo/ackNo:
+------------------------------------
+
+The idea is that there is a feedback (seq/ack) mechanism between the JT & TT which works as follows...
+
+TT starts off by sending an ack of '-1' (indicates initial contact, replaces the existing 'initialContact' boolean); and at every step the JT increments the ack and sends a new JTResponse object with the incremented ack as the 'seqNo' and 'actions'. The JT also stores the last seq and the JTResponse object sent to each of the task-trackers. OTOH the TT also stores the last 'seq' which it recieved from the JT, which is what it sends out in the subsequent heartbeat as 'ack'.
+
+How does this help? If a TT misses the heartbeat response from the JT, it sends a stale which 'ack' disagrees with the newer 'seq' on the JT, this prompts the JT to resend the 'saved' JTResponse object back to the TT... thus solving the 'lost messages' issue. If JT never hears back from a TT for a long time the existing ExpireTrackers.run removes the TT from its queue and also discards the saved JTResponse object for that TT.
+
+-*-*-
+
+Thoughts?
+, To clarify, the point of the type ids in the TaskTrackerActions is so that we can serialize the list of actions efficiently.
+
+I'd make TaskTrackerAction an abstract class like:
+
+abstract class TaskTrackerAction implements Writable {
+  /** Get the type id for a type */
+  public abstract int getTypeId();
+
+  /** Create an instance of the appropriate child type. */
+  public static TaskTrackerAction newInstance(int typeId);
+}
+
+and then the children look like:
+
+class StartTaskAction extends TaskTrackerAction {
+  int getTypeId() { return 1; }
+  Task newTask;
+  public void readFields(...) throws IOException {...}
+  public void write(...) throws IOException {...}
+}
+
+KillTaskAction has a jobid and taskid.
+KillJobAction has a jobid.
+
+We also need a action to reinitialize the task tracker (ReinitializeSelfAction?).
+
+"JTResponse" is too information free. How about "TaskTrackerActionList" instead.
+
+I think we are better off using a boolean than a special value for ackNo. As a side effect we can use short for ackNo because it is ok if it rolls around. And taking a hint from linux, we are probably better starting at a -100 so that we wrap pretty soon after start up. *smile*, I'd like to counterpropose:
+HeartbeatResponse instead of JTResponse
+
+and clarify:
+HeartbeatResponse statusUpdate(TaskTrackerStatus status, boolean initialContact, short heartbeatResponseId);
+, Ok, here is an initial patch for review; I'll test this on a bigger cluster once HADOOP-753 / HADOOP-754 are resolved... meanwhile I'd appreciate feedback on this one..., +1, http://issues.apache.org/jira/secure/attachment/12345946/HADOOP-639_1.patch applied and successfully tested against trunk revision 480610, The new protocol method signature is inconsistent:
+
+public HeartbeatResponse updateStatus(TaskTrackerStatus status, boolean);
+
+Everyone refers to this as the heartbeat, why not still call it that?
+
+public HeartBeatResponse heartbeat(TaskTrackerStatus status, boolean);
+
+Either that, or completely remove 'heartbeat' from our vocabulary.  Personally, I prefer using heartbeat consistently for this, but I wouldn't reject this patch over that.  I feel more strongly however that the naming should be consistent.  We shouldn't call it a heartbeat response unless it's a response to something we call a heartbeat., Makes sense Doug, here is the naming change to 'heartbeat'... appreciate your feedback.
+
+Meanwhile could you please hold off committing this patch till I do some further testing on a large cluster (am currently blocked on HADOOP-753 / HADOOP-754) ... once i get that done i'll give a heads-up. Meanwhile I'd love to hear about any other comments/nits you have with any part of this patch... thanks!, Testing on a small cluster brought out a minor bug in the previous patch; hence this new one.
+
+I'll keep testing some more; as alway appreciate any feedback..., I just went through the patch.. I had a qeustion regarding the patch... it seems like the JOB_KILL action is sent per task from the JobTracker to TaskTracker? (just had a glance so might be wrong).. If yes, shouldnt we be just sending one action per job from the jobtracker to tasktracker ? since we already have a list of job -> tasks_executed_on_tasktracker in the tasktracker itself? , sorry I meant TASK_KILL_ACTION is sent per task... , Mahadev, TASK_KILL_ACTION has to be sent per task right? The same job could have multiple map/reduce task running on the same TaskTracker... or am I missing something here?
+, Arun, I meant ... the following:
+
+The jobtracker should send the following two messages:
+
+1) KILL_TASK-- which is per task message... and this one kills any task and cleans it up
+
+2) THe other one I mentioned is the one when the JobTracker decides that a job has finished/failed and wants all the tasktrackers to cleanup. In this case we could just send a jobid and cleanup message from the Jobtracker to tasktracker since we have a mapping of jobID --> TIP_EXECUTED_OR_RUNNING on a tasktracker. So we do not need to send cleanup messages for all tasks at the end of job finish/fail. 
+
+It is the second one that I was talking about in my previous comments., Updated patch to reflect changes to trunk..., Ah, thanks for the clarification Mahadev - let me get back with that change too..., also, it would be cleaner if we had a RUNNINGJOB->cleanup method, which calls cleanup on all the tasks and then removes the job directory. This way we do not have to delete the job direcotry in each tasks cleanup., Mahadev, there is a corner-case which will fail if we take the RunningJobs.cleanup route: if after the job 'cleanup' the JT allocates a new task to the same TT, that task will fail since the job-dir is gone, which is why this patch will rely on the KillJobAction (sent by JT after the job completes/killed/fails) to cleanup the job-dir... your take?, sorry to have miscommunicated again! :). .. what I meant was the patch should still rely on KILLJOBACTION but rather than cleaning up the job directory in each task cleanup we could just have a cleanup method on running job that cleans up the tasks which the RunningJob has and then cleans up the job directory --- (implying that the job directory cleanup code would move from task cleanup to job cleanup).
+
+so the code would look something like:
+if (JOBKILLACTION){
+  for all runningJob.tasks {
+    tasks.cleanup()
+  }
+ deleteJobDir()
+}
+ Also I have just been commenting since I took a look at the patch :). I can file different bugs so that you do not have to incorporate these changes into your patch which would avoid making your patch huge., Mahadev, appreciate for your review/comments...
+
+ I have something very similar to the above code except for a difference:
+
+Since the KillJobAction is processed as a part of the 'heartbeat', I don't do the cleanup 'inline' (keep the heartbeat processin tight) ... and as exists I delegate the 'cleanup' part to the 'tasksToCleanup' thread which periodically wakes up and cleans-out tasks - I set a 'purgeJobFiles' flag for the last task in runningJobs['jobid'], and that lets TaskTracker.TaskInProgress.jobHasFinished to cleanup the job-dir.
+
+Thoughts?, Ok, here is another patch with Mahadev's suggestions.
+
+Appreciate any feedback, I've tested this pretty good..., +1, http://issues.apache.org/jira/secure/attachment/12346582/HADOOP-639_5_20061207.patch applied and successfully tested against trunk revision r482999, I just committed this.  Thanks, Arun!]

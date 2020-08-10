@@ -1,0 +1,62 @@
+[I'll have to look at this code in trunk more carefully, but I think you're right that cases can arise in which the wrong job is scheduled. The main one I notice is when several jobs are below their min or fair share and one of them times out. When this job times out, the FairShareComparator looks at all the jobs in order of min or fair share ratio and picks the one with the lowest one to launch. However, that job may itself have been launched quite a bit later than the one that timed out, so the timed out job needs to wait even longer. The issue is going to be worse if some pools have preemption enabled and some don't, or if pools have different preemption timeouts.
+
+I think fixing this might require a slightly different approach than you proposed because of the semantics we want for timeouts. We want preemption to occur only if a job (or pool) has not been serviced for X seconds, in which case the preempted resources should go to that job. If we just sort the jobs using FairShareComparator, we may miss the fact that a job later in the fair share order has actually timed out and requires preemption now. Instead, it would be better to change FairShareComparator (and its equivalent in Facebook's 0.20) to sort jobs by whether they are past their preemption timeout first. We should also think about whether it's best to do this in the comparator or outside of it. I think one of the cleaner solution would be to do this prioritization outside the comparator (i.e. sort the jobs and then pull out the starved ones), because this way, we don't need to modify all the comparators to take into account preemption timeouts.
+
+So in summary, I'd propose the following approach:
+* In the FairScheduler object, keep track of which pools are currently starved and past their preemption timeouts. This could be as simple as calling tasksToPreempt() on each heartbeat or more complicated if we want to cache this value somehow.
+* In FairScheduler.assignTasks, subdivide the pools into timed-out and non-timed-out ones and prioritize assigning tasks to the former. We can still use the FairShareComparator to sort the pools of each type. At the end of the day, all pools should be put into a global order and the assignTasks method can proceed as normal., i am not proposing preempting for jobs that don't meet preemption criteria. Let me try to rephrase more accurately - assuming that there's one total ordering -L - of jobs at any time (for purposes of scheduling after taking min/fair shares into account).
+
+every preemption_interval secs:
+* assume we can schedule N tasks from one preemption interval to the next
+* start walking L from beginning to end stopping when >= N schedulable tasks have been traversed
+** for each job J encountered if J.needsPreemption() - then bump up preemption count appropriately.
+
+N is a parameter to this protocol. If N is too aggressive - then we may kill tasks unnecessarily. i think we can make a fairly good guess of N based on past behavior. We can be a bit pessimistic - at worst this will delay preemption a bit.
+
+---
+
+AFAI understand - the faircomparator _should_ be placing the jobs with the most deficit in terms of fair/main share at the head of the sorted jobs list already. So i don't understand why we should go about changing it. The main issue i see is the duplication of job ordering logic in two different places (fairComparator and tasksToPreempt()) and i am hoping that by centralizing the ordering logic in one place - we will avoid inconsistency (and the code will be easier to understand and maintain)., to add - for any job J - there's no point preempting tasks from any other job J' that's ahead of J in the sorted list. 
+
+(We have evidence of this happening internally (preempted tasks from a job and then scheduled them right back before scheduling the job requesting preemption) - although i am not sure it can happen in trunk code.), What I was trying to say is not that we shouldn't look at the job ordering, but that we have to prioritize giving tasks to jobs that have required preemption. If we don't do this, then there's no guarantee that the jobs at the head of the ordering L will be the ones that actually require preemption. It's true that if we estimate N correctly, then we know that *eventually* jobs will get to launch tasks before the next preemption interval, but even that is not as good a guarantee as saying that as soon as your timeout passes, we will kill some tasks and give those slots directly to you.
+
+I think the scheme I proposed above is the simplest way to achieve this without requiring any sort of estimation of heuristics. It's exactly the same logic we have before, except that in assignTasks, we sort jobs first by whether they need preemption, and then by the fair share comparator. We don't need to change the comparator in any way, just to add a bit of extra logic to prioritize these needy jobs. We are also guaranteed this way that preempted tasks go directly to a job that needed preemption, and that you get your slots one or two heartbeats after your preemption timeout expires., Just to add a bit, one other complication with the "walk down the ordering" approach is that the ordering may change over time as jobs get slots and as their old tasks finish. It's hard to look at the ordering now and know exactly which jobs will launch tasks before the next preemption interval. In contrast, with the way I proposed, you don't need any such estimation. We just directly fix the issue that a timed-out job may not be at the head of the ordering. Does this make sense?, > we have to prioritize giving tasks to jobs that have required preemption
+
+i don't follow - the fairsharecomparator is supposed to be doing this already. if not - we have a bigger problem on our hand. jobs that are furthest behind in fair/min share are at the head of the sorted list based on fairsharecomparator. the only reason a different set of jobs gets rights to preemption is because the tasksToPreempt() call is not using fairsharecomparator logic. if it was - there would be no problem to begin with. 
+
+can u explain why the fairsharecomparator is not doing the correct thing already?
+
+a simple way of getting past the re-ordering issue is to invoke tasksToPreempt() very very frequently and make N (the max number of tasks to preempt) really small. I would hazard to say we can even do this every heartbeat (since we have a sorted list - we only need to see if the head of the queue needs preemption)., i think i phrased this jira very badly.
+
+here's the real problem: job A preempts job B. after preemption, job B keeps getting slots before job A gets all the slots it has asked for. after sometime jobA requests even more preemption.
+
+Note that it's ok for some jobC to get slots (if it's higher than jobA in priority based on fair share). i don't want to get into reintroducing some kind of logic to handle starvation (which is what forcing jobA to be scheduled before jobC would basically amount to). We had deficits earlier to deal with starvation - but that was very difficult to explain/deal with. i am ok with the current behavior - ultimately resources will be taken from jobs that are overscheduled to those that are underscheduled.
+
+spent a fair bit of time looking at our logs on why this phenomenon might be happening. the biggest contributing factor (so far) seems to be the policy in FS.assignTasks() to cycle through jobs (in 0.20) while assigning tasks for a given heartbeat. we frequently get into situations where a TT is advertising multiple slots (because we are bottlenecked on JT and heartbeat processing is slow) and the JT will not give all the slots to the highest priority job. the faircomparator is doing the right thing (the logs indicate that jobB gets slots only after jobA has gotten the first slot from the heartbeat).
+
+So we need to strike a better balance perhaps on having diversity of jobs on a machine versus giving higher priority jobs multiple slots when heartbeats arrive., rephrasing. the ordering of the jobs in faircomparator seems consistent with the logic that figures out what to preempt (contrary to my initial intuition)., Scott - all yours. 
+
+one additional observation is that the fact that we continue rotating across different jobs causes us to get into situations that require preemptions in the first place. we should do our best not to schedule jobs that are above their fair/min share if there are jobs that are below those thresholds in the queue., Joydeep: Thanks. I will submit a patch based on our discussion yesterday., Alright, please summarize what the fix is as well. I still believe that prioritizing jobs that require preemption in assignTasks will get around most of these problems in trunk (modulo heartbeats being super slow). The logic that only launches one task from each job per assignTasks is Facebook-specific as far as I know., @Matei - i checked the trunk code - i could be wrong - but it seemed to me that assignTasks was rotating across pools (although i don't know what happens inside each poolschedulable)
+
+note that the problem precedes preemption. as i tried to point in my last update - the fact that we assign rotate across jobs contributes in the first place (where some jobs end up with way more than fairshare). so i would like to see a solution where we try not to assign tasks to jobs above fair/main share if there are jobs that are below fair/min share. that way we don't have/need a preemption specific solution. it's a generic problem., In trunk, there's a while(true) loop that is used to launch tasks. In this loop, we have a for loop across pools that finds the first pool in the scheduling order which has tasks to launch. So it's entirely possible for a pool to launch multiple tasks on an assignTasks() call as long as it remains at the top of the sort order. (Note that we also re-sort the pools after each task launched). I think this will do exactly what you wanted. As soon as the pool at the front of the queue hits its fair share, the next pool will go to the top of the ordering, and so on. Let me know if there's any case where this doesn't happen this way., looking at the code - it says:
+
+     List<PoolSchedulable> scheds = getPoolSchedulables(taskType);
+      for (Schedulable sched: scheds) { // This loop will assign only one task    
+
+
+this seems similar to what we have internally. typically we have one pool per user except for admin stuff. so if one user is depriving another user of slots - then we will keep assigning to the user who has more than fair share if the heartbeat advertises multiple slots. (and assignMultiple is true which it is for us)
+
+note that in high load scenarios (and particularly if a lot of tasks are killed at once) - heartbeats do end up advertising multiple slots. , I think Matei is right. The difference is that the trunk code always sort the jobs again for every task it assigned.
+After assigning one task, the loop will sort the pools again and inside PoolSchedulable.assignTask() jobs will be sorted again.
+Our internal code does round robin task assignment on the sorted jobs.
+So this problem should better in the trunk code.
+But this may still happen for trunk code because the higher order jobs may be all waiting for locality.
+
+The other point is that we should immediately assign the tasks we just preempted to the job that triggers preemption.
+Currently we may preempt for a job because it is starving but the preempted tasks may be assigned to other jobs.
+Then this job will keep killing tasks if it cannot get the tasks that it just killed.
+One way to solve this is to remember the job that starved for tasks and give them higher priority in the comparator.
+
+, if we are comfortable assigning multiple tasks from one job to the same slot - then there is no jira to solve here. we can simply merge in the assigned job into the sorted list before trying to get the next job and mimic the behavior in trunk. (note we already merge assigned jobs back into the sorted array - we just do it at the end of the function and not after assigning every task).
+
+i was under the impression that there was a deliberate attempt (in our version) to assign tasks from different jobs to the same slot. i don't know whether this is a feature or a bug or what the history is here. any ideas?, As we discussed, this should not be a problem for the trunk version.
+I am closing this now. We can reopen it if we observe it later.]

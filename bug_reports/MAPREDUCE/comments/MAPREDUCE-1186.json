@@ -1,0 +1,233 @@
+[Some attempts that I've verified which use DistributedCache got stuck doing chmod on the base-dir for the distcache. When I myself tried to replicate this scenario, I found out that chmod indeed takes a lot of time when number of files is large (For 35K files,2.7GB in archive directory, it took 1.2 minutes.) This should be fixed, we shouldn't do a recursive chmod on the whole archive directory for every task., This recursive chmod was done as part of HADOOP-4490. See [this|https://issues.apache.org/jira/browse/HADOOP-4490?focusedCommentId=12674476&page=com.atlassian.jira.plugin.system.issuetabpanels%3Acomment-tabpanel#action_12674476] comment there., Some history:
+
+Before HADOOP-4490, files and archives localized as part of distributed cache used to be given executable permissions. I suppose an assumption was that the directories and files created during this localization process had read permissions automatically for the owner of the files. And since the owner of the files, basically the user tasktracker is running as, was also the owner of the task process, this was sufficient to access the cache files.
+
+In HADOOP-4490, we had a situation where the tasktracker and the task could run as different users. The tracker localizes the files and the task needs to access the files. So at a minimum, read and execute permissions on directories and files to others needed to be granted. As mentioned in the comment linked above, a choice was made to recursively set these permissions on all files starting from the base directory - a performance problem as observed on clusters with a very, very large number of localized cache files.
+
+In MAPREDUCE-856, to solve the requirement of securing access to the distributed cache files, the local directory structure was changed to be per user. Further, in the LinuxTaskController, ownership and permissions were set for all files under a user's archive folder to the user and providing access only to that user. For the DefaultTaskController, the same changes as made in HADOOP-4490 were retained, though it was possibly unnecessary.
+
+First, to revisit if we need any permission setting for distributed cache files:
+
+I think this is still required. For the DefaultTaskController, executable permissions need to be set on the localized files as in the pre-HADOOP-4490 days. For the LinuxTaskController, we need to change ownership and set permissions in the task controller for that user.
+
+However, in both cases, I suppose we only need to set permissions for files that are actually copied from DFS to the local file system (including any directories created in this process). This will address the issue raised in this JIRA., Here's a proposal:
+- We should remove the recursive call to set permissions in TrackerDistributedCacheManager.localizeCache().
+- To handle the case for the default task controller, we can set execute permissions for all localized files and archives as done before HADOOP-4490. This can be done by using Java APIs directly rather than executing chmod.
+- For the LinuxTaskController, we can take the help of changes introduced in MAPREDUCE-1098.
+-- In MAPREDUCE-1098, a random id was generated into the local file path for every URI that was freshly localized.
+-- So I suppose we can assume that if a random id has the right permissions and ownership, all files under this directory would have the right permissions and ownership. Conversely, if these are not set, we should set them for all files under this directory.
+-- We can get the random id directory by removing the normalized URI path from the full path saved in the task's configuration for a given URI.
+
+Does this work ?, The above proposal looks good for Yahoo! distribution. 
+In trunk, after MAPREDUCE-856, distributed cache does not need to set any permissions for LinuxTaskController. Although for the default task controller, we can set execute permissions as done in pre HADOOP-4490.
+
+, Patch for Y! distribution, Patch for trunk doing the one-line change. And fixed a minor bug in testcase.
+The patch can be improved more by doing some more changes in LinuxTaskController. , Patch incorporating Arun's offline review comments on Y!20 patch., test-patch and ant test passed on my machine, for the Y!20 patch, The trunk patch needs more work, no?
+
+Nits on ydist patch:
+# CacheStatus.uniqueSubDir should probably be called CacheStatus.parentDir
+# There are some extra LOG.info statements introduced here, are they just for debugging or do you intend to keep them in the source?, bq. The trunk patch needs more work, no? 
+Yes, it needs more work with LinuxTaskController which, after HADOOP-4493, does a recursive chown+chmod on $mapred.local.dir/$user/$distcache (thankfully not $mapred.local.dir)., Patch renaming uniqueSubDir. I think the log will be useful in debugging, so leaving it as is.
+
+Verified that chmod is not done on baseDir, by manually verifying logs. 
+Reproduced the issue by putting about 1Lakh files in base dir,  and running a job using 5 files on distributed cache.
+Verified that the same job, under same environment, finishes faster with the patch.
+
+Verified that streaming and pipes jobs, which use executables from distributed cache, work fine (with both DefaultTaskController and LinuxTaskController).
+
+Thanks Karthikeyan for helping in testing.
+
+test-patch and ant test passed on local machine, except TestHdfsProxy., I dither, I preferred both 'unique' and 'parent' prefixes for CacheStatus.parentDir, so I renamed it to be CacheStatus.uniqueParentDir... no other changes. *grazing at my navel*, Forgot --no-prefix, Patch looks fine to me., Patch for trunk, with changes done in task-controller.c, Amarsri,  Vinod and I discussed the trunk patch a bit. The current implementation attempts to work as follows:
+- Before task launch, the task controller is launched to secure localized cache files. Previously, all files under $mapred-local-dir/$user/taskTracker/archive were secured. Obviously, we are trying to fix that in the context of this JIRA.
+- The patch lists the directories under $mapred-local-dir/$user/taskTracker/archive, (which after MAPREDUCE-1098, is the list of random id directories that were localized).
+- For each directory, if the path is not already secured, it secures it recursively.
+
+This approach has a race condition that we identified:
+- Say a task has localized a file and has launched the task controller to secure the path, and the task controller is currently under operation.
+- In parallel, say another task localized another file into a different random id directory.
+- The task controller could get the random id directory created by the second task when it is listing directories and set permissions for it. However, this directory does not contain fully localized files and hence it would be incompletely localized.
+
+The key problem here is that this approach does not have a real idea of what files were localized by a task as part of the distributed cache. One way to fix that would be to pass the paths to the task controller, as a list of random id directories under $mapred-local-dir/$user/taskTracker/archive that were localized in this task. This is what I suggested in the proposal above. However, there are a few problems with this proposal as well:
+
+- How do we get the list of these paths ? There's currently no way exposed by distributed cache about these files.
+- This could be a huge list, if several tens of files are being localized in a task. How would we transfer all this info to the task-controller ? A huge command line of paths to the task controller could be unmanageable, hit some command line length limits, etc. Other approaches (like transferring the info through a file) would also be cumbersome.
+- It could result in duplicate work. Say if two tasks running in parallel are sharing a file, both of them would get the random id directory to secure, and both would try and secure the path.
+
+To solve these problems, I am proposing the following:
+- Change the directory structure for localized cache files as: $mapred-local-dir/$user/taskTracker/archive/$task-id, where task-id is for the task attempt on behalf of which localization is happening. Note that a task could use localized files that have already been localized for another task-id. Since a cache entry stores the full path for a cache key, it can retrieve this information.
+- Move securing the cache file path in the same code path as where localization of the cache files happens.
+
+The last point is actually important in this new proposal, because without that, we might have a situation that a task could use files that have been localized by a prior task-id, but is not yet secured. And if we don't wait for that, we would have incompletely secured cache files in use.
+
+One drawback I can think of this approach is that the new task-id directory in the path might give a wrong impression that the files localized under it are all the files used by the task in distributed cache. But clearly, files localized under other task-ids could be used as well.
+
+Comments on this proposal ?, bq. Move securing the cache file path in the same code path as where localization of the cache files happens.
+We should do this for the correctness part, as Hemanth pointed out. 
+
+Hemanth, if we are doing the above, current directory structure is still fine, right?  We need not introduce task-id in the directory structure. The patch will be replacing current FileUtil.chmod call with the call to TaskController.  Does it make sense?, I was concerned that this will actually result in a process launch for the task-controller for every localized URI. However, I realized that even pre-HADOOP-4490, there was a process launch because a chmod was done on the localized file. Given that, I am OK with this proposal. I would recommend we run some reasonable benchmarks (say a job with lots of files in distributed cache) with and without the patch a couple of times to see if there's any impact due to this change., Patch for review, implementing the proposal., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12428158/patch-1186-2.txt
+  against trunk revision 891111.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/203/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/203/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/203/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/203/console
+
+This message is automatically generated., Some feedback:
+
+- I would like to keep the call for cleanupStorage in TaskTracker.initialize(). It helps in cases of abrupt TT shutdown. Admittedly, it may not be fully effective - because we would not be able to cleanup files like we do in MAPREDUCE-896 (i.e. using the task-controller's help). Still, it would cleanup whatever it can and that would be a considerable amount of space under normal conditions, I think.
+- In TrackerDistributedCacheManager.localizeCache where we construct DistributedCacheContext, I think it makes sense to just call conf.get(JobContext.USER_NAME) rather than building a new JobConf object for this one value.
+- Should we rename DistributedCacheContext to DistributedCacheFileContext, as it is operating on only one file ? Same for TaskController.initializeDistributedCache - change to initializeDistributedCacheFile. Likewise in C code as well.
+- Document DistributedCacheContext mentioning what it is useful for.
+- Store the uniqueDir as a Path object instead of a string. This is consistent with our using higher level objects like File in the Contexts.
+- Remove LOG.info print in DefaultTaskController.initializeDistributedCache. Instead have a LOG.warn in the exception handler.
+- Guard the Debug logs using LOG.isDebugEnabled.
+- Do not send full paths (as given in localizedUniqueDir) to task-controller. This is for security purposes to prevent people from sending random paths and getting permissions changed as a hack. Instead, we *hardcode* the path construction as much as possible inside the task-controller. For e.g. in this case, if we send the selected base directory (mapred-local-dir), user and random-id, we can easily construct the full path from the pattern such as $mapred-local-dir/taskTracker/$user/distcache/$random-id. This is just another safeguard in case the task-controller is compromised somehow. This naturally means the C code changes a bit as well, so the code will need to construct the path in initialize_distributed_cache and then call secure_path. Please follow the pattern we use in other methods of task-controller while doing this. Specifically:
+-- We need to validate that the passed in mapred-local-dir is valid. Please take a look at check_tt_root
+-- We also need to construct the path using methods like concatenate. Please take a look at get_attempt_directory for an example.
+- It would be very helpful to add a comment on why testDeleteCache needs to override configuration to set a single mapred local dir.
+- I would like to see a regression test for this, that ensures that file permissions are being set only for the file being localized. So can we do something like this ? Localize a file. After localization is complete, create a file under the directory where the file is localized and ensure that it has permissions different from what is set by default. Then, localize another file. After checking that the second file has the right permissions, verify that the file created after the first localization has the permissions you set and not the default permissions. This should work for both the LinuxTaskController case and the default case. 
+
+Also, I would just like you to watch for changes in MAPREDUCE-896, which I suspect will most likely clash with this patch. So, some merge may be required., Patch incorporating almost all of review comments, except the following two.
+
+bq. I would like to keep the call for cleanupStorage in TaskTracker.initialize(). 
+Currently, delete for the local directories happens in two places in initialize(). I removed the second one which is essentailly a no-op earlier. But now it would delete directories after task-controller's setup.
+
+bq.  Remove LOG.info print in DefaultTaskController.initializeDistributedCache. Instead have a LOG.warn in the exception handler.
+I have retained LOG.info statement, it would be helpful in debugging. 
+
+, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12428892/patch-1186-3.txt
+  against trunk revision 893469.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/340/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/340/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/340/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/340/console
+
+This message is automatically generated., This is getting close. I do have some feedback though:
+
+- In the same line as removing the dead call to cleanupStorage(), should we also remove the call to this.distributedCacheManager.purgeCache() ?
+- I don't think we need to convert the random number to a positive number. Doing so actually increases the chances our random numbers could clash with previous calls. Offline, I actually just found out why you did this (*smile*). So, let's fix the other issue by passing an escape sequence for the negative number to the task controller.
+- Should we move the logic to construct the full path to the distributed cache file into DistributedCacheFileContext, in some method like getLocalizedUniqueDirectory ?
+- Previously we were setting ugo+rx for distributed cache files. In DefaultTaskController, we are changing this to only execute. I suggest we not change this. Any reason for doing so ?
+- Rename TaskCommands.INITIALIZE_DISTRIBUTEDCACHE also to TaskCommands.INITIALIZE_DISTRIBUTEDCACHEFILE.
+- localized_unique_dir in task-controller.c should be freed to release memory.
+- Instead of using the 'failed' variable as a boolean, I think you can directly set 'failed' to INITIALIZE_DISTCACHE_FAILED and return it.
+- Please add documentation to describe testCustomPermissions.
+- In testCustomPermissions, delete the hand created file in a finally block to handle cleanup during unexpected failures. , With public and private visibilities introduced for distributed cache files(through MAPREDUCE-744), the implementation for setting permissions for localized files changes in the following way:
+1. Localized public files can have read and execute permissions for all the users, recursively on localized dir (Current DefaultTaskController's code)
+2. Localized private files,
+    a. With DefaultTaskController, can have recursive execute permission on the localized dir (Pre HADOOP-4490 code).
+    b. With LinuxTaskController, owner is the user, group owner is TT, and the permissions are r_xrws___ on the localized dir(Current LinuxTaskController's code).
+
+1 and 2(a) are different, because if the user has not give permissions for others(i.e. private files), I think we should not give permissions for all.
+
+Thoughts, I originally thought if 2a and 2b should be the same, except that ownership would be different if the DefaultTaskController is used. However, since we do not enforce exclusive group ownership for the TT in the DefaultTaskController case, we might end up opening the group permissions on localized files and make it less private than Amarsri's proposal.
+
+So, I am +1 for the proposal above., Patch with suggested proposal and incorporating review comments., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12429424/patch-1186-4.txt
+  against trunk revision 895914.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/355/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/355/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/355/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/355/console
+
+This message is automatically generated., Test timeout for TestEmptyJob is not related to the patch. 
+Looking at the console log, I could see jetty problem. It timed out because tracker could not come up (see HADOOP-4744). The corresponding console log:
+{noformat}
+     [exec]     [junit] 2010-01-05 07:00:33,128 INFO  http.HttpServer (HttpServer.java:start(435)) - Port returned by webServer.getConnectors()[0].getLocalPort() before open() is -1. Opening the listener on 0
+     [exec]     [junit] 2010-01-05 07:00:33,128 INFO  http.HttpServer (HttpServer.java:start(440)) - listener.getLocalPort() returned 60202 webServer.getConnectors()[0].getLocalPort() returned 60202
+     [exec]     [junit] 2010-01-05 07:00:33,129 INFO  http.HttpServer (HttpServer.java:start(473)) - Jetty bound to port 60202
+     [exec]     [junit] 82779 [main] INFO org.mortbay.log - jetty-6.1.14
+     [exec]     [junit] 2010-01-05 07:00:33,146 INFO  net.NetworkTopology (NetworkTopology.java:add(327)) - Adding a new node: /default-rack/host0.foo.com
+     [exec]     [junit] 2010-01-05 07:00:33,148 INFO  mapred.JobTracker (JobTracker.java:addNewTracker(2180)) - Adding tracker tracker_host0.foo.com:localhost/127.0.0.1:36038 to host host0.foo.com
+     [exec]     [junit] 2010-01-05 07:00:33,150 ERROR mapred.TaskTracker (TaskTracker.java:offerService(1360)) - Caught exception: java.io.IOException: Jetty problem. Jetty didn't bind to a valid port
+     [exec]     [junit] 	at org.apache.hadoop.mapred.TaskTracker.checkJettyPort(TaskTracker.java:1180)
+     [exec]     [junit] 	at org.apache.hadoop.mapred.TaskTracker.offerService(TaskTracker.java:1338)
+     [exec]     [junit] 	at org.apache.hadoop.mapred.TaskTracker.run(TaskTracker.java:2037)
+     [exec]     [junit] 	at org.apache.hadoop.mapred.MiniMRCluster$TaskTrackerRunner.run(MiniMRCluster.java:207)
+     [exec]     [junit] 	at java.lang.Thread.run(Thread.java:619)
+     [exec]     [junit] 
+     [exec]     [junit] 2010-01-05 07:00:33,152 INFO  mapred.TaskTracker (TaskTracker.java:run(755)) - Shutting down: Map-events fetcher for all reduce tasks on tracker_host0.foo.com:localhost/127.0.0.1:36038
+{noformat}, The same test passed on my machine., Two minor nits before this is good to go:
+
+- I would recommend we pull out the new code that sets up permission in TrackerDistributedCacheManager into a separate method. localizeCache seems big enough to split
+- I also think a test case that verifies permissions are only set for newly localized *public* files is required for completeness of testing., Patch with comments incorporated., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12429517/patch-1186-5.txt
+  against trunk revision 896265.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/359/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/359/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/359/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/359/console
+
+This message is automatically generated., +1 for the changes. I will commit this., I committed this to trunk. Thanks, Amareshwari !, Integrated in Hadoop-Mapreduce-trunk #198 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Mapreduce-trunk/198/])
+    . Modified code in distributed cache to set permissions only on required set of localized paths. Contributed by Amareshwari Sriramadasu.
+, Does this change mean that we cannot package a bunch of python scripts into a zip/jar file, and let hadoop unpack them and run it?
+, No, the unjarred/unzipped files in DistributedCache will have the x bit set, this jira was only about not chmod'ing more files than required., An updated version of the patch for earlier version of hadoop. Not for commit here.]

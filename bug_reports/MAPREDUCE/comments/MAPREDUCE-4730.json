@@ -1,0 +1,172 @@
+[Here's what I have gathered so far from a heap dump of an AM attempt that was just about to run out of memory.  Most of the memory was consumed by byte buffers, specifically it looked like most of them were RPC response buffers.
+
+I think there might be a flow control issue in the IPC layer that lead to this.  More than half of the mappers finished before the first reducer started, and thousands of reducers all launched within a few seconds of each other.  They all asked the AM for map completion task events, which currently caps the response to 10000 events per query.  Since more than 10000 maps completed before the first reducers started, each reducer saw a full event list which took around 900K for each response buffer.  There were many IPC Handler threads to service the calls, but only one Responder thread to send out the rather large response buffers.  I see there's a blocking queue to prevent too many calls from coming in at once, but I didn't see any flow control between the Handlers and the Responder thread.  It appears that as long as the Handler threads can keep up with call queue relatively low, they can continue to queue up call response data faster than the Responder thread can send it out.  Eventually this will exhaust available memory leading to an OOM., A little more digging and I'm a bit more confident that this is a flow control problem in the IPC layer.  I think the scenario goes like this:
+
+# 1000's of reducers start asking for map completion events about the same time
+# IPC Server.Handler thread fields a call off the queue, makes the call and gets 900K of data
+# Handler thread queues up the response data to the connection, likely sees its the only thing in the queue, and tries to push out the data
+# It's too big to send it all without blocking so it pushes the remainder back onto the response queue for the Responder thread to deal with and moves on to another call from the call queue
+# Lots of reducers are queueing up in the call queue to get their 900K of data, and the handler threads are processing them and pushing that data on the response queues as fast as they can
+# Responder thread and/or socket I/O can't keep pace with the rate at which handlers are generating 900K responses and we eventually exhaust memory
+
+, Patch to lower the number of map completion events reducers ask for at a time from 10000 to 500.  This is a short-term fix to allow 20x the number of reducers to run in the same IPC response footprint as before.
+
+Ran a sleep job test with 20000 mappers and 3000 reducers with the fix, and it was able to complete with a standard AM size (1.5GB slot)., Filed HADOOP-8942 to track the lack of flow control in the server IPC., The patch is simple enough if Jenkins comes back OK I am a +1 on it., Great analysis! 900K * 3000 reducers = 2.7GB, so the numbers are adding up.
+
+Instead of hard-coding it, each reducer could base it on the total number of reducers for the job (from configuration)?, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12549736/MAPREDUCE-4730.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2939//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2939//console
+
+This message is automatically generated., Also, lessening it has performance implications on small jobs (not sure how much) given the fetcher loop runs every 1 second irrespective of whether there are more events or not. So, hate to propose it, but shall we add in a config to override this?, Is the 1 second sleep necessary?  Seems like we could eliminate that sleep if we got a maximum-sized response?, I think immediately turning around and asking for the next MAX_EVENTS maps if we just received MAX_EVENTS entries would be a straightforward way to eliminate the sleep penalty.  Unfortunately I don't think that will work all the time due to another bug where the caller can receive less than MAX_EVENTS entries even though that many entries were processed during the call.
+
+TaskAttemptListenerImpl is calling Job.getTaskAttemptCompletionEvents with the same fromEvent and maxEvents passed in from the reducer but is then filtering the result for just map events.  This means that even though we receive maxEvents in completion events the caller could see less than that if there are one or more reducer completion event mixed in there.  Worse, if all of the events are reducer events then zero events will be reported back to the caller and it won't bump up fromEvent on the next call.  Reducer never makes progress and we're toast.  This could happen in a case where all maps complete, more than MAX_EVENTS reducers complete, but some straggling reducers get fetch failures and cause a map to be restarted.  This is less likely to occur with an ask size of 10000 since you'd have to have 10000 reducers complete in a row, but it's more likely with an ask size of 500., Filed MAPREDUCE-4733 to track the filtering/windowing issue in TaskAttemptListenerImpl.getMapCompletionEvents, bq. Seems like we could eliminate that sleep if we got a maximum-sized response?
++1., New patch that attempts to scale the maximum number of events a reducer will ask for per RPC call based on some fuzzy numbers.  It still keeps maxEventsToFetch between 100 and 10000 to avoid extremes.
+
+Since events appear to be just a little under 100 bytes each, the patch currently targets around 300MB of memory on the AM for RPC response processing.  This can still be exceeded given enough reducers, but the user should be able to bump up the AM memory size at that point and buy quite a bit more reducers.
+
+This patch also implements the do-not-wait-if-we-got-a-full-response logic to avoid wasting time while trying to fetch all the completion events.
+
+Still need to do some testing at scale, but quick touch-testing on a single-node cluster seems to work so putting it out there for comment and Jenkins., Note that this change can cause the bug described in MAPREDUCE-4733 to becomes much more prevalent as that bug manifests much easier as maxEventsToFetch becomes smaller., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12549805/MAPREDUCE-4730.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated -4 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2945//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2945//console
+
+This message is automatically generated., Update on testing, I was able to test this (along with the fix for MAPREDUCE-4733) using a sleep job with 20000 maps and 3000 reduces on a cluster big enough to mass-launch the map and reduce phases.  The AM with a 1.5GB slot size stayed up during the job, where previously it failed even with a larger slot.
+
+The only issue I ran into was a significant number of maps and reduces failed because they timed out trying to establish a connection to the AM.  I suspected the AM could have been busy garbage collecting and causing the delays, so I bumped up the AM size to 3G and it ran smoothly with no connection timeout failures from any tasks., Patch looks good.
+
+Can you try writing a simple test for EventFetcher? You can mock umbilicalProtocol, shuffleScheduler and reporter I suppose. Then you can validate your current change also. Let me know if it becomes too cumbersome.
+
+bq. The only issue I ran into was a significant number of maps and reduces failed because they timed out trying to establish a connection to the AM.
+This is new. I don't remember us running into it when we ran AMScalability. Can you file a bug, more details will be great to have., Thanks for the review, Vinod.  I'll work on a test case for EventFetcher.
+
+bq. I don't remember us running into it when we ran AMScalability. Can you file a bug, more details will be great to have.
+
+I'll run the test case again and see if I can get more details on what is causing the connect timeouts for tasks when they are launched en-masse.  Is AMScalability capable of emulating the kind of simultaneous connect storm that a large cluster will exhibit?, I was thinking that the connection timeouts are unrelated to HADOOP-8942.
+
+You are right, AMScalability only runs maps, so there is no chance to uncover this issue.
+
+Are these socket timeout exceptions? I remember running into those with gridmix, but never got around to the bottom of that because of more pressing concerns., Yes, these are socket timeout exceptions.  The timeouts are somewhat related to HADOOP-8942 in the sense that when the AM heap starts to fill up from buffering all those responses, it will spend more time garbage collecting and enough garbage collecting leads to unresponsiveness and ultimately timeouts on some of the clients., Added a test case for the EventFetcher that verifies it now immediately asks for events as long as it received a max response., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12550687/MAPREDUCE-4730.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2965//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2965//console
+
+This message is automatically generated., Neat test case!
+
++1, checking this in., I just committed this to trunk, branch-2 and branch-0.23. Thanks Jason!, Integrated in Hadoop-trunk-Commit #2925 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/2925/])
+    MAPREDUCE-4730. Fix Reducer's EventFetcher to scale the map-completion requests slowly to avoid HADOOP-8942. Contributed by Jason Lowe. (Revision 1401941)
+
+     Result = SUCCESS
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1401941
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/task/reduce/EventFetcher.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/task/reduce/Shuffle.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/task/reduce/TestEventFetcher.java
+, Integrated in Hadoop-Yarn-trunk #16 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/16/])
+    MAPREDUCE-4730. Fix Reducer's EventFetcher to scale the map-completion requests slowly to avoid HADOOP-8942. Contributed by Jason Lowe. (Revision 1401941)
+
+     Result = SUCCESS
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1401941
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/task/reduce/EventFetcher.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/task/reduce/Shuffle.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/task/reduce/TestEventFetcher.java
+, Integrated in Hadoop-Hdfs-0.23-Build #415 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/415/])
+    MAPREDUCE-4730. Fix Reducer's EventFetcher to scale the map-completion requests slowly to avoid HADOOP-8942. Contributed by Jason Lowe.
+svn merge --ignore-ancestry -c 1401941 ../../trunk/ (Revision 1401943)
+
+     Result = SUCCESS
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1401943
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/task/reduce/EventFetcher.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/task/reduce/Shuffle.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/task/reduce/TestEventFetcher.java
+, Integrated in Hadoop-Hdfs-trunk #1206 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1206/])
+    MAPREDUCE-4730. Fix Reducer's EventFetcher to scale the map-completion requests slowly to avoid HADOOP-8942. Contributed by Jason Lowe. (Revision 1401941)
+
+     Result = SUCCESS
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1401941
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/task/reduce/EventFetcher.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/task/reduce/Shuffle.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/task/reduce/TestEventFetcher.java
+, Integrated in Hadoop-Mapreduce-trunk #1236 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1236/])
+    MAPREDUCE-4730. Fix Reducer's EventFetcher to scale the map-completion requests slowly to avoid HADOOP-8942. Contributed by Jason Lowe. (Revision 1401941)
+
+     Result = FAILURE
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1401941
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/task/reduce/EventFetcher.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/task/reduce/Shuffle.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/task/reduce/TestEventFetcher.java
+]

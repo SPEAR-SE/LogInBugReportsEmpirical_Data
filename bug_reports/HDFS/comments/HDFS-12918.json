@@ -1,0 +1,111 @@
+[I can take a look at this if you haven't already started to work on the patch. Please let me know., [~manojg] thanks, we encountered this during testing.  I wasn't planning on creating a patch as we're not blocked but it looks like a simple enough fix., [~zamsden],
+  There is an addendum patch HDFS-12682 after HDFS-12258 to make the policy immutable by pulling the EC state to {{ErasureCodingPolicyInfo}}. As you pointed out {{hdfs.proto}} default value looks wrong to me as well. But, in the PBHelperClient code there is an explicit handling for this, both while saving the ECPolicy and while retrieving.  So, ECPI saved and retrieved from FSImages should be right. 
+
+{{PBHelperClient}}
+{noformat}
+  /**
+   * Convert the protobuf to a {@link ErasureCodingPolicyInfo}. This should only
+   * be needed when the caller is interested in the state of the policy.
+   */
+  public static ErasureCodingPolicyInfo convertErasureCodingPolicyInfo(
+      ErasureCodingPolicyProto proto) {
+    ErasureCodingPolicy policy = convertErasureCodingPolicy(proto);
+    ErasureCodingPolicyInfo info = new ErasureCodingPolicyInfo(policy);
+    Preconditions.checkArgument(proto.hasState(),
+        "Missing state field in ErasureCodingPolicy proto");
+    info.setState(convertECState(proto.getState()));  <====
+    return info;
+  }
+
+  /**
+   * Convert a {@link ErasureCodingPolicyInfo} to protobuf.
+   * The protobuf will have the policy, and state. State is relevant when:
+   * 1. Persisting a policy to fsimage
+   * 2. Returning the policy to the RPC call
+   * {@link DistributedFileSystem#getAllErasureCodingPolicies()}
+   */
+  public static ErasureCodingPolicyProto convertErasureCodingPolicy(
+      ErasureCodingPolicyInfo info) {
+    final ErasureCodingPolicyProto.Builder builder =
+        createECPolicyProtoBuilder(info.getPolicy());
+    builder.setState(convertECState(info.getState()));  <===
+    return builder.build();
+  }
+
+{noformat}
+
+Listing Policies:
+{noformat}
+$ hdfs ec -listPolicies
+Erasure Coding Policies:
+ErasureCodingPolicy=[Name=RS-10-4-1024k, Schema=[ECSchema=[Codec=rs, numDataUnits=10, numParityUnits=4]], CellSize=1048576, Id=5], State=DISABLED
+ErasureCodingPolicy=[Name=RS-3-2-1024k, Schema=[ECSchema=[Codec=rs, numDataUnits=3, numParityUnits=2]], CellSize=1048576, Id=2], State=ENABLED
+ErasureCodingPolicy=[Name=RS-6-3-1024k, Schema=[ECSchema=[Codec=rs, numDataUnits=6, numParityUnits=3]], CellSize=1048576, Id=1], State=ENABLED
+ErasureCodingPolicy=[Name=RS-LEGACY-6-3-1024k, Schema=[ECSchema=[Codec=rs-legacy, numDataUnits=6, numParityUnits=3]], CellSize=1048576, Id=3], State=DISABLED
+ErasureCodingPolicy=[Name=XOR-2-1-1024k, Schema=[ECSchema=[Codec=xor, numDataUnits=2, numParityUnits=1]], CellSize=1048576, Id=4], State=DISABLED
+{noformat}
+
+But, there is another version of {{convertErasureCodingPolicy}} which takes in only {{ErasureCodingPolicy}} where the state is missing and the default  state from {{ErasureCodingPolicyProto}} will be used.
+
+{noformat}
+  /**
+   * Convert a {@link ErasureCodingPolicy} to protobuf.
+   * This means no state of the policy will be set on the protobuf.
+   */
+  public static ErasureCodingPolicyProto convertErasureCodingPolicy(
+      ErasureCodingPolicy policy) {
+    return createECPolicyProtoBuilder(policy).build();
+  }
+{noformat}
+
+Probably you are seeing the default value of the EC state from the callers (like ListStatus, BlockRecovery, BlockGroupChecksum etc.,) of the above convert util. Can you please confirm where you are seeing the inconsistent EC state? , Thanks Zach for reporting this and Manoj for investigating.
+
+As Manoj pointed out, I found this too while fixing HDFS-12682. Although it is a mistake there, it was not changed due to the fear of incompatible behavior, when discussing whether that should be set to 'DISABLED'. 
+
+According to [protobuf doc|https://developers.google.com/protocol-buffers/docs/proto#optional]: {{If the default value is not specified for an optional element, a type-specific default value is used instead...For enums, the default value is the first value listed in the enum's type definition}}.
+
+I think we check whether a state is set in the protobuf by {{proto.hasState()}}, so this wrong default shouldn't be visible downstream - so also echoing Manoj: where is this observed?, 
+A new check added in the convert seems to be not backward compatible. It is going to break the upgrade from previous image format where the ErasureCodingPolicyProto didn't have state field. It is suppose to be an optional field and the below check need to be relaxed as well. [~xiaochen] your thoughts please?
+
+{noformat}
+  /**
+   * Convert the protobuf to a {@link ErasureCodingPolicyInfo}. This should only
+   * be needed when the caller is interested in the state of the policy.
+   */
+  public static ErasureCodingPolicyInfo convertErasureCodingPolicyInfo(
+      ErasureCodingPolicyProto proto) {
+    ErasureCodingPolicy policy = convertErasureCodingPolicy(proto);
+    ErasureCodingPolicyInfo info = new ErasureCodingPolicyInfo(policy);
+    Preconditions.checkArgument(proto.hasState(),    <======
+        "Missing state field in ErasureCodingPolicy proto");
+    info.setState(convertECState(proto.getState()));
+    return info;
+  }
+{noformat}
+, Maybe that is the real bug then.  I got this exception when upgrading an existing HDFS cluster - reformatting was required:
+
+
+{noformat}
+Failed to load image from FSImageFile(file=/data/2/dfs/nn/current/fsimage_0000000000008728887, cpktTxId=0000000000008728887)
+java.lang.IllegalArgumentException: Missing state field in ErasureCodingPolicy proto
+	at com.google.common.base.Preconditions.checkArgument(Preconditions.java:88)
+	at org.apache.hadoop.hdfs.protocolPB.PBHelperClient.convertErasureCodingPolicyInfo(PBHelperClient.java:2973)
+	at org.apache.hadoop.hdfs.server.namenode.FSImageFormatProtobuf$Loader.loadErasureCodingSection(FSImageFormatProtobuf.java:386)
+	at org.apache.hadoop.hdfs.server.namenode.FSImageFormatProtobuf$Loader.loadInternal(FSImageFormatProtobuf.java:298)
+	at org.apache.hadoop.hdfs.server.namenode.FSImageFormatProtobuf$Loader.load(FSImageFormatProtobuf.java:188)
+	at org.apache.hadoop.hdfs.server.namenode.FSImageFormat$LoaderDelegator.load(FSImageFormat.java:227)
+	at org.apache.hadoop.hdfs.server.namenode.FSImage.loadFSImage(FSImage.java:928)
+	at org.apache.hadoop.hdfs.server.namenode.FSImage.loadFSImage(FSImage.java:912)
+	at org.apache.hadoop.hdfs.server.namenode.FSImage.loadFSImageFile(FSImage.java:785)
+	at org.apache.hadoop.hdfs.server.namenode.FSImage.loadFSImage(FSImage.java:719)
+	at org.apache.hadoop.hdfs.server.namenode.FSImage.recoverTransitionRead(FSImage.java:317)
+	at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.loadFSImage(FSNamesystem.java:1072)
+	at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.loadFromDisk(FSNamesystem.java:704)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.loadNamesystem(NameNode.java:665)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.initialize(NameNode.java:727)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.<init>(NameNode.java:950)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.<init>(NameNode.java:929)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.createNameNode(NameNode.java:1653)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.main(NameNode.java:1720)
+{noformat}
+, We have an upgrade incompatible fix landed in 3.0 at e565b5277d5b890dad107fe85e295a3907e4bfc1. The fix is necessary and it verifies the EC Policy state when loading FSImage. This issue is nothing to do with the default value for the ECPolicyState field in the ErasureCodingPolicyProto. While the ECPolicyState field is optional in ECPolocyProto message for over the wire communications, but its mandatory in FSImage for the EC files. I hope the upgrade incompatible changes before the 3.0 GA are ok. Please let me know if you have other thoughts. ]

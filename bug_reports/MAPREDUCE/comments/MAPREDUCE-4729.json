@@ -1,0 +1,163 @@
+[That is a bit odd.  The only thing I can think of is that the jhist files from the previous runs were corrupted some how.  The way we have set things up on the AM an OOM will shut things down very hard with no time for cleanup, so the end of the file may have had some issues. This is just speculation. , IIRC, The AM recovery is tolerant to corrupted records towards the end of file.
+
+Thomas, can you look at the history files directly and see if AMStarted events are getting correctly logged in each generation? Each Job Attempt should have AMStarted events from all the previous generations., The jobhistory file itself only has one AM_STARTED event which is for the 4th attempt. So it must be the jhist file is getting lost of corrupt from the other attempts somehow., It looks like we retain the history files from all attempts, did you look at them all? Also, please see if you find this log in any of the AM attempts:
+{code}
+"Got an error parsing job-history file " + historyFile + ", ignoring incomplete events."
+{code}, Ok, so I figured this out.  The job is using output format org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.PigOutputFormat, which has the OutputCommitter which is set to null.  This caused the MRAppMaster recoveryService to not start:
+
+ "org.apache.hadoop.mapreduce.v2.app.MRAppMaster: Not starting RecoveryService: recoveryEnabled: true recoverySupportedByCommitter: false ApplicationAttemptID: 4"
+
+Since the recovery service didn't start it didn't parse the old job history files, thus didn't have the list of old AMs. 
+
+I think we should fix that so that even if recovery isn't supported we atleast parse and get the previous AM attempt info., I'm not a pig expert but perhaps we should also follow up with pig team to see if they should support Recovery, bq. I think we should fix that so that even if recovery isn't supported we atleast parse and get the previous AM attempt info.
++1
+
+bq. I'm not a pig expert but perhaps we should also follow up with pig team to see if they should support Recovery
+This is a general issue with all OutputFormats. We need to educate users that they need to start implementing recovery., bq. I think we should fix that so that even if recovery isn't supported we atleast parse and get the previous AM attempt info.
+Attached patch does this., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12551662/MAPREDUCE-4729-20121031.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2974//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2974//console
+
+This message is automatically generated., The patch looks good to me.  I like how we short circuit the reading of the history file because we know that what we want to read is in a single chunk. However, I am a bit conflicted about where the parsing of the job history file is happening.  I kind of feel that it should go in the recovery service. In this case we are only doing a partial recovery, not a full recovery.  I can see in the future we would want to add in other things to the partial recovery, like when/if we add in a summary of the history file for fast reading it would be nice to propagate that to the next file no matter what happens so that the history server can show a full view of what is happened in the application.  But, I am fine with it the way it is and if you feel strongly the other way feel free to check it in as is +1. , I tried testing the patch with a sleep job using -Dyarn.app.mapreduce.am.job.recovery.enable=false and manually killing the ApplicationMaster with a kill -9, but it didn't work.  The log showed this exception:
+
+{noformat}
+2012-11-01 14:37:01,543 WARN [main] org.apache.hadoop.mapreduce.v2.app.MRAppMaster: Could not parse the old history file. Will not have old AMinfos 
+java.io.IOException: Incompatible event log version: null
+	at org.apache.hadoop.mapreduce.jobhistory.EventReader.<init>(EventReader.java:70)
+	at org.apache.hadoop.mapreduce.v2.app.MRAppMaster.readJustAMInfos(MRAppMaster.java:915)
+	at org.apache.hadoop.mapreduce.v2.app.MRAppMaster.start(MRAppMaster.java:846)
+	at org.apache.hadoop.mapreduce.v2.app.MRAppMaster$1.run(MRAppMaster.java:1143)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:396)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1378)
+	at org.apache.hadoop.mapreduce.v2.app.MRAppMaster.initAndStartAppMaster(MRAppMaster.java:1139)
+	at org.apache.hadoop.mapreduce.v2.app.MRAppMaster.main(MRAppMaster.java:1098)
+{noformat}
+
+It looks like the AM is buffering the history file output, and we didn't flush out the AMInfos from previous runs.  When I used a normal kill instead of kill -9, it worked.  We will want to flush/sync the job history file after writing the AMInfos to help guard against unclean teardowns losing prior AM attempts in the history.  This can be fixed in a separate JIRA if we don't want to fix it here.
+
+Couple of other comments on the patch:
+* Application attempts start from 1 instead of 0, so the first attempt tries to recover AMInfos when it shouldn't and leads to a large FileNotFoundException stacktrace being logged
+* Nit: In RecoveryService.parse there's an extra space logged before a comma.  {{LOG.info("Got an error parsing job-history file "}} should be {{LOG.info("Got an error parsing job-history file"}}
+* Nit: The body of the while loop in readJustAMInfos could be a bit cleaner with fewer conditionals.  For example:
+{code}
+      while ((event = jobHistoryEventReader.getNextEvent()) != null) {
+        if (event.getEventType() == EventType.AM_STARTED) {
+          amStartedEventsBegan = true;
+          AMStartedEvent amStartedEvent = (AMStartedEvent) event;
+          amInfos.add(MRBuilderUtils.newAMInfo(
+            amStartedEvent.getAppAttemptId(), amStartedEvent.getStartTime(),
+            amStartedEvent.getContainerId(),
+            StringInterner.weakIntern(amStartedEvent.getNodeManagerHost()),
+            amStartedEvent.getNodeManagerPort(),
+            amStartedEvent.getNodeManagerHttpPort()));
+        } else if (amStartedEventsBegan) {
+          // This means AMStartedEvents began and this event is a
+          // non-AMStarted event.
+          // No need to continue reading all the other events.
+          break;
+        }
+      }
+{code}, bq.  However, I am a bit conflicted about where the parsing of the job history file is happening. I kind of feel that it should go in the recovery service.
+I am not sure either ways but RecoveryService is wired into the AppMaster and is selected dynamically depending on whether recovery is enabled or not. We can rewire this, but that's a slightly bigger change. I'd like to keep this as is., Thanks for testing this Jason. And for the comments too.
+
+bq. We will want to flush/sync the job history file after writing the AMInfos to help guard against unclean teardowns losing prior AM attempts in the history.
+Wanted to this, but ran into couple more not so critical bugs - setupEventWriter() is getting called for all AMStarted events! Let's fix both in a separate ticket.
+
+Fixed the other issues. Good catch on the AttemptId part., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12551761/MAPREDUCE-4729-20121101.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2980//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2980//console
+
+This message is automatically generated., +1, will commit shortly.  Filed MAPREDUCE-4767 to track the lack of flushing for AMInfo records., Thanks, Vinod!  I commmitted this to trunk, branch-2, and branch-0.23., Integrated in Hadoop-trunk-Commit #2949 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/2949/])
+    MAPREDUCE-4729. job history UI not showing all job attempts. Contributed by Vinod Kumar Vavilapalli (Revision 1404817)
+
+     Result = SUCCESS
+jlowe : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1404817
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/recover/RecoveryService.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestAMInfos.java
+, Integrated in Hadoop-Yarn-trunk #24 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/24/])
+    MAPREDUCE-4729. job history UI not showing all job attempts. Contributed by Vinod Kumar Vavilapalli (Revision 1404817)
+
+     Result = SUCCESS
+jlowe : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1404817
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/recover/RecoveryService.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestAMInfos.java
+, Integrated in Hadoop-Hdfs-0.23-Build #423 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/423/])
+    svn merge -c 1404817 FIXES: MAPREDUCE-4729. job history UI not showing all job attempts. Contributed by Vinod Kumar Vavilapalli (Revision 1404825)
+
+     Result = SUCCESS
+jlowe : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1404825
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/recover/RecoveryService.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestAMInfos.java
+, Integrated in Hadoop-Hdfs-trunk #1214 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1214/])
+    MAPREDUCE-4729. job history UI not showing all job attempts. Contributed by Vinod Kumar Vavilapalli (Revision 1404817)
+
+     Result = FAILURE
+jlowe : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1404817
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/recover/RecoveryService.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestAMInfos.java
+, Integrated in Hadoop-Mapreduce-trunk #1244 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1244/])
+    MAPREDUCE-4729. job history UI not showing all job attempts. Contributed by Vinod Kumar Vavilapalli (Revision 1404817)
+
+     Result = FAILURE
+jlowe : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1404817
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/recover/RecoveryService.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/TestAMInfos.java
+]

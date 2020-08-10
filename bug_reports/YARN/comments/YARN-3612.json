@@ -1,0 +1,154 @@
+[Thanks Todd! I think this is a result of the resource calculation done in the task's updateResourceCounters() which is continuously called to send progress update.
+
+One option is to optionally disable the use of the ResourceCalculatorPlugin in the task, which will get rid of this overhead. Looking into the code, seems that the ResourceCalculatorPlugin is only used in the task to update CPU_MILLISECONDS, PHYSICAL_MEMORY_BYTES and VIRTUAL_MEMORY_BYTES counters which are only referenced in TestTTResourceReporting., Here is a patch that adds this option of disabling the use of  ResourceCalculatorPlugin in the task. I have confirmed that this change doesn't affect TestTTResourceReporting., I agree that it's just those counters that are getting set by this code path. But, they're useful counters. So while it's nice to be able to disable it for a speed boost, I think we should also look into whether there is any more efficient way we can provide those counters. Does anyone have an idea about this?
+
+Lacking a more efficient way of determining your child process hierarchy, we could probably do some optimization on the code to filter out the tasks that are actually opened and looked at, eg:
+- only look at directories in /proc which are owned by the current user
+- only look at directories which were created more recently than the current pid's directory
+- for each pid, cache its creation time, and if you've already looked at that pid, don't look at it again in the next iteration of the plugin.
+
+I imagine with the above optimizations we could get the overhead down to 1-2%.
+
+As for the patch itself, the config naming isn't very clear. In my version I called the same config "mapred.task.calculate.resource.usage" -- to indicate that it's a boolean flag, not a class name., I agree Todd, thanks! Another simpler alternative to the patch I uploaded above can be to optionally only report these resource counters at the end, instead of calculating and reporting them with every update. I agree that having a continuous update of these counters is more useful, but I adding an option to only report them at the end can be a good compromise too. What do you think?, The problem with only doing it at the end is that jobs like streaming then won't account their child processes. At the end of the task, the streaming child process already exited.
+
+If we only want to count our own usage (and not our child hierarchy), then we could avoid this whole complication and just read stats from /proc/self/stat., I meant when the task is done. So currently these counters' updates are done from two locations: continuously from the communication thread run(), and then only once at the end from the done() method. So we can optionally disable the continuous calls from the communication thread which constitutes the main overhead.
+
+getPhysicalMemorySize(), getVirtualMemorySize() and getCumulativeCpuTime() in ResourceCalculatorPlugin obtains the cumulative value for the current process tree, so when this is called from the done, it should still account for any child processes. Is that correct?, But a streaming task will only finish once its child process (the actual streaming workload) has exited. Thus, it won't be part of the process tree anymore, so it wouldn't be properly accounted., Many thanks Todd! I agree, I looked more into how these values are updated, I thought the streaming process is still accounted for because of the cumulative nature of how these values are calculated. For example, in getCumulativeCpuTime():
+
+{code}
+    cpuTime += incJiffies * JIFFY_LENGTH_IN_MILLIS;
+    return cpuTime;
+{code}
+
+But seems that the pTree and its values are only updated when getProcResourceValues() is called, and it is only called from initialize() and updateResourceCounters() in the Task.
+
+So Basically any resource changes, between two calls of getProcResourceValues(), won't be accounted for.
+
+Since this overhead is happening with every update from the task, what if we add a new configuration property that defines a number of update skips before updating the resource counters. For example, the resource counters will be only updated every 10 updates (by default), but the user can still configure the resolution of these updates through this configuration property. What do you think?, Here is a draft patch implementing what I described in my previous comment., Ahmed, your suggested approach means that in the case of streaming jobs we may lose the info for up to 9 updates (default), right?, Thanks Tucu, It is not just streaming jobs. The approach in the previous patch only calculates and updates resource counters every configurable number of skips (for example 10 skips instead of doing such calculation with every update/hearbeat)., I have also looked into Todd's suggestions above. Here is an updated patch that incorporates further optimization in terms of filtering processes based on their owner and start time, and also cache these excluded processes to avoid recalculation in future calls. Here is the updated patch. I'll be still adding some tests., I finally got time to get back to this patch. Sorry for the delay. Here is the updated version including tests., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12544793/MAPREDUCE-4469_rev4.patch
+  against trunk revision .
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/2846//console
+
+This message is automatically generated., - the two overloads of getProcessOwner are repetitive - you could implement one in terms of the other
+- I'd like to avoid the shell command usages here - forks can be reasonably expensive and also blow up the virtual size of the process tree. Instead, I think it's sufficient to check something like:
+
+{code}
+boolean isPidOwnedByMe(int pid) {
+  File pidDir = new File(procFsDir, String.valueOf(pid));
+  // the environment of a process is only readable by the user
+  // running that process
+  File fileInPidDir = new File(pidDir, "environ");
+  return fileInPidDir.canRead();
+}
+{code}
+
+This wouldn't cause extra forks and I think would have equivalent results, so long as the user running the code isn't root.
+
+----
+
+- excludeList should be named something like {{excludedPids}}
+- The following would be faster using StringUtils.split:
+{code}
+String[] strSplitted = str.split("\\s+");
+{code}
+(since the data is exactly space-delimited, we dont need the full overhead of a regex)
+- Rather than setting the configuration as a number of updates to skip, I think it's better to set an interval at which the data will be re-calculated. Otherwise the value of this configuration is scaled with respect to another configuration (the counter update interval), which gets messy.
+- I'm wondering, if we did the owner exclusion, and we improved the parsing to use StringUtils.split, if it might be fast enough to avoid having to cache the exclusions. Any chance you could run a benchmark? My concern is that the exclusion idea doesn't work when pids get recycled (there are only 64k of them so this happens pretty often), Many thanks Todd for the comments! I'll be investigating these new changes and updating the patch accordingly., If you're looking for a resource usage of a process and its children, look at {{man getrusage}} which includes a flag to get the CPU usage of the children.  Mind you, you'd need native code to get at it., The problem with the getrusage approach is that it only includes terminated children, which means it doesn't track usage as the process progresses.
+
+That said, maybe we really don't care, and we should just tally our own resource usage and then at the time of cleanup, add the children?, Sorry got busy with other stuff in the past period. I'll be uploading the updated patch in the coming few days., Here is the updated patch. Thanks Todd and Phil for your comments! I have updated the patch to get rid of the excludedPids caching which may result in miscalculations due to pid recycling as Todd highlighted. The patch also uses StringUtils.split(). Since getrusage only accounts for terminated children, the updates will be missing important resource usage info for any currently running children which haven't terminated yet, so in my opinion we shouldn't use it. I have also added a time frequency property (in milliseconds instead of skips) determining when the resource usage counters are updated. Please take a look and let me know if you have any comments., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12565910/MAPREDUCE-4469_rev5.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3261//console
+
+This message is automatically generated., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12565910/MAPREDUCE-4469_rev5.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / f1a152c |
+| Console output | https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/5506/console |
+
+
+This message was automatically generated., branch-1 is not getting new fixes, but it looks like {{ProcfsBasedProcessTree}} in trunk could benefit from this same set of optimizations. I'll leave the issue open, in case someone has the time and inclination to rebase it., [~chris.douglas], rebased the patch and moved the JIRA to YARN as code change is primarily there., Moreover, I have not added the config as I do not see anyone disabling it. Thoughts ?, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 39s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 33s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 34s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   0m 51s | The applied patch generated  3 new checkstyle issues (total was 43, now 41). |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 37s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 24s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:green}+1{color} | yarn tests |   1m 57s | Tests passed in hadoop-yarn-common. |
+| | |  38m 34s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12731802/YARN-3612.01.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 4536399 |
+| checkstyle |  https://builds.apache.org/job/PreCommit-YARN-Build/7854/artifact/patchprocess/diffcheckstylehadoop-yarn-common.txt |
+| hadoop-yarn-common test log | https://builds.apache.org/job/PreCommit-YARN-Build/7854/artifact/patchprocess/testrun_hadoop-yarn-common.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/7854/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf905.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7854/console |
+
+
+This message was automatically generated., Fixed checkstyle issues, \\
+\\
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 29s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 31s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 32s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:green}+1{color} | checkstyle |   0m 52s | There were no new checkstyle issues. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 37s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 24s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:green}+1{color} | yarn tests |   1m 56s | Tests passed in hadoop-yarn-common. |
+| | |  38m 19s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12731807/YARN-3612.02.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 4536399 |
+| hadoop-yarn-common test log | https://builds.apache.org/job/PreCommit-YARN-Build/7856/artifact/patchprocess/testrun_hadoop-yarn-common.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/7856/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf906.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7856/console |
+
+
+This message was automatically generated., bq. Moreover, I have not added the config as I do not see anyone disabling it. Thoughts ?
+
+The config change could be useful for MR jobs that want to avoid the CPU overhead. Suggest changing calls to {{nanoTime}} from {{currentTimeMillis}} since it's measuring durations.
+
++1 overall, even without the change to {{Task}}., Cancelling the patch as it no longer applies.  [~varun_saxena] would you be willing to rebase the patch?]

@@ -1,0 +1,287 @@
+[[~gzh1992n] thank you for the report. IIUC, the comparator must ensure that the relation be transitive. 
+
+https://docs.oracle.com/javase/7/docs/api/java/lang/Comparable.html
+
+I think that DRF comparator is not transitive with my intuition. [~kasha], what do you think? Can we design the comparator as transitive comparator?, {quote}
+I think that DRF comparator is not transitive with my intuition.
+{quote}
+I think that's right.[~ozawa]
+
+FairShareComparator uses {{getResourceUsage()}} and {{getDemand()}} and {{getMinShare()}} to implement {{compare(Schedulable s1, Schedulable s1)}}.The three methods must return same Resource anyway while we are sorting, otherwise will break transitivity.
+
+How about add snapshot feature in Schedulable? We snapshot Schedulable before sorting.Then we sort but use snapshot Resource in comparator . Result of sorting will very close to real situation, because sorting is very fast., [~gzh1992n] - thanks for reporting and working on this. I haven't had a chance to look at it closely enough. Will take me a couple of days to do so. 
+
+On the surface, it seems benign to sort a snapshot of Schedulables. The other way would be to use ReadWriteLock in FSQueue: getters would all try to get a readLock while the sort holds the write lock? , I am trying to solve the issue, but I am failed.
+In my opinion, the issue cause by concurrent operation on {{FSAppAttempt}}.When {{FSLeafQueue}} is sorting FSAppAttempt, the inner {{Resource}} of FsAppAttempt is modified.In this case, {{FairShareComparator}} may cannot work correctly.Base on this idea, I write YARN-4743-cdh5.4.7.patch(I have attached).The patch use snapshot to protect elements during the sorting.Sadly, this problem doesn't resolve with the patch.I got same exception on sorting and more frequently crash.I begin to doubt whether the comparator have a problem really.I reviewed {{FairShareComparator}} code and simulate all cases, but did not found any bugs.
+
+I need some idea. I'd like to verify two things.1)Can inner Resource be modified during the sorting?Who could review it for me? 2)Does comparator also have mistakes really or my patch is incorrect?
+
+I doubt that float-point precision in comparator, but it's hard to reappear in test cluster(never reappear). It happen with low probability in larger cluster., I don't think snapshot could resolve this, as in YARN-5371, node is only sorted with unused resource. this seems caused by a > b, and b > c, but while sorting a and c, a < c. we should snapshot all sorting element and then sort to avoid this, or could add -Djava.util.Arrays.useLegacyMergeSort=true to YARN_OPS to use mergeSort not TimSort for Collection#sort., [~sandflee] I also met this problem when sort NodeIdList in FairScheduler#continuousSchedulingAttempt(),
+I think the root cause is NodeAvailableResourceComparator is not transitive.
+, bq. I think the root cause is NodeAvailableResourceComparator is not transitive.
+agree, but do we really need comparator to be transitive?  it may reduce the perform greatly.
+, 感觉这是一个 jdk本身的漏洞，比较器里面 相比较的两个值 如果同时为空的话，传入的顺序可能决定了返回值 的结果，破坏了 "传递性"
+
+	JDK-6804124 : (coll) Replace "modified mergesort" in java.util.Arrays.sort with timsort
+	http://bugs.java.com/bugdatabase/view_bug.do?bug_id=6804124
+
+
+可以在 jvm中配置 java.util.Arrays.useLegacyMergeSort=true
+
+	[或者在程序中 System.setProperty("java.util.Arrays.useLegacyMergeSort", "true")]
+, Thanks [~benedict jin]'s valuable information. Nice catch, I will try it later. Could you please rewrite it in English? So that more people can understand. , We don't sort running apps anymore according to YARN-3547, and the code invoking the {{TimSort()}} has been removed. For that case, I will close this one as 'Won't fix'. Feel free to reopen it if anyone has concerns., Thanks [~yufeigu] ,i also met this problem,my scenario is that i decommission all my cluster nodemangers,after that ,thread "continuous scheduling" was down,then i found this exception was happened in "Collections.sort" in thread "continous scheduling" . , Hi [~imstefanlee], continous scheduling uses the same code, I guess you got the similar stack trace. Please check your hadoop version to see if it has YARN-3547. , Thanks ,my hadoop version is 2.4.0 and i just found that continuousScheduling thread has removed collections.sort in hadoop-3.0.0, i will review the code carefully., Sorry for some reason did not deal with this issue for a long time. Now pick it up, we have found the bug.
+Reopen the issue., The bug cause by NaN.
+
+I wrote a test case to verify {{FairShareComparator}}(see patch), and then found that the {{FairShareComparator}} can not deal with weights=0 correctly. We dump the collection(see timsort.log) that broke sorting from our cluster to confirm whether it is 0. The weight should be greater than or equal to 1(I think).  In fact, weight would be 0.
+
+We get NaN when memorySize=0 and weight=0.
+{code}
+useToWeightRatio1 = s1.getResourceUsage().getMemorySize() /
+  s1.getWeights().getWeight(ResourceType.MEMORY)
+{code}
+
+I'm not sure whether this is a bug for weight.We can talk about this in another issue.
+If weight = 0 , the demand memory must be 0 and {{yarn.scheduler.fair.sizebasedweight}} is enable.
+Formula:  weight = log2(1 + demand) 
+
+it seems that a meaningful weight must be greater than or equal to 1. So I just fix weight to 1 in patch. Anyway we need more strict code.
+
+
+BTW:
+I think there are still problems related to concurrency(Like the description says that).
+If you enable {{yarn.resourcemanager.work-preserving-recovery.enabled}}(default is false in my version), {{recoverContainer}} method would be invoked in another thread. The method can modify {{attemptResourceUsage}}. This will go wrong when you are sorting {{FSAppAttempt}}.
+If as I think, we may need to create a new issue to fix this., Why demand is 0? Because {{updateDemand}} is invoked after adding {{FSAppAttempt}} to {{runnableApps}} list., I don't recommed setting {{java.util.Arrays.useLegacyMergeSort=true}}.The way just avoid getting RuntimeException, but can not avoid getting a wrong order of sorting result. In the trunk version, although we use a tree structure to sort, but can't avoid getting a wrong result either., thanks [~gzh1992n] ,the patch you fixed is that the exception happended in +FairSharePolicy+,but my scenario is that +Collections.sort(nodeIdList, nodeAvailableResourceComparator)+ throws exception when decommission nodemanagers, +nodeAvailableResourceComparator+ only compares node available memory. , Hi [~gzh1992n], thanks for working on this. Some thoughts about the patch. Both 0.5(weight value less than 1.0) or 0.0 are valid value for weights in fair scheduler. Once use case of zero-weight would be that user uses the zero-weight queue to run jobs when there is no jobs for other non-zero-weight queues. So it make no sense to me to enforce weight larger than 1.0. 
+If NaN affects the transitive, we can avoid NaN by other ways. For example, if the first weight is 0.0 and the second is bigger than 0.0, obviously, the second one is needier than the first one., Thanks for you comment.I will submit a new patch in recent days., Added to contributor's list and assigned to [~gzh1992n] , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 16s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 8m 50s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 20s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 38s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 54s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 20s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 17s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 11 new + 8 unchanged - 0 fixed = 19 total (was 8) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 1s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 38m 33s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 54m 58s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12834084/YARN-4743-v2.patch |
+| JIRA Issue | YARN-4743 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 6e071942a91f 3.13.0-95-generic #142-Ubuntu SMP Fri Aug 12 17:00:09 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 4bca385 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/13436/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/13436/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/13436/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, [~yufeigu]  Could you review patch v2. Does that look ok?, Hi [~gzh1992n], thanks for working on this. 
+The patch v2 looks generally good to me. Some nits:
+1. If you want to use if-else statements, better to use {{weight1 == 0}} instead of {{weight1 != 0}} to get better readability. Or we can use this to avoid if-else statements
+{code}
+useToWeightRatio1 = -weight1;
+useToWeightRatio2 = -weight2;
+{code}
+2. Please describe the change in doc of function {{FairShareComparator}}.
+3. Please fixed all style issue in Hadoop QA's comment.
+4. Can we put the {{TestFairShareComparator}} into {{TestSchedulingPolicy}}, and add doc for the function in the unit test?
+5. Not sure why {{startTimeColloection}} and {{nameCollection}} are needed. Can you explain a little bit?, [~yufeigu], thanks for reviewing.
+
+{quote}
+5. Not sure why startTimeColloection and nameCollection are needed. Can you explain a little bit?
+{quote}
+
+Because some pieces of codes involve these two variables.
+{code:title=FairShareComparator}
+      if (res == 0) {
+        // Apps are tied in fairness ratio. Break the tie by submit time and job
+        // name to get a deterministic ordering, which is useful for unit tests.
+        res = (int) Math.signum(s1.getStartTime() - s2.getStartTime());
+        if (res == 0)
+          res = s1.getName().compareTo(s2.getName());
+      }
+{code}
+
+I will submit a new patch this week., Patch v3:
+1.Add doc
+2.Put {{TestFairShareComparator}} into {{TestSchedulingPolicy}}, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 14s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 20s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 38s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 16s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 55s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 18s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 1 new + 12 unchanged - 0 fixed = 13 total (was 12) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 6s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 17s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 35m 50s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 50m 3s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.TestRMRestart |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12835106/YARN-4743-v3.patch |
+| JIRA Issue | YARN-4743 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux be86ad9498f5 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / dbd2057 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/13500/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/13500/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/13500/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/13500/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/13500/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 18s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 45s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 20s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 58s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 13s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 0s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 39m 30s {color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 53m 55s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12835157/YARN-4743-v4.patch |
+| JIRA Issue | YARN-4743 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux f2990e7beca8 3.13.0-95-generic #142-Ubuntu SMP Fri Aug 12 17:00:09 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / dbd2057 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/13503/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/13503/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, [~gzh1992n], the v4 looks really good. A minor nit: can you describe how to deal with zero-weight in document of FairShareComparator? Something like "give slots to the non-zero weight one if the other one's weight is zero". Thanks!, [~gzh1992n], since we're doing batch review, I upload patch v5 for you including some changes in doc. So [~kasha] can review and commit., | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 13s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 20s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 17s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 21s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 19s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 15s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m  5s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 35m 54s{color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 51m 35s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | YARN-4743 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12835683/YARN-4743-v5.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 21ab7a0a2f6c 3.13.0-95-generic #142-Ubuntu SMP Fri Aug 12 17:00:09 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 022bf78 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/13598/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/13598/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, +1
+
+Checking this in.. , Thanks [~gzh1992n] for the contribution, [~yufeigu] for the reviews and updating the patch. 
+
+Just committed this to trunk and branch-2. , Thanks [~yufeigu], [~kasha] for reviewing!, SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #10715 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/10715/])
+YARN-4743. FairSharePolicy breaks TimSort assumption. (Zephyr Guo and (kasha: rev 4df8ed63ed93f2542e4b48f521b0cc6624ab59c1)
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/policies/FairSharePolicy.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestSchedulingPolicy.java
+]

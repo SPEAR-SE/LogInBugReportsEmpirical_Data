@@ -1,0 +1,114 @@
+[can we also have a thread stack taken after the topology gets stalled? It may be of help in debugging the problem further. , And I think we need to include section to UI representing "in-backpressure" by which components/tasks., We have a backup on the write where we will poll every 100ms to be sure everything is in sync.  We should have a backup polling for reading the data from ZK too.  I thought we did, because we have that on all of the other triggers from ZK, but looking at the code I don't see it., [~revans2] Not sure what you mean by "back on the write" .. are u saying have background thread that simply polls ZK every so often ?  That might fix this issue.
+
+However, there is one basic issue with this BP mechanism in general. It can put too much load on ZK. For each enable/disable throttle signal raised by any worker we have all this interaction going on with ZK..
+
+- Some worker adds/deletes ZK node 
+- ZK issues callbacks to all workers with watches setup
+- All those workers will list the parent node in ZK to count the number of children (expensive?)
+- All those workers will setup another watch in ZK
+ 
+Given that PaceMaker was introduced to take load off of ZK... this approach feels like a regression in terms of ability to scale. There are some other issues as well but thats for later.
+
+After reviewing BP, I done feel it is sufficiently mature to be considered stable and ready for production. 
+
+IMO Until we have a more solid BP mechanism we should disable it by default as soon as possible. I can open another jira for that., +1. Given that there are few issues we should turn it off in defaults.yaml.
+
+My understanding of backpressure by talking to/debugging with [~roshan_naik] is as soon as we hit the higher or lower ceiling we take an action. 
+I would like to see if we can add a time duration to understand that if the bolt is actually hit the ceiling continuously i.e we are not constantly sending signal to spout turn it on or off. Lets say as user if I set this time duration to 1min we can check the higher watermark being hit consistently for 1min than send a signal to turn on back pressure and similarly on lower watermark part. Otherwise we can end up generating false positives on turning on back pressure. 
+
+Also agree with [~roshan_naik] about increased load on zookeeper. If possible explore the possibility of it by a message transfer back to spout or via acker. I am not clear if this is possible need to look into it.
+, [~roshan_naik],
+
+When writing to ZK every 100 ms we will check to be sure that the ZK state matches the local worker state, just in case there is a race condition and they got off some how.  So yes we should have a backup thread to poll ZK for backpressure in case we get off some how with the triggers.
+
+As for the load on ZooKeeper yes, that too is one of my concerns, and we at Yahoo have been holding off turning it on by default until it has stabilized a bit and until we have moved all of our clusters to pacemaker.  We expect to turn it on fairly soon.  How expensive is it though?  If you are running zookeeper in the default configuration it can be very expensive because you are constrained by a single disk's IOps, and if you have lots of throttling going on then those IOps can get eaten up fairly quickly.  If you have the flush turned off, then it is going to be constrained by the write log to the disk, or by the network whichever saturates first.  If it is the write log then you get about 80MB/sec of writes, this is just writing a small amount of metadata, so it should not have that big of an impact, but I have not really measured it.  If the network then reads will likely saturate first because of the listings, but again this is a relatively small amount of metadata, so it should have a relatively small impact.
+
+If you want to turn it off in defaults.yaml that is fine, just file a separate JIRA for that.  If you have a better solution that will reduce the load on ZK that would be great, again file another JIRA for that and we can discuss details there.  I am skeptical that we will get anywhere near as good of a throughput if we put in a delay of some sort, and I think we would start to run into issues with heaps filling up if we put in too much of a delay., 
+Have not worked out a concrete solution to avoiding ZK as yet. But [~sriharsha]'s  line of thinking is interesting ... basically see if we can use the internal messaging system as opposed to messaging over ZK. 
+
+Opened STORM-1956 for disabling BP by default. , I'm OK to disable backpressure by default for short time, but we should work on resolving backpressure issue now, and enable backpressure again at next release or so.
+This is not same as 'event logging', cause event logging is a kind of unique feature of Storm, but backpressure is common feature of recent streaming frameworks. Also backpressure is the only choice of non-ACK topology which needs throttle., I am not sure that we can use our internal messaging as is to make this work.  The messages to turn on and off backpressure would likely get blocked behind actual data messages and never make it to the spout that is throttled off.  I would prefer to see us go towards the model of JStorm and have a topology master, there is a lot of work that ZK is doing that could be moved over to a master. It could easily take over the responsibilities of both pacemaker/ZK(for metrics) and ZK for backpressure.
+
+I'm not sure I am ready to let the master reschedule the topology itself, I prefer to still have centralized scheduling, but I could be persuaded., I have the same concern as Jungtake with disabling backpressue by default. If my understanding is correct, transfer queues are not bounded anymore and if acking is not enabled, can keep growing. This will result in out of memory exceptions. , [~abhishek.agarwal] [~kabhwan] As we can see keeping this as default is resulting in performance degradation that we are unable to fix in near-term. Since this is a new feature turning it off by default makes sense until we figure out more details.
+[~kabhwan] of course the idea is to fix any issues and make it default., [~sriharsha] We can disable the back-pressure. But I want to know what will be the alternative for topologies with non-acking? If backpressure is not enabled, there should be some other way to bound the send/receive queues., [~abhishek.agarwal] we don't have alternative for non-acking before this back pressure feature. We always told users to depend on acking & topology.max.spout.pending if they need a way to control the fast spout., I'm okay with polling ZK for changes as a fix (for now) so we can keep backpressure on by default. There are obviously issues with the design of backpressure in general, but polling shouldn't make these issues significantly worse. I don't think the load on ZK will increase appreciably from a few nodes polling. The load problem is inherent to other parts of backpressure design.
+
+We could also turn it off by default, but it's nice to have a flow-control mechanism that works automatically without needing the user to perform acking. It might be some time until we have a better system in place. , ok. my understanding was that spout will continue emitting new tuples even if consumer is not consuming fast enough. But that won't happen because spout doesn't emit further if transfer queue is full - 
+https://github.com/apache/storm/blob/1.x-branch/storm-core/src/clj/org/apache/storm/daemon/executor.clj#L647
+[~kabhwan] doesn't this address your concern? 
+
+, [~knusbaum] another issue that we've seen is erratic toggling between back pressure on/off. IMO adding a time duration before turning the back pressure on/off might yield a better experience here. Currently we toggle as soon as we hit the higher watermark , how about we observe the pattern for configurable amount of time before we turn on the back pressure. Does this makes sense., If my understanding is right, DisruptorQueue.publish() is only called with block=true from background thread (Flusher), and for other threads it's not blocked. (This change is from Disruptor Batching of Storm 1.0.0.)
+So receive queues for tasks will receive tuples anyway unless OOME has occurred. There's no blocking on consumer side., I see. You mean to say that consumer may be slow but transfer thread will continue to populate receive queues. Since transfer thread doesn't slow down, spout too will keep pumping out the data. is that correct?, Receive thread in downstream is not blocked at all, so transfer thread in upstream is not blocked at all unless there're some other issues which make worker unable to send messages (for example,  downstream worker crash), Removing EPIC since hotfix (STORM-1956) is applied to 1.0.2., 1.x-branch, back pressure works perfect!, Hi [~roshan_naik] [~revans2] [~knusbaum] [~kabhwan],
+
+I tested with the word count example sent by Roshan, the results is: Backpressure works fine for 1.x-branch while in master (2.x), we have a NullPointerExecution in SpoutExecutor.
+
+(1) in 1.x-branch, back pressure works well (see the attached screenshot). The back pressure flag gets set and unset intermittently depending on the population in disruptor queues. [~roshan_naik], I think your guess of reason (racing condition) is incorrect since we have cyclic check of flags every 100 ms, as mentioned by Bobby.
+
+
+(2) in test for master, I see the topology gets stalled quickly, less than a minute. But the reason is not because of the bug of back pressure, it is due to the NullPointerException in Executor.
+https://github.com/apache/storm/blob/master/storm-core/src/jvm/org/apache/storm/executor/spout/SpoutExecutor.java#L205
+[~Cody] Could you help with this NPE since you worked on Storm-1277? 
+Thanks a lot!
+
+
+ 80 2016-08-16 21:19:15.102 o.a.s.m.EventLoggerBolt [INFO] EventLoggerBolt prepare called
+ 81 2016-08-16 21:19:15.107 o.a.s.m.FileBasedEventLogger [INFO] logFilePath /Users/zliu6/git/joe/storm/storm-dist/binary/target/storm/logs/workers-artifacts/FileReadWordCountTopo-1-1471407540/6700    /events.log
+ 82 2016-08-16 21:19:15.110 o.a.s.e.b.BoltExecutor [INFO] Prepared bolt __eventlogger:[2]
+ 83 2016-08-16 21:20:17.242 o.a.s.u.Utils [ERROR] Async loop died!
+ 84 java.lang.RuntimeException: java.lang.NullPointerException
+ 85     at org.apache.storm.utils.DisruptorQueue.consumeBatchToCursor(DisruptorQueue.java:468) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+ 86     at org.apache.storm.utils.DisruptorQueue.consumeBatchWhenAvailable(DisruptorQueue.java:434) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+ 87     at org.apache.storm.utils.DisruptorQueue.consumeBatch(DisruptorQueue.java:424) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+ 88     at org.apache.storm.executor.spout.SpoutExecutor$2.call(SpoutExecutor.java:137) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+ 89     at org.apache.storm.utils.Utils$7.run(Utils.java:2227) [storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+ 90     at java.lang.Thread.run(Thread.java:745) [?:1.8.0_77]
+ 91 Caused by: java.lang.NullPointerException
+ 92     at org.apache.storm.executor.spout.SpoutExecutor.tupleActionFn(SpoutExecutor.java:205) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+ 93     at org.apache.storm.executor.Executor.onEvent(Executor.java:257) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+ 94     at org.apache.storm.utils.DisruptorQueue.consumeBatchToCursor(DisruptorQueue.java:455) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+ 95     ... 5 more
+ 96 2016-08-16 21:20:17.860 o.a.s.e.e.ReportError [ERROR] Error
+ 97 java.lang.RuntimeException: java.lang.RuntimeException: java.lang.NullPointerException
+ 98     at org.apache.storm.utils.Utils$7.run(Utils.java:2237) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+ 99     at java.lang.Thread.run(Thread.java:745) [?:1.8.0_77]
+100 Caused by: java.lang.RuntimeException: java.lang.NullPointerException
+101     at org.apache.storm.utils.DisruptorQueue.consumeBatchToCursor(DisruptorQueue.java:468) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+102     at org.apache.storm.utils.DisruptorQueue.consumeBatchWhenAvailable(DisruptorQueue.java:434) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+103     at org.apache.storm.utils.DisruptorQueue.consumeBatch(DisruptorQueue.java:424) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+104     at org.apache.storm.executor.spout.SpoutExecutor$2.call(SpoutExecutor.java:137) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+105     at org.apache.storm.utils.Utils$7.run(Utils.java:2227) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+106     ... 1 more
+107 Caused by: java.lang.NullPointerException
+108     at org.apache.storm.executor.spout.SpoutExecutor.tupleActionFn(SpoutExecutor.java:205) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+109     at org.apache.storm.executor.Executor.onEvent(Executor.java:257) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+110     at org.apache.storm.utils.DisruptorQueue.consumeBatchToCursor(DisruptorQueue.java:455) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+111     at org.apache.storm.utils.DisruptorQueue.consumeBatchWhenAvailable(DisruptorQueue.java:434) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+112     at org.apache.storm.utils.DisruptorQueue.consumeBatch(DisruptorQueue.java:424) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+113     at org.apache.storm.executor.spout.SpoutExecutor$2.call(SpoutExecutor.java:137) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+114     at org.apache.storm.utils.Utils$7.run(Utils.java:2227) ~[storm-core-2.0.0-SNAPSHOT.jar:2.0.0-SNAPSHOT]
+115     ... 1 more
+
+ 
+ , [~kabhwan] [~revans2], once the NPE is fixed, we may enable the back pressure by default again. :), [~zhuoliu]  The problem we encountered not the storm workers are unable to add a node in zookeeper but it rather happening very fast thus erratic on/off behavior with backpressure. Thats what we are discussing in this jira. Its not just NPE but the current behavior in backpressure not ideal and there are some proposals here in improving it., With BP disabled the topo ran fine. Dont think saw any NPE during my runs., Hi roshan,
+Could you test 1-x branch with bp enabled? 
+So here bp just helped us find a bug in other parts of storm: the pending queue of spout executor gets polled and referenced before a null checking.
+, Hi Sriharsha, yep, I was talking about the short-term diagnosis of the root cause. In the long term, if we have such as topology master's appearance to take the back pressure or more other responsibility, I would be happy to see that. Thanks., OK, I will look into the NPE issue., I have test storm 1.0.1 ABP in our staging cluster[ 10 machine nodes and a topology with 32 workers, 120 executors ] on, the topology will stall within 10 mins very possibly
+    i see that when all the topology tasks throttle off, the backpressure root node on ZK still have child nodes which cause   the "stall", if i delete the child node manually, the spouts will continue to consume normally(but will again stall within 10 minutes), so  i agree with @Roshan Naik, [~danny0405] thanks sincerely for the testing. 
+I checked back the code,
+In
+https://github.com/apache/storm/blob/master/storm-core/src/clj/org/apache/storm/daemon/worker.clj#L156
+to reduce the traffic to ZK, we checked the previous flag to update to Zookeeper only when it is necessary (the flag has changed), but still there may some very weird case we have inconsistency between local "prev-backpressure-flag" and the worker backpressure node at Zookeeper (see STORM-1949).
+(One such weird case I would think of is: the worker-backpressure call does not update the zk flag successfully but no exception was caught and the local flag updating still succeeds),
+I was commenting at https://github.com/apache/storm/pull/1627 to suggest a tradeoff remedy to achieve better resilience.
+, [~roshan_naik] I was going to run your example to reproduce but the link doesn't work anymore. Can you provide an updated link?, I replicated a halted topology using my own WordCount but the way I got it to halt was to set the receive buffer size to be very small 4. 
+
+I took a heap dump of the worker that was set in the backpressure znode and found that one of the executors had the backpressure atomic variable set to true, while the disruptor queue's _throttleOn was false.
+
+I tried running the same topology with the executor-specific change in https://github.com/apache/storm/pull/1632, and it didn't halt. That change removes the backpressure atomic variable, in favor of the disruptor's _throttleOn. However, this needs more testing. I'll try other things tomorrow and comment here., Attaching the wordcount topo that i used., The amount of  *additional* pressure this BP mechanism adds to ZK in it current state really should be sufficient reason to leave it disabled by default. If we fix the problem I noted in the description, as per Bobby's suggestion, that would put even more pressure on ZK. Putting such pressure on ZK (or Nimbus) from any subsystem in Storm is essentially a regression in terms of scaling ability, which then begets future fixes (PaceMaker for instance), [~abellina] thanks for the diagnosis, that is super helpful. This shows that the root cause should not be: we are not syncing correctly between local worker flag and remote zk worker entry for backpressure;
+rather: we are not syncing the disruptorQueue.getBackpressure() with the flag in executor data correctly.
+Since our refactoring in https://github.com/apache/storm/pull/1627  is directly accessing the disruptor queue to get the backpressure flag rather than having an additional flag in executor data which is error-prone when flipping,
+we may NOT need to add the ADDITIONAL ZK pressure which I mentioned previously in the JIRA., Hi [~roshan_naik], [~abellina] has https://github.com/apache/storm/pull/1632 merged into 2.x master. Would you mind testing your example with the latest master? See if the refactoring has fixed the bug you mentioned. Thank you in advance!, Sorry I have not been able to put time on this. Looks like some users on the mailing list are also running into this issue in production.  I am unable to give this time for at least a couple weeks, but I dont want to be a blocker to getting this fix into 1.x. I have shared the topology here in the jira, would be great if we got some help on this ? [~abellina] or [~zhuoliu] would you be able to give it a shot ?, We are using Storm version 1.0.1.2.5.3.0-37 and the issue is still reproducible                                                           ,                                                                      
+                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                              , [~vaibhavnir007] thanks for the information.
+See https://issues.apache.org/jira/browse/STORM-2039
+I see the fix from [~abellina] went into 2.0.0, 1.1.0, 1.0.3,
+so 1.0.1* may not have it. Really appreciate if you could try with 1.0.3 or up. ]

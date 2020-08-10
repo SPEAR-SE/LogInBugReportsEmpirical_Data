@@ -1,0 +1,105 @@
+[REPRODUCE TEST CASE STEP BY STEP
+====================================
+1).  start zookeeper cluster, says server1(localhost:6181), server2(localhost:4181), server3(localhost:2181)
+    let's assume now server2 is the LEADER.
+
+2). use zkCli.sh create a persistence node /curator_exists_watch
+
+3). use Curator Framework2.9.1 to create a simple Java Client Application,  as following:
+
+*****
+
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.framework.api.CuratorWatcher;
+import org.apache.curator.retry.ExponentialBackoffRetry;
+import org.apache.zookeeper.WatchedEvent;
+
+public class ExistingWatchDemo {
+
+	public static void main(String[] args) throws Exception {
+
+		CuratorFrameworkFactory.Builder builder = CuratorFrameworkFactory.builder();
+		builder = builder.connectString("localhost:2181,localhost:6181")
+                                         .sessionTimeoutMs(15000)
+				         .connectionTimeoutMs(10000)
+                                        .retryPolicy(new ExponentialBackoffRetry(5000, Integer.MAX_VALUE));
+		
+		final CuratorFramework zkClient = builder.build();
+
+		zkClient.start();
+
+		CuratorWatcher watcher = new CuratorWatcher() {
+
+			public void process(WatchedEvent event) throws Exception {
+                                 System.out.println("received event " + event);
+                                 System.out.println("watch again ...");
+                                zkClient.checkExists().usingWatcher(this).forPath("/curator_exists_watch");
+			}
+			
+		};
+		
+		zkClient.checkExists().usingWatcher(watcher).forPath("/curator_exists_watch");
+
+		Thread.sleep(600 * 1000);
+
+	}
+
+}
+
+*****
+
+to stay us to reproduce in more convenience, here we provide only 2 servers in the connection string instead of 3 both, says as server1(FOLLOWING) server3(FOLLOWING)
+
+4).  breakpoint at 2 places: 
+ 
+    FinalRequestProcessor.java: line 303 :         zks.getZKDatabase().setWatches(relativeZxid, 
+    NIOServerCnxn.java: line 966:                     synchronized(factory.cnxns){
+
+
+5).  running the client app ExistingWatchDemo.java, let say the client application connection to server3(2181)
+
+6). use the IDE make a remote debug session connect to another server of the connection string which we provided, here server1(6181)
+
+7). now kill -STOP server3(2181), the client app will find the server hang and reconnect to  server1(6181), we can confirm the reconnect in
+the client's log:
+
+---------
+016-10-14 13:31:21,505 [myid:] - INFO  [main-SendThread(localhost:2181):ClientCnxn$SendThread@1096] - Client session timed out, have not heard from server in 3754ms for sessionid 0x357c1a4462b000e, closing socket connection and attempting reconnect
+2016-10-14 13:31:22,389 [myid:] - INFO  [main-SendThread(localhost:6181):ClientCnxn$SendThread@975] - Opening socket connection to server localhost/0:0:0:0:0:0:0:1:6181. Will not attempt to authenticate using SASL (unknown error)
+2016-10-14 13:31:22,392 [myid:] - INFO  [main-SendThread(localhost:6181):ClientCnxn$SendThread@852] - Socket connection established to localhost/0:0:0:0:0:0:0:1:6181, initiating session
+2016-10-14 13:31:22,392 [myid:] - DEBUG [main-SendThread(localhost:6181):ClientCnxn$SendThread@892] - Session establishment request sent on localhost/0:0:0:0:0:0:0:1:6181
+2016-10-14 13:31:22,407 [myid:] - INFO  [main-SendThread(localhost:6181):ClientCnxn$SendThread@1235] - Session establishment complete on server localhost/0:0:0:0:0:0:0:1:6181, sessionid = 0x357c1a4462b000e, negotiated timeout = 15000
+---------
+
+the reconnect will hit the breakpoint FinalRequestProcessor.java: line 303 as following:
+
+Thread [CommitProcessor:1] (Suspended (breakpoint at line 303 in FinalRequestProcessor))	
+	FinalRequestProcessor.processRequest(Request) line: 303	
+	CommitProcessor.run() line: 74	
+
+8). now kill the process of  the client app, kill -9 <pid of client app>, this will let us another breakpoint hit, as following
+ 
+Daemon Thread [NIOServerCxn.Factory:0.0.0.0/0.0.0.0:6181] (Suspended (breakpoint at line 966 in NIOServerCnxn))	
+	NIOServerCnxn.close() line: 966	
+	NIOServerCnxn.doIO(SelectionKey) line: 360	
+	NIOServerCnxnFactory.run() line: 208	
+	Thread.run() line: 745	
+
+9).  now resume the breakpoint(NIOServerCnxn:966) in step 8, after that, then resume the breakpoint (FinalRequestProcessor:303) in step 7
+
+10). now use wchp and cons to check the leak watch, as following shows
+
+pguodeMacBook-Air:bin pguo$ echo wchp | nc localhost 6181
+/curator_exists_watch
+       	0x357c1a4462b000e
+
+pguodeMacBook-Air:bin pguo$ echo cons | nc localhost 6181
+ /0:0:0:0:0:0:0:1:61702[0](queued=0,recved=1,sent=0)
+ , Looking, OK yup. This is a different race than what we fixed in ZOOKEEPER-1382. Because we don't check to see if the watch we're setting is still on a live connection when we set it, we can totally race to set a watch vs deleting watches from a connection.
+
+Thinking., So it looks like all of the watches (not just the watches resent by the client) can suffer from a race between closing the client and clearing the watches for that connection and actually storing the watches in the data structure. This is also a bug in trunk. I'm playing around with it (and have the world's ugliest hacks to repro in tests + judicious thread.sleeps) but heads-up to folks ([~phunt] [~fpj] etc), Thanks for having a look, [~fournc]. I think you're right about the race between closing the connection and setting new watches. When we expire the session, that race goes away because the {{closeSession} and {{setWatches}} are serialized in the request processor pipeline, but not for closing connections.
+
+There is one related point I'm unsure about. When I was looking at the code, I noticed that only NIO close invokes {{ZooKeeperServer.removeCnxn}} -> {{ZKDatabase.removeCnxn}} -> {{DataTree.removeCnxn}}, which remove the watches. I'm wondering what that's the case., I noticed that as well. Does anyone actually use the Netty implementations in production?, https://issues.apache.org/jira/plugins/servlet/mobile#issue/ZOOKEEPER-2358
+
+The issue above addresses Netty issue., Is there any recommended fix option on this issue?, Because watches are one-time triggers, you could try triggering the watch by removing, adding, or changing the data in the watched nodes. I believe that should remove all set watches. But there's no easy fix that I can see.]

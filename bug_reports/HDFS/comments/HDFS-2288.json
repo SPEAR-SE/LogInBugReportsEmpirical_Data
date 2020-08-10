@@ -1,0 +1,114 @@
+[One simple scenario is:
+- Client is writing a file with replication 0
+- Client calls fsync
+- the DN crashes, so the pipeline fails
+- DN comes back up, and a reader tries to read the file before lease recovery has occurred
+
+I think it's correct to return the full number of bytes on the disk, reasoning being:
+- If just this DN crashed, the pipeline would have recovered before any more data was written, and the longer replicas would have a newer generation stamp stored in the NN. If the local DN has an older genstamp than what the client requests, it will throw an IOE in FSDataset.getReplicaVisibleLength
+- If all of the DNs crashed at the same time, and the client didn't update the generation stamp, then the replicas may have different lengths. But, all of the replicas are at least as long as the last successful fsync, which is the only guarantee we have to provide.
+
+Thoughts?, bq. Client is writing a file with replication 0
+I meant a replication 1... need more caffeine this afternoon :), Test case and patch, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12491864/hdfs-2288.txt
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 4 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+
+
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/1167//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/1167//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1167//console
+
+This message is automatically generated., {quote}
+    If all of the DNs crashed at the same time, and the client didn't update the generation stamp, then the replicas may have different lengths. But, all of the replicas are at least as long as the last successful fsync, which is the only guarantee we have to provide.
+{quote}
+We also provide read consistency, i.e. if N bytes are successful read from one datanode, then the same N bytes are available from all datanodes in the pipeline so that the client can switch to other datanodes and continue reading.  If the replicas have different lengths and client is reading from the datanode with longest length, then it continue reading from the other datanodes., Nicholas: given the above, do you think this patch is correct?, Todd, visible length is a notion which exists when pipeline is in progress. As Nicholas said it guarantees consistency of reads from replicas at different stages.
+In your scenario if I understood it correctly after writing one replica and failing on hflush(), nobody would've seen any bytes yet, therefore visible length should be 0.
+When DN restarts after the crash there is no visible length since there is no pipeline. Non-finalized replicas become RWR, which means the recovery hasn't started for them yet. And clients should not read from RWR replicas until the recovery finishes.
+Section 8.3 of the design doc says "The length of an rwr is a negative number." Also worth checking the replica state transition diagram under 9.1
+So I think the behavior is correct (to the specs). What is the HBase logic there?, Hi Konstantin. Thanks for taking a look at this. I didn't flesh out the scenario quite enough:
+
+- Writer is writing to a pipeline, alternating writes and hflush()
+- A concurrent reader is reading from the replicas (just behind the writer). Thus maybe it sees 30MB out of the 64MB block in progress.
+- The writer and the three DNs crash/restart
+- The reader continues trying to read, and is now unable to see the data they previously saw, until lease recovery proceeds (many minutes)
+
+This seems incorrect. I think the reason it's not mentioned in the design doc is that the design didn't cover all the cases of concurrent readers behind writers., Yes, this is how it was designed. In case of DN failure you need to wait until the rbw block is recovered to see its data. Can you see it after recovery? 
+Making the data available earlier will be an optimization.
+Also in normal operation it is not likely that all 3 nodes for that block crash, so you will be able to read data from other nodes while the failed replica is recovering., Sorry to have left this ticket idle for such a long time. We're circling back to finish getting HBase tests passing on 23/trunk and ran afoul of this again. To continue the prior discussion:
+
+bq. We also provide read consistency, i.e. if N bytes are successful read from one datanode, then the same N bytes are available from all datanodes in the pipeline so that the client can switch to other datanodes and continue reading.
+
+By my understanding of the code, we do not provide this guarantee. For example, consider:
+- Client writing to 3 DNs
+- The network link between DN1 and DN2 in the pipeline is severed.
+- DN2 is sending an "ack" for some bytes back to DN1, but gets stuck sending over the severed network link
+
+During this window of time before the pipeline has timed out, if a client connects, the "bytesAcked" counter on DN3 will be higher than the "bytesAcked" counter on DN1. So, if a client connects to DN3, and then reconnects to DN1, it will have fewer visible bytes.
+
+So, I would counter that the above is not quite the right guarantee.
+
+Let me look deeper into the HBase test to understand whether it's a case that could happen in practice. Perhaps the correct result is not to return a "0" visible length but rather to throw an exception, forcing the client to retry or bail.
+
+
+
+, Hey Todd,
+
+I think you're right, there's a bug in the way visible length is calculated. My understanding of visible length is "the length that all datanodes in the pipeline contain at least such amount of data." (HDFS-814), and given that RBW#getVisibleLength returns getBytesAcked() and not all DNs necessarily have the same # bytes Ack'd, they could disagree on the visible length of the replica. That being said, aside from this bug (and potentially others) the intent / goal should be to maintain this property right?
+
+What's the case in HBase that can hit this, it's reading a file that's recovering its pipeline that is also under lease recovery? 
+
+Thanks,
+Eli, Ah, never mind this is the TestLogRolling#testLogRollOnPipelineRestart failure.
+, > Nicholas: given the above, do you think this patch is correct?
+
+Hi Todd, first sorry that I forgot to answer it earlier.  I think the patch is incorrect.  The data in RWR should not be visible since the RWR may be invalid.  I agree with Konstantin that the reader should wait for recovery.  Yes, it will take minutes.  Why it takes so long?  It is because the writer only writes to a single replica in the first place., > My understanding of visible length is "the length that all datanodes in the pipeline contain at least such amount of data."
+
+There is no trusted source to obtain such information, unless you keep it in ZooKeeper or want to address the Byzantine Generals' Problem internally, which we don't.
+
+Let me try to explain the notion of *visible length*. 
+As per the [design doc|https://issues.apache.org/jira/secure/attachment/12445209/appendDesign3.pdf] visible length is the _"number of bytes that have been acknowledged by the downstream DataNodes"_. It is replica (not block) specific, meaning it can be different for different replicas at a given time. In the document it is called BA (bytes acknowledged), compared to BR (bytes received).
+
+If we have 3 replicas: r1, r2, r3 then all of them could have received the same number of bytes:
+r1.BR = r2.BR = r3.BR, 
+but visible lengths are different, because r3 hasn't acknowledged the latest packet to r2 and r1. Until then
+r3.BA = r3.BR
+r2.BA = r2.BR - p
+r1.BA = r1.BR - p
+where p is the packet length.
+
+Now when a client reads a byte it first verifies with one of the replicas, suppose it was r3, if the byte is visible. The last-received-byte is visible in r3, and this means the client can read it from any replica. When the client reads the last-received-byte from r1, it sends to r1 the visible length obtained from r3. DN containing r1 realizes that the client has already confirmed with another replica, that the byte was visible there, and lets the client read that byte, even though it is not yet locally visible.
+
+So our consistency guarantee is that after a client had read a byte from one replica that client (or any other knowledgeable of the fact) can read that same byte from any other replica., Rosolve as invalid.  Please feel free to reopen if you think it is not., There's two definition of visible length, or rather we're using the same name for two things:
+
+1. The above definition by Konst and the design doc which defines it as property of the replica:
+
+{quote}
+visible length is the "number of bytes that have been acknowledged by the downstream DataNodes". It is replica (not block) specific, meaning it can be different for different replicas at a given time. In the document it is called BA (bytes acknowledged), compared to BR (bytes received).
+{quote}
+
+2. Nicholas' definition in HDFS-814 and DFSClient#getVisibleLength which defines it as a property of a file:
+
+{quote}
+The visible length is the length that *all* datanodes in the pipeline contain at least such amount of data. Therefore, these data are visible to the readers.
+{quote}
+
+According to this definition the visible length of a file is the floor of all visible lengths of all the replicas of the last block. It's a static property set on open, eg is not updated when a writer calls hflush. Also DFSInputStream#readBlockLength returns the 1st visible length of a replica it finds, so it seems possible (though unlikely) in a failure scenario it could return a length that was longer than what all replicas had.
+
+Perhaps we should rename DFSClient#getVisibleLength?, Filed HDFS-3219 for this., Eli, I forgot to comment on this earlier.  I think you might have some misunderstanding on the hflush design.  Let's continue the discussion on HDFS-3219.]

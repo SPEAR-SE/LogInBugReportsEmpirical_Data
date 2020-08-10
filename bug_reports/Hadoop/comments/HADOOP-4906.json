@@ -1,0 +1,89 @@
+[A user complained about this on core-user@ supplying the following trace:
+{noformat}
+java.lang.OutOfMemoryError: Java heap space 
+at java.util.Arrays.copyOf(Arrays.java:2882) 
+at java.lang.AbstractStringBuilder.expandCapacity(AbstractStringBuilder.java:100)
+at java.lang.AbstractStringBuilder.append(AbstractStringBuilder.java:390) 
+at java.lang.StringBuffer.append(StringBuffer.java:224) 
+at com.sun.org.apache.xerces.internal.dom.DeferredDocumentImpl.getNodeValueString(DeferredDocumentImpl.java:1167)
+at com.sun.org.apache.xerces.internal.dom.DeferredDocumentImpl.getNodeValueString(DeferredDocumentImpl.java:1120)
+at com.sun.org.apache.xerces.internal.dom.DeferredTextImpl.synchronizeData(DeferredTextImpl.java:93)
+at com.sun.org.apache.xerces.internal.dom.CharacterDataImpl.getData(CharacterDataImpl.java:160)
+at org.apache.hadoop.conf.Configuration.loadResource(Configuration.java:928)
+at org.apache.hadoop.conf.Configuration.loadResources(Configuration.java:851)
+at org.apache.hadoop.conf.Configuration.getProps(Configuration.java:819) 
+at org.apache.hadoop.conf.Configuration.get(Configuration.java:278) 
+at org.apache.hadoop.conf.Configuration.getBoolean(Configuration.java:446) 
+at org.apache.hadoop.mapred.JobConf.getKeepFailedTaskFiles(JobConf.java:308) 
+at org.apache.hadoop.mapred.TaskTracker$TaskInProgress.setJobConf(TaskTracker.java:1506)
+at org.apache.hadoop.mapred.TaskTracker.launchTaskForJob(TaskTracker.java:727)
+at org.apache.hadoop.mapred.TaskTracker.localizeJob(TaskTracker.java:721) 
+at org.apache.hadoop.mapred.TaskTracker.startNewTask(TaskTracker.java:1306) 
+at org.apache.hadoop.mapred.TaskTracker.offerService(TaskTracker.java:946) 
+at org.apache.hadoop.mapred.TaskTracker.run(TaskTracker.java:1343) 
+at org.apache.hadoop.mapred.TaskTracker.main(TaskTracker.java:2354)
+{noformat}, I have seen this happen too. In one case the input path entry in our JobConf used up quite a bit of of ram since we were trying to merge a lot of small files into bigger ones. The JobConf for each task was kept in ram until the Job completed, but since we were running a lot of tasks the TaskTracker ran out of ram before the job could finish., Yes this is a bug. References to completed/failed TaskInProgress objects from a datastructure (TaskTracker.tasks Map datastructure) are never cleared. The TaskInProgress object also has a JobConf reference... , TaskInProgress object references are held by Map<TaskAttemptID, TaskInProgress> *tasks* and Map<JobID, RunningJob> *runningJobs*. These are not cleared until the job is complete.
+These are not really required to be hanging around till the job completion. As soon as the task finishes, these can be cleared., By reducing the TaskTracker heap size and running SleepJob with high number of map tasks I could reproduce the OOM.
+With the attached patch, TaskInProgress objects are being garbage collected and I am not seeing the OOM with the same settings., bq. These are not really required to be hanging around till the job completion. As soon as the task finishes, these can be cleared. 
+
+Unfortunately this isn't true. We need the TaskInProgress object in TaskTracker.tasks at least for failing the TaskAttempt of maps whose map-outputs are lost... see TaskTracker.mapOutputLost. I guess we need to just set defaultJobConf/localJobConf to null in TaskInProgress.cleanup for now? Sigh!
+
+----
+
+Unrelated rant: My head still hurts from having to track this down in the mess that the TaskTracker has evolved into... I guess we need to seriously start thinking of cleaning up the TaskTracker, moving TaskTracker.TaskInProgress (very bad name too!) to it's own file, simplifying the interaction between the child TaskAttempt and the TaskTracker etc. Thoughts? , bq. I guess we need to just set defaultJobConf/localJobConf to null in TaskInProgress.cleanup for now
++1. I would say that we also nullify the TIP.diagnosticInfo since this is user settable too. Since a TIP has no other user settable data, and all TIPs of a particular job are removed when the latter completes, it should be okay to keep the TIPs in memory.., sigh! just setting TaskInProgress.localJobConf to null doesn't seem to make JobConf object getting garbage collected. TaskInProgress.localJobConf references are being indirectly held by other classes -> MapOutputFile, MapTask and MapTaskRunner. so we need to set jobConf in these as well to null. , this patch sets the TaskInProgress#localJobConf object references to null., Since this problem affects the 0.19 branch, can we get this fix into the 0.19 branch as well? Thanks., Setting the JobConf references to null in TaskInProgress#cleanup had problem since the TaskRunner thread may need the ref later. Had an offline discussion with Devaraj and decided that TaskRunner#run would be the better place to clean the references.
+This patch makes the JobConf references to null in the finally block of TaskRunner#run. Also had to keep some data in member variables of MapOutputFile and TaskInProgress so that JobConf reference is not required when task finishes., It struck to me that there might be a better approach to the one we have taken, since the present one is hard to maintain. 
+Currently there is a new JobConf object created for each task via new JobConf(rjob.jobFile) in TaskTracker#localizeJob. Since this object is created from a file, new references are created for all properties. Instead of that what if we create JobConf as below:
+
+{code}
+//keep a reference to JobConf in RunningJob
+rjob.localized = true;
+rjob.jobConf = localJobConf;
+{code}
+
+{code}
+//create the task level JobConf
+launchTaskForJob(tip, new JobConf(rjob.jobConf)); 
+{code}
+
+This way the properties for task's conf will be shallow cloned resulting in only reference copy instead of full new object creation. Also there would be a side benefit as there is no need to parse xml file and create JobConf for each task.
+Thoughts ?, Being little clear on my last comment. The code could look like this in TaskTracker.java:
+
+{code}
+private void localizeJob(TaskInProgress tip) throws IOException {
+.......
+.......
+synchronized (rjob) {
+      if (!rjob.localized) {
+           ........
+           ........
+           //keep a reference to JobConf in RunningJob
+            rjob.localized = true;
+            rjob.jobConf = localJobConf;
+     }
+}
+    //create the task level JobConf 
+    launchTaskForJob(tip, new JobConf(rjob.jobConf)); 
+}
+{code}, This seems like a good interim solution. +1
+
+I'd be happy to commit this if we could run a large sleep-job and confirm the fix. Thanks!, Ran a SleepJob by putting a large dummy property value (20MB) in JobConf. 
+* Without the patch, the OOM came after running 44 map tasks. This is expected as the default TT heap size is 1GB so the OOM should come within 50 tasks (20MB *50) executions.
+* With the patch, the no of tasks ran successfully past 1000, then I stopped it. During the run, monitored the heap size which remains almost steady., does this bug exist in 0.19 as well? If so, can we get it into 0.19 branch too?, bq. does this bug exist in 0.19 as well? If so, can we get it into 0.19 branch too? 
+yes. Will upload the patch for 0.19 shortly., all tests passed. ant test-patch :
+-1 overall.
+     [exec]
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+     [exec]
+     [exec]     -1 tests included.  The patch doesn't appear to include any new or modified tests.
+     [exec]                         Please justify why no tests are needed for this patch.
+     [exec]
+     [exec]     +1 javadoc.  The javadoc tool did not generate any warning messages.
+     [exec]
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+     [exec]
+     [exec]     +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+     [exec]
+     [exec]     +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+It is not easy to write a test case for this.
+, same patch applies to 0.19 branch as well., Minor nit - we should remove TaskTracker.RunningJob.jobFile since it isn't used anymore..., incorporated Arun's comment, I just committed this. Thanks, Sharad!]

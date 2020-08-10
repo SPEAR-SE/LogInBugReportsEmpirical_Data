@@ -1,0 +1,130 @@
+[
+JVM :
+      -  For NIO sockets, Sun's implementation  uses a internal direct buffer. It keeps up to 3 such buffers for each thread. It creates a new one each time the existing buffers are not large enough.
+
+RPC Server :
+      -  While sending and receiving serialized data, the handlers invoke read() or write() with the _entire_  buffer.
+      - If there are RPCs that return a lot of data (e.g. listFiles() on a large directory), it ends up creating large direct buffers
+      - in one of the cases, clients listed a large directory (35k files, 6MB serialized data).
+             -- in addition the clients increased number of files after such calls.
+             -- as result, server ends up creating thousands of 6MB buffers since each time JVM requires a slightly larger direct buffer.
+             -- Full GC might help but not a viable option.
+             -- Not sure even after full GC if this memory will be returned back to OS.  
+
+I think fix is fairly straight fwd. RPC server read or write in smaller chunks. for e.g. : 
+{code}
+     // Replace
+     nWritten = write(buf, 0, len); 
+
+    // with 
+    nWritten = 0;
+    while (nWritten < len) {
+         int ret = write(buf, nWritten, MIN(len-nWritten, 64KB));
+         if (ret <= 0) break;
+        //...
+    }
+{code}
+, Attached patch splits i/o into 8k chunks. Most RPC server reads and writes are be much smaller than this. 
+
+The patch is for 0.18 branch., Suggested fix sounds good to me.  +1 on patch.  Would suggest fixing spelling in javadoc if commit.  Patch applied fine to TRUNK with some fluff.
+, 
+Thanks Stack. I will check javadoc again, would appreciate any specific fixes there.
+
+Updated patch has a small fix : '{{ret <= 0}}' is replaced by '{{ret < ioSize}}'. This avoids extra system call incase of partial i/o (or extra blocking in case of blocking sockets). , patch for trunk is attached (essentially renamed).
+
+Another big benefit from this approach is that it avoids many many copies done JDK while writing a large response. E.g. writing a 6MB response might require tens (if not hundreds) of calls to non-blocking write().. and each of these writes copies all the data to be written!., Raghu: There is one on line #60 ('lager') but is so minor it does not merit regen of patches.  Ran a little loading test w/ patch installed in a 0.19 pedigree hadoop and nothing obviously broken.  +1 again.  , Thanks Stack. I will fix it in the next iteration of the patch., The patch looks good. Although I did not go into direct buffers implementation details.
+My only concern is how do we test that
+# it prevents memory leaks;
+# it does note degrade the performance.
+
+Performance-wise we can just do a bunch of {{ls}}-s for one large directory, measure average rpc time before and after the patch, and post numbers in here.
+For leaking I don't have any idea how we can do it other than simple monitoring memory consumption using top. Any ideas?, Thanks Konstantin.
+
+Both are already tested (big thanks to Koji). Not only it does not degrade performance, it improves it (as noted in comment on Dec 8th) for large responses.  For e.g. if the response is 10MB :
+  - without this patch :
+       --  it might take say 100 write operations (each time buffer size decreasing slightly) 
+       -- That implies JVM copies all 10MB  whopping 50 times !!.
+
+ - with this patch :
+       -- it will take 1250 write system calls (each writing 8KB) 
+       -- But there is only one copy made.
+       -- 8KB limit can be increased to a larger one, though not required. RPC server is not meant for serving very large responses anyway.
+       -- In my experience most people underestimate cost of buffer copies and over estimate cost of system call.
+     
+Regd the tests : 
+    - It was shown that if you list a directory in a loop, each time creating a new directory there, the total virtual memory taken by NN shoots up. This patch does prevent that.
+    - In the same test, NN does take less CPU. But one of the stats missing was how fast we were able to list and create the directories. 
+           -- I think actual benefit is even better the raw CPU in the test shows.
+, Updated patch with minor javadoc corrections., In one of the Koji's experiments on branch 0.18: 
+
+{quote}
+[...] I should run longer to see if there's any trend.  
+
+The most ciritcal difference is, after the list attack, namenode's vm memory was 
+
+1) WITHOUT Raghu's patch  total kB        20895184    (20G)
+2) WITH Raghu's patch     total kB        15211256    (15G)
+
+with heap limit of 14G.  :) [...]
+{quote}, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12395979/HADOOP-4797.patch
+  against trunk revision 726129.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no tests are needed for this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3737/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3737/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3737/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3737/console
+
+This message is automatically generated., (Edit : minor correction in shell command for running the test)
+
+About CPU:  Looks like there is orders of magnitude improvement in CPU taken by write operation for 10MB RPC response with the patch. Atached micro benchmark TestRpcCpu.patch runs a simple server that has only one call '{{byte[] getBuffer()}}' that just returns a static byte array. 
+
+Measured cpu reported by /proc/pid/stat for the server for 10 iterations client fetching 10MB buffer :
+* With out the patch : 38500 (40 seconds per iteration)
+* With the patch : 12500 (20 seconds per iteration, more on this later)
+* RPC server takes 3 times less CPU. 
+* Important thing to note is that both of these have a large fixed CPU cost outside of final write() operation.. So real cpu benefit of just around write is much much higher.
+* Given the work done on RPC server and client is same (10 seconds each), 
+    ** With out the patch : write() adds 20-30 seconds
+    ** with the patch : negligible.
+
+It is bit shocking to see that it takes 20 seconds to fetch 10MB even with the patch. I don't think it can be expained by extra copies (as mentioned in HADOOP-4813). It is mostly a problem in object writable. I will try out a fix for that. This patch will show much better CPU improvement once we improve Object writable for arrays.
+
+How to run the test :{noformat}
+$ ant package
+# for server
+$ bin/hadoop jar build/hadoop-0.20.0-dev-test.jar testrpccpu server 
+
+#client : if you run client on a diff machine set "rpc.test.cpu.server.hostname" in 
+#conf/hadodop-site.xml
+$ bin/hadoop jar build/hadoop-0.20.0-dev-test.jar testrpccpu 
+{noformat}
+
+, 
+Ok, benchmark with much saner results. Only difference is that this one returns (a Writable) ByteArray instead of naked a 'byte []' to avoid ObjectWritable from handling the array. CPU for 100 calls : 
+
+  * With out the patch ~ 7000
+  * With the patch ~ 1050 
+  * RPC server takes 6-7 times less CPU to serve 10MB buffer.
+
+I hope 6-7 times less is pretty good for a side benefit. 
+
+In the he previous version of the benchmark, client reads much slower, so 10MB mostly requires more write() calls. The extra CPU penalty in trunk is directly proportional to number write() calls required to write the full buffer., Updated patches with minor javadoc changes., +1 , I just committed this to 0.18, 0.19, 0.20, and trunk., Raghu how is this affecting 0.17.2?, Integrated in Hadoop-trunk #698 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/698/])
+    ]

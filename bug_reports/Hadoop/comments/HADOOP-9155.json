@@ -1,0 +1,355 @@
+[Do {{rm -f /tmp/foo /tmp/bar; rmdir /tmp/foodir /tmp/bardir}} and try this test program:
+
+{code}
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(void) {
+  int fd = creat("/tmp/foo", S_IRWXU);
+  close(fd);
+  mkdir("/tmp/foodir", S_IRWXU);
+  umask(0700);
+  fd = creat("/tmp/bar", S_IRWXU);
+  close(fd);
+  mkdir("/tmp/bardir", S_IRWXU);
+  return 0;
+}
+{code}
+
+If, like me, your umask is set to {{022}}, you should have two files and two directories in your /tmp directory that look like this:
+{code}
+cmccabe@keter:~/test> ls -ld /tmp/foo* /tmp/bar*
+---------- 1 cmccabe users    0 Dec 18 15:10 /tmp/bar
+d--------- 2 cmccabe users 4096 Dec 18 15:10 /tmp/bardir
+-rwx------ 1 cmccabe users    0 Dec 18 15:10 /tmp/foo
+drwx------ 2 cmccabe users 4096 Dec 18 15:10 /tmp/foodir
+{code}
+
+So there is not umask bug here.  In UNIX, umask is applied consistently to files and directories; we do the same in Hadoop.
+
+However, there is a bug here-- an HDFS-specific problem, HDFS-4319.  The issue is that HDFS is treating all files as executable, even though it doesn't actually store that bit for any files.  So really it would make sense to treat all files in HDFS as *not* executable, the same way as was done in branch-1., I'm not saying umask default value have bug, I'm saying that the base permissions should be different for dir and file.
+In your program, you are not using base permission(default permission) at all(you are using S_IRWXU explicitly). I think the correct test  should use mkdir and touch(or cat) to create dir and files, not low level system calls., {code}
+decster:/tmp> touch /tmp/foo
+decster:/tmp> mkdir /tmp/foodir
+decster:/tmp> ls -ld /tmp/foo*
+-rw-r--r--  1 decster  wheel   0 Dec 19 08:44 /tmp/foo
+drwxr-xr-x  2 decster  wheel  68 Dec 19 08:45 /tmp/foodir
+{code}, Here is some code create files and dirs using default permission:
+{code}
+
+FileSystem.java
+
+  /**
+   * Create an FSDataOutputStream at the indicated Path with write-progress
+   * reporting.
+   * @param f the file name to open
+   * @param overwrite if a file with this name already exists, then if true,
+   *   the file will be overwritten, and if false an error will be thrown.
+   * @param bufferSize the size of the buffer to be used.
+   * @param replication required block replication for the file. 
+   */
+  public FSDataOutputStream create(Path f,
+                                            boolean overwrite,
+                                            int bufferSize,
+                                            short replication,
+                                            long blockSize,
+                                            Progressable progress
+                                            ) throws IOException {
+    return this.create(f, FsPermission.getDefault().applyUMask(
+        FsPermission.getUMask(getConf())), overwrite, bufferSize,
+        replication, blockSize, progress);
+  }
+
+  /**
+   * Call {@link #mkdirs(Path, FsPermission)} with default permission.
+   */
+  public boolean mkdirs(Path f) throws IOException {
+    return mkdirs(f, FsPermission.getDefault());
+  }
+
+{code}
+
+The problem is they both use same FsPermission.getDefault() as base permission. mkdirs should use 777 and create should use 666
+, Regarding HDFS-4319, I read the code of CopyToLocal, it seams it doesn't copy fspermission from src to dest, but just use default permission, which leads to this problem?
+{code}
+CommandWithDestination.java
+    void writeStreamToFile(InputStream in, PathData target) throws IOException {
+      FSDataOutputStream out = null;
+      try {
+        out = create(target);
+        IOUtils.copyBytes(in, out, getConf(), true);
+      } finally {
+        IOUtils.closeStream(out); // just in case copyBytes didn't
+      }
+    }
+    
+    // tag created files as temp files
+    FSDataOutputStream create(PathData item) throws IOException {
+      try {
+        return create(item.path, true);
+      } finally { // might have been created but stream was interrupted
+        deleteOnExit(item.path);
+      }
+    }
+
+{code}, I think you're right.  The problem is that the default permission for {{FileSystem#create}} is the same default as for {{FileSystem#mkdirs}}, namely {{0777}}.  It would make more sense for the default to be {{0666}} for files and {{0777}} for directories.
+
+I was confused by your earlier statement that "Currently umask works differently as linux convention"-- but as you later said, it's not umask that's working incorrectly here.  I'm going to update the description and link this to HDFS-4319; feel free to change it later., Hi Binglin,
+
+I think you understand what is going on in this JIRA.  I've been thinking of fixing this myself, but I won't get to it until after vacation.   If you want to take it instead, feel free., Look through the code, FsPermission::getDefault are used across all projects. Most of them are used to create dirs(and symlinks, also should have default value 0777), a few are used to create files. I think we should fix this way:
+
+1. keep the same name getDefault for compatibility, but its meaning has changed to "default permission for dir and symlink", add getFileDefault() to return 0666, further we can add getDirDefault for clearity. No need for symlink cause we never let user choose symlink permission when create symlink.
+
+2. Do the same for FileContext.DEFAULT_PERM, add FileContext.FILE_DEFAULT_PERM
+
+3. Keep all mkdir(and createSymlink) call using getDefault or FileContext.DEFAULT_PERM unchanged(there are too many of them, most in test code), make all create file call use getFileDefault() or FileContext.FILE_DEFAULT_PERM, so as to keep changes at minimal.
+
+4. when creating new FileStatus with default permission, use following logic
+{code}
+    this.permission = (permission == null) ? ((isdir || symlink!=null) ? 
+        FsPermission.getDefault() : 
+        FsPermission.getFileDefault()) : permission;
+{code} 
+
+5. Create multiple sub JIRAs for each sub-project.
+, Initial patch for common sub-project., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12562091/HADOOP-9155.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common:
+
+                  org.apache.hadoop.fs.TestFileStatus
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/1918//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/1918//console
+
+This message is automatically generated., Sorry, my code base is a little old, looks like HADOOP-9147 add some new test in TestFileStatus. , {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12562186/HADOOP-9155.v2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 4 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/1922//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/1922//console
+
+This message is automatically generated., Looks good to me.  Did you test that FSShell's copyToLocal no longer creates local files with 0777? , I manually test it on my macbook:
+decster:~/hadoop-3.0.0> bin/hadoop fs -touchz /ffff
+decster:~/hadoop-3.0.0> bin/hadoop fs -ls /
+Found 1 items
+-rw-r--r--   3 decster supergroup          0 2012-12-28 12:30 /ffff
+decster:~/hadoop-3.0.0> bin/hadoop fs -get /ffff .
+12/12/28 12:30:56 WARN util.NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+decster:~/hadoop-3.0.0> bin/hadoop fs -copyToLocal /ffff f2
+12/12/28 12:32:08 WARN util.NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+decster:~/hadoop-3.0.0> ll
+total 0
+drwxr-xr-x   7 decster  staff  238 Dec 28 11:41 bin
+drwxr-xr-x   4 decster  staff  136 Dec 28 12:30 data
+drwxr-xr-x   3 decster  staff  102 Dec 28 11:41 etc
+-rw-r--r--   1 decster  staff    0 Dec 28 12:32 f2
+-rw-r--r--   1 decster  staff    0 Dec 28 12:30 ffff
+drwxr-xr-x   7 decster  staff  238 Dec 28 11:41 include
+drwxr-xr-x   7 decster  staff  238 Dec 28 11:41 libexec
+drwxr-xr-x   7 decster  staff  238 Dec 28 12:30 logs
+drwxr-xr-x  22 decster  staff  748 Dec 28 11:41 sbin
+drwxr-xr-x   4 decster  staff  136 Dec 28 11:41 share, some the output format is somehow changed be jira, but the permission of the two files is correct 644 (666 apply umask 022), Patch looks pretty good to me. A few little comments:
+
+# This comment is inaccurate:
+{code}
+   /**
++   * Get the default permission for file.
++   */
++  public static FsPermission getDirDefault() {
++    return new FsPermission((short)00777);
++  }
+{code}
+# I think this patch misses a spot in FileSystem where we should now be using one of the new default values:
+{code}
+  public boolean mkdirs(Path f) throws IOException {
+    return mkdirs(f, FsPermission.getDefault());
+  }
+{code}
+# Similarly I think this patch misses a few spots in FileContext, FTPFileSystem, and RawLocalFs.
+# In this change in FileStatus, why continue to use {{FsPermission.getDefault}} instead of the new {{FsPermission.getDirDefault}}?
+{code}
++    this.permission = (permission == null) ? ((isdir || symlink!=null) ? 
++        FsPermission.getDefault() : 
++        FsPermission.getFileDefault()) : permission;
+{code}
+# Should we perhaps mark the old default permissions as being {{@Deprecated}}? I think we should.
+
+Otherwise the patch looks good to me., Ah, sorry, I just noticed [this comment|https://issues.apache.org/jira/browse/HADOOP-9155?focusedCommentId=13537770&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-13537770] of yours explaining why you continue to use {{FsPermission.getDefault}} in a few places. It seems fine to me to continue to use that in the tests, but I do think we should use the new {{FsPermission.getDirDefault}} call in the main code., Thanks Aaron for the review.
+New version of the patch, changes:
+1. fix #1 in previous comment
+2. replace all getDefault with getDirDefault when involving directory.
+2. As for symlink, still use getDefault(for dir and symlink), cause "getDirDefault" is for directory only. So I'm not sure about deprecating getDefault, cause it still has some value for symlink. And since user can only create symlink with default permission, getDefault should only be used internally, but not deprecated?, build env has some issue recently, resubmit, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12563706/HADOOP-9155.v3.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 4 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.ha.TestZKFailoverController
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/2009//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/2009//console
+
+This message is automatically generated., Thanks, Binglin. The way you dealt with this makes sense to me.
+
+I just noticed that the latest patch needed to be rebased slightly on trunk, so here's an updated patch that's identical to the latest save for some line number offset changes.
+
++1, I'm going to commit this momentarily., Forgot to mention - I'm pretty confident the test failure is unrelated. I ran the test in my env with the patch applied several times and it never failed., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12564057/HADOOP-9155.v3.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/2020//console
+
+This message is automatically generated., Integrated in Hadoop-trunk-Commit #3209 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/3209/])
+    HADOOP-9155. FsPermission should have different default value, 777 for directory and 666 for file. Contributed by Binglin Chang. (Revision 1431148)
+
+     Result = SUCCESS
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1431148
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileContext.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileStatus.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ftp/FTPFileSystem.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/local/RawLocalFs.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/FsPermission.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileContextPermissionBase.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestFileStatus.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestLocalFSFileContextMainOperations.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestLocalFileSystemPermission.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsFileStatus.java
+, I've just committed this to trunk and branch-2.
+
+Thanks a lot for the contribution, Binglin., Integrated in Hadoop-Yarn-trunk #92 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/92/])
+    HADOOP-9155. FsPermission should have different default value, 777 for directory and 666 for file. Contributed by Binglin Chang. (Revision 1431148)
+
+     Result = SUCCESS
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1431148
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileContext.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileStatus.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ftp/FTPFileSystem.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/local/RawLocalFs.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/FsPermission.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileContextPermissionBase.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestFileStatus.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestLocalFSFileContextMainOperations.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestLocalFileSystemPermission.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsFileStatus.java
+, Integrated in Hadoop-Mapreduce-trunk #1309 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1309/])
+    HADOOP-9155. FsPermission should have different default value, 777 for directory and 666 for file. Contributed by Binglin Chang. (Revision 1431148)
+
+     Result = FAILURE
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1431148
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileContext.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileStatus.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ftp/FTPFileSystem.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/local/RawLocalFs.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/FsPermission.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileContextPermissionBase.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestFileStatus.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestLocalFSFileContextMainOperations.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestLocalFileSystemPermission.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsFileStatus.java
+, Integrated in Hadoop-Hdfs-trunk #1281 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1281/])
+    HADOOP-9155. FsPermission should have different default value, 777 for directory and 666 for file. Contributed by Binglin Chang. (Revision 1431148)
+
+     Result = FAILURE
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1431148
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileContext.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileStatus.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ftp/FTPFileSystem.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/local/RawLocalFs.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/FsPermission.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileContextPermissionBase.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestFileStatus.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestLocalFSFileContextMainOperations.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestLocalFileSystemPermission.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsFileStatus.java
+, merged to branch-0.23, Integrated in Hadoop-Hdfs-0.23-Build #498 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/498/])
+    HADOOP-9155. FsPermission should have different default value, 777 for directory and 666 for file (Binglin Chang via tgraves) (Revision 1434864)
+
+     Result = FAILURE
+tgraves : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1434864
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileContext.java
+* /hadoop/common/branches/branch-0.23/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileStatus.java
+* /hadoop/common/branches/branch-0.23/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+* /hadoop/common/branches/branch-0.23/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/ftp/FTPFileSystem.java
+* /hadoop/common/branches/branch-0.23/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/local/RawLocalFs.java
+* /hadoop/common/branches/branch-0.23/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/FsPermission.java
+* /hadoop/common/branches/branch-0.23/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FileContextPermissionBase.java
+* /hadoop/common/branches/branch-0.23/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestFileStatus.java
+* /hadoop/common/branches/branch-0.23/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestLocalFSFileContextMainOperations.java
+* /hadoop/common/branches/branch-0.23/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestLocalFileSystemPermission.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+* /hadoop/common/branches/branch-0.23/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/HdfsFileStatus.java
+]

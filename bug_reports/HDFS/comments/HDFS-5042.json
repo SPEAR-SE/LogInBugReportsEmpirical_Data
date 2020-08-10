@@ -1,0 +1,494 @@
+[I think this is expected behavior. To void this, you probably need to set the "sync on close" option. I'd also recommend the "sync.behind.writes" option if you enable "sync on close" to avoid bursty IO. With those two options together, you'll have a bit of a performance impact, but not awful, and you'll avoid data loss on complete power failure., Thanks, Todd, for the suggestions.  Do you know if "sync on close" not only syncs the file but also the directory entry after the rename?  My impression would be that the file gets closed and synced, but that then rename happens from blocksBeingWritten to current and if the directory is not also fsynced also synced after the rename then the above scenario will still happen., That's a good point. I don't think it does sync the directory, since that's AFAIK not possible in Java, So perhaps the best course then is to have the NameNode accept block reports from blocksBeingWritten under certain circumstances in order to guarantee durability., We've also reproduced the data loss (though with less frequency) even with dfs.datanode.synconclose set to true.
+
+We should do something along the line of CASSANDRA-3250 in the data node when "sync on close" is turned on., Is this a problem when enabling write barriers on the DNs? EXT3 has them off by default.
+In that case we might need to move the file in place first and then fsync the file, that should force the meta updates in order... I'm sure that'd cause other problems.
+, We actually reproduce the problem (pretty easily: a couple times out of 10)  on ext4 with barrier enabled (you need nobarrier to turn it off).
+
+BTW, move the file first defeat the purpose of the atomic rename. We should fsync both (file and directory) and check the result of both before return the status of close., Thanks Luke.
+
+I meant to say: (1) finish writing the block. (2) Move it. (3) fsync or fdatasync the block file in the new location.
+(We'd just change the order of moving vs. fsync.)
+
+The rename would still be atomic (file block is written completely before we move it), but doing the fsync after should order the meta data commits correctly assuming write barriers. Then again the write and the move would be two different transactions as far as the fs is concerned.
+
+Agree it's cleanest if we in fact sync both actions.
+, The write barrier support, as I understand it, is strictly used to flush device/disk cache, which is not actually relevant here. 
+
+You're trying to rely on fs impl detail to minimize fsync. OTOH, I think I might have found a real work-around for ext3/ext4, use dirsync mount option in conjunction with "sync on close"., Cool. That should work.
+, We should study the perf impact.
+
+Previously I found that sync-on-close severely impacted file creation time - unless sync-behind-writes is also enabled. (Interestingly sync-behind-writes should not cause any performance detriment as we're dealing with immutable files, and hence delaying writing these dirty blocks to disk in the hopes that they'd be updated before we do so is pointless anyway). 
+, Updating the results for 1000 files DFSIO write test run with dirsync enabled/disabled and results for both runs are similar except for a very small diff in Avg IO rate of -2% with dirsync enabled.  
+
+DFSIO Test:
+./hadoop jar $HADOOP_HOME/share/hadoop/mapreduce/hadoop-mapreduce-client-jobclient-2.3.0-cdh5.0.1-sfdc-2.0.0-tests.jar TestDFSIO -write -nrFiles 1000 -fileSize 1000
+
+Env1 (Datanodes:15, Containers:29, mount options: rw,dirsync,noatime)
+===========================================================
+14/10/14 04:11:47 [main] INFO  fs.TestDFSIO(855): ----- TestDFSIO ----- : write
+14/10/14 04:11:47 [main] INFO  fs.TestDFSIO(855):            Date & time: Tue Oct 14 04:11:47 GMT+00:00 2014
+14/10/14 04:11:47 [main] INFO  fs.TestDFSIO(855):        Number of files: 1000
+14/10/14 04:11:47 [main] INFO  fs.TestDFSIO(855): Total MBytes processed: 1000000.0
+14/10/14 04:11:47 [main] INFO  fs.TestDFSIO(855):      Throughput mb/sec: 21.114069074888118
+14/10/14 04:11:47 [main] INFO  fs.TestDFSIO(855): Average IO rate mb/sec: 21.986719131469727
+14/10/14 04:11:47 [main] INFO  fs.TestDFSIO(855):  IO rate std deviation: 4.507905485162703
+14/10/14 04:11:47 [main] INFO  fs.TestDFSIO(855):     Test exec time sec: 1937.989
+14/10/14 04:11:47 [main] INFO  fs.TestDFSIO(855): 
+
+Env2 (Datanodes:15, Containers:29, mount options: rw,noatime)
+====================================================
+14/10/14 04:32:25 [main] INFO  fs.TestDFSIO(855): ----- TestDFSIO ----- : write
+14/10/14 04:32:25 [main] INFO  fs.TestDFSIO(855):            Date & time: Tue Oct 14 04:32:25 GMT 2014
+14/10/14 04:32:25 [main] INFO  fs.TestDFSIO(855):        Number of files: 1000
+14/10/14 04:32:25 [main] INFO  fs.TestDFSIO(855): Total MBytes processed: 1000000.0
+14/10/14 04:32:25 [main] INFO  fs.TestDFSIO(855):      Throughput mb/sec: 21.391594681989666
+14/10/14 04:32:25 [main] INFO  fs.TestDFSIO(855): Average IO rate mb/sec: 22.406478881835938
+14/10/14 04:32:25 [main] INFO  fs.TestDFSIO(855):  IO rate std deviation: 5.169537520933585
+14/10/14 04:32:25 [main] INFO  fs.TestDFSIO(855):     Test exec time sec: 1872.904
+14/10/14 04:32:25 [main] INFO  fs.TestDFSIO(855): 
+, We can make it optional and put in after HDFS-8791. , We also faced the same problem. Can we recover this kind of block from namenode after getting block report? 
+If reported block genstamp and size is matching with the namenode in memory metadata then NameNode can send a command to datanode to recover from wrong replica state.
+, bq. Can we recover this kind of block from namenode after getting block report? 
+In most cases, these block files will be 0 byte after reboot. The file system has already lost data, so there is nothing NN or DN can do. The solution is to sync the directory entry. , Thanks [~kihwal]. In my case blocks are in complete state in namenode, but datanodes reported in RBW state after reboot., We've seen that too. Unless there is other bug in Hadoop, I think directory sync will fix that too., It seems like Lucene has figured out how to fsync a directory in Java 7, worth revisiting this for HDFS given that we've dropped Java 6 support?, Thanks [~andrew.wang] for the pointer.
+LUCENE did find the workaround in LUCENE-5588, which was recently broken by openjdk commit tracked in LUCENE-6169.
+
+This [link|http://blog.httrack.com/blog/2013/11/15/everything-you-always-wanted-to-know-about-fsync/] gives the initial idea of how it might work. But since there's no official documentation of the behavior, openjdk commit broken it.
+
+Also this workaround is only for linux.
+So need to find a way which works in all platforms or we can adopt this itself atleast for linux.
+
+from this [link|http://mail.openjdk.java.net/pipermail/nio-dev/2015-May/003140.html]
+{noformat}(Windows already ensure that the metadata is written correctly after atomic rename). On the other hand, MacOSX looks like ignoring fsync requests completely - also on files - if you don't use a special fnctl{noformat}
+Looks like this directory sync not required for windows afterall. May be some windows expert confirm this.?, bq. It seems like Lucene has figured out how to fsync a directory in Java 7, worth revisiting this for HDFS given that we've dropped Java 6 support?
++1 for adding the support for branches that require java 7 and higher. I guess the bug in java 9 is not our immediate concern., Attached the proposed changes for trunk,, attached the branch-2 patch, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 26s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 46s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 53s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 18s{color} | {color:green} branch-2 passed with JDK v1.8.0_131 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m  0s{color} | {color:green} branch-2 passed with JDK v1.7.0_131 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 33s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 57s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 30s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 49s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 30s{color} | {color:green} branch-2 passed with JDK v1.8.0_131 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 52s{color} | {color:green} branch-2 passed with JDK v1.7.0_131 {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 15s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 12s{color} | {color:green} the patch passed with JDK v1.8.0_131 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 43s{color} | {color:green} the patch passed with JDK v1.7.0_131 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  6m 43s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 30s{color} | {color:orange} root: The patch generated 2 new + 320 unchanged - 1 fixed = 322 total (was 321) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  1s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 14s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javadoc {color} | {color:red}  0m 43s{color} | {color:red} hadoop-common-project_hadoop-common-jdk1.8.0_131 with JDK v1.8.0_131 generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:red}-1{color} | {color:red} javadoc {color} | {color:red}  0m 50s{color} | {color:red} hadoop-common-project_hadoop-common-jdk1.7.0_131 with JDK v1.7.0_131 generated 1 new + 10 unchanged - 0 fixed = 11 total (was 10) {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m  0s{color} | {color:green} hadoop-common in the patch passed with JDK v1.7.0_131. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 54m  3s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_131. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 23s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}186m  1s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_131 Failed junit tests | hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+|   | hadoop.hdfs.server.namenode.TestDecommissioningStatus |
+| JDK v1.7.0_131 Failed junit tests | hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+|   | hadoop.tracing.TestTraceAdmin |
+|   | hadoop.hdfs.server.namenode.ha.TestDFSUpgradeWithHA |
+|   | hadoop.hdfs.server.blockmanagement.TestReplicationPolicyWithUpgradeDomain |
+| JDK v1.7.0_131 Timed out junit tests | org.apache.hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:8515d35 |
+| JIRA Issue | HDFS-5042 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12869210/HDFS-5042-branch-2-01.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 11b7df05d2bb 3.13.0-107-generic #154-Ubuntu SMP Tue Dec 20 09:57:27 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / fe185e2 |
+| Default Java | 1.7.0_131 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_131 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_131 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/19538/artifact/patchprocess/diff-checkstyle-root.txt |
+| javadoc | https://builds.apache.org/job/PreCommit-HDFS-Build/19538/artifact/patchprocess/diff-javadoc-javadoc-hadoop-common-project_hadoop-common-jdk1.8.0_131.txt |
+| javadoc | https://builds.apache.org/job/PreCommit-HDFS-Build/19538/artifact/patchprocess/diff-javadoc-javadoc-hadoop-common-project_hadoop-common-jdk1.7.0_131.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/19538/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_131.txt |
+| JDK v1.7.0_131  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/19538/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/19538/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Updated the patch to fix javadoc and checkstyle, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 18s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 41s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 15m 40s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 15m 32s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m  1s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m  7s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 41s{color} | {color:green} trunk passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 36s{color} | {color:red} hadoop-common-project/hadoop-common in trunk has 19 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 46s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 15s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 14m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 14m 40s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  2m  3s{color} | {color:orange} root: The patch generated 2 new + 307 unchanged - 1 fixed = 309 total (was 308) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m  3s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 38s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  7m 48s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 72m 11s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 36s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}151m 56s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+|   | hadoop.hdfs.server.namenode.ha.TestPipelinesFailover |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:14b5c93 |
+| JIRA Issue | HDFS-5042 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12869396/HDFS-5042-02.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 2a583979c386 3.13.0-107-generic #154-Ubuntu SMP Tue Dec 20 09:57:27 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / d0f346a |
+| Default Java | 1.8.0_131 |
+| findbugs | v3.1.0-RC1 |
+| findbugs | https://builds.apache.org/job/PreCommit-HDFS-Build/19554/artifact/patchprocess/branch-findbugs-hadoop-common-project_hadoop-common-warnings.html |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/19554/artifact/patchprocess/diff-checkstyle-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/19554/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/19554/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/19554/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, updated patch, Mentioned directory sync will be called on block close() if sync_on_close is configured., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 22s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 38s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 14m 20s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 14m 25s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 57s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m  4s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 41s{color} | {color:green} trunk passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 22s{color} | {color:red} hadoop-common-project/hadoop-common in trunk has 19 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 36s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 12m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 57s{color} | {color:green} root: The patch generated 0 new + 307 unchanged - 1 fixed = 307 total (was 308) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m  3s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 28s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 36s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  7m 41s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 70m 39s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 39s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}144m 29s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure090 |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure080 |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailure |
+|   | hadoop.hdfs.TestDFSRSDefault10x4StripedOutputStreamWithFailure |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:14b5c93 |
+| JIRA Issue | HDFS-5042 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12869501/HDFS-5042-03.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux a63fbf0bd5e5 3.13.0-107-generic #154-Ubuntu SMP Tue Dec 20 09:57:27 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 52661e0 |
+| Default Java | 1.8.0_131 |
+| findbugs | v3.1.0-RC1 |
+| findbugs | https://builds.apache.org/job/PreCommit-HDFS-Build/19565/artifact/patchprocess/branch-findbugs-hadoop-common-project_hadoop-common-warnings.html |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/19565/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/19565/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/19565/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Hi [~kihwal]/[~andrew.wang]
+Do changes looks good to you?, {{fsync(File fileToSync)}} will leak file descriptors and other associated objects in the current code.   Can we cache some directory FileChannels? Caching source dirs might be simple. We just make sure they get added/removed when volumes get added/removed online. But then I am not sure how much impact it will have. For majority of use cases, those directory inodes will stay cached in kernel, so it is less likely cause any seeks.  It might mattter for dense datanodes with high memory pressure., bq. fsync(File fileToSync) will leak file descriptors and other associated objects in the current code. 
+I am not sure what makes you think like this. channel is opened in {{try-with-resources}} block, so it should get closed automatically.
+{code}    try(FileChannel channel = FileChannel.open(fileToSync.toPath(),
+        isDir ? StandardOpenOption.READ : StandardOpenOption.WRITE)){
+      fsync(channel, isDir);
+    }{code}
+Am I missing something here?
+
+bq. Can we cache some directory FileChannels? Caching source dirs might be simple. We just make sure they get added/removed when volumes get added/removed online. But then I am not sure how much impact it will have. For majority of use cases, those directory inodes will stay cached in kernel, so it is less likely cause any seeks. It might mattter for dense datanodes with high memory pressure
+Caching seems to be good improvement for src directory, which will be either of tmp or rbw. Caching of destination is not good.
+, bq. Am I missing something here?
+Sorry, did not look closely., Does it make sense to have {{FileIoProvider#sync()}} to call the new {{IOUtils.fsync()}}?, bq. Does it make sense to have FileIoProvider#sync() to call the new IOUtils.fsync()?
+Yes, I will update the patch., Updated the patch, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 20s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 18s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 12m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 50s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 33s{color} | {color:green} trunk passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 23s{color} | {color:red} hadoop-common-project/hadoop-common in trunk has 19 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 29s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 12m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 41s{color} | {color:green} root: The patch generated 0 new + 307 unchanged - 1 fixed = 307 total (was 308) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 27s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  7m 42s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 65m 13s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 34s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}132m 34s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure160 |
+|   | hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+|   | hadoop.hdfs.web.TestWebHdfsTimeouts |
+|   | hadoop.hdfs.TestDFSStripedInputStreamWithRandomECPolicy |
+|   | hadoop.hdfs.server.balancer.TestBalancer |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure150 |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:14b5c93 |
+| JIRA Issue | HDFS-5042 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12869701/HDFS-5042-04.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux a31fc119ab69 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 1c8dd6d |
+| Default Java | 1.8.0_131 |
+| findbugs | v3.1.0-RC1 |
+| findbugs | https://builds.apache.org/job/PreCommit-HDFS-Build/19595/artifact/patchprocess/branch-findbugs-hadoop-common-project_hadoop-common-warnings.html |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/19595/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/19595/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/19595/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, +1 the latest patch looks good., bq. +1 the latest patch looks good.
+Hold on. {{TestDataNodeHotSwapVolumes}} is failing with the patch. , Fixed the test failure., Attaching branch-2 patch, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  9s{color} | {color:red} HDFS-5042 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HDFS-5042 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12870244/HDFS-5042-05-branch-2.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/19661/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Re-attaching the branch-2 patch with name changed., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} docker {color} | {color:red}  0m 30s{color} | {color:red} Docker failed to build yetus/hadoop:8515d35. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HDFS-5042 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12870246/HDFS-5042-branch-2-05.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/19662/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 37s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 47s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 15m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 14m 32s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 42s{color} | {color:green} trunk passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 39s{color} | {color:red} hadoop-common-project/hadoop-common in trunk has 19 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 41s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 49s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 15m  2s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 15m  2s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  2m  3s{color} | {color:orange} root: The patch generated 1 new + 307 unchanged - 1 fixed = 308 total (was 308) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 28s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 18s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 92m 52s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 44s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}173m 37s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure080 |
+|   | hadoop.hdfs.server.namenode.TestNameNodeMXBean |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailureWithRandomECPolicy |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:14b5c93 |
+| JIRA Issue | HDFS-5042 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12870243/HDFS-5042-05.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 647ecd3ddd63 3.13.0-108-generic #155-Ubuntu SMP Wed Jan 11 16:58:52 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 31058b2 |
+| Default Java | 1.8.0_131 |
+| findbugs | v3.1.0-RC1 |
+| findbugs | https://builds.apache.org/job/PreCommit-HDFS-Build/19660/artifact/patchprocess/branch-findbugs-hadoop-common-project_hadoop-common-warnings.html |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/19660/artifact/patchprocess/diff-checkstyle-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/19660/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/19660/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/19660/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Seems some problem with yetus for branch-2., Thanks for the patch [~vinayrpet]. I think we need to ensure dir sync on *hsync()* also as client apps may consider the data is flushed to disk. What is your view?, bq. I think we need to ensure dir sync on hsync() also as client apps may consider the data is flushed to disk. What is your view?
+I think, its a good point.
+I have been trying to verify this issue.
+Found small blocks created and closed before powere failure, were nowhere exists on disk. Neither in rbw nor in finalized. May be because when the block files were created in rbw these entries also failed to sync to device.
+May be first hsync() request on block file can call fsync on its parent directory (rbw) directory., +1 on the syncing rbw on the fisrt hsync().  But let's focus on the completed files in this jira and implement the extra safety in a separate one.  Let's get the branch-2 patch buttoned up., bq. +1 on the syncing rbw on the fisrt hsync(). But let's focus on the completed files in this jira and implement the extra safety in a separate one. Let's get the branch-2 patch buttoned up.
+Thanks [~kihwal].
+Branch-2 patch is already attached, but jenkins is refusing to take it up. Seems some problem in building docker image., For trunk patch, checkstyle can be ignored, as its inline with previous indentation. Test failures are unrelated., +1 the trunk patch looks good. Also the branch-2 patch looks fine. , I've committed this to trunk and branch-2. branch-2.8 does not have a separate FileIoProvider, so it will need a different patch.  I am resolving this for now., SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #11805 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/11805/])
+HDFS-5042. Completed files lost after power failure. Contributed by (kihwal: rev 1543d0f5be6a02ad00e7a33e35d78af8516043e3)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
+* (edit) hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/IOUtils.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/FileIoProvider.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/LocalReplica.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java
+, Attaching the branch-2.8 patch, Attaching branch-2.7 patch as well., In the 2.8 patch,
+{code}
++   * @param fileToSync the file to fsync
++   * @param isDir if true, the given file is a directory (we open for read and
++   *          ignore IOExceptions, because not all file systems and operating
++   *          systems allow to fsync on a directory)
++   */
++  public static void fsync(File fileToSync) throws IOException {
+{code}
+{{isDir}} is not actually a parameter for the method.
+
+{{TestDataNodeHotSwapVolumes}} fails like the previous version of trunk patch., Oops. thats the wrong patch I attached.
+Here is the updated one for branch-2.8, Updated branch-2.7 patch as well., The patches look good. Now the fix is in branch-2.8 and branch-2.7.  Thanks for fixing this Vinay., Thanks a lot [~kihwal] for reviews and commit.
+Thanks everyone for the discussion and pushing this long pending issue to closure., +1, hear hear!
+
+Thanks [~vinayrpet] for driving this in after 4 years, and [~andrew.wang] for the pointer to the possible solution., We are seeing significant performance degradation in 2.8 with this change. Whenever the write load increases, multiple datanodes stop heartbeating for a long time, causing missing blocks.  All other Xceiver threads and the actor threads are waiting for the dataset impl lock. The writes make progress, but slow enough to get always caught by jstack.
+
+{noformat}
+"DataXceiver for client  at xxx [Receiving block BP-aaa:blk_xxxx_xxxx]"
+ #343116 daemon prio=5 os_prio=0 tid=0x00007f3b1ef18000 nid=0x19193 runnable [0x00007f3a5c104000]
+   java.lang.Thread.State: RUNNABLE
+        at sun.nio.ch.FileDispatcherImpl.force0(Native Method)
+        at sun.nio.ch.FileDispatcherImpl.force(FileDispatcherImpl.java:76)
+        at sun.nio.ch.FileChannelImpl.force(FileChannelImpl.java:388)
+        at org.apache.hadoop.io.IOUtils.fsync(IOUtils.java:394)
+        at org.apache.hadoop.io.IOUtils.fsync(IOUtils.java:376)
+        at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl.fsyncDirectory(FsDatasetImpl.java:899)
+        at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl.finalizeReplica(FsDatasetImpl.java:1756)
+        at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl.finalizeBlock(FsDatasetImpl.java:1724)
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receiveBlock(BlockReceiver.java:949)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.writeBlock(DataXceiver.java:854)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opWriteBlock(Receiver.java:166)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:103)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:288)
+        at java.lang.Thread.run(Thread.java:745)
+
+   Locked ownable synchronizers:
+        - <0x00000000d5ff46f8> (a java.util.concurrent.locks.ReentrantLock$NonfairSync)
+{noformat}
+
+We are still analyzing whether there are other factors in play., Whether doing the fsync() outside the dataset impl lock will help?, Here is the addendum patch to move fsync() out of lock.
+[~kihwal], If this is fine to you, can create another Jira to push this if required., Wondering if we should make this feature configurable. There are some filesystems (like ext4), where these fsync's are affecting much more than the datanode process. If YARN is using the same disks and is writing significant amounts of intermediate data or performing other disk-heavy operations, the entire system will see significantly degraded performance (like disks at 100% for 10s of minutes). , bq. Here is the addendum patch to move fsync() out of lock.
+It should definitely help. I think the only requirement is that fsync to be done before acking back to the client. , bq. Wondering if we should make this feature configurable
+This is already using the existing configuration of *dfs.datanode.synconclose*, I felt that was sufficient., Created HDFS-12157 for the fsyncDir outside lock., SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #14057 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/14057/])
+HDFS-5042. Completed files lost after power failure. Contributed by (xyao: rev 5a81e70c448cf9674323ed220c758726d51a1aec)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/LocalReplica.java
+* (edit) hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/IOUtils.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/FileIoProvider.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
+]

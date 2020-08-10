@@ -1,0 +1,198 @@
+[Could someone help to see if this is a real issue? Thanks., Is this the full server log? Does anything happen between 22:04:39 and 22:05:20? Session expiration requires consensus over the quorum so to perform a session expiration operation, a proposal has to be sent out by leader to the quorum and wait until leader receives ACKs from a quorum of servers. If during this process leader election happens, then client might be able to renew the session at the same (or a different server), which is what the client log shows here.
+
+For the available server log posted here, in particular:
+* {{ org.apache.zookeeper.server.PrepRequestProcessor	Processed session termination for sessionid }} does not mean session is expired. It only implies that the request passed one of the processor stage.
+* Similarly, {{ org.apache.zookeeper.server.quorum.CommitProcessor	Processing request:: sessionid:0x25cd1e82c110001 type:closeSession }} does not mean session close is performed. At this stage the commit processor only queued the closing request which will be processed later once the leader receives enough ACKs from a quorum. So if leader dies, then this will not be committed.
+
+It should be easy to find hard evidence regarding whether or not the session close transaction was finally committed by quorum or not. When DEBUG is enabled, there should be lots of information related to what proposals got committed in different servers. That is also the reason I was asking if the server log is completed or not.
+
+It will be a bug however if we find out that the close session was committed across quorum yet client was still able to renew the session., These session expiration logs don't exactly represent this session(isClosing is true) has been removed
+more logs,client and server configuration,ZK's usage scenarios for your kafka cluster would make sure this problem further   
+For this possible incompleted logs, let's me tell this story:
+  22:05:18.590 the clinet did a request(may be a transaction request) that was sent to the leader,but a leader has broken down(LE happened) between 22:04:39 and 22:05:20, so client had not heard from server in 4485ms 
+  22:05:19.326 the clinet reconnected to server who was a follower,activated this session(renew with the same sessionId) and this session moved from leader to one follower
+Haha,I'm kidding seriously!, [~hanm], thanks for the reply. I am attaching the log of 2 of the 3 ZK servers around that time. During that window, there was some potential network issue that may prevent ZK servers from talking to each other. The network issue seems to be gone after 22:05:20, when the ZK cluster stabilized again.
+
+Assuming that session 25cd1e82c110001 didn't really get expired at that point, I got a followup question. A month later, the whole ZK cluster was down and was restarted. On restarting, I saw the following logging in ZK server about deleting an ephemeral in that session. 
+
+
+{code:java}
+August 2nd 2017, 23:41:55.076	DEBUG	org.apache.zookeeper.server.DataTree	Deleting ephemeral node /cp15/brokers/ids/0 for session 0x25cd1e82c110001 
+{code}
+
+I assume that's because ZK server thinks that session is expired? However, in ZK server's commit log, I didn't find any entry about closing that session. Is that normal? Thanks,, In zk.1 log, looks like server 1 (which was leader a.t.m.) was cut off right after it proposing expiring session 25cd1e82c110001:
+
+{noformat}
+June 27th 2017, 22:04:39.001   DEBUG org.apache.zookeeper.server.quorum.Leader Proposing:: sessionid:0x25cd1e82c110001 type:closeSession cxid:0x0 zxid:0x200000fc4 txntype:-11 reqpath:n/a
+
+June 27th 2017, 22:04:39.076   ERROR org.apache.zookeeper.server.quorum.LearnerHandler Unexpected exception causing shutdown while sock still open
+{noformat}
+
+And then server 1 went into leader election and eventually became a follower. So the session expiring proposal never went through quorum thus the session 25cd1e82c110001 was not expired. A more convincing proof regarding the results of session expiration would be to search all the log for something like "Committing request:: sessionid:0x25cd1e82c110001" - if we have a hit then that means the session expiring request reached a consensus and got committed. 
+
+Regarding the follow up question, if the session was not expired, then it is possible at least in one case that we will see the "logging in ZK server about deleting an ephemeral in that session.". That case is when a server receives session expiration request, it persists the session close request locally to tnx log file, and then got cut off from rest of quorum. When this server restarts, it will load its data tree from persistent log files, then replay session close request which leads to delete ephemerals. Later when this server joins the quorum its state will be synced with leader, which does not have the close session transaction (otherwise the session would be expired already at quorum level), so leader will tell this server to truncate its log by dropping the session close request, and the server will do so by truncate and reloading logs, which eventually bring its data tree on par with rest of quorum. , [~hanm], thanks for the explanation. The client on session 25cd1e82c110001 actually died around Aug 2, 23:16:11. From ZK server's log, the last ping from that session was around that time. Then ZK server was restarted around 23:41:28.
+
+{code:java}
+August 2nd 2017, 23:16:11.086	DEBUG	org.apache.zookeeper.server.FinalRequestProcessor	sessionid:0x25cd1e82c110001 type:ping cxid:0xfffffffffffffffe zxid:0xfffffffffffffffe txntype:unknown reqpath:n/a
+August 2nd 2017, 23:16:11.086	DEBUG	org.apache.zookeeper.server.quorum.CommitProcessor	Processing request:: sessionid:0x25cd1e82c110001 type:ping cxid:0xfffffffffffffffe zxid:0xfffffffffffffffe txntype:unknown reqpath:n/a
+August 2nd 2017, 23:41:28.699	INFO	org.apache.zookeeper.server.NIOServerCnxnFactory	binding to port 0.0.0.0/0.0.0.0:2181
+August 2nd 2017, 23:41:29.149	DEBUG	org.apache.zookeeper.server.DataTree	Deleting ephemeral node /cp15/brokers/ids/0 for session 0x25cd1e82c110001
+{code}
+
+However, I couldn't find any entry about the closing of that session in ZK commit log around that time. So, it's not clear to me if ZK server ever closed that session. Should every closed session be in the ZK commit log?
+, bq. Should every closed session be in the ZK commit log?
+
+I think so but please give me some time to double check on my side. One quick search is to scan through your log file and if you see any of the (legitimate) session closing got logged as part of CommitProcessor's debug log then that is a positive of the theory.
+
+Another thing I noticed is that in zk.0 log, there are a few errors, such as {{error: -103}} or {{type:error}}, which might be fine but indicates some issues of the data on this specific server., [~hanm], I tried it locally. It seems that every time a session is closed. The log4j log will log the deleting of ephemeral nodes with the session and type:closeSession in FinalRequestProcessor. 
+
+{code:java}
+[2017-08-09 16:00:46,325] DEBUG Processing request:: sessionid:0x15dc93a4f1a0000 type:closeSession cxid:0x3f zxid:0x39 txntype:-11 reqpath:n/a (org.apache.zookeeper.server.FinalRequestProcessor)
+[2017-08-09 16:00:46,325] DEBUG Deleting ephemeral node /brokers/ids/0 for session 0x15dc93a4f1a0000 (org.apache.zookeeper.server.DataTree)
+[2017-08-09 16:00:46,326] DEBUG sessionid:0x15dc93a4f1a0000 type:closeSession cxid:0x3f zxid:0x39 txntype:-11 reqpath:n/a (org.apache.zookeeper.server.FinalRequestProcessor)
+{code}
+
+However, for the above incident, I didn't find any logging of closeSession in the log4j log.
+, [~junrao] I also did experiments on my side, when a session is closed the {{CommitProcessor}} should log something like:
+{noformat}2017-08-09 22:41:49,824 [myid:2] - DEBUG [SyncThread:2:CommitProcessor@386] - Committing request:: sessionid:0x10000134d2f0000 type:closeSession cxid:0x1 zxid:0x200000002 txntype:-11 reqpath:n/a{noformat}
+But this is for 3.5, which has changed a lot in terms of how commit works, and I realized you are using 3.4. But, from what you just referred about {{didn't find any logging of closeSession in the log4j log}} I think we can conclude that this specific session was not closed.
+
+To circle back to original question - assuming this problematic session is not closed (which is what existing evidence demonstrates), does this create any inconsistency or confusions at higher level in your use case? Were you expecting this session got closed based on what you observed at client side?, [~hanm], in this case, session 25cd1e82c110001 was created by a Kafka broker. The broker registers an ephemeral node in ZK on startup. That Kafka broker went down around Aug 2, 23:16:11. The expectation is that its ZK session will be closed and the registered ephemeral node will be removed. Another Kafka broker (the controller) has a child watcher on the ephemeral node's parent path. It will be notified about the broker change and process it accordingly. The problem is that the controller never received such notification. This led the Kafka cluster to a bad state.
+
+You were saying that the following entry doesn't necessarily mean that the ephemeral node is actually removed since it could be restored. Is there any logging indicating the restore?
+{code:java}
+August 2nd 2017, 23:41:29.149	DEBUG	org.apache.zookeeper.server.DataTree	Deleting ephemeral node /cp15/brokers/ids/0 for session 0x25cd1e82c110001
+{code}
+
+, bq. That Kafka broker went down around Aug 2, 23:16:11. The expectation is that its ZK session will be closed and the registered ephemeral node will be removed.
+
+The expectation will be correct if this Kafka broker really died. But if it was a transient interruption, i.e. network issues between that Kafka broker and ZooKeeper, then the session will be renewed and ephemeral nodes appertain to that session will be intact. From the original log posted, the session {{0x25cd1e82c110001}} was renewed (though the timestamp of the log does not match {{Aug 2, 23:16:11}} so probably we are not talking about same event. In any case, do we have any evidence that indicates the broker in question really died?
+
+bq. the following entry doesn't necessarily mean that the ephemeral node is actually removed since it could be restored.
+
+Correct, I think this log does not imply the final quorum state W.R.T. the ephemeral nodes, because the logging here was done before a consensus regarding the ephemeral removal proposal was reached. When a server thinks a client is dead and initiates the session closing, it will start removing the ephemerals from its data tree while waiting for the votes of the ephemeral removal proposal, so the ephemeral nodes removal here does not have transactional semantic because it does not consider the proposal results.
+
+bq. Is there any logging indicating the restore?
+
+When log level is set to DEBUG, {{FinalRequestPrecessor}} will log all requests it processes, including the ephemeral nodes recreate (which is just normal ephemeral node create since it has no notion of a state). You can probably search {{type:create}} in logs.
+
+The restore will only happen when a server restarts, or rejoin quorum, and finds out it has out dated state with rest of quorum. Otherwise, the ephemeral nodes will either be removed already at quorum level, or not removed at all (on this specific server) :). In both cases (restarts/rejoin quorum), the server will recover the expected state from rest of quorum by replaying transactions logs. , [~hanm], that broker stopped logging around Aug 2, 23:16:11, which matches the time when the ping from that session stopped showing in ZK log. If the pinging stops, ZK server should expire that session after the session timeout, right?
+
+I also grepped for all references to /cp15/brokers/ids/0 in the log. After "Deleting ephemeral node", the node was recreated later, but for a different session (which is when that broker was restarted). So, there is no indication that session 0x25cd1e82c110001 was restored.
+
+{code:java}
+ZK server 2:
+August 2nd 2017, 23:41:29.019	DEBUG	org.apache.zookeeper.server.DataTree	Deleting ephemeral node /cp15/brokers/ids/0 for session 0x5cc2b607d10002
+August 2nd 2017, 23:41:29.149	DEBUG	org.apache.zookeeper.server.DataTree	Deleting ephemeral node /cp15/brokers/ids/0 for session 0x25cd1e82c110001
+August 2nd 2017, 23:42:12.105	DEBUG	org.apache.zookeeper.server.FinalRequestProcessor	Processing request:: sessionid:0x25ceb96455e0000 type:getData cxid:0x4c4 zxid:0xfffffffffffffffe txntype:unknown reqpath:/cp15/brokers/ids/0
+August 2nd 2017, 23:42:12.105	DEBUG	org.apache.zookeeper.server.quorum.CommitProcessor	Processing request:: sessionid:0x25ceb96455e0000 type:getData cxid:0x4c4 zxid:0xfffffffffffffffe txntype:unknown reqpath:/cp15/brokers/ids/0
+August 2nd 2017, 23:42:12.105	DEBUG	org.apache.zookeeper.server.FinalRequestProcessor	sessionid:0x25ceb96455e0000 type:getData cxid:0x4c4 zxid:0xfffffffffffffffe txntype:unknown reqpath:/cp15/brokers/ids/0
+August 2nd 2017, 23:42:21.982	DEBUG	org.apache.zookeeper.server.FinalRequestProcessor	sessionid:0x25ceb96455e0000 type:getData cxid:0x4c8 zxid:0xfffffffffffffffe txntype:unknown reqpath:/cp15/brokers/ids/0
+August 2nd 2017, 23:42:21.982	DEBUG	org.apache.zookeeper.server.FinalRequestProcessor	Processing request:: sessionid:0x25ceb96455e0000 type:getData cxid:0x4c8 zxid:0xfffffffffffffffe txntype:unknown reqpath:/cp15/brokers/ids/0
+August 2nd 2017, 23:42:21.982	DEBUG	org.apache.zookeeper.server.quorum.CommitProcessor	Processing request:: sessionid:0x25ceb96455e0000 type:getData cxid:0x4c8 zxid:0xfffffffffffffffe txntype:unknown reqpath:/cp15/brokers/ids/0
+
+ZK server 1:
+August 2nd 2017, 23:41:54.966	DEBUG	org.apache.zookeeper.server.DataTree	Deleting ephemeral node /cp15/brokers/ids/0 for session 0x5cc2b607d10002
+August 2nd 2017, 23:41:55.076	DEBUG	org.apache.zookeeper.server.DataTree	Deleting ephemeral node /cp15/brokers/ids/0 for session 0x25cd1e82c110001
+August 2nd 2017, 23:42:12.045	DEBUG	org.apache.zookeeper.server.quorum.CommitProcessor	Processing request:: sessionid:0x15da553c7ec0000 type:create cxid:0x26 zxid:0xfffffffffffffffe txntype:unknown reqpath:/cp15/brokers/ids/0
+August 2nd 2017, 23:42:12.095	DEBUG	org.apache.zookeeper.server.FinalRequestProcessor	Processing request:: sessionid:0x15da553c7ec0000 type:create cxid:0x26 zxid:0x40000004d txntype:1 reqpath:/cp15/brokers/ids/0
+August 2nd 2017, 23:42:12.095	DEBUG	org.apache.zookeeper.server.FinalRequestProcessor
+
+ZK server 0:
+August 2nd 2017, 23:42:12.107	DEBUG	org.apache.zookeeper.server.DataTree	Failed: 98416546127020032,38,17179869261,1501717332053,1
+:'/cp15/brokers/ids/0,#7b226c697374656e65725f73656375726974795f70726f746f636f6c5f6d6170223a7b22494e5445524e414c223a22504c41494e54455854222c225245504c49434154494f4e223a22504c41494e54455854222c2245585445524e414c223a225341534c5f504c41494e54455854227d2c22656e64706f696e7473223a5b22494e5445524e414c3a2f2f62726f6b65722d696e7465726e616c2d302e637031352e7376632e636c75737465722e6c6f63616c3a39303731222c225245504c49434154494f4e3a2f2f62726f6b65722d696e7465726e616c2d302e637031352e7376632e636c75737465722e6c6f63616c3a39303732222c2245585445524e414c3a2f2f72302e6b61666b612e676f73706f74636865636b2e6177732e636f6e666c75656e742e636c6f75643a39303932225d2c227261636b223a227230222c226a6d785f706f7274223a373230332c22686f7374223a2262726f6b65722d696e7465726e616c2d302e637031352e7376632e636c75737465722e6c6f63616c222c2274696d657374616d70223a2231353031373137333332303337222c22706f7274223a393037312c2276657273696f6e223a347d,v{s{31,s{'world,'anyone}}},T,9
+August 2nd 2017, 23:42:12.108	DEBUG	org.apache.zookeeper.server.DataTree	Adjusting parent cversion for Txn: 1 path:/cp15/brokers/ids/0 err: -110
+{code}
+
+So, what do you think happened there? Did the session 0x25cd1e82c110001 ever get closed? Could this be a ZK bug?, bq. If the pinging stops, ZK server should expire that session after the session timeout, right?
+
+Correct. If the client dies ZK server should expire the session, eventually. 
+
+bq. Did the session 0x25cd1e82c110001 ever get closed?
+
+Based on what's discussed so far, I don't think this session is closed, because:
+* There is no evidence that closing session proposal was committed.
+* The ephemeral nodes associated with the session were not deleted. That is why later attempts to recreate same node get error {{-110}}, which means nodes already exist: {{DEBUG	org.apache.zookeeper.server.DataTree	Adjusting parent cversion for Txn: 1 path:/cp15/brokers/ids/0 err: -110}}.
+, [~hanm], from the above server 1's log, the path actually seems to be created successfully on 23:42:12.095 in session 0x15da553c7ec0000. This session matches the ZK session of that Kafka broker after restart. So if session 0x25cd1e82c110001 was never closed, the creation in session 0x15da553c7ec0000 should fail right? It's not clear which session is associated with "DEBUG org.apache.zookeeper.server.DataTree	Adjusting parent cversion for Txn: 1 path:/cp15/brokers/ids/0 err: -110" since the session is not logged.
+
+Also, do you think not expiring session 0x25cd1e82c110001 after pinging stops is a bug in ZK? , Yes, you are correct. The node creation was a success. The error logged ({{Adjusting parent cversion for Txn: 1 path:/cp15/brokers/ids/0 err: -110}}) is not unexpected during recovery process and such log does not imply the node failed to create, after checking the related code.
+
+So, it seems that the ephemeral nodes associated with the session 0x25cd1e82c110001 were deleted at quorum level, otherwise creation will not succeed. That is a pretty strong evidence that the session *should be* expired already otherwise the ephemeral nodes will not get deleted at quorum level (if we can find other evidence shows that the close session proposal was committed, that's even stronger).
+
+Assuming the session 0x25cd1e82c110001 is closed in this case.. now the problem seems to be about watcher triggering - that is the deletion of the ephemerals should trigger the watcher so controller would receive notification but actually no notifications were received, correct?
+
+bq. do you think not expiring session 0x25cd1e82c110001 after pinging stops is a bug in ZK?
+
+Yes it should be a bug, if we prove session 0x25cd1e82c110001 is not closed after client was dead., The controller didn't receive any notification between August 2nd 2017, 23:15:21.031 and August 2nd 2017, 23:42:12.109. So, it missed the event of broker going down and only picked up the restarting of the broker., [~hanm], I am attaching the log from 3 ZK servers on Aug. 2. What happened was the following.
+
+1. All 3 ZK servers went down around 23:16 and were restarted around 23:41.
+
+2. Kafka controller, which never went down during that window, was able to re-establish its ZK session around 23:41:58.
+
+{code:java}
+August 2nd 2017, 23:41:58.499	INFO	org.apache.zookeeper.ClientCnxn	Socket connection established to zookeeper-2.cp14.svc.cluster.local/100.71.124.93:2181, initiating session
+{code}
+
+3. Kafka broker 0 (non-controller) went down on 23:17:18 and was restarted on 23:42:12.
+
+Supposedly, the old ZK session for broker 0 (25cd1e82c110001) should be expired after the ZK servers were restarted (but it didn't seem to happen). When will the clock for session expiration starts when the ZK cluster was restarted? After the ZK cluster has elected a leader?
+, [~hanm], I found some additional info on Jun. 27. I actually do see session 25cd1e82c110001 being closed in the commit log on 2 of the 3 ZK servers.
+
+First, I saw the following on ZK server 1's log4j log. It appears that it first expired session 25cd1e82c110001. Then there was some ZK leader election, potentially due to a network issue. Finally, it allowed a client to renew session 25cd1e82c110001.
+
+{code:java}
+ZK 1 : 
+June 27th 2017, 22:04:39.000   org.apache.zookeeper.server.ZooKeeperServer Expiring session 0x25cd1e82c110001, timeout of 12000ms exceeded
+June 27th 2017, 22:04:39.001   org.apache.zookeeper.server.quorum.CommitProcessor Processing request:: sessionid:0x25cd1e82c110008 type:closeSession cxid:0x0 zxid:0x200000fc5 txntype:-11 reqpath:n/a
+June 27th 2017, 22:04:39.001   org.apache.zookeeper.server.quorum.CommitProcessor Processing request:: sessionid:0x25cd1e82c110001 type:closeSession cxid:0x0 zxid:0x200000fc4 txntype:-11 reqpath:n/a
+June 27th 2017, 22:04:39.001   org.apache.zookeeper.server.quorum.Leader Proposing:: sessionid:0x25cd1e82c110001 type:closeSession cxid:0x0 zxid:0x200000fc4 txntype:-11 reqpath:n/a
+June 27th 2017, 22:04:39.001   org.apache.zookeeper.server.quorum.Leader Proposing:: sessionid:0x25cd1e82c110008 type:closeSession cxid:0x0 zxid:0x200000fc5 txntype:-11 reqpath:n/a
+June 27th 2017, 22:04:39.001   org.apache.zookeeper.server.PrepRequestProcessor Processed session termination for sessionid: 0x25cd1e82c110008
+June 27th 2017, 22:04:39.001   org.apache.zookeeper.server.PrepRequestProcessor Processed session termination for sessionid: 0x25cd1e82c110001
+...
+June 27th 2017, 22:04:42.064   org.apache.zookeeper.server.quorum.QuorumPeer LOOKING
+...
+June 27th 2017, 22:04:45.824   org.apache.zookeeper.server.quorum.Learner FOLLOWING - LEADER ELECTION TOOK - 3760
+...
+June 27th 2017, 22:05:20.324   org.apache.zookeeper.server.ZooKeeperServer Client attempting to renew session 0x25cd1e82c110001 at /100.96.5.6:47618
+June 27th 2017, 22:05:20.324   org.apache.zookeeper.server.quorum.Learner Revalidating client: 0x25cd1e82c110001
+June 27th 2017, 22:05:20.324   org.apache.zookeeper.server.ZooKeeperServer Session establishment request from client /100.96.5.6:47618 client's lastZxid is 0x2000003af
+June 27th 2017, 22:05:20.325   org.apache.zookeeper.server.ZooKeeperServer Established session 0x25cd1e82c110001 with negotiated timeout 12000 for client /100.96.5.6:47618
+{code}
+
+In ZK server 1's commit log, I saw the following, which indicates that session 25cd1e82c110001 was closed.
+{code:java}
+6/27/17 22:04:39 session 0x25cd1e82c110001 cxid 0x0 zxid 0x200000fc4 closeSession null
+{code}
+
+I saw the same session close in ZK server 2's commit log.
+{code:java}
+6/27/17 22:04:39 session 0x25cd1e82c110001 cxid 0x0 zxid 0x200000fc4 closeSession null
+{code}
+
+However, I don't see the same session close in ZK server 0's commit log.
+
+Also, in ZK server 2 and 0's log4j log, there was no logging for session 25cd1e82c110001 from 22:04:39.000 (when server 1 expired the session) to 22:05:20.325 (when server 1 renewed the session). 
+
+So, my questions are 
+(1) Does the presence of closeSession indicate that session 25cd1e82c110001 was indeed expired on 6/27/17 22:04:39?
+(2) Why the closeSession for 25cd1e82c110001 didn't show up in the commit log of ZK server 0?
+
+I am also attaching the log around that time in case you need them. Thanks., bq. the old ZK session for broker 0 (25cd1e82c110001) should be expired after the ZK servers were restarted (but it didn't seem to happen). 
+
+The expected behavior in this case is actually opposite: when ZK servers restarts, as long as clients, including broker 0 can reconnect to ZK within the configured time limits, the session will be renewed. This is because when ZK server restarts (or when it loses quorum during LE), the clock used for session timeout stops ticking until a new quorum is formed. In this case the ZK servers were down (23:16) before broker 0 is down (23:17) so it's totally possible for broker 0 to renew the session.
+
+bq. In ZK server 1's commit log, I saw the following, which indicates that session 25cd1e82c110001 was closed.
+
+Could you please point to me the file name of the attached log that appertains to this? I don't find the file (the latest attached log file has dates as 8/02 instead of 6/27)., [~hanm], attached please find the parsed commit log from ZK server 0, 1 and 2. If you grep for close on session 0x25cd1e82c110001, you will see it in broker 1 and 2's commit log, but not on broker 0. Note that the timestamp in the commit log is PDT, which is 7 hours ahead of UTC time. All the log4j logs in this jira are using UTC time., [~hanm], were you able to find any new info from the log?, [~junrao] sorry was on vacation thus apologize for being slow on this. Will have another look during weekend. , [~junrao] - ok, finally get back to this :=).
+
+I checked the broker 1 and 2's commit log, session {{0x25cd1e82c110001}} was referenced after the "session close" log statement. For example, in server 1's log file, the first reference of the session 0x25cd1e82c110001 after it's "closed" is:
+{quote}6/27/17 3:05:20 PM PDT session 0x25cd1e82c110001 cxid 0xdc zxid 0x30000047b setData '/cp15/brokers/topics/xxxx/state,#7b22636f6e74726f6c6c65725f65706f6368223a312c226c6561646572223a302c2276657273696f6e223a312c226c65616465725f65706f6368223a352c22697372223a5b302c315d7d,10
+{quote}
+Similarly for server 2's commit log session 0x25cd1e82c110001 is referenced after the "closed" statement as well.
+
+I think in this case session 0x25cd1e82c110001 is not get closed. It could be that the close requests were sent to server 1 and 2 and then something happened so the close requests never committed. Note the "close session" entry in the commit log is missing some context so I can't really tell where this log statement was from - if we have more detailed log such to indicate where this log statement was coming from, I might be able to tell the state of the server at that time. 
+
+One way to make sure the close session proposal really gets committed across the quorum is to looking for this log statement (need to enable debug logging): [https://github.com/apache/zookeeper/blob/branch-3.4/src/java/main/org/apache/zookeeper/server/quorum/CommitProcessor.java#L164]
+
+At this point, the proposal reached consensus and is persistent across a quorum of nodes (the state change might not yet applied to the data tree, but as long as the proposal is persistent we are fine). ]

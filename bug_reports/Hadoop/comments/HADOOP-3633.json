@@ -1,0 +1,121 @@
+[Datanode's stack trace. 
+It doesn't show DataXceiveServer running, Tasks were failing with these error messages.
+{noformat}
+2008-06-24 21:51:38,389 INFO org.apache.hadoop.dfs.DFSClient: Exception in createBlockOutputStream java.net.SocketTimeoutException:
+69000 millis timeout while waiting for channel to be ready for read. ch : java.nio.channels.SocketChannel[connected local=/99.88.77.66:45481 remote=/99.88.77.66:98765]
+2008-06-24 21:51:38,389 INFO org.apache.hadoop.dfs.DFSClient: Abandoning block blk_8837990207306721973
+2008-06-24 21:51:38,421 INFO org.apache.hadoop.dfs.DFSClient: Waiting to find target node: 99.88.77.66:98765
+2008-06-24 21:52:54,093 INFO org.apache.hadoop.dfs.DFSClient: Exception in createBlockOutputStream java.net.SocketTimeoutException:
+69000 millis timeout while waiting for channel to be ready for read. ch : java.nio.channels.SocketChannel[connected local=/99.88.77.66:45519 remote=/99.88.77.66:98765]
+2008-06-24 21:52:54,093 INFO org.apache.hadoop.dfs.DFSClient: Abandoning block blk_802858319825475456
+2008-06-24 21:52:54,094 INFO org.apache.hadoop.dfs.DFSClient: Waiting to find target node: 99.88.77.66:98765
+2008-06-24 21:54:09,097 INFO org.apache.hadoop.dfs.DFSClient: Exception in createBlockOutputStream java.net.SocketTimeoutException:
+69000 millis timeout while waiting for channel to be ready for read. ch : java.nio.channels.SocketChannel[connected local=/99.88.77.66:45553 remote=/99.88.77.66:98765]
+2008-06-24 21:54:09,097 INFO org.apache.hadoop.dfs.DFSClient: Abandoning block blk_-4807850860721655539
+2008-06-24 21:54:09,098 INFO org.apache.hadoop.dfs.DFSClient: Waiting to find target node: 99.88.77.66:98765
+2008-06-24 21:55:24,315 INFO org.apache.hadoop.dfs.DFSClient: Exception in createBlockOutputStream java.net.SocketTimeoutException:
+69000 millis timeout while waiting for channel to be ready for read. ch : java.nio.channels.SocketChannel[connected local=/99.88.77.66:45587 remote=/99.88.77.66:98765]
+2008-06-24 21:55:24,315 INFO org.apache.hadoop.dfs.DFSClient: Abandoning block blk_-2804036762457133352
+2008-06-24 21:55:24,322 INFO org.apache.hadoop.dfs.DFSClient: Waiting to find target node: 99.88.77.66:98765
+{noformat}, There are 2 issues here, imo
+# why there is OutOfMemoryError, probably memory leak.
+# DataXceiveServer.run() should catch all exceptions as any server, not only IOExceptions, and shutdown the data-node. 
+Otherwise it is not clear that there is a problem with this node, it appears to happily sending heartbeats, but in fact cannot
+do any data processing because the server thread is dead., > 1. why there is OutOfMemoryError, probably memory leak.
+
+According to http://forum.java.sun.com/thread.jspa?threadID=605782&messageID=3360044, "OutOfMemoryError: unable to create new native thread" is due to too many threads, but not out-of-memory.
+
+DataXceiveServer creates a thread for each block receiving/sending request.  It might create too many thread if there are many block requests., True. It looks like that one data-node received ~2000 blocks in one second.
+This is a destination node during block replication, so many data-nodes were sending blocks to this destination.
+Don't know why, but it happened. May be there is a flaw in the random number generator in ChooseTargets() or it could be that most of 
+other nodes on the cluster are pretty much full.
+This occurred between two heartbeats, when the name-node has not yet received the information that this particular data-node is too busy.
+
+I propose to introduce a parameter in the Datanode that would limit the number of concurrent BlockReceives the data-node can handle.
+This means that if D1 sends a block to D2 and D2 is already receiving enough blocks then D2 sends back to D1 a BusyException, and the 
+transfer fails. The name-node will later reschedule the block to to be replicated another node.
+Which happens now anyway because D2 is too slow and D1 gets SocketTimeoutException (after 8 minutes)., Should be fixed in 0.18. We see this rather regularly when many cluster nodes get full. , bq. True. It looks like that one data-node received ~2000 blocks in one second.
+In the case we looked at, it was 2000 blocks in one *minute*.
+
+bq. or it could be that most of other nodes on the cluster are pretty much full.
+Confirmed that this is happening on cluster with plenty of space.
+
+, The patch includes:
+# Exception handling in DataXceiveServer, which warns in case of IOException and keeps running, 
+but shuts down the entire data-node in case of other throwables. That way we will not have zombie
+data-nodes that pretend they are alive by heartbeating but in fact are unable to do any data 
+processing because the DataXceiveServer is dead.
+# Throttling of the number of concurrent data-processing thread. We should not allow infinite
+number of threads to avoid data-nodes running out of space. I set the limit to 256 for now,
+let me know if it too low/high or should be configurable.
+# I removed the xceiverCount member and related class Count and replaced it by getXceiverCount()
+method, which returns the number of current xceiver threads, which can be obtained from the 
+threadGroup. I  noticed that block scanner transfers were not counting the xceiver count.
+Now it is done automatically., Opened a Jira for the namenode scheduling side which was assigning too many blocks to small number of datanodes causing this bug., 
+If HADOOP-3685 fixes the root cause of this jira, can we we postpone #2 above and just have #1 for this jira?
+, No, I think #2 is a must. It should be fixed independently on fixing replication targets. Two reasons:
+# In general, I think any limited resources in the system particularly the number of threads like in this case should have explicit limitations in the code.
+Handling such limits by waiting for OutOfMemoryError is incorrect.
+My 256 limit is based on observations on a cluster, which had problems handling 400 replications at once.
+# Exception handling #1 alone will not help 0.17 since the nodes will shut down instead of becoming zombie, which on a full cluster
+can lead to cascading effects (more replications cause more failures) if administrators will not urgently restart the nodes.
+
+Scheduling 2000 targets to the same node just revealed the problem of uncontrolled thread reproduction on data-nodes. 
+The same can happen if many clients will read from or write to the same data-node at the same time., >Scheduling 2000 targets to the same node just revealed the problem of uncontrolled thread reproduction on data-nodes.
+The same can happen if many clients will read from or write to the same data-node at the same time.
+
+Yes. There many more DOS situations with Hadoop.
+
+The question is not if we should handle these cases, but rather how. I think 256 is too low for some clusters and rejections of connection is a blunt shortcut to handling the situation. I am pretty certain this will lead to problems and will limit Hadoop functionality.
+
+The situation here is similar to how a server (Hadoop RPC server for e.g.) should handle the excess connections. 
+
+IMHO, we will have to visit this issue and again and I want to register my opinion now :)., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12385146/DataXceivr.patch
+  against trunk revision 673517.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no tests are needed for this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2785/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2785/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2785/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2785/console
+
+This message is automatically generated., > The question is not if we should handle these cases, but rather how.
+
+The first thing is that we should handle limitations. Current code does not, the patch does. I am glad we agree on that.
+On "how", as I said before 256 comes from practical observations. I have seen cases when nodes were struggling to handle
+more than that, and I'd rather be conservative here than leaving the problem unsolved by setting the limit too high.
+
+> this will lead to problems and will limit Hadoop functionality.
+
+On the contrary, currently the functionality of hadoop is bounded by the lack of thread limitation because nodes become dysfunctional.
+Introducing the limit will make it functional again.
+The 256 limit does not look low if you look at it from the point of view of how many clients can simultaneously do transfers.
+On a 2000 node cluster it is about 500,000 of them. It is pretty big even if you divide it by the replication factor of 3 for writes.
+
+Although I agree it would be better to have a method of calculating the limit based on some natural criteria like hardware 
+configuration or heap size. I would be glad to hear ideas in this direction., +1 patch looks good., Need patches for both 17 and 18, if different., bq. If HADOOP-3685 fixes the root cause of this jira, can we we postpone #2 above and just have #1 for this jira?
+
+I think even with HADOOP-3685 fix, we still have this over-assignment issue when dfs is almost full. 
+It'll be nice to have the throttling set.   
+
+Can we have this limit(256) configurable?  For different OS/hardware/clusters, we might want to change this value., We should start with a reasonable default and make it configurable iff we encounter situations where it would help., Updated the patch with new packaging.
+
+I agree with Sameer, lets do it without configuration parameters, and revisit this if there will ever be a need to modify 
+the the hard limit. As we have seen in the past parameters like that can be very confusing., Needs separate patches for 0.18 and 0.17 because of the directory and package restructuring., I just committed this., Integrated in Hadoop-trunk #581 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/581/])]

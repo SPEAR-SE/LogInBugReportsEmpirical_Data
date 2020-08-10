@@ -1,0 +1,143 @@
+[The protocol and code has changed quite a bit around write path, but memory copies essentially remain the same as in the picture above., The attached patch reduces buffer copies on DataNode. DataNode read one 
+packet and writes it to mirror and the local disk. Each packet contains
+io.file.buffer.size of data. 
+
+Below: 'b.i.s' is BufferedInputStream and 'b.o.s' is BufferedOutputStream, and these are
+are much larger than typical size of read or write to them. 
+
+Each {{--->}} represents a memory copy.
+
+- Datanode : 
+-- before :{noformat}
+                                                     + ---> b.o.s ---> mirror socket
+                                                     |
+  client socket ---> b.i.s ---> small DataNode buf --|
+                                                     |
+                                                     + ---> b.o.s ---> local disk 
+  {noformat}
+-- after : {noformat}
+                                                   + ---> mirror socket
+                                                   |
+  client socket ---> Large Datanode buf (Packet) --|
+                                                   |
+                                                   + ---> local disk 
+  {noformat}
+  
+- Client : 
+-- before: Client used 64k packets irrespective of io.file.buffer.size. 
+   So the extra copy for b.o.s was not present if io.file.buffer.size at or
+   below 64k. But each packet required 2 writes.
+-- after : the size of packet is based on io.file.buffer.size and we use one
+   write to write to datanode socket.    
+
+
+I don't have numbers regd cpu savings. In absolute numbers, for given amount of data  on one DataNode, CPU saved on DataNode should be larger than CPU saved when same amount is read with HADOOP-2758.
+
+DFSIO benchmark numbers have been very sensitive to buffering (not to CPU) while writing, we need to show this patch does not negatively affect this benchmark.
+, The attached patch applies after applying the patch from HADOOP-2758.
+, Test results show *30%* improvement in DataNode CPU with the patch. I think it makes sense. Based on the picture above before this patch, with replication of 3, the data is copied 6 + 6 + 4 times and with this patch it is 3 + 3 + 2. Each of these datanodes verify CRC. Approximating cost of checksumming to be twice that of a memory copy, we get (8+6)/(14+6) == 70%. If we increase the size of checksum chunk, cost of CRC will go down. It is be 68% with a factor of 1.5 for CRC.
+
+Test Setup : three instances of 'dd if=/dev/zero 4Gb | hadoop -put - 4Gb'. More importantly, DataNode was modified to write the deta to '/dev/null' instead of the block file. Otherwise I could not isolate the test from disk activity. The cluster has 3 datanodes. The clients, Namenode, and datanodes are all running on the same node. The test was CPU bound.
+
+CPU measurement : Linux reports a process' cpu in /proc/pid/stat : 14th entry is user cpu and 15th is kernel cpu. I think these are specified in  jiffies. Like most things with Linux kernel, these are approximations but reasonably dependable in large numbers.   The numbers reported are sum of cpu for each of the three datanodes.
+
+below: 'u' and 'k' are user and kernel cpu in thousands of jiffies.
+
+|| Test || Run 1 || Run 2 || Run 3 || Avg Total Cpu || Avg Time ||
+| Trunk* | 8.60u 2.52k 372s | 8.36u 2.48k 368s |  8.39u 2.40k 368s | *10.95*  | 369s |
+| Trunk + patch* | 5.61u 2.22k 289s | 5.38u 2.16k 296s | 5.57u 2.25k 289s | *7.73 (70%)*| 291s (79%) |
+{{*}} : datanodes write data to /dev/null.
+
+Currently, DFSIO benchmark shows dip in write b/w. I am still looking into it.
+
+, The dip in DFSIO benchmark turned out to be because of the fact that DFSIO creates files with a buffersize of 1000000!. The buffersize passed while creating file is passes on to FileSystem implementation (DFSClient in this case). This brings up the question on how an implementation can treat user specified buffersize. Can increasing buffersize (as in this case) reduce performance, i.e. should an implementation allow it?
+
+This is what happens on trunk: 
+- user specified buffesize is effectively does not matter on trunk. 
+- Client sends buffers up packets of 64k size and flushes them after the pkt if full. There could at most 10 such packets in the pipeline at a time.. usually much less.
+- DataNodes use io.file.buffer.size for their streams.
+
+With the patch here :
+- user specified bufferesize sets the packet size.
+- at DataNodes, packet size dictates write size for mirror stream and local file (i.e. it io.file.buffer.size does not matter).
+- The rest is same.
+
+Another proposal :
+- {{packetSize = Min( 64k, buffersize );}} 
+- {{Max # packets in pipeline = Max(buffersize/packetSize, 10)}}
+
+'64k' here could be made an configurable (may be "dfs.write.packet.size") so that different 'real' buffer sizes could be used for experimentation.
+
+How does the above proposal sound?
+
+ 
+ 
+, I would vote for keeping the packetSize fixed at 64K and not make it dependent on any user defined configuration parameter. , Whats wrong with a internal variable with default of 64k? How do we know 64k is the best for all platforms, though its a pretty good value?, We could certainly fetch the value from the conf, my point was not to insert this configuration parameter in the hadoop-defaults.xml file. Do you agree?, Yeah. This won't be in hadoop-defaults.xml. It will be an internal variable., Patch updated for trunk., Patch updated for trunk., A few initial comments:
+1. Once Packet.getBuffer() is called, no more data can be written to packet. This is not obvious to code readers. Better add this restriction to the comment.
+2. packetSize/writePacketSize in DFSClient don't include the size of the packet header. I think it is better to rename them to packetPayloadSize/writePacketPayloadSize.
+3. The packet size guess calculation in DataNode should match the calculation in DFSClient., Thanks Hairong. Attached patch fixes the above. 
+Regd #2, changed {{packetSize}} to include the header rather than changing its name., A few more comments:
+1. Currently DFSClient moves the checksum down to fill the gap when a partial packet needs to be sent. To avoid the copy, we could instead store the checksums in the reversed order starting from the dataStart.
+2. Datanode does not verify checksums before a packet is sent to the down stream datanode in the pipeline. This is a change from the current trunk's behavior.
+3. In Datanode.BlockReceiver.readnextPacket, it is clearer to change the variable "pktLen" to be payloadLen.
+4. Datanode.BlockReceiver.checksumOut does not need a big buffer. SMALL_BUFFER_SIZE should do., > 1. Currently DFSClient moves the checksum down to fill the gap when a partial packet needs to be sent. To avoid the copy, we could instead store the checksums in the reversed order starting from the dataStart.
+
+Or, is it good to interleave data and checksums?, Thanks for the review Hairong.
+
+- #1 :  interesting suggestion. It would be a change in protocol that affects other datanode transfers like reading etc. We rarely send partial packets (mainly fsync). Also checksum data is less than one percent of the packet. I hope it is ok for this patch. Note that this is not a memory copy that did not exist before (previously all the data was copied).
+
+- #2: Yes it is a change from previous behavior. Before this patch it didn't matter since we handled 512 bytes at a time. The receiving datanode verifies the checksum anyway. Checking checksum after tunneling data downstream (theoretically) reduces latency. This is the same reason datanode first sends the data to mirror and then stores the data locally.
+
+- #3. sure.
+- #4. yes., > Or, is it good to interleave data and checksums?
+:-). The main purpose of this and some more patches is not to interleave data and checksums., Updated patch has changes related to Hairong's review., {{DATA_TRANSFER_VERSION}} is incremented., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12381710/HADOOP-1702.patch
+  against trunk revision 654315.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    -1 findbugs.  The patch appears to introduce 2 new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2432/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2432/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2432/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2432/console
+
+This message is automatically generated., +1. The patch looks good., Fixed findbugs warnings and ran 'ant patch'., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12381909/HADOOP-1702.patch
+  against trunk revision 655593.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2452/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2452/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2452/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2452/console
+
+This message is automatically generated., I just committed this., Integrated in Hadoop-trunk #491 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/491/])]

@@ -1,0 +1,66 @@
+[[~sscaffidi]: I think I hit this earlier and changing this broke the hive bucketing (which uses hash as is to decide filenames).
+
+You should probably look into why you're not able to take advantage of HIVE-6924, Looks like the MapJoinKeyBytes class was removed as part of HIVE-9331 (git commit c8ba0f96, 2015-01-15). In my testing, I found Cloudera's distro of Hive 1.1 was using MapJoinKeyObject, which makes sense, but I've been looking through both their patched Hive code as well as master/trunk from upstream and I don't see anything significant they changed from upstream that's related to this.
+
+
+I'm still trying to suss out another part of the issue that led me to finding the bug I reported here: In my affected Hive queries, which join a STRING column (from the large table) with an INT column (from the small table that is used for the mapjoin hashtable), Hive is converting the STRING and the INT into DOUBLE for the purpose of the join, which, AFAICT, is a change in behavior since Hive 0.13. Because the values I'm joining on are all fairly small integers (about 160,000 values, ranging from 1 to 999,999), the bad hashCode implementation for DoubleWritable causes the HashMap Hive builds in the local task to degenerate into a linked-list that is both exceedingly slow to build as well as load in the subsequent map tasks. :(
+
+On the other hand, the conversion to a DOUBLE to do the comparison makes sense given the table of implicit conversions in the documentation - it seems to me that the old behavior must have been incorrect and has since been "fixed" :) Unfortunately I have too many users with too many queries that depend on the performance of the old behavior - it's easier for me to patch Hadoop or Hive!
+
+Once I figure out where/why Hive's behavior changed, I'll file a ticket there, too, if necessary, hopefully with useful patches :), Oh! Also, using Murmur Hash here would not help, since the root of the problem is related to getting the hashCode of an object representing a number, which should (usually) involve simply using the number itself - typically a highly performant operation. For numeric types whose representation is larger than an int (32 bits), a typical solution is to simply "or" the number by itself, shifted by 32 bits, repeating until you have only 32 bits left, then return that value.
+
+Luckily this operation is not only extremely cheap to perform, it's already built-in to Java's Double class, and documented here for those who might need to know how it's done:
+  http://docs.oracle.com/javase/7/docs/api/java/lang/Double.html#hashCode%28%29
+
+As the hashCode method in DoubleWritable currently does, for whole numbers between +/-MAX_INT (more or less), casting a double's bitwise representation to an int removes almost all of the significant (in the sense of significant to representing the desired numerical value) bits! The implementation at the link above does the right thing, and provides far better distribution for assigning buckets in a HashMap.
+
+I would personally want to find out why fixing hashCode() in Hadoop's DoubleWritable breaks bucketing in Hive - I have some suspicions as to how that might happen, but I would need more info about exactly what you found.
+, This is the simplest fix that does not create a Double object to calculate a correct hashCode. I have not yet tested this in a production-level environment, though. I can add some tests to show effectiveness of the hashCode distribution if desired., This is the simplest fix that does not create a Double object to calculate a correct hashCode. I have not yet tested this in a production-level environment, though. I can add some tests to show the effectiveness of the hashCode distribution if desired., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  16m 24s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:red}-1{color} | tests included |   0m  0s | The patch doesn't appear to include any new or modified tests.  Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. |
+| {color:green}+1{color} | javac |   7m 33s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 33s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:green}+1{color} | checkstyle |   1m  6s | There were no new checkstyle issues. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 19s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 34s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 53s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | common tests |  22m 22s | Tests passed in hadoop-common. |
+| | |  61m 10s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12744896/HADOOP-12217.1.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 1df39c1 |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HADOOP-Build/7247/artifact/patchprocess/testrun_hadoop-common.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/7247/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf906.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/7247/console |
+
+
+This message was automatically generated., bq. I would personally want to find out why fixing hashCode() in Hadoop's DoubleWritable breaks bucketing in Hive - I have some suspicions as to how that might happen, but I would need more info about exactly what you found.
+
+Touching the hashcode of any Writable breaks existing distributions in Hive - the hash is used to distribute data to satisfy the BUCKETED BY operations in DDLs.
+
+The bucket map-joins and sorted-merge joins will give incorrect results after you do something like this, because data will end up in different buckets for the old and new data, when you upgrade hadoop.
+
+Take a look at what happened to Varchar for instance - HIVE-8488
+
+bq. Luckily this operation is not only extremely cheap to perform,
+
+The new Optimized hashtable does *NOT* use the Writable::hashCode(), instead uses a post-serialization hashcode (i.e murmur hash of the byte[] formed out of the BinarySortableSerde). This is because allocating objects in the inner loop results in allocator churn and frequent GC  pauses - so it is cheaper to never allocate a Double/DoubleWritable, particularly when they're going to be an L1 cache miss (Writable -> Double -> double).
+
+The use of murmur came in as part of the L1 cache optimized hashtable in hive 0.14 (though it was committed the same month that 0.13 came out), which allows us to pack about ~6x the number of k-v pairs in the same amount of memory (DoubleWritable is way bigger than 8 bytes).
+
+bq.  Once I figure out where/why Hive's behavior changed, I'll file a ticket there, too, if necessary, hopefully with useful patches 
+
+Please try the same queries in Tez mode and see whether you're hitting the same issues - I suspect the core performance issues in MRv2 mode have mostly no recourse, because they can't readjust during runtime (which is what the L1 cache optimized hash-join does).]

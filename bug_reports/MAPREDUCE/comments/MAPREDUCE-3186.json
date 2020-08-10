@@ -1,0 +1,307 @@
+[Sid wrote:
+> AM talking to the RM – the AM currently logs an exception and
+> continues (RMCommunicator.startAllocatorThread()). This should
+> be fixed in the MRAppMaster based on the kind of exception
+> (temporary timeout versus some kind of a kill response from the RM).
+ 
+If I'm debugging this correctly, the RMCommunicator (via the startAllocationThread() method) sends a heartbeat to the RM. This heartbeat does catch an UndeclaredThrowableException when the RM is down, caused a ConnectException. The RMCommunicator sends the heartbeat about every second (depending on the config option), and this exception is thrown during each heartbeat as long as the RM is down. When the RM comes back up, however, exceptions stop being thrown altogether.
+ 
+I'm still investigating to see why no exception is thrown.
+ 
+It seems that the "right" thing for this communication mechanism between the RM and the AM to recognize that the AM is no longer valid and throw the appropriate exception so that the AM can exit cleanly.
+
+It looks like when the "rogue" MRAM contacts the RM, the RM is telling the AM to reboot, but the RMAM is ignoring it.
+
+I would say that on the MRAM side, RMContainerAllocator.getResource() calls RMContainerRequestor.makeRemoteRequest() to get the response from the RM. At that point, RMContainerAllocator.getResource() should check the reboot flag from the response and throw an exception, which should cause RMCommunicator thread to exit.
+
+, bq. If the resource manager is restarted while the job execution is in progress, the job is getting hanged. UI shows the job as running.
+This must be the AM UI. RM completely forgets about all the applications today.
+
+bq. It seems that the "right" thing for this communication mechanism between the RM and the AM to recognize that the AM is no longer valid and throw the appropriate exception so that the AM can exit cleanly.
+Yes, till we support RM-restart, this should alleviate the issues. +1.
+
+I believe this is not a blocker as we mostly are not going to have RM-restart in 0.23., Yes RM-restart is not that common, but when it does I don't want to have to ssh to every one of our 4000 nodes in a cluster and try to kill off all of the running AppMasters.  Even with scripts that can be painful.  
+
+What about other containers?  Are they also not killed off when the NM exits?, Even before RM restart goes in - I'm in favor of having the MRAM 1) act on the reboot command to shut itself (and possibly it's tasks) down, and 2) Have a configurable timeout in the AM to kill itself if the RM is down for too long.
+We're currently dependent on AMs being well behaved. If a cluster is restarted - it loses track of all information about running containers, and there's currently no way to kill them., RE: Bobby's question about other containers:
+
+> What about other containers? Are they also not killed off when the NM exits?
+In my experimentation, I have seen the YarnChild tasks ending after completing their work, so they all eventuall go away. But the AM stays around. However, this was only tested with wordcount for a 1.5G file, and so the behavior of the child tasks may not be so well-behaved all the time.
+
++1 for making the MRAM honor the reboot flag from the RM and setting a configurable timeout. I think this will cover the biggest chunk of the problem., BTW, it doesn't look like there is a "retries" config property that matches.
+
+I see MRJobConfig.mapreduce.job.end-notification.retry.attempts.
+
+Is that the right flag to use?
+
+, MRAppMaster still doesn't exit even after adding the check of the reboot flag and returning from the thread within RMCommunicator.startAllocatorThread().
+
+In the logs, I do see it catching the exception and returning, but it looks like something is still running.
+
+If I read it correctly, JobHistoryEventHandler is still running as well as ContainerLauncherRouter and ContainerAllocatorRouter.
+
+Does something need to be done to trigger the CompositeServiceShutdownHook?, Eric,
+ You have to make sure, stop gets called. Look at MRAppMaster::JobFinishEventHandler:stop().
+, Thanks Mahadev. But I'm still not getting which transition should be triggering the call to JobFinishEventHandler:stop()? Is it something in JobImpl? I think that's where the normal "finished" transition happens., Generating a JobEvent(jobId, JobEventType.INTERNAL_ERROR) from the RMCommunicator and it's subclasses would cause the job  to go into an error state - and generate kills for individual tasks, before sending out a JobFinishEvent., Thanks Sid! That did the trick.
+
+One more question...
+
+Any thoughts on the best way to unit test this?
+, Problems being solved and their solutions:
+
+# +When an application is running and the RM goes down, the MRAppMaster loops forever.+
+Changes were made to {{RMContainerAllocator::getResources()}} to attempt to make contact with RM a certain number of times. The number of retries is based on {{MRJobConfig.MR_AM_TO_RM_RETRIES}}, which property name is {{yarn.app.mapreduce.am.scheduler.connection.retries}}.
+??This is a new yarn config property??.
+If contact with the RM fails the specified number of times, {{RMContainerAllocator::getResources()}} will generate an INTERNAL_ERROR event and will throw a YarnException, which will be caught by {{RMCommunicator::AllocatorThread}} and cause that thread to exit.
+# When the RM is stopped and restarted, the MRAppMaster does not honor the "shouldreboot" flag sent from the RM and keeps attempting to connect with the new RM.
+Changes were made to {{RMContainerAllocator::getResources()}} to check the reboot rlag in the response from the call to {{makeRemoteRequest()}}. If the reboot flag is set, {{RMContainerAllocator::getResources()}} will generate an INTERNAL_ERROR event and will throw a YarnException which is caught by {{RMCommunicator::AllocatorThread}} and cause that thread to exit.
+, @Eric,
+ We should probably add a test case for this., @Mahadev
+
+Would you be able to suggest the best way to unit test this?
+
+Here are the manual tests I performed:
+
+# I ran the following in a single node cluster:
+## Start the {{wordcount}} test with a 1.5G file
+## Make sure the {{wordcount}} application is in the RUNNING state.
+## Stop the RM, HS, and NM daemons
+## Restart the RM, HS, and NM daemons
+## Check that MRAppMaster java task has exited and log contains the following string: "ERROR [RMCommunicator Allocator] org.apache.hadoop.mapreduce.v2.app.rm.RMContainerAllocator: Error communicating with RM: Resource Manager doesn't recognize AttemptId: application_XXXXXXXXXXXXX_XXXX"
+
+# I ran the following in a single node cluster:
+## Start the {{wordcount}} test with a 1.5G file
+## Make sure the {{wordcount}} application is in the RUNNING state.
+## Stop the RM, HS, and NM daemons
+## Wait for the MRAppMaster java task to exit. This may take a few minutes.
+## Check that MRAppMaster java task has exited and log contains the following string: "ERROR [RMCommunicator Allocator] org.apache.hadoop.mapreduce.v2.app.rm.RMContainerAllocator: Error communicating with RM: Could not contact RM after 10 tries."
+## 10 is the default number of retries.
+
+# I ran the following in a single node cluster:
+## Edit the yarn-site.xml config file.
+## Add the following property: <br> name = yarn.app.mapreduce.am.scheduler.connection.retries <br> value = 7
+## Start the {{wordcount}} test with a 1.5G file
+## Make sure the {{wordcount}} application is in the RUNNING state.
+## Stop the RM, HS, and NM daemons
+## Wait for the MRAppMaster java task to exit. This may take a few minutes.
+## Check that MRAppMaster java task has exited and log contains the following string: "ERROR [RMCommunicator Allocator] org.apache.hadoop.mapreduce.v2.app.rm.RMContainerAllocator: Error communicating with RM: Could not contact RM after 7 tries."
+
+, I also ran the manual tests on the 10-node cluster and they were successful., @Eric,
+ Looked at the patch, a minor comment:
+
+{noformat}
+ retrycount = getConfig().getInt(MRJobConfig.MR_AM_TO_RM_RETRIES,
++                                       MRJobConfig.DEFAULT_MR_AM_TO_RM_RETRIES);
+{noformat}
+
+We should probably avoid reading the config entry everytime we call get resources. The maxretry can be inited in init() call.
+
+Regarding the test, you should be able to mock failure the communicate with the RM and make sure that an internal error is generated. Also, if the MRApp shutsdown on an internal error., Also, 
+- can the timeout be changed from #failedAttempts to actual time. Currently the MRAM sends a heartbeat at a specific interval (2s default). This may change to ask for containers the moment a task needs to be launched.
+- The LocalContainerAllocator (used by uberized jobs) would need to be changed as well., I have addressed all of the following issues except for the unit tests. I wanted to get the new patch up here so you could look at it while I simulatneously address the unit tests.
+
+Mahadev wrote:
+> We should probably avoid reading the config entry everytime we call get resources. The maxretry can be inited in init() call.
+Done. I initialzed variables in the init.
+
+> Regarding the test, you should be able to mock failure the communicate with the RM and make sure that an internal error is generated. Also, if the MRApp shutsdown on an internal error.
+Still working on the unit tests.
+
+
+
+Sid wrote:
+> can the timeout be changed from #failedAttempts to actual time. Currently the MRAM sends a heartbeat at a specific interval (2s default). This may change to ask for containers the moment a task needs to be launched.
+Changed to a timed interval that will keep trying to contact the RM and error out only if a certain amount of time has expired.
+
+> The LocalContainerAllocator (used by uberized jobs) would need to be changed as well.
+I have changed the LocalContainerAllocator code as well. Good catch.
+, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12501131/MAPREDUCE-3186.v2.txt
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    -1 javac.  The applied patch generated 1701 javac compiler warnings (more than the trunk's current 1699 warnings).
+
+    -1 findbugs.  The patch appears to introduce 170 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed the unit tests build
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1175//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1175//artifact/trunk/hadoop-mapreduce-project/patchprocess/newPatchFindbugsWarningshadoop-mapreduce-client-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1175//artifact/trunk/hadoop-mapreduce-project/patchprocess/newPatchFindbugsWarningshadoop-mapreduce-client-app.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1175//artifact/trunk/hadoop-mapreduce-project/patchprocess/newPatchFindbugsWarningshadoop-mapreduce-client-core.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1175//artifact/trunk/hadoop-mapreduce-project/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1175//artifact/trunk/hadoop-mapreduce-project/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-web-proxy.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1175//artifact/trunk/hadoop-mapreduce-project/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-nodemanager.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1175//artifact/trunk/hadoop-mapreduce-project/patchprocess/newPatchFindbugsWarningshadoop-yarn-common.html
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1175//console
+
+This message is automatically generated., The findbugs warnings are not related. None of them are in methods changed by this jira.
+
+Also, just to be sure, I created a dummy patch (whitespace changes to 1 file) and ran {{bash ../dev-support/test-patch.sh ../../foo}} in branch-0.23/hadoop-mapred-project. This generated a lot of findbugs warnings.
+
+Then I ran {{bash ../dev-support/test-patch.sh ../../MAPREDUCE-3186.v2.txt}} against the real patch. This also generated the same warnings as before with no new ones., Also, I did not see the javac warnings in the branch-0.23 build., On Trunk, there are 2 new warnings in LocalContainerAllocator.java. Not sure why these didn't show up in the test-patch output for branch.0.23.
+
+There wee already 2 of these in LocalContainerAllocator.java, and since I added 2 new event calls, it makes sense that the 2 new ones would show up:
+
+[WARNING] /hadoop/source/apache/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java:[145,27] [unchecked] unchecked call to handle(T) as a member of the raw type org.apache.hadoop.yarn.event.EventHandler
+[WARNING] /hadoop/source/apache/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java:[147,25] [unchecked] unchecked call to handle(T) as a member of the raw type org.apache.hadoop.yarn.event.EventHandler
+
+
+
+
+, Thanks Eric. Looks good. 
+There's a minor change required to LocalContainerAllocator - {{getConfig()}} isn't available in the constructor. Updating the patch., mvn test results (trunk)
+{noformat} 
+[INFO] Executed tasks
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Summary:
+[INFO] 
+[INFO] hadoop-yarn ....................................... SUCCESS [1.521s]
+[INFO] hadoop-yarn-api ................................... SUCCESS [8.088s]
+[INFO] hadoop-yarn-common ................................ SUCCESS [20.775s]
+[INFO] hadoop-yarn-server ................................ SUCCESS [0.184s]
+[INFO] hadoop-yarn-server-common ......................... SUCCESS [8.614s]
+[INFO] hadoop-yarn-server-nodemanager .................... SUCCESS [59.487s]
+[INFO] hadoop-yarn-server-web-proxy ...................... SUCCESS [0.869s]
+[INFO] hadoop-yarn-server-resourcemanager ................ SUCCESS [1:24.650s]
+[INFO] hadoop-yarn-server-tests .......................... SUCCESS [7.150s]
+[INFO] hadoop-yarn-applications .......................... SUCCESS [0.168s]
+[INFO] hadoop-yarn-applications-distributedshell ......... SUCCESS [16.336s]
+[INFO] hadoop-yarn-site .................................. SUCCESS [0.277s]
+[INFO] hadoop-mapreduce-client ........................... SUCCESS [0.167s]
+[INFO] hadoop-mapreduce-client-core ...................... SUCCESS [6.246s]
+[INFO] hadoop-mapreduce-client-common .................... SUCCESS [8.616s]
+[INFO] hadoop-mapreduce-client-shuffle ................... SUCCESS [1.390s]
+[INFO] hadoop-mapreduce-client-app ....................... SUCCESS [2:17.547s]
+[INFO] hadoop-mapreduce-client-hs ........................ SUCCESS [11.807s]
+[INFO] hadoop-mapreduce-client-jobclient ................. SUCCESS [5:22.206s]
+[INFO] hadoop-mapreduce .................................. SUCCESS [0.240s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time: 11:36.947s
+[INFO] Finished at: Thu Oct 27 18:10:22 PDT 2011
+[INFO] Final Memory: 58M/390M
+[INFO] ------------------------------------------------------------------------
+{noformat} , Committed the patch. Thanks Eric and Sid. , Integrated in Hadoop-Mapreduce-trunk #874 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/874/])
+    MAPREDUCE-3186. User jobs are getting hanged if the Resource manager process goes down and comes up while job is getting executed. (Eric Payne via mahadev)
+
+mahadev : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1190122
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+, Integrated in Hadoop-Mapreduce-trunk-Commit #1199 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Commit/1199/])
+    MAPREDUCE-3186. User jobs are getting hanged if the Resource manager process goes down and comes up while job is getting executed. (Eric Payne via mahadev)
+
+mahadev : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1190122
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+, Integrated in Hadoop-Mapreduce-0.23-Commit #88 (See [https://builds.apache.org/job/Hadoop-Mapreduce-0.23-Commit/88/])
+    MAPREDUCE-3186. User jobs are getting hanged if the Resource manager process goes down and comes up while job is getting executed. (Eric Payne via mahadev) - Merging r1190122 from trunk
+
+mahadev : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1190123
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+, Integrated in Hadoop-Mapreduce-0.23-Build #65 (See [https://builds.apache.org/job/Hadoop-Mapreduce-0.23-Build/65/])
+    MAPREDUCE-3186. User jobs are getting hanged if the Resource manager process goes down and comes up while job is getting executed. (Eric Payne via mahadev) - Merging r1190122 from trunk
+
+mahadev : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1190123
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+, Integrated in Hadoop-Hdfs-0.23-Commit #90 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Commit/90/])
+    MAPREDUCE-3186. User jobs are getting hanged if the Resource manager process goes down and comes up while job is getting executed. (Eric Payne via mahadev) - Merging r1190122 from trunk
+
+mahadev : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1190123
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+, Integrated in Hadoop-Hdfs-trunk-Commit #1259 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/1259/])
+    MAPREDUCE-3186. User jobs are getting hanged if the Resource manager process goes down and comes up while job is getting executed. (Eric Payne via mahadev)
+
+mahadev : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1190122
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+, Integrated in Hadoop-Common-0.23-Commit #90 (See [https://builds.apache.org/job/Hadoop-Common-0.23-Commit/90/])
+    MAPREDUCE-3186. User jobs are getting hanged if the Resource manager process goes down and comes up while job is getting executed. (Eric Payne via mahadev) - Merging r1190122 from trunk
+
+mahadev : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1190123
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+, Integrated in Hadoop-Common-trunk-Commit #1182 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/1182/])
+    MAPREDUCE-3186. User jobs are getting hanged if the Resource manager process goes down and comes up while job is getting executed. (Eric Payne via mahadev)
+
+mahadev : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1190122
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+, Integrated in Hadoop-Hdfs-0.23-Build #53 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/53/])
+    MAPREDUCE-3186. User jobs are getting hanged if the Resource manager process goes down and comes up while job is getting executed. (Eric Payne via mahadev) - Merging r1190122 from trunk
+
+mahadev : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1190123
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+, Integrated in Hadoop-Hdfs-trunk #846 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/846/])
+    MAPREDUCE-3186. User jobs are getting hanged if the Resource manager process goes down and comes up while job is getting executed. (Eric Payne via mahadev)
+
+mahadev : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1190122
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/local/LocalContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMCommunicator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/rm/RMContainerAllocator.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+, Hello bro,
+
+2018-07-25 10:02:39,659 ERROR [RMCommunicator Allocator] org.apache.hadoop.mapreduce.v2.app.rm.RMContainerAllocator: Error communicating with RM: Resource Manager doesn't recognize AttemptId: appattempt_1532512489575_0001_000002
+2018-07-25 09:58:22,587 ERROR [RMCommunicator Allocator] org.apache.hadoop.mapreduce.v2.app.rm.RMContainerAllocator: Error communicating with RM: Resource Manager doesn't recognize AttemptId: appattempt_1532512489575_0001_000001
+
+ 
+
+How to resolve the above issue on CDH5.15
+
+ ]

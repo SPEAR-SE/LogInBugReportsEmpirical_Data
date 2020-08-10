@@ -1,0 +1,223 @@
+[we have seen this happen when zookeeper functions, including zookeeper_close(), are called on handles that have already been closed. (aka double free.) is it possible that you had previously called zookeeper_close() on the handle?, Not in any way that I can see.  The only code in my app that calls zookeeper_close() looks like this:
+
+{quote}
+  if (_zk_handle != NULL) {
+    // assume for now that there is only a single zookeeper client instance
+    assert(_closing_zh == NULL);
+    _closing_zh = _zk_handle;
+    ...
+    zookeeper_close(_zk_handle);
+    _zk_handle = NULL;
+    ...
+  }
+{quote}
+
+In order to call zookeeper_close() twice on the same handle, it would have to pass through that assert, which would have failed.  (The app uses non-preemptive cooperative threading, so there shouldn't be any races there.)
+, Oops, sorry.  Here's the code again:
+{code}
+  if (_zk_handle != NULL) {
+    assert(_closing_zh == NULL);
+    _closing_zh = _zk_handle;
+    ...
+    zookeeper_close(_zk_handle);
+    _zk_handle = NULL;
+    ...
+  }
+{code}, do you also set _closing_zh to null after the close? is it possible that this block is invoked concurrently by two different threads? or is it protected by a mutex? (i don't mean to pry, just a sanity check :), Yes, sorry, _closing_zh is set to NULL after the if block.
+
+And I mentioned above that we use cooperative threading, so concurrency races shouldn't be an issue., I have the same problem.
+
+It may be reproduced by the following steps:
+1 create two zk handle A and B
+2 use A to create an ephemeral node under path P
+3 use B to getchild of P and set a watcher
+4 in the watcher function, getchild of P and set the watcher
+5 close A
+6 close B
+
+It will be reproduced in a probability of about 10%.
+
+I found zookeeper_close is called three times when closing B. destroy is called twice, one of which is called from do_completion.
+
+I think there is a race condition in  zookeeper_close.
+
+int zookeeper_close(zhandle_t *zh)
+{
+    int rc=ZOK;
+    if (zh==0)
+        return ZBADARGUMENTS;
+
+    zh->close_requested=1;
+    if (inc_ref_counter(zh,0)!=0) {
+	/* Signal any syncronous completions before joining the threads */
+        enter_critical(zh);
+        free_completions(zh,1,ZCLOSING);
+        leave_critical(zh);
+
+        adaptor_finish(zh); // If do_completion is finished before here, zookeeper_close will be called twice. Once in do_completion, another in adaptor_finish.
+        return ZOK;
+    }
+    if(zh->state==ZOO_CONNECTED_STATE){
+
+
+, sorry, code again
+{code:none}
+int zookeeper_close(zhandle_t *zh)
+{
+    int rc=ZOK;
+    if (zh==0)
+        return ZBADARGUMENTS;
+
+    zh->close_requested=1;
+    if (inc_ref_counter(zh,0)!=0) {
+	/* Signal any syncronous completions before joining the threads */
+        enter_critical(zh);
+        free_completions(zh,1,ZCLOSING);
+        leave_critical(zh);
+
+        adaptor_finish(zh);// If do_completion is finished before here, zookeeper_close will be called twice. Once in do_completion, another in adaptor_finish.
+        return ZOK;
+    }
+    if(zh->state==ZOO_CONNECTED_STATE){
+{code}, test codes to reproduce this bug, sorry for upload many times. my network sucks.
+
+stack trace:
+{code:none}
+#1  0x0000003e75a0b0c0 in pthread_cond_broadcast@@GLIBC_2.3.2 () from /lib64/libpthread.so.0
+#2  0x00002ad3f8a504c1 in unlock_completion_list () from /usr/lib/libzookeeper_mt.so.2
+#3  0x00002ad3f8a46f47 in free_completions () from /usr/lib/libzookeeper_mt.so.2
+#4  0x00002ad3f8a47152 in cleanup_bufs () from /usr/lib/libzookeeper_mt.so.2
+#5  0x00002ad3f8a471b5 in destroy () from /usr/lib/libzookeeper_mt.so.2
+#6  0x00002ad3f8a4731c in zookeeper_close () from /usr/lib/libzookeeper_mt.so.2
+#7  0x00002ad3f8a474e8 in api_epilog () from /usr/lib/libzookeeper_mt.so.2
+#8  0x00002ad3f8a47370 in zookeeper_close () from /usr/lib/libzookeeper_mt.so.2
+#9  0x0000000000401aed in zookeeper_client::~zookeeper_client() ()
+#10 0x0000000000401744 in main ()
+{code}
+or
+{code:none}
+#1  0x0000003e75a0b0c0 in pthread_cond_broadcast@@GLIBC_2.3.2 () from /lib64/libpthread.so.0
+#2  0x00002ad98e6a485a in adaptor_finish () from /usr/lib/libzookeeper_mt.so.2
+#3  0x00002ad98e69b370 in zookeeper_close () from /usr/lib/libzookeeper_mt.so.2
+#4  0x0000000000401ae5 in zookeeper_client::~zookeeper_client() ()
+#5  0x000000000040173b in main ()
+{code}, Attached is an interim patch for this bug that solves the problems exhibited by tsulin's test on my system., When I run tsulin's test under valgrind on my system with Zookeeper 3.3.3, after only 5 iterations I see double-free errors of the type
+
+{noformat}
+==10430== Invalid read of size 8
+==10430==    at 0x405823: free_completions (zookeeper.c:1066)
+==10430==    by 0x405B4F: cleanup_bufs (zookeeper.c:1125)
+==10430==    by 0x403D47: destroy (zookeeper.c:366)
+==10430==    by 0x409961: zookeeper_close (zookeeper.c:2327)
+==10430==    by 0x40785F: api_epilog (zookeeper.c:1661)
+==10430==    by 0x413A82: adaptor_finish (mt_adaptor.c:205)
+==10430==    by 0x4097DF: zookeeper_close (zookeeper.c:2298)
+==10430==    by 0x4036AC: zookeeper_client::~zookeeper_client() (ZOOKEEPER-981.cpp:54)
+==10430==    by 0x403325: main (ZOOKEEPER-981.cpp:112)
+==10430==  Address 0x5b5c0e8 is 296 bytes inside a block of size 728 free'd
+==10430==    at 0x4C240FD: free (vg_replace_malloc.c:366)
+==10430==    by 0x409979: zookeeper_close (zookeeper.c:2329)
+==10430==    by 0x40785F: api_epilog (zookeeper.c:1661)
+==10430==    by 0x414083: do_completion (mt_adaptor.c:335)
+==10430==    by 0x4E2F8B9: start_thread (pthread_create.c:300)
+==10430==    by 0x58C002C: clone (clone.S:112)
+{noformat}
+
+However, when I run with the above attached patch, I was able to run over 100 times without any valgrind errors.
+
+The patch itself probably isn't good enough as it is -- it's a mismatch of inc_ref_counter and api_epilog.  But I thought I'd post it here until a more knowledgeable ZK developer can make a proper one., Looks like we should get this into 3.4. , Reuploading to run the patch via hudson., Ben, 
+  Would you be able to review this patch? , -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12486732/ZOOKEEPER-981-v1.patch
+  against trunk revision 1146961.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/399//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/399//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/399//console
+
+This message is automatically generated., Patrick, sorry if this is a dense question, but why is this issue assigned back to me?  My understanding is that it's waiting for a review from Ben.
+
+Feel free to assign back to me if I'm misunderstanding the assignee protocol., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12486732/ZOOKEEPER-981-v1.patch
+  against trunk revision 1152141.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/442//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/442//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/442//console
+
+This message is automatically generated., Jeremy,
+ The jira is usually assigned to the person who uploads the patch and has done work on it. The patch assignment does not change if it needs reviews. Hope that helps., ben,
+ Can you review this?, do you think we could incorporate the test in the tar file into the patch? it should easily convert to a cppunit test., I saw the same problem. Maybe ref_counter should be increased before we free zh, helei are you saying that you see the problem even with this patch applied?, I just committed this to trunk. The change looks good to me. Ben we can probably add a testcase in a different jira., Integrated in ZooKeeper-trunk #1304 (See [https://builds.apache.org/job/ZooKeeper-trunk/1304/])
+    ZOOKEEPER-981. Hang in zookeeper_close() in the multi-threaded C client. (Jeremy Stribling via mahadev)
+
+mahadev : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1170430
+Files : 
+* /zookeeper/trunk/CHANGES.txt
+* /zookeeper/trunk/src/c/src/zookeeper.c
+, Sorry for not response in time. I saw another problem with this patch applied. Hang in zookeeper_close() again. here is the stack:
+(gdb) bt
+#0  0x000000302b80adfb in __lll_mutex_lock_wait () from /lib64/tls/libpthread.so.0
+#1  0x000000302b1307a8 in main_arena () from /lib64/tls/libc.so.6
+#2  0x000000302b910230 in stack_used () from /lib64/tls/libpthread.so.0
+#3  0x000000302b808dde in pthread_cond_broadcast@@GLIBC_2.3.2 () from /lib64/tls/libpthread.so.0
+#4  0x00000000006b4ce8 in adaptor_finish (zh=0x6902060) at src/mt_adaptor.c:217
+#5  0x00000000006b0fd0 in zookeeper_close (zh=0x6902060) at src/zookeeper.c:2297
+(gdb) p zh->ref_counter 
+$5 = 1
+(gdb) p zh->close_requested 
+$6 = 1
+(gdb) p *zh
+$7 = {fd = 110112576, hostname = 0x6903620 "", addrs = 0x0, addrs_count = 1, 
+  watcher = 0x62e5dc <doris::meta_register_mgr_t::register_mgr_watcher(_zhandle*, int, int, char const*, void*)>, last_recv = {tv_sec = 1321510694, 
+    tv_usec = 552835}, last_send = {tv_sec = 1321510694, tv_usec = 552886}, last_ping = {tv_sec = 1321510685, tv_usec = 774869}, next_deadline = {
+    tv_sec = 1321510704, tv_usec = 547831}, recv_timeout = 30000, input_buffer = 0x0, to_process = {head = 0x0, last = 0x0, lock = {__m_reserved = 0, 
+      __m_count = 0, __m_owner = 0x0, __m_kind = 0, __m_lock = {__status = 0, __spinlock = 0}}}, to_send = {head = 0x0, last = 0x0, lock = {
+      __m_reserved = 0, __m_count = 0, __m_owner = 0x0, __m_kind = 1, __m_lock = {__status = 0, __spinlock = 0}}}, sent_requests = {head = 0x0, last = 0x0, 
+    cond = {__c_lock = {__status = 1, __spinlock = -1}, __c_waiting = 0x0, __padding = '\0' <repeats 15 times>, __align = 0}, lock = {__m_reserved = 0, 
+      __m_count = 0, __m_owner = 0x0, __m_kind = 0, __m_lock = {__status = 0, __spinlock = 0}}}, completions_to_process = {head = 0x2aefbff800, 
+    last = 0x2af0e05f40, cond = {__c_lock = {__status = 592705486850, __spinlock = -1}, __c_waiting = 0x45, 
+      __padding = "E\000\000\000\000\000\000\000\220\006\000\000\000", __align = 296352743424}, lock = {__m_reserved = 1, __m_count = 0, 
+      __m_owner = 0x1000026ca, __m_kind = 0, __m_lock = {__status = 0, __spinlock = 0}}}, connect_index = 0, client_id = {client_id = 86551148676999146, 
+    passwd = "G懵擀\233\213\f闬202筴\002錪\034"}, last_zxid = 82057372, outstanding_sync = 0, primer_buffer = {buffer = 0x6902290 "", len = 40, 
+    curr_offset = 44, next = 0x0}, primer_storage = {len = 36, protocolVersion = 0, timeOut = 30000, sessionId = 86551148676999146, passwd_len = 16, 
+    passwd = "G懵擀\233\213\f闬202筴\002錪\034"}, 
+  primer_storage_buffer = "\000\000\000$\000\000\000\000\000\000u0\0013}惜薵闬000\000\000\020G懵擀\233\213\f闬202筴\002錪\034", state = 0, context = 0x0, 
+  auth_h = {auth = 0x0, lock = {__m_reserved = 0, __m_count = 0, __m_owner = 0x0, __m_kind = 0, __m_lock = {__status = 0, __spinlock = 0}}}, 
+  ref_counter = 1, close_requested = 1, adaptor_priv = 0x0, socket_readable = {tv_sec = 0, tv_usec = 0}, active_node_watchers = 0x6901520, 
+  active_exist_watchers = 0x69015d0, active_child_watchers = 0x6902ef0, chroot = 0x0}
+I think the ref_counter is suposed to be 2 or 3 here. 1 seems not correct. thanks again, @helei please enter a new JIRA with this issue, reference this jira in your description. thanks!]

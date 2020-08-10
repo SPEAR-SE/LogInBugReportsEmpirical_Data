@@ -1,0 +1,219 @@
+[Here's the output from jcarder that shows the cycle (this was detected while running TestLostTracker with jcarder instrumentation using the branch at http://github.com/toddlipcon/jcarder/tree/cloudera), Attaching a patch, removes the need to lock on faultyTrackerInfo, by changing the field to a concurrent hash map and not locking on addition and removal. , Simply making _potentiallyFaultyTrackers_ a concurrent HashMap and removing the *synchronized* keyword might introduce more issues. I think the reason for synchronizing on _potentiallyFaultyTrackers_ was to perform some operations in an atomic manner. Have you checked if the semantics remain same after removing the synchronized keyword? I think making _potentiallyFaultyTrackers_ as concurrent HashMap is better but might be dangerous.
+
+One other way to avoid the deadlock would be by marking few non-private apis in JobTracker.FaultyTrackerInfo as synchronized. Mainly
+{code}
+JobTracker.FaultyTrackerInfo.incrementFaults // called via Heartbeat and testcases
+JobTracker.FaultyTrackerInfo.markTrackerHealthy // called via Heartbeat
+JobTracker.FaultyTrackerInfo.shouldAssignTasksToTracker // called via Heartbeat and testcases
+JobTracker.FaultyTrackerInfo.isBlacklisted // called in multiple cases .. need to check
+JobTracker.FaultyTrackerInfo.getFaultCount // called via Heartbeat and testcases
+JobTracker.FaultyTrackerInfo.getReasonForBlackListing // never used!
+JobTracker.FaultyTrackerInfo.setNodeHealthStatus // called via Heartbeat and testcases
+{code}
+
+So except JobTracker.FaultyTrackerInfo.isBlacklisted(), all the calls are centrally locked on JobTracker. Hence adding the synchronized keyword in the method signature wouldnt introduce any overhead. Need to check on JobTracker.FaultyTrackerInfo.isBlacklisted()., Wouldnt simply making JobTracker.FaultyTrackerInfo.potentiallyFaultyTrackers a concurrent HashMap and removing the *synchronized* block in JobTracker.FaultyTrackerInfo.isBlacklisted() solve the deadlock issue?, Attaching new patch after discussion with Amar. Made the map concurrent map and changed the getters not to lock on the map. This way we will remove the lock on the second resource for Client API's which don't lock on {{JobTracker}}, I wonder if [JSure|http://wiki.apache.org/hadoop/HowToUseConcurrencyAnalysisTools] was able to find the issue? M.b. Chris wants to comment on this?, Prior to the patch, all accesses to FaultInfo objects were synchronized on potentiallyFaultyTrackers and so sort of internally synchronized themselves. However, we are relaxing that restriction with this patch, atleast for isBlackListed and the reasonForBlacklisting. I think we should guard the accesses to these variables or make them volatile, no?, What if we move the code from JobTracker.blacklistedTaskTrackers() to FaultyTrackersInfo. Something like
+{code}
+FaultyTrackersInfo {
+  blacklistedTaskTrackers {
+    synchronized (potentiallyFaultyTrackers) {
+      synchronized (taskTrackers) {
+        // code  that we have today JobTracker.blacklistedTaskTrackers()
+        for (TaskTracker tt : taskTrackers.values()) {
+          // ...
+        }
+      }
+    }
+  }
+}
+blacklistedTaskTrackers() {
+return FaultyTrackersInfo.blacklistedTaskTrackers()
+}
+{code}
+
+This kindof solves the lock reversal issue we are facing now and also makes more sense because JobTracker.FaultyTrackersInfo is the right module to answer the blacklistedTaskTrackers() query. Thoughts?, JobTracker.FaultyTrackerInfo.isBlacklisted is called, holding taskTrackers lock, from methods JobTracker.activeTaskTrackers(), JobTracker.blacklistedTaskTrackers(), JobTracker.removeTracker(), JobTracker.taskTrackerNames(), JobTracker.updateTaskTrackerStatus(). But methods FaultyTrackerInfo.{remove/add}HostCapacity hold the lock on potentiallyFaultyTrackers and then lock taskTrackers. Moreover all the callers of FaultyTrackerInfo.{remove/add}HostCapacity hold JobTracker lock. 
+Discussed offline with Amar and Jothi, and we think that we should maintain the order that taskTrackers lock first, then potentiallyFaultyTrackers lock in methods {remove/add}HostCapacity also. Since, those methods already hold JobTracker lock, this code change should not introduce any side-effects.
+
+Thoughts?, Had a brief discussion with Amareshwari on this. Looks like only JobTracker.activeTaskTrackers() and JobTracker.blacklistedTaskTrackers() are calling JobTracker.FaultyTrackerInfo.isBlacklisted() without the JobTracker lock. So extending the comment [here|https://issues.apache.org/jira/browse/MAPREDUCE-1342?focusedCommentId=12796996&page=com.atlassian.jira.plugin.system.issuetabpanels%3Acomment-tabpanel#action_12796996], I think we can do something like
+{code}
+FaultyTrackersInfo {
+  getTaskTrackers(boolean blacklisted) {
+    synchronized (potentiallyFaultyTrackers) {
+      synchronized (taskTrackers) {
+        // code  that we have today JobTracker.blacklistedTaskTrackers()
+        for (TaskTracker tt : taskTrackers.values()) {
+          if (isBlacklisted(tt) equals blacklisted) {
+            // add to return set
+          }
+        }
+      }
+    }
+  }
+}
+blacklistedTaskTrackers() {
+return FaultyTrackersInfo.getTaskTrackers(true)
+}
+activeTaskTrackers() {
+return FaultyTrackersInfo.getTaskTrackers(false)
+}
+{code}
+
+Currently, activeTaskTrackers() and blacklistedTaskTrackers() differ only on the condition whether the tasktracker is faulty or not. Thoughts?, Hmm... first I think it's clear that this is a critical bug to be fixed asap.
+
+Given the extremely fragile nature of the locking structure in the JobTracker I'm very, very scared to make much changes here... 
+
+How about a simpler proposal: Let's make JobTracker.activeTaskTrackers() and JobTracker.blacklistedTaskTrackers() synchronized methods. First these are called only from the jsps, second this will sweep the inverted locking order under the carpet of having to lock the JobTracker itself - thus solving the deadlock. 
+
+I realize this is very ugly and I'm cringing as I suggest this, but I do value the fact that this will do away with the need for more significant changes - changes I'm very leery of!
+
+Thoughts?, Patch making the methods activeTaskTrackers(), blacklistedTaskTrackers() and taskTrackerNames() synchronized. These are the methods which lock taskTrackers and then potentiallyFaultyTrackers, without JobTracker lock., Todd, Can you please run the test and confirm that deadlock no longer exists, after applying the patch ?, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12429711/patch-1342.txt
+  against trunk revision 897076.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/364/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/364/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/364/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/364/console
+
+This message is automatically generated., Patch for Y! distribution.
+
+Ran test-patch and ant test. All the tests passed except TestKillSubProcesses(due to MAPREDUCE-408)., bq. -1 tests included.
+Patch makes a few methods synchronized. It is difficult to write a unit test for the issue., bq. Todd, Can you please run the test and confirm that deadlock no longer exists, after applying the patch ?
+
+Reran the tests overnight and looks good here. +1 based on that (though I didn't look at the patch contents themselves), For maintainability, should we document in these method's javadoc why these methods are synchronized?, bq. For maintainability, should we document in these method's javadoc why these methods are synchronized? 
+
++1
+
+Other than this, I think this band-aid will hold., Agreed. Although this isn't pretty, the same thing is done in tons of other places all around the JT - in fact, I had to add a feature to jcarder specifically to ignore lock cycles that are gated by a higher-level lock., Patch adding the comments for synchronization, as suggested by Nigel.
+
+Thanks Todd for verifying the deadlock., Shouldn't we make JobTracker.getFaultCount and JobTracker.taskTrackers too?
+
+Oh, and thanks for your help Todd!, bq. Shouldn't we make JobTracker.getFaultCount and JobTracker.taskTrackers too?
+
+Those ones aren't currently causing deadlock potential, though perhaps they have potential ConcurrentModificationExceptions. The jcarder tests don't verify anything except deadlock., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12429993/patch-1342-1.txt
+  against trunk revision 898019.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/263/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/263/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/263/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/263/console
+
+This message is automatically generated., Patch with Arun's comments incorporated. Now, taskTrackers or potentiallyFaultyTrackers is always locked holding JobTracker lock. The newly synchronized methods are called from testcases or already synchronized methods., Patch for Yahoo! distribution, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12430006/patch-1342-2-ydist.txt
+  against trunk revision 898019.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/266/console
+
+This message is automatically generated., Now that some more methods have been made synchronized, I'd like to rerun jcarder another time, just to make sure we didn't introduce a new deadlock while fixing this one. I should have a chance to do so in the next day or two., Attaching the patch again. As Hudson picked up wrong patch., +1 for QA
+Tested both global blacklisting through health scripts as well as through task attempt killing. Also tested for
+multiple nodes blacklisting and coming out of blacklisting. The UI also reflects the changes correctly.
+
+, Ran test-patch and ant test on Y! dist patch, all tests passed except TestHdfsProxy., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12430093/patch-1342-2.txt
+  against trunk revision 898486.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/381/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/381/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/381/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/381/console
+
+This message is automatically generated., Minor nit: I'd request you to add comments about the locking assumptions/order to some more methods which need them  e.g. to JobTracker.removeTracker. Other than that this looks ready... thanks!, Added comments about locking order assumptions to methods JobTracker.addNewTracker and JobTracker.removeTracker., Patch for trunk, Also verified that the callers from jsps do not have any issues., test-patch passed for Y! dist patch, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12430117/patch-1342-3.txt
+  against trunk revision 898486.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/382/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/382/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/382/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/382/console
+
+This message is automatically generated., Ran jcarder on https://issues.apache.org/jira/secure/attachment/12430093/patch-1342-2.txt (md5sum 0de59f7b4deb8c4d5e3ea991ba838617) and looks good., +1
+
+Amareshwari, I'd appreciate if you could provide a patch for the Apache 0.20 branch too... I'll commit all the way back to 0.20.2. Thanks!, A discussion with Owen convinced me that this might not warrant going all the way back into branch-0.20.
+
+I've committed this to trunk, but it I can't apply it cleanly to branch-0.21. Amareshwari can you please provide one for branch-0.21? Thanks!, bq. A discussion with Owen convinced me that this might not warrant going all the way back into branch-0.20.
+
+Could you elaborate? Is it just that this hasn't been observed in practice, or is there some concern about it? , Apologies, I should have been more clear: the reason is that it hasn't been observed in practice and is potentially in a far corner., Integrated in Hadoop-Mapreduce-trunk #206 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Mapreduce-trunk/206/])
+    . Fixed deadlock in global blacklisting of tasktrackers. Contributed by Amareshwari Sriramadasu.
+, Patch for branch 0.21.
+Ran test-patch and ant test. All tests passed., I verified the changes in the patch for Branch 0.21 to see the shared data structures are accessed under the JT lock. Also the patch for 21 seems similar to the patch for trunk. Will commit the changes to branch 0.21 to unblock other patches., I just committed this to branch 0.21 also to trunk. Thanks, Amareshwari !, Integrated in Hadoop-Mapreduce-trunk-Commit #225 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Mapreduce-trunk-Commit/225/])
+    ]

@@ -1,0 +1,138 @@
+[Snapshots of the three members of the ZooKeeper ensemble.
+The 8 missing nodes in "the follower that is not ok" were created in the end of epoch 1:
+ < cZxid = 0x0000010000007d
+ ...
+ < cZxid = 0x000001000000a9
+ while the complete list is:
+ ...
+ cZxid = 0x0000010000007b
+ cZxid = 0x0000010000007d
+ ...
+ cZxid = 0x000001000000a9
+ cZxid = 0x00000200000004
+ ...
+ 4 of the 6 ephemeral owners of these nodes have made modifications during epoch 2, which makes me think that this problem might not be related with session expiration, but more likely with synchronization after leader election.
+ Even though some of the missing znodes were modified in epoch 2, "the follower that is not ok" didn't use this event to notice that something was wrong and e.g. restart and synchronize via snapshot., I have been able to reach a similar situation if data loss for one of the servers is included in the picture.
+Say we have servers A, B and C.
+1 - A, B and C form an ensemble and reach up to zxid 0x0000010000007b.
+2 - C is stopped.
+3 - A and B continue until transaction 0x000001000000a9.
+4 - A is stopped. B is stopped and loses all data.
+5 - B and C are restarted and form an ensemble starting with zxid 0x0000010000007b. They build a different story up to 0x00000200000004.
+6 - A is restarted, joins the new ensemble, receives a DIFF and continues working.
+7 - Transactions in A from 0x0000010000007d to 0x000001000000a9 maybe irrelevant. In any case they do not contain the creation of the znodes included in the history of B and C.
+Since losing data for one server is a possibility in my case, I am considering forcing synchronization via snapshot as the solution for this.
+Any help or opinions will be very appreciated., This is a bit confusing. Since you wiped out the state of B, you lost quorum for the transactions that A and B had committed. It is possible that A had a snapshot containing txns in 7d to 9a which confused it and got you in this broken scenario. If A didn't have such a snapshot, then it should have truncated and received a diff. Forcing a snapshot transfer shouldn't be necessary. , I bet it is even more confusing for me :-). But I do have the logs of how I reproduced the problem, so I will upload that. It was anyway easy to reproduce, I just followed the steps above with an ensemble of three and whatever transactions. 
+Forcing the snapshot in every synchronisation is not the only solution. It can also be solved with a check to verify that the followers have the same history as the leader. Since synchronisation is the only time in which a different history could be joining in, a check of the last transaction should be enough. The check could be done comparing the entire transaction information or with a checksum. This information (transaction info or checksum) could be sent from the follower to the leader anytime before the decision of whether to synchronise using DIFF, TRUNC or SNAP, and the leader could then send an SNAP if the checksum was wrong (and log a big WARN message).
+This also covers the problem of an operator wrongly starting one of the members of the ensemble with a data dir coming from another ensemble.
+However, this does mean a small change in the protocol, which can be done keeping backwards compatibility. The leader reports that it is able to optionally receive this information, and the follower sends that information only if the leader supports it., Similar to what Flavio already said, here is what I see. 
+
+Between step 4 and 5, you actually lose majority of the machine at once, so the quorum move forward without committed txns from (1,7c) to (1,a9)
+
+At step 6, A should get a TRUNC to (1,7b) and start getting DIFF with txn from (2,1) to  (2,4).  If A ever produced a snapshot after (1, 7b) , A won't be able to process TRUNC correctly and crash and never join a quorum. 
+
+If this is not the behavior that you observe, it is a bug in an implementation not the protocol.    , Thanks a lot Flavio and Thawan for looking into this!
+I thought A does not get a TRUNC because B and C are already in a zxid that is higher than a9, which is the highest zxid that A has seen.
+I thought a TRUNC is only sent if the leader has a lower zxid than the incoming learner.
+The logs and data dir for this case are attached now.
+This is the resulting data in the wrong follower:
+[3, 2, 1, 6, zookeeper, 5, 5bis, 4]
+And this is the resulting data in the leader and the other follower:
+[3, 2, 1, 4bis, 6, zookeeper, 5bis]
+I am not saying that this is an error in the protocol. I am only saying that I see it as a problem and a small modification of the protocol is one of the solutions. Another solution would be adding an option to force SNAP synchronization, and there are very likely more., Haven't have time to go over your log yet, it might be possible that current release don't handle all the cases correctly.  I believe ZOOKEEPER-1413 should already fixed this issue. If you can repro the problem using trunk, I will fix it. 
+
+With ZOOKEEPER-1413, the leader knows that  (1,7c) to (1,a9)  don't belong to its history, so it is going to send TRUNC. If the leader don't have sufficient history, it will send SNAP to A. , It does occur in trunk also. Logs attached in file logs_trunk.tar.gz.
+However I did see the TRUNC used for synchronization a couple of times, and also a message of being unable to send TRUNC because of different epochs and sending snapshot instead. So it was a bit harder to reproduced.
+This is the data in server A:
+[Fbc, Cbc, 6a, 4a, 7bc, 5a, 8bc, 3, 2, 1, 9a, 9bc, 7a, 8a, zookeeper, Abc, 6bc, Bbc, Dbc, Ebc]
+This is the data in server B:
+[Fbc, Cbc, 7bc, 5bc, 8bc, 4bc, 3, 2, 1, 9bc, zookeeper, Abc, 6bc, Bbc, Dbc, Ebc]
+I am working in the patch that sends information about the last transaction from the learner to the leader. That means that synchronization via snapshot will only happen when this problem occurs. Personally I don't see any other way to solve this, please tell me if you do., @german, I still don't understand if your use case is valid or not. From your earlier description, it didn't sound like you had a valid use case because you introduced too many faults. , Hello Flavio,
+I am sure that for me is a worrying case, I can't tell if it is a valid case for ZooKeeper in general.
+The faults are the following (for a cluster of three nodes):
+- One server fails, and stops for a while.
+- During this while another server fails and loses all data.
+If e.g. you have data in RAM, losing all data with a failure (and not losing it with other failures) may be quite frequent.
+I agree that this requires failure of 2 out of three nodes, which should not happen, but in any case a result of permanent inconsistency is not acceptable to me. Nodes can be taken out for maintenance and the administrator will bring nodes up and down and never think that if he does so carelessly the system will be broken forever when it is taken out of maintenance., If I understand your scenario correctly, you can't do what you want with ZooKeeper. There is one server stopped (fault one) and right after you wipe out the content of a second server (fault two). You have a three-node ensemble, which tolerates only one fault. How do you expect ZooKeeper to deal with it?
+
+Now, we can generalize this case in the following way. If there is a minority disconnected, and you wipe out the data of one of the servers in the live quorum, then ZooKeeper is not guaranteed to work because some committed transactions lost majority. You're violating fundamental assumptions of the replication protocol.  , I would expect ZooKeeper to stop giving service or to lose data. 
+I would not expect it to create a permanent inconsistency in the data., Ok, thanks for the clarification. Here are my current thoughts then. In the A, B, C scenario  above, I would have expected that A truncates its history and adopts the state of  B, C, losing some transactions. But, according to you observations, A is not getting some of the new transactions of B, C, which does not correspond to my expectation, so that's the only thing I believe we would need to fix if anything.
+
+The thing that throws me is that in any case your data is broken! I'm not exactly sure why it matters to have a consistent ensemble with a broken state. One point you made is that we could try to detect the problem so that A decides not to make further progress. Unfortunately, A can't determine whether the transactions it has and B, C don't have been committed or not. The txn log only contains accepted txns. A cannot distinguish this run from one in which A is the only one that has accepted these txns.
+
+Given that we are discussing an invalid scenario, I'd like to propose that we lower the severity of this issue to major or critical. This means that it is not a blocker for 3.4.6, but we could still try to get this in if we can converge to a solution. , For my case there is a simple solution, since our snapshots are very small we have already applied a patch that forces snapshot synchronization and avoids the problem. In any case, severity was changed by Patrick Hunt, you may want to check with him in case you haven't done so already.
+The attached patch proposes a fix in which an incremental hash that should be unique for each transaction history is associated with each transaction. This hash is sent to the Leader (only if the leader supports it).
+The Leader then sends an snapshot if the hash doesn't match its history for the same transaction.
+At least this was the intention of the change :-).
+I had only time to check the patch for 3.4 and at least it passes the regression test.
+Reviews and comments will be very appreciated., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12606790/ZOOKEEPER-1777.patch
+  against trunk revision 1529344.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    -1 javac.  The patch appears to cause tar ant target to fail.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1642//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1642//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1642//console
+
+This message is automatically generated., The updated version of the patch for trunk seems to pass the regression tests.
+However, it still lacks an specific test for the error test reported in this JIRA.
+It is not intended to be the final version, it is there to help with the discussion of the proposal., i'm curious about the goal here. the scenario is that we have zookeeper servers that have suffered permanent data losses (since they were using ram disks) and restart with empty data. in effect they are lying: they are voting as if they didn't suffer a failure, so our quorum protocols lose their guarantee.
+
+the fix should be to detect the lie and halt. correct?
+
+if you instead detect inconsistent followers and force them to sync up, you may get consistency in the ensemble, but you may be inconsistent with reality and with what the clients view is., Thanks a lot.
+I am very focused on the particular way in which ZooKeeper is used in my case and often I lose the general picture.
+The fix proposed in the patch is to solve the inconsistency and continue working. This is because in my case, as one as there is a single picture of reality it is not that important if that picture is missing a part of the history. It is on the other hand tremendously important that the ZooKeeper service is not interrupted.
+I understand that this might not be the case for many others.
+So please help me find a solution that fits the general case, if that is possible. I can also understand that there might be no solution that fits the general case.
+It would be possible to extend the checking of the history to clients. That will help to detect the problem. The thing is that there might be solutions in which clients just need to be restarted and in others this might be a fatal error that should never happen and the best action is a system halt and a huge error report.
+I am linking this to ZOOKEEPER-832, since they both deal with these case that only happen if the quorum is broken, and they both require a decision of what (if anything) to do in those cases., I don't understand why we are not truncating. As I explained before this is what I would expect ZooKeeper to do. , fwiw I upped the priority in order that we triage this issue appropriately. If we've done so and we feel confident that this is not a blocker, well don't consider me a blocker to making progress. (e.g. downgrading again and/or moving out to a future release, etc...), I'd like to understand why the truncation is not working, but since we don't actually guarantee correctness in such scenarios, I don't think it should block the release. Again, we can keep working on it until we produce a release candidate, but I'd like to make sure that we agree that it shouldn't block the release when time comes., I believe the truncation is not working because it doesn't detect the problem. It is possible that the servers have a compatible history in terms of zxid numbers, but it is still a different history. For example:
+1 - A, B and C form an ensemble and reach up to zxid 3.
+2 - C is stopped. C was the leader. There is a new leader election and a new epoch.
+3 - A and B continue until transaction 6, epoch 2.
+4 - A is stopped. B is stopped and loses all data.
+5 - B and C are restarted and form an ensemble starting with zxid 3, epoch 1. They build a different story up to zxid 9, epoch 2.
+6 - A is restarted, joins the new ensemble, receives a DIFF (in epoch 2 from zxid 7 to 9) and continues working.
+7 - Transactions in A for epoch 2 from 4 to 6 are different from those in B and C, but they have the same zxid.
+Could that be it?
+In my humble opinion, the fact that the algorithm doesn't guarantee correctness in those scenarios, doesn't mean that the working software shouldn't cover the case and have an acceptable behavior. In terms of academic demonstration of an algorithm it would be perfectly ok, in terms of having this component in a production environment it is not., ... of course that depends on the requirements of that production environment. Again, I tend to look at my case, sorry about that. I will do my best to have something agreed before 3.4.6 is released.
+I am assuming that the requirements are:
+- The problem is detected.
+- There is a big WARN in the log. 
+- Optionally the system halts, otherwise client sessions are closed, and the inconsistency in the ensemble is solved (taken away)., Could anybody help me see if this might work?
+- The hash check of each transaction is stored together with the rest of session data.
+- This hash check is sent together with the transaction response to the clients.
+- Clients store the last transaction's hash check.
+- Clients send the last transaction's hash check when connecting to the ensemble.
+1 - The problem is detected when a server with wrong data tries to connect to the leader.
+2 - Big WARN in the log.
+3 - An snapshot is sent to this server, including the session data with the transactions' hash checks.
+4 - If a client attempts to connect using a wrong transaction hash check, the session for that client is closed. Another WARN in the log.
+, I have noticed that ZOOKEEPER-1413 does solve part of the issues included here.
+E.g. ZOOKEEPER-1413 solves the inconsistencies when joining an ensemble with a lower epoch (instead of the current behavior in branch 3.4, which is an infinite loop in the leader and the joining server). 
+Any chances to consider ZOOKEEPER-1413 a bug fix instead of an improvement and include it in the 3.4 branch?, I think that's a pretty big change to include in a double dot (fix) release., I have received a different suggestion that has less impact. The idea would be to reserve some bits of the zxid for sanity check (e.g. 12 bits).
+That means that the zxid will rollover more often, but the remaining space for zxid+epoch (51 bits) still should last for more than one hundred years. 
+This sanity check will be calculated by the leader when increasing the zxid and it can be e.g. a random number.
+When a Follower connects to a leader or a client connects to a server, the leader and the server will only check if they see this zxid in their transaction history. If it is not there, then there is a warning and an snap is sent to the follower or the client connection is closed.
+There is no need to modify any protocol or storage with this, as far as I see. And most likely the biggest impact will be on the test cases. However if this is a configuration option, it will also be possible to decide to avoid the failures in some of the test cases.
+Any comments or opinions?, Most of what I'll say I have already said, but given that [~phunt] made a comment about including it in 3.4, I'll say it again.
+
+I don't think the situation you're describing here is a bug. I understand that for some reason this is important to you, so it makes sense to consider changes. However, the changes proposed here touch upon pretty core concepts of ZooKeeper, and consequently I'm not comfortable accepting any of these changes until I understand precisely their impact and if they are even needed. I have already mentioned that if there is any problem, it should be with the truncation implementation, but now I'm seeing changes to the format of zxids and that gives me headaches. 
+
+I would really appreciate if we could keep it for 3.5.0 so that we can think carefully about the implications of any change that is proposed here. I haven't dedicated the time this issue deserves because I've been focusing on the 3.4.6 issues.
+]

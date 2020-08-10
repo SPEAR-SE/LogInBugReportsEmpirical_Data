@@ -1,0 +1,410 @@
+[I'm glad you filed this.  I was just getting frustrated with this issue myself in the last couple weeks and have various thoughts on the issue.  Some of these ideas are raw and flawed, but  here is what I have been thinking:
+
+Ideally, the framework would limit the classes visible to a job to the minimum required for job execution.  A job could then bring in its own dependencies.  Also, if there was a built-in hadoop dependency hidden by default that a job wanted, it could request access to it.
+
+Similarly frustrating and related, is how a M/R job has to submit its whole job jar to the cluster each time.  I have a 28MB jar, and a workflow of about 35 dependent M/R jobs (A DAG of them).   Towards the end of this chain, the jobs get smaller and smaller in data size (the end ones are joining, augmenting, transforming and sorting data aggregated by the earlier jobs).  
+Two big things account for more clock time than the 'heavy lifting' work of the initial 'big data' jobs -- job submission time and scheduling inefficiencies.  The former is related to dependency management.
+
+If the framework could support installing jars into an 'application' classloader space and then jobs reference that space, task latency could be reduced significantly as each job submission would not need to also submit all its dependency jars.  In my case, the job jar would probably become a couple hundred K instead of almost 30MB -- or even zero K if the jobs could just be stored and called.  TaskTracker nodes could cache these application library spaces to reduce job start-up time.
+
+In some ways, the dependency management above is like an application server.  Each 'application' has its own classloader space, and there might be several different jobs available in an 'application' -- analogous to several servlets available in a web app.    Like an app server, there will probably be a need for a lib directory that is global, one that is exclusive to the framework, and a per-application space.
+
+
+There are some questions related to static variables related to such classloader partitioning.  With shared JVM's across tasks, users expect statics to live from one task to another in the same job.  This means the classloader in a JVM corresponds with the Job ID and whether it is a M or R.  Per-Job classloaders could enable JVM recycling across jobs in the distant future because disposing of a Job's classloader will free its static variables.  That in turn leads to the possibility of future reductions in start-up time and per task costs., bq. If the framework could support installing jars into an 'application' classloader space and then jobs reference that space, task latency could be reduced significantly as each job submission would not need to also submit all its dependency jars. 
+
+Scott, this is precisely what the DistributedCache was designed for. Please load your jars to HDFS, add your jars to the DistributedCache and then they are 'localized' once per-tasktracker and all jobs can use the same:
+
+http://hadoop.apache.org/common/docs/r0.20.0/api/org/apache/hadoop/filecache/DistributedCache.html
+, The documentation for DistributedCache says:
+"Its efficiency stems from the fact that the files are only copied _once per job_ and the ability to cache archives which are un-archived on the slaves."
+
+Is the documentation wrong? or the claim that the distribution happens one per tasktracker and multiple jobs can use it incorrect? 
+The documentation above is ambiguous -- does it copy items once per job, un-archiving once per slave per job?  or does it cache un-archived data on slaves across a longer period of time?
+
+What I am suggesting is not a Job-scope cache, but something that has a much longer scope -- days, weeks, months -- to share between many different jobs without per job copying or unpacking unless the contents have changed.   It is unclear from the documentation on DistributedCache if there is any optimization outside of the Job scope.  If it had this sort of optimization already that would be great.
+
+, Getting custom classloaders right is one of the hardest things to do in Java. Whoever volunteers to do this *and I opt to run away from it* had better talk to the experts in the area. If it is purely for short-lived standalone tasks things would be simpler (less classloader leakage risks), but you still have to be very good at handling the problems a CL tree brings to the table
+
+# returning anything loaded by a custom CL means the CL and all loaded classes hang around in VM, reloading becomes tricky.
+# multiple singletons in a single JVM
+# object equality tests fail
+# wierd errors that you had better log rather than hope don't happen.
+
+I've always felt that the ASF ought to have an "understands classloaders" qualification; if you don't pass it, you don't get to submit classloaders to the codebase. , I also just ran into this issue.  (Again, due to using a recent release of avro + jackson.)
+
+Is there any workaround for this?  (Short of having to go into every node on the cluster and removing the jackson jar from the hadoop installation?, We have a patch for yahoo-hadoop-0.20 in MAPREDUCE-1938 to help solve this., The patch in MAPREDUCE-1938 does unfortunately not solve the issue when the job implementation uses custom class loaders to load dependency classes. The proposed patch only addresses the issue when no custom class loaders are in the picture.
+
+As a first step, it would really help (us anyway), if jobs would not be started with stuff on the classpath that is not at all required for job execution per se (e.g. jetty libs, the eclipse java compiler, jasper...).
+
+Secondly, hadoop could actually start with only the hadoop api types on the classpath plus a small launcher that would load hadoops implementation in an isolated child loader, so that implementation dependencies do not leak through to the job's implementation. I am not sure if the hadoop implementation is ready for implementation/api separation via class loaders though. 
+
+I patched hadoop 0.20.2 to exclude all libs in lib/server from the jobs classpath and I move all non-job related jars into that server folder in my hadoop installation. That helped somewhat. , Here's a proof of concept for isolated classloaders in YARN. This approach uses OSGi for isolation. The idea is that the task JVM uses a Felix container to load the job JAR (which is an OSGi bundle) so that user code can use whichever libraries it likes, even if they conflict with system JARs.
+
+In this example I have created a fictitious library with two incompatible versions. Version 1 is used by the system (in YarnChild) while version 2 is used by the example Mapper. Without isolation the job fails with a java.lang.NoSuchMethodError - regardless of whether the user JARs are first or second on the classpath. When run using isolation, the job succeeds and we can see that both version 1 and version 2 of the library are used:
+
+{noformat}
+/tmp/logs//application_1346151477167_0001/container_1346151477167_0001_01_000002/stdout:message 2
+/tmp/logs//application_1346151477167_0001/container_1346151477167_0001_01_000002/syslog:2012-08-28 11:58:52,317 INFO [main] org.apache.hadoop.mapred.YarnChild: message 1
+{noformat}
+
+To run:
+* Checkout a revision of trunk that doesn't have MAPREDUCE-4068 ('svn up -r 1376252')
+* Apply the patch
+* Run 'mvn versions:set -DnewVersion=3.0.0' to change the version numbers to non-SNAPSHOT values, since OSGi doesn't like them.
+* Build:
+{noformat}
+(cd hadoop-mapreduce-project/hadoop-mapreduce-examples/lib-v1; mvn install)
+(cd hadoop-mapreduce-project/hadoop-mapreduce-examples/lib-v2; mvn install)
+mvn clean install -DskipTests
+(cd hadoop-mapreduce-project/hadoop-mapreduce-examples/class-isolation-example/; mvn install)
+mvn package -Pdist -DskipTests -Dtar
+{noformat}
+* Install the tarball and run
+{noformat}
+bin/hadoop fs -mkdir -p input
+bin/hadoop fs -put /usr/share/dict/words input
+bin/hadoop jar ~/.m2/repository/org/apache/hadoop/class-isolation-example/1.0-SNAPSHOT/class-isolation-example-1.0-SNAPSHOT.jar org.apache.hadoop.examples.classisolation.Driver input output
+{noformat}
+
+Still to do/future improvements:
+* Make compatible with MAPREDUCE-4068.
+* Write a unit test.
+* Currently only the Mapper is loaded using an OSGi service - extend the approach for all user-defined classes in a MR job.
+* Use OSGi fragments so that user job JARs don't need a Registrar class, since it would be a part of the host bundle that the job JAR extends.
+* Write a utility to convert existing job JARs to OSGi bundles (or fragments).
+, New patch with a unit test. The test isn't integrated into the build yet, so you have to build the class-isolation-example module manually first. I've also removed the fictitious libs and instead used Guava as an example of an incompatibility., Tom, I don't understand specific advantages of OSGI or Felix, so please pardon some of my questions.
+
+However, with MR being an application in YARN (see MAPREDUCE-4421) we can just add user jars in front of the classpath for the tasks (we already allow it). This isn't the same Map/Reduce child inherits the TT classpath problem in MR1 (actually even in MR1 you can put child jars ahead in the classpath for a long while now). Given this, do we need to bring in OSGI or Felix, what do else do they provide? Thanks., Arun, 
+
+I see where Tom is coming from. Irrespective of how the Hadoop services are deployed, you need to be able to do things like submit jobs from OSGi containers (e.g Spring & others) which is what this patch appears to offer. And if Oracle finally commit to OSGi now that Java 8 is being redefined, it'd be good from all clients.
+
+I would like to see a way to support this which doesn't put an OSGi JAR on the classpath of everything.
+
+Tom -is there a way to abstract away OSGi support so that it's optional, even if its a subclass of JobSubmitter? An {{org.apache.hadoop.mapreduce.osgi.OSGiJobSubmitter}} could override some new specific protect methods to enable this., Putting user jars before/after the application dependencies doesn't actually solve the problem.  
+
+* The conflict might require a user jar that is not compatible with one needed by the framework, either order breaks something
+* The user might override a system jar and alter functionality in a way that breaks the framework, or subverts security.
+
+Both the host container and the user code need to be able to be certain of what code they are executing without stepping on each other's toes.  This is _not possible_ with one classpath., If we are lucky, projecct jigsaw will be pulled back into Java 8.  According to: http://mreinhold.org/blog/late-for-the-train-qa it has not yet been decided.
+
+If it is brought back in, then perhaps we can wait until Java has a module system 1 to 1.5 years from now.  If not, I do not think Hadoop can wait until Java 9, sometime 2015 to 2016 ish., Scott makes a good case for why some kind of classloader isolation is needed.
+
+The patch is still a work in progress, but the idea is that the OSGi support is optional - so if you use a regular (non-OSGi) job JAR then it works like it does today, while if your job JAR is an OSGi bundle (basically a JAR with extra headers in the manifest, and possibly some embedded dependencies) then it is loaded in an OSGi container in the task JVM. This allows folks who want to use OGSi to do so while not impacting others. (Hopefully this answers Steve's question.)
+
+From the point of view of this JIRA, OSGi is simply a means to ensure classloader isolation. That means that if Jigsaw became a reality, then we could use that instead or as well. OSGi has many other features, but they are not used for this change. (Note that there are other ongoing efforts to make Hadoop more OSGi-friendly, covered in HADOOP-7977, and while some might be helpful for this JIRA (such as HADOOP-6484), none is required.)
+
+Also, in the future OSGi containers could improve container reuse by providing better isolation between jobs, since bundles can be unloaded, although I haven't spent any time looking at how that would work in the context of MR., bq. The conflict might require a user jar that is not compatible with one needed by the framework, either order breaks something
+
+You can always change the client framework and make it work with user code, per job, with class path ordering. There is currently always a way in both Hadoop 1 and 2 to submit a job with arbitrary dependencies, even though it might not be pretty (may require change to client framework).
+
+bq. The user might override a system jar and alter functionality in a way that breaks the framework, or subverts security.
+
+The client framework code can always be changed per job to accommodate new dependencies. MR security is done at protocol level, i.e. no amount class path ordering can subvert security.
+
+I agree with Arun that this is a nice to have feature to improve usability. Advanced users can already achieve whatever that can be achieved (including running an OSGi container) per job.
+ , {quote}
+You can always change the client framework and make it work with user code, per job, with class path ordering. There is currently always a way in both Hadoop 1 and 2 to submit a job with arbitrary dependencies, even though it might not be pretty (may require change to client framework).{quote}
+
+Without a user doing classloader gymnasitics and fancy packaging themselves, there is not always a way.  A user cannot simply package a jar up and ask hadoop to execute it and expose to the user's execution environment only the public Hadoop API.
+, bq. Without a user doing classloader gymnasitics and fancy packaging themselves, there is not always a way.
+
+That's an interesting way to say that except for some ways that would always work, there is not always a way. Using the standard task API to bootstrap an OSGi container is reasonably straight forward :)
+
+bq. A user cannot simply package a jar up and ask hadoop to execute it and expose to the user's execution environment only the public Hadoop API.
+
+I do agree that there is a usability issue for certain (and arguably less common) use cases, where a user wants to use dependencies that conflict with client framework. However the proposed OSGi approach makes the usability worse for common cases: You'll always need OSGi bundles, which is a form of "fancy packaging", to run your jobs.
+
+A more reasonable (and less heavy) solution would not require users to make any change (including adding metadata to their jars) to their existing code., Prompted by this discussion I had a look at using a classloader approach similar to how servlet containers are implemented. The servlet spec says that classes in the WEB-INF/classes directory and JARs in the WEB-INF/lib directory are loaded in preference to system classes. I found this page about classloading in Jetty useful: http://docs.codehaus.org/display/JETTY/Classloading.
+
+The attached patch does a similar thing for the Hadoop task classpath by using a custom classloader for classes instantiated by reflection in MapTask. The unit test from the previous patch passes with this implementation. I think this is worth exploring further.
+, I agree that the new (much) lighter weight approach is worth exploring. Thanks Tom! , no, we don't want to go anywhere near servlet classloaders, because you end up in WAR EAR and app server trees. The app server takes priority, except in the special case of JBoss in the past, which shared classes across webapps
+
+https://community.jboss.org/wiki/JBossClassLoaderHistory
+http://docs.jboss.org/jbossweb/2.1.x/class-loader-howto.html
+
+people will hit walls when they try to do things like upgrade the XML parser or try and add a new URL handler. 
+
+I'll look at the patch, but classloaders are a mine of grief. That's the strength of OSGi: the grief is standardised an someone else has done the grief mining already
+, There is no need to be scared of classloaders, especially for the simple "load only and then exit" scenarios that we're talking about. Most of the class loader issues stem from long running containers that need to dynamically load/unload classes. OSGi is an overkill for MR tasks. To be clear, I'm not anti-OSGi, which I think is perfectly fine for managing server-side plugins., bq. Most of the class loader issues stem from long running containers that need to dynamically load/unload classes.
+
+Also, the case we are talking about does not have the complex classloader trees that app servers have, so there are no sibling class sharing issues. In the task JVM there is only a single user app, so the classloader hierarchy is linear (boot, extension, system, job).
+
+There are a few cases where certain APIs make assumptions about which classloader to use:
+
+* *The system classloader*. For example, URL stream handlers are loaded by the classloader that loaded java.net.URL (boot), or the system classloader. So if a task registered a URL stream handler and it was in the job JAR, then it wouldn't be found since it was loaded by the job classloader, not the system classloader.  In this case, the workaround is to implement a factory and call URL.setURLStreamHandlerFactory().
+* *The caller's current classloader*. For example, java.util.ResourceBundle uses the caller's current classloader, so if the framework tries to load a bundle then the bundle (e.g. a localization bundle) would not be found if it were in the job JAR, since the system classloader (which loaded the framework class) can't see the job classloader's classes. As it happens, MR counters use resource bundles; however, they explicitly use the context classloader, so this problem doesn't occur (see org.apache.hadoop.mapreduce.util.ResourceBundles). (Also, I imagine the use of resource bundles to localize counter names in the job JAR is very rare.)
+* *The context classloader*. For example, JAXP uses the context classloader to load the DocumentBuilderFactory specified in a system property. This case is covered by setting the context classloader to be the job classloader for the duration of the task (my latest patch does this). Most APIs that involve classloaders use the context classloader these days.
+
+So all of these cases can be handled. Also note that by default the job classloader is not used, to enable it you need to set mapreduce.job.isolated.classloader to true for your job.
+
+The latest patch handles the case of embedded lib and classes directories in the JAR, as well as distributed cache files and archives. The unit test passes (and fails with a NoSuchMethodError due to the class incompatibility if mapreduce.job.isolated.classloader is set to false). So I think it is pretty close now - the main thing left to do is sort out the build for the test, which relies on the MR examples module.
+
+, Nice.
+
+What I would add is the capability of blacklisting packages. This is, if a package is blacklisted and a class under that package hierarchy is found in the job JARs, the job should fail. This is something avail in webapp classloaders to avoid webapps for bundling things like servlet/jsp JARs that would break things. In our case we would blacklist common/hdfs/yarn/mapred packages and log4j (the factory is a singleton and if present in the job JARs will trash the log configuration of hadoop). I could see other JARs fitting this blacklist, thus I'd suggest that we have a config property with the list of blacklisted packages.
+
+This is isolating MR jobs from Hadoop JARs. I think we should do the same at YARN level to isolate YARN JARs from AM JARs. Because of this, the JobClassLoader should be in common and probably have a different name, like IsolationClassLoader. Also it should receive, in the constructor, the blacklist.
+, Tom, one thing I've forgot to mention in my previous comment, we should see how to enable the classloader on the client side as well as it may be required (to use different JARs) for the submission code. May be as another JIRA. 
+
+Also, don't recall now if it is there or not, we may want o have a job config property to disable it in case some app runs into funny issues with it., Thanks for the comments Alejandro.
+
+bq. What I would add is the capability of blacklisting packages. 
+
+I think that is a good idea. Servlet containers do this - e.g. system classes in Jetty are always loaded from the parent (http://docs.codehaus.org/display/JETTY/Classloading). Rather than failing the job if the class is a system class and is found in the job classpath (as you suggested) I think it would be acceptable to log a warning but load from the system classpath. I expect the default blacklist would be {{java.,javax.,org.apache.commons.logging.,org.apache.log4j.,org.apache.hadoop.}}.
+
+bq. I think we should do the same at YARN level to isolate YARN JARs from AM JARs. Because of this, the JobClassLoader should be in common and probably have a different name, like IsolationClassLoader. 
+ 
+Other YARN apps might benefit from this work, so perhaps we should add the classloader to YARN (not Common, since HDFS shouldn't need it), and the MR-specific parts would stay in MR, of course.
+
+bq. we should see how to enable the classloader on the client side as well as it may be required (to use different JARs) for the submission code. May be as another JIRA. 
+
+I think this is a slightly different problem, since users generally have more control over the JVM they submit from than the JVM the task runs in. So, yes, another JIRA would be appropriate.
+
+bq. Also, don't recall now if it is there or not, we may want o have a job config property to disable it in case some app runs into funny issues with it.
+
+Agreed. It's off by default in the current patch., New patch which moves the classloader to YARN (renamed ApplicationClassLoader), and adds ability to blacklist system classes, which are never loaded by the application classloader., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12554482/MAPREDUCE-1700.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3046//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3046//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-yarn-common.html
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3046//console
+
+This message is automatically generated., Address findbugs issue., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12554490/MAPREDUCE-1700.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3047//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3047//console
+
+This message is automatically generated., # {{Task}} should get the string {{"APP_CLASSPATH"}} from the {{ApplicationConstants}}.
+# the test dir logic won't work on windows if {{test.build.data}} isn't set :{{System.getProperty("test.build.data", "/tmp")}} -that default should be replaced with {{System.getProperty("java.io.tmpdir')}}
+# in {{ApplicationClassLoader.loadClass()}} it looks to me like it is possible to have the situation {{c==null}} && {{ex==null}} at the {{if (c==null} throw ex;}} clause -if {{parent.loadClass() => null}}. Some check for a null {{ex}} value and setting to (something?) would avoid this.
+# the tests should look for resource loading too, just to be thorough.
+
+Other than that, with my finite classloader knowledge -looks good. Someone who understands OSGi should do  quick review too.
+, Thanks for the review Steve. I've addressed all your points in a new patch. (OSGi experts are also welcome to take a look of course!), {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12554512/MAPREDUCE-1700.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3049//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3049//console
+
+This message is automatically generated., Now that we have a much better way of dealing with dependency conflicts, what will be the fate of "mapreduce.job.user.classpath.first" feature? Is there any use case where this feature works but the CCL approach don't or somehow is preferred over CCL for some reason? If none, shall we deprecate it?, I don't know of a reason that "mapreduce.job.user.classpath.first" would be preferable to CCL. However, I'd suggest waiting a release or so before deprecating it though, so we can see how CCL fares., bq. what will be the fate of "mapreduce.job.user.classpath.first" feature?
+
+I think we should still keep it as an "expert" feature, as it can be used to replace the implementation of the job/app classloader itself in rare cases. We probably should print a WARNING when the feature is used. The new job/app classloader behavior can be used as a much saner default., {quote}
+bq. Tom, one thing I've forgot to mention in my previous comment, we should see how to enable the classloader on the client side as well as it may be required (to use different JARs) for the submission code.
+
+I think this is a slightly different problem, since users generally have more control over the JVM they submit from than the JVM the task runs in. So, yes, another JIRA would be appropriate.
+{quote}
+
+I think AM also runs user code, if a custom output format is defined., Kihwal, that's true - thanks for pointing it out. I've modified the patch to take care of that case, by setting the classloader for the MRAppMaster (when the configured of course).
+
+I've also created YARN-286 for the YARN part of this patch so it can be committed separately.
+
+This patch is a combined patch so that Jenkins can test it as a whole., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12562082/MAPREDUCE-1700.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3157//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3157//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-mapreduce-client-common.html
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3157//console
+
+This message is automatically generated., Updated patch to fix the findbugs issue and use code in YARN-286 which is now committed., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12563283/MAPREDUCE-1700.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3194//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3194//console
+
+This message is automatically generated., +1 The patch looks good. I hope people try this with many different use cases., I just committed this. Thanks to everyone who provided feedback., Integrated in Hadoop-trunk-Commit #3203 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/3203/])
+    MAPREDUCE-1700. User supplied dependencies may conflict with MapReduce system JARs. (Revision 1430929)
+
+     Result = SUCCESS
+tomwhite : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1430929
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/YarnChild.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common/src/main/java/org/apache/hadoop/mapreduce/v2/util/MRApps.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common/src/test/java/org/apache/hadoop/mapreduce/v2/util/TestMRApps.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+, Integrated in Hadoop-Yarn-trunk #92 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/92/])
+    MAPREDUCE-1700. User supplied dependencies may conflict with MapReduce system JARs. (Revision 1430929)
+
+     Result = SUCCESS
+tomwhite : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1430929
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/YarnChild.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common/src/main/java/org/apache/hadoop/mapreduce/v2/util/MRApps.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common/src/test/java/org/apache/hadoop/mapreduce/v2/util/TestMRApps.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+, Integrated in Hadoop-Mapreduce-trunk #1309 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1309/])
+    MAPREDUCE-1700. User supplied dependencies may conflict with MapReduce system JARs. (Revision 1430929)
+
+     Result = FAILURE
+tomwhite : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1430929
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/YarnChild.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common/src/main/java/org/apache/hadoop/mapreduce/v2/util/MRApps.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common/src/test/java/org/apache/hadoop/mapreduce/v2/util/TestMRApps.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+, Integrated in Hadoop-Hdfs-trunk #1281 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1281/])
+    MAPREDUCE-1700. User supplied dependencies may conflict with MapReduce system JARs. (Revision 1430929)
+
+     Result = FAILURE
+tomwhite : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1430929
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/YarnChild.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common/src/main/java/org/apache/hadoop/mapreduce/v2/util/MRApps.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common/src/test/java/org/apache/hadoop/mapreduce/v2/util/TestMRApps.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+, Awesome!, Merged to branch-0.23., Integrated in Hadoop-Hdfs-0.23-Build #510 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/510/])
+    merge -r 1430928:1430929 Merging MAPREDUCE-1700 to branch-0.23 (Revision 1440100)
+
+     Result = SUCCESS
+kihwal : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1440100
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/YarnChild.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common/src/main/java/org/apache/hadoop/mapreduce/v2/util/MRApps.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-common/src/test/java/org/apache/hadoop/mapreduce/v2/util/TestMRApps.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/MRJobConfig.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/resources/mapred-default.xml
+, This is an awesome change. I've always wondered why this support wasn't there. Thanks!, Hi Tom, can you elaborate more on why "org.apache.commons.logging.,org.apache.log4j." should be blacklisted? we are trying to do the similar class loader thing for another software, so want to learn some experience here :), [~xumingming], the set of packages to blacklist came from the Jetty (http://docs.codehaus.org/display/JETTY/Classloading), which is why Commons Logging and Log4j were included. Excluding logging classes prevents inadvertant double initialization of the logging system - once when the task JVM starts and again when the user code is loaded. Note that you can change the system default by setting mapreduce.job.classloader.system.classes., Hello,
+
+We are seeing some similar issues in Samza usage and trying to borrow some ideas from Hadoop. I read through this ticket and YARN-286 but am still trying to figure out how it resolves the (e.g. Avro) conflict? For us we have a single thread that is similar to JobImpl executing user code like map/reduce as well as some system logic such as ser-de. Let's say we have a Avro 1.4 jar in CLASSPATH and another Avro 1.7 jar in APP_CLASSPATH. The task's ApplicationClassLoader would then first load Avro 1.7 from CLASSPATH, but then when it needs Avro 1.4 for ser-de it will fail because it has already loaded Avro 1.7 which is backward incompatible. Am I missing anything here?, The idea of the application classloader is that there are two classloaders (the application classloader and the JVM's classloader) which can keep its copies of the same class. It is possible for the application classloader to load and use avro 1.7 (from the app classpath) and for the JVM classloader to load and use avro 1.4 (from the main classpath). It is essentially achieved by reversing the standard parent-first loading approach., Thanks [~sjlee0] for the quick replies. I think my main confusion is coming from setContextClassLoader() for the thread.
+
+More specifically let's say the thread does both some "framework logic" and some user logic like:
+
+{code}
+message = system.getMessage().deserialize();  // this is system code
+result = process(message); // this is user code that could introduce other dependencies
+system.send(result.serialize); // this is system code again
+{code}
+
+then setting this thread's context class loader to the application class load seems not be sufficient to me since the thread would also need to execute some framework logic that would require a different class loader?
+
+Sorry about the consecutive questions and if people feel strong about it, I can move to the mailing list. Just feel it is more efficient asking the questions here with patches at hand., More specifically, I feel for it to really work, one has to do sth. like:
+
+{code}
+Thread thread = Thread.currentThread();
+ClassLoader old = thread.getContextClassLoader();
+thread.setContextClassLoader(newClassLoader);
+
+try {
+    // user code like process(), map(), reduce(), etc..
+} finally {
+    thread.setContextClassLoader(old);
+}
+{code}, I would also advise moving this discussion to the mailing group. That way you'll get a bigger audience. Also, this is a resolved JIRA, so I don't think this is the best place to conduct the discussion.
+
+The thread context classloader is a poor abstraction that's fraught with issues. There is no well-defined contract on how to set and use it. The current hadoop code does pretty much what you're describing above. However, it's difficult to pinpoint always when the user code runs and when the system code runs, so it's bound to be imprecise at some point.
+
+Normally the TCCL is not the main way to load classes. So it would be a problem only if some code explicitly invokes Thread.getContextClassLoader() to retrieve the TCCL and uses it to load classes. So in practice, it's uncommon we see issues due to this although it's possible in principle., [~sjlee0] I have sent my questions to the users mailing list with a more detailed description. I would appreciate it if you can help resolving my confusions.]

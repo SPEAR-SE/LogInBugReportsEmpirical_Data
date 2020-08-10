@@ -1,0 +1,340 @@
+[[~vanzin]/[~lirui], could you please review?
+cc: [~csun], Hmm, the options are poorly named (my fault, and they always confuse me when I look at them now), but the current use looks correct.
+
+"client.connect.timeout" is for the connection that the Spark driver opens to HS2.
+"server.connect.timeout" is actually used in two places, but is basically the time allowed between HS2 starting the Spark driver, and the SASL handshake to finish., Thanks, [~vanzin]. To confirm, when you say "the current use looks correct", do you mean with or without the patch? {{registerClient()}} is called before the remote driver connecting back to HS2. For that, I think it should use client.connect.timeout. However, {{config.getServerConnectTimeoutMs()}} returns the value for *server.connect.timeout*. That's why I think the patch here is needed., I mean the current code without the patch.
+
+{{registerClient()}} is called on the server side; so it basically starts the countdown for the "SASL handshake" timeout (which is what "getServerConnectTimeoutMs()" and is probably a better name for that method). The client should connect back and authenticate within that timeout., Actually my understanding is a little different. Checking the code, I see:
+1. On server side (RpcServer constructor), saslHandler is set a timeout using {{getServerConnectTimeoutMs()}}.
+2. On client side, in {{Rpc.createClient()}}, saslHandler is also set a timeout using  {{getServerConnectTimeoutMs()}}.
+These two are consistent, which I don't see any issue.
+
+On the other hand, 
+3. On server side, in {{Repc.registerClient()}}, ClientInfo stores {{getServerConnectTimeoutMs()}}. And, the timeout happens, the exception is TimeoutException("Timed out waiting for client connection.").
+4. On client side, in {{Rpc.createClient()}}, the channel is initialized with {{getConnectTimeoutMs()}}.
+
+To me, it seems there is mismatch between 3 and 4. In 3, the timeout message implies "connection timeout", while the value is what is supposed to be that for saslHandler handshake. This is why I think 3 should use {{getConnectTimeoutMs()}} instead.
+
+Could you take another look?
+
+I actually ran into issues with this. Our cluster is constantly busy, and it takes minutes for the Hive to get a YARN container to launch the remote driver. In that case, the query fails with a failure of creating a spark session. For such a scenario, I supposed we should increase *client.connect.timeout*. However, that's not effective. On the other hand, if I increase *server.connect.timeout*, Hive waits longer  for the driver to come up, which is good. However, doing that has a bad consequence that Hive will wait as long to declare a failure if for any reason the remote driver becomes dead.
+
+With the patch in place, the problem is solved in both cases. I only need to increase *client.connect.timeout* and keep *server.connect.timeout* unchanged., Hi [~xuefuz], I tried your patch locally. {{hive.spark.client.connect.timeout}} defaults to 1000ms. But starting the RemoteDriver can easily take longer than that. Therefore my job just failed with "Timed out waiting for client connection".
+I'm quite ignorant about the Rpc code. What I see is we have two timeout configs with different default value. And the specific code here needs the one with the bigger default value. I'd really appreciate it if [~vanzin] could give more detailed explanations about the purposes of the two configs, and whether they're used inconsistently as Xuefu pointed out.
+
+Besides, the naming is really confusing to me, like SparkClient is the RpcServer, and we pass ClientProtocol to serverDispatcher etc. I understand the client/server concepts are probably reversed for HS2/RemoteDriver and Rpc. Wondering if it's better to make it somehow consistent., [~xuefuz] I see what you mean, but I think your analysis is slightly off.
+
+1 and 2 are actually where the problem, if any, is; 2 should use {{getConnectTimeoutMs()}} instead of the server version. As Rui said, the "server timeout" here, which is actually the "authentication timeout", needs to be much longer than the client timeout since it involves the time to start the driver.
+
+So basically: all calls made on the client side (= Spark driver) should use {{getConnectTimeoutMs()}}, all calls made on the server side (= HS2) should use {{getServerConnectTimeoutMs()}} (although, if I remember the code correct, the one timeout set up in {{registerClient()}} ends up taking precedence over all others on the server path).
+
+> doing that has a bad consequence that Hive will wait as long to declare a failure if for any reason the remote driver becomes dead
+
+That's kinda hard to solve, because the server doesn't know which client connected until two things happen: first the driver has started, second the driver completed the SASL handshake to identify itself. A lot of things can go wrong in that time. There's already some code, IIRC, that fails the session if the spark-submit job dies with an error, but aside from that, it's kinda hard to do more.
+, [~vanzin], thanks for your insight. I think we are approaching to something. I'm going to change #2 to use {{getConnectTimeoutMs()}} and try it out. Naming is one thing, but yes, the server-side timeout should be bigger. When I tested with my patch, I actually made *client.connect.timeout* much bigger than *server.connect.timeout* and that's why I didn't have the problem that [~lirui] got. 
+
+{quote}That's kinda hard to solve, because the server doesn't know which client connected until...{quote}
+My original problem (with no patch so ever) was about a busy cluster where it took longer time (up to 10m) to get a container to run the driver. To overcome that, I increased *server.connect.timeout* to 10m which worked. With that, however, I got a different problem when the driver suddenly dies (due to OOM, for instance), at which point the driver had already connected back to Hive and the job was running. In such a case, Hive wouldn't detect the driver was gone until 10m later. My patch here was to solve this problem.
+
+With the new understanding, I'd like to make sure that both the problems are solved: 1. user should be able to increase *server.connect.timeout* to handler longer startup of the driver. 2. Hive should be able to immediately detect the death of the driver (after connection has been made).
+
+Any additional thoughts?, bq. I got a different problem when the driver suddenly dies (due to OOM, for instance) ... Hive wouldn't detect the driver was gone until 10m later.
+
+If you mean it dies before the SASL handshake is complete, then in that case maybe my understanding that the server timeout applies to the whole connection + handshake is wrong and that should be fixed. i.e. the timeout set up in {{registerClient}} should apply to the whole handshake and not only until there's a connection.
+
+But if it dies after the SASL handshake, then it seems like the problem is somewhere else and shouldn't really be related to either of these timeouts., Patch #1 followed what [~vanzin] suggested. With it, I observed the following behavior:
+
+1. Increasing *server.connect.timeout* will make hive wait longer for the driver to connect back, which solves the busy cluster problem.
+2. Killing driver while the job is running immediately fails the query on Hive side with the following error:
+{code}
+2017-01-20 22:01:08,235	Stage-2_0: 7(+3)/685	Stage-3_0: 0/1	
+2017-01-20 22:01:09,237	Stage-2_0: 16(+6)/685	Stage-3_0: 0/1	
+Failed to monitor Job[ 1] with exception 'java.lang.IllegalStateException(RPC channel is closed.)'
+FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.spark.SparkTask
+{code}
+
+This meets my expectation.
+
+However, I didn't test the case of driver death before connecting back to Hive. (It's also hard to construct such a test case.) In that case, I assume that Hive will wait for *server.connect.timeout* before declaring a failure. I guess there isn't much we can do for this case. I don't think the change here has any implication on this., [~vanzin], could you please review the patch? Thanks.
+[~lirui], Could you also try and review the patch? Thanks., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12848640/HIVE-15671.1.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 9 failed/errored test(s), 10974 tests executed
+*Failed tests:*
+{noformat}
+TestDerbyConnector - did not produce a TEST-*.xml file (likely timed out) (batchId=235)
+org.apache.hadoop.hive.cli.TestEncryptedHDFSCliDriver.testCliDriver[encryption_join_with_different_encryption_keys] (batchId=159)
+org.apache.hadoop.hive.cli.TestHBaseNegativeCliDriver.testCliDriver[cascade_dbdrop] (batchId=226)
+org.apache.hadoop.hive.cli.TestHBaseNegativeCliDriver.testCliDriver[generatehfiles_require_family_path] (batchId=226)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[orc_ppd_basic] (batchId=135)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[orc_ppd_schema_evol_3a] (batchId=136)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[limit_pushdown3] (batchId=144)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[schema_evol_text_vec_part] (batchId=149)
+org.apache.hive.service.cli.TestEmbeddedThriftBinaryCLIService.testTaskStatus (batchId=213)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/3085/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/3085/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-3085/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 9 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12848640 - PreCommit-HIVE-Build, Hi [~xuefuz], I tried your case but didn't reproduce your issue. Here's my findings (w/o patch):
+# I set {{hive.spark.client.server.connect.timeout}} to 10min and kill the driver during execution of the job. (Hive CLI + yarn-cluster mode)
+# Hive can detect the job failure instantly. But whether the CLI can return instantly (blocking on {{RemoteSparkJobMonitor.startMonitor}}) depends on whether we're in the middle of retrieving job progress from the driver. If we're, CLI needs to wait for {{hive.spark.client.future.timeout}}, default to 1min. If not, CLI returns instantly., The patch looks ok but I don't know how it relates to the issue you described. This is shortening the timeout on the client side, and you seemed to be concerned about some long timeout on the server side. This patch will just make sessions fail more quickly when the server is in a weird state and is taking long to reply to client messages., Thanks, [~lirui] and [~vanzin].
+
+I retried the case that Rui described. Yes, Hive detects the disconnection right after the driver process is killed. I think killing the process will close the socket, so the other end detects the problem right way.
+
+I guess my original problem is not about killing the driver process. Rather, if the connection between Hive and the driver is congested but not broken before the driver exists abnormally, Hive will not detect a broken connection, so it will not time out until *server.connect.timeout* has elapsed. I agree the patch doesn't help this case. I also agree with Marcelo that the patch only makes the driver be more willing to exit if Hive happens to be busy.
+
+Let me step back and recap what I really need. 1. I want Hive to wait longer for the driver to connect back in case of a busy cluster. Increasing *server.connect.timeout* solves the problem. 2. I also want Hive to detect a nonreachable driver early in case of network congestion or abnormal exit. In reality, #2 is also decided by *server.connect.timeout*.
+
+Now, I'm wondering if it's possible to define a timeout for the initial connection (driver connecting back to Hive), and another timeout for subsequent communications between Hive and the driver. Is this possible at all?
+, As a side note, the patch here might be still needed. If Hive is busy or the connection between Hive and the driver is congested, we want the driver to go away quicker too. When this happen in one case, I saw that the driver, not knowing Hive was gone, was still allocating executors and killing them after 60s because they idled out. (This probably doesn't happen that much in normal conditions. I got this because apparently we are having networking issues at the moment.), I may encounter this situation you mentioned. I run a query, Hive on Spark, failed with error:
+2017-02-08 09:50:59,331 Stage-2_0: 1039(+2)/1041        Stage-3_0: 796(+456)/1520       Stage-4_0: 0/2021       Stage-5_0: 0/1009       Stage-6_0: 0/1
+2017-02-08 09:51:00,335 Stage-2_0: 1040(+1)/1041        Stage-3_0: 914(+398)/1520       Stage-4_0: 0/2021       Stage-5_0: 0/1009       Stage-6_0: 0/1
+2017-02-08 09:51:01,338 Stage-2_0: 1041/1041 Finished   Stage-3_0: 961(+383)/1520       Stage-4_0: 0/2021       Stage-5_0: 0/1009       Stage-6_0: 0/1
+Failed to monitor Job[ 2] with exception 'java.lang.IllegalStateException(RPC channel is closed.)'
+FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.spark.SparkTask
+
+the driver was indeed failed with some unknown reason:
+
+17/02/08 09:51:04 INFO exec.Utilities: PLAN PATH = hdfs://hsx-node1:8020/tmp/hive/root/b723c85d-2a7b-469e-bab1-9c165b25e656/hive_2017-02-08_09-49-37_890_6267025825539539056-1/-mr-10006/71a9dacb-a463-40ef-9e86-78d3b8e3738d/map.xml
+17/02/08 09:51:04 INFO executor.Executor: Executor killed task 1169.0 in stage 3.0 (TID 2519)
+17/02/08 09:51:04 INFO executor.CoarseGrainedExecutorBackend: Driver commanded a shutdown
+17/02/08 09:51:04 INFO storage.MemoryStore: MemoryStore cleared
+17/02/08 09:51:04 INFO storage.BlockManager: BlockManager stopped
+17/02/08 09:51:04 INFO exec.Utilities: PLAN PATH = hdfs://hsx-node1:8020/tmp/hive/root/b723c85d-2a7b-469e-bab1-9c165b25e656/hive_2017-02-08_09-49-37_890_6267025825539539056-1/-mr-10006/71a9dacb-a463-40ef-9e86-78d3b8e3738d/map.xml
+17/02/08 09:51:04 WARN executor.CoarseGrainedExecutorBackend: An unknown (hsx-node1:42777) driver disconnected.
+17/02/08 09:51:04 ERROR executor.CoarseGrainedExecutorBackend: Driver 192.168.1.1:42777 disassociated! Shutting down.
+17/02/08 09:51:04 INFO executor.Executor: Executor killed task 1105.0 in stage 3.0 (TID 2511)
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Shutdown hook called
+17/02/08 09:51:04 INFO remote.RemoteActorRefProvider$RemotingTerminator: Shutting down remote daemon.
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Deleting directory /mnt/disk6/yarn/nm/usercache/root/appcache/application_1486453422616_0150/spark-71da1dfc-99bd-4687-bc2f-33452db8de3d
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Deleting directory /mnt/disk2/yarn/nm/usercache/root/appcache/application_1486453422616_0150/spark-7f134d81-e77e-4b92-bd99-0a51d0962c14
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Deleting directory /mnt/disk5/yarn/nm/usercache/root/appcache/application_1486453422616_0150/spark-77a90d63-fb05-4bc6-8d5e-1562cc502e6c
+17/02/08 09:51:04 INFO remote.RemoteActorRefProvider$RemotingTerminator: Remote daemon shut down; proceeding with flushing remote transports.
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Deleting directory /mnt/disk4/yarn/nm/usercache/root/appcache/application_1486453422616_0150/spark-91f8b91a-114d-4340-8560-d3cd085c1cd4
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Deleting directory /mnt/disk1/yarn/nm/usercache/root/appcache/application_1486453422616_0150/spark-a3c24f9e-8609-48f0-9d37-0de7ae06682a
+17/02/08 09:51:04 INFO remote.RemoteActorRefProvider$RemotingTerminator: Remoting shut down.
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Deleting directory /mnt/disk7/yarn/nm/usercache/root/appcache/application_1486453422616_0150/spark-f6120a43-2158-4780-927c-c5786b78f53e
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Deleting directory /mnt/disk3/yarn/nm/usercache/root/appcache/application_1486453422616_0150/spark-e17931ad-9e8a-45da-86f8-9a0fdca0fad1
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Deleting directory /mnt/disk8/yarn/nm/usercache/root/appcache/application_1486453422616_0150/spark-4de34175-f871-4c28-8ec0-d2fc0020c5c3
+17/02/08 09:51:04 INFO executor.Executor: Executor killed task 1137.0 in stage 3.0 (TID 2515)
+17/02/08 09:51:04 INFO executor.Executor: Executor killed task 897.0 in stage 3.0 (TID 2417)
+17/02/08 09:51:04 INFO executor.Executor: Executor killed task 1225.0 in stage 3.0 (TID 2526)
+17/02/08 09:51:04 INFO executor.Executor: Executor killed task 905.0 in stage 3.0 (TID 2423)
+
+in hive's log, 
+
+2017-02-08T09:51:04,327  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 INFO scheduler.TaskSetManager: Finished task 971.0 in stage 3.0 (TID 2218) in 5948 ms on hsx-node8 (1338/1520)
+2017-02-08T09:51:04,346  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 INFO rpc.RpcDispatcher: [DriverProtocol] Closing channel due to exception in pipeline (org.apache.hive.spark.client.RemoteDriver$DriverProtocol.handle(io.netty.channel.ChannelHandlerContext, org.apache.hive.spark.client.rpc.Rpc$MessageHeader)).
+2017-02-08T09:51:04,346  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 WARN rpc.RpcDispatcher: [DriverProtocol] Expected RPC header, got org.apache.hive.spark.client.rpc.Rpc$NullMessage instead.
+2017-02-08T09:51:04,347  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 INFO rpc.RpcDispatcher: [DriverProtocol] Closing channel due to exception in pipeline (null).
+2017-02-08T09:51:04,347  INFO [RPC-Handler-3] rpc.RpcDispatcher: [ClientProtocol] Closing channel due to exception in pipeline (Connection reset by peer).
+2017-02-08T09:51:04,347  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 ERROR scheduler.LiveListenerBus: Listener ClientListener threw an exception
+2017-02-08T09:51:04,347  INFO [stderr-redir-1] client.SparkClientImpl: java.lang.IllegalStateException: RPC channel is closed.
+2017-02-08T09:51:04,347  INFO [stderr-redir-1] client.SparkClientImpl:  at com.google.common.base.Preconditions.checkState(Preconditions.java:149)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.rpc.Rpc.call(Rpc.java:276)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.rpc.Rpc.call(Rpc.java:259)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.RemoteDriver$DriverProtocol.sendMetrics(RemoteDriver.java:270)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.RemoteDriver$ClientListener.onTaskEnd(RemoteDriver.java:490)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.scheduler.SparkListenerBus$class.onPostEvent(SparkListenerBus.scala:42)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.scheduler.LiveListenerBus.onPostEvent(LiveListenerBus.scala:31)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.scheduler.LiveListenerBus.onPostEvent(LiveListenerBus.scala:31)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.ListenerBus$class.postToAll(ListenerBus.scala:55)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus.postToAll(AsynchronousListenerBus.scala:37)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1$$anonfun$run$1$$anonfun$apply$mcV$sp$1.apply$mcV$sp(AsynchronousListenerBus.scala:80)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1$$anonfun$run$1$$anonfun$apply$mcV$sp$1.apply(AsynchronousListenerBus.scala:65)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1$$anonfun$run$1$$anonfun$apply$mcV$sp$1.apply(AsynchronousListenerBus.scala:65)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at scala.util.DynamicVariable.withValue(DynamicVariable.scala:57)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1$$anonfun$run$1.apply$mcV$sp(AsynchronousListenerBus.scala:64)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.Utils$.tryOrStopSparkContext(Utils.scala:1181)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1.run(AsynchronousListenerBus.scala:63)
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 WARN rpc.Rpc: Failed to send RPC, closing connection.
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl: java.nio.channels.ClosedChannelException
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 WARN client.RemoteDriver: Shutting down driver because RPC channel was closed.
+2017-02-08T09:51:04,348  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 INFO client.RemoteDriver: Shutting down remote driver.
+
+2017-02-08T09:51:04,349  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 ERROR scheduler.LiveListenerBus: Listener ClientListener threw an exception
+2017-02-08T09:51:04,349  INFO [stderr-redir-1] client.SparkClientImpl: java.lang.IllegalStateException: RPC channel is closed.
+2017-02-08T09:51:04,349  INFO [stderr-redir-1] client.SparkClientImpl:  at com.google.common.base.Preconditions.checkState(Preconditions.java:149)
+2017-02-08T09:51:04,349  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.rpc.Rpc.call(Rpc.java:276)
+2017-02-08T09:51:04,349  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.rpc.Rpc.call(Rpc.java:259)
+2017-02-08T09:51:04,349  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.RemoteDriver$DriverProtocol.sendMetrics(RemoteDriver.java:270)
+2017-02-08T09:51:04,349  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.RemoteDriver$ClientListener.onTaskEnd(RemoteDriver.java:490)
+2017-02-08T09:51:04,349  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.scheduler.SparkListenerBus$class.onPostEvent(SparkListenerBus.scala:42)
+2017-02-08T09:51:04,349  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.scheduler.LiveListenerBus.onPostEvent(LiveListenerBus.scala:31)
+2017-02-08T09:51:04,350  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.scheduler.LiveListenerBus.onPostEvent(LiveListenerBus.scala:31)
+2017-02-08T09:51:04,350  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.ListenerBus$class.postToAll(ListenerBus.scala:55)
+2017-02-08T09:51:04,350  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus.postToAll(AsynchronousListenerBus.scala:37)
+2017-02-08T09:51:04,350  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1$$anonfun$run$1$$anonfun$apply$mcV$sp$1.apply$mcV$sp(AsynchronousListenerBus.scala:80)
+2017-02-08T09:51:04,350  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1$$anonfun$run$1$$anonfun$apply$mcV$sp$1.apply(AsynchronousListenerBus.scala:65)
+2017-02-08T09:51:04,350  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1$$anonfun$run$1$$anonfun$apply$mcV$sp$1.apply(AsynchronousListenerBus.scala:65)
+2017-02-08T09:51:04,350  INFO [stderr-redir-1] client.SparkClientImpl:  at scala.util.DynamicVariable.withValue(DynamicVariable.scala:57)
+2017-02-08T09:51:04,350  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1$$anonfun$run$1.apply$mcV$sp(AsynchronousListenerBus.scala:64)
+2017-02-08T09:51:04,350  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.Utils$.tryOrStopSparkContext(Utils.scala:1181)
+2017-02-08T09:51:04,350  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1.run(AsynchronousListenerBus.scala:63)
+2017-02-08T09:51:04,350  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 INFO scheduler.DAGScheduler: Asked to cancel job 2
+2017-02-08T09:51:04,350  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 ERROR scheduler.LiveListenerBus: Listener ClientListener threw an exception
+
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl: java.lang.InterruptedException
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at java.lang.Object.wait(Native Method)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at java.lang.Object.wait(Object.java:502)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.scheduler.JobWaiter.awaitResult(JobWaiter.scala:73)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.SimpleFutureAction.org$apache$spark$SimpleFutureAction$$awaitResult(FutureAction.scala:165)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.SimpleFutureAction.ready(FutureAction.scala:120)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.SimpleFutureAction.ready(FutureAction.scala:108)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at scala.concurrent.Await$$anonfun$ready$1.apply(package.scala:86)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at scala.concurrent.Await$$anonfun$ready$1.apply(package.scala:86)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at scala.concurrent.BlockContext$DefaultBlockContext$.blockOn(BlockContext.scala:53)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at scala.concurrent.Await$.ready(package.scala:86)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.JavaFutureActionWrapper.getImpl(FutureAction.scala:303)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.JavaFutureActionWrapper.get(FutureAction.scala:316)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.RemoteDriver$JobWrapper.call(RemoteDriver.java:362)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.RemoteDriver$JobWrapper.call(RemoteDriver.java:323)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at java.lang.Thread.run(Thread.java:745)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 ERROR scheduler.LiveListenerBus: Listener ClientListener threw an exception
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl: java.lang.IllegalStateException: RPC channel is closed.
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at com.google.common.base.Preconditions.checkState(Preconditions.java:149)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.rpc.Rpc.call(Rpc.java:276)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.rpc.Rpc.call(Rpc.java:259)
+2017-02-08T09:51:04,351  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.RemoteDriver$DriverProtocol.sendMetrics(RemoteDriver.java:270)
+2017-02-08T09:51:04,352  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.hive.spark.client.RemoteDriver$ClientListener.onTaskEnd(RemoteDriver.java:490)
+2017-02-08T09:51:04,352  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.scheduler.SparkListenerBus$class.onPostEvent(SparkListenerBus.scala:42)
+2017-02-08T09:51:04,352  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.scheduler.LiveListenerBus.onPostEvent(LiveListenerBus.scala:31)
+2017-02-08T09:51:04,352  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.scheduler.LiveListenerBus.onPostEvent(LiveListenerBus.scala:31)
+2017-02-08T09:51:04,352  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.ListenerBus$class.postToAll(ListenerBus.scala:55)
+2017-02-08T09:51:04,352  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus.postToAll(AsynchronousListenerBus.scala:37)
+2017-02-08T09:51:04,352  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1$$anonfun$run$1$$anonfun$apply$mcV$sp$1.apply$mcV$sp(AsynchronousListenerBus.scala:80)
+2017-02-08T09:51:04,352  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1$$anonfun$run$1$$anonfun$apply$mcV$sp$1.apply(AsynchronousListenerBus.scala:65)
+2017-02-08T09:51:04,352  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1$$anonfun$run$1$$anonfun$apply$mcV$sp$1.apply(AsynchronousListenerBus.scala:65)
+2017-02-08T09:51:04,352  INFO [stderr-redir-1] client.SparkClientImpl:  at scala.util.DynamicVariable.withValue(DynamicVariable.scala:57)
+2017-02-08T09:51:04,352  INFO [stderr-redir-1] client.SparkClientImpl:  at org.apache.spark.util.AsynchronousListenerBus$$anon$1$$anonfun$run$1.apply$mcV$sp(AsynchronousListenerBus.scala:64)
+
+2017-02-08T09:51:04,654  INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 INFO util.ShutdownHookManager: Deleting directory /tmp/spark-65f40590-d87f-4701-b374-6b3b2a11538c
+2017-02-08T09:52:04,346  WARN [b723c85d-2a7b-469e-bab1-9c165b25e656 main] impl.RemoteSparkJobStatus: Error getting stage info
+java.util.concurrent.TimeoutException
+        at io.netty.util.concurrent.AbstractFuture.get(AbstractFuture.java:49) ~[netty-all-4.0.23.Final.jar:4.0.23.Final]
+        at org.apache.hadoop.hive.ql.exec.spark.status.impl.RemoteSparkJobStatus.getSparkStageInfo(RemoteSparkJobStatus.java:161) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.ql.exec.spark.status.impl.RemoteSparkJobStatus.getSparkStageProgress(RemoteSparkJobStatus.java:96) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.ql.exec.spark.status.RemoteSparkJobMonitor.startMonitor(RemoteSparkJobMonitor.java:82) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.ql.exec.spark.status.impl.RemoteSparkJobRef.monitorJob(RemoteSparkJobRef.java:60) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.ql.exec.spark.SparkTask.execute(SparkTask.java:101) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.ql.exec.Task.executeTask(Task.java:199) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.ql.exec.TaskRunner.runSequential(TaskRunner.java:100) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.ql.Driver.launchTask(Driver.java:1997) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.ql.Driver.execute(Driver.java:1688) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.ql.Driver.runInternal(Driver.java:1419) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.ql.Driver.run(Driver.java:1143) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.ql.Driver.run(Driver.java:1131) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.cli.CliDriver.processLocalCmd(CliDriver.java:233) ~[hive-cli-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.cli.CliDriver.processCmd(CliDriver.java:184) ~[hive-cli-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.cli.CliDriver.processLine(CliDriver.java:400) ~[hive-cli-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.cli.CliDriver.processLine(CliDriver.java:336) ~[hive-cli-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.cli.CliDriver.processReader(CliDriver.java:430) ~[hive-cli-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.cli.CliDriver.processFile(CliDriver.java:446) ~[hive-cli-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.cli.CliDriver.executeDriver(CliDriver.java:749) ~[hive-cli-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.cli.CliDriver.run(CliDriver.java:715) ~[hive-cli-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at org.apache.hadoop.hive.cli.CliDriver.main(CliDriver.java:642) ~[hive-cli-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method) ~[?:1.8.0_60]
+        at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62) ~[?:1.8.0_60]
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43) ~[?:1.8.0_60]
+        at java.lang.reflect.Method.invoke(Method.java:497) ~[?:1.8.0_60]
+        at org.apache.hadoop.util.RunJar.run(RunJar.java:221) ~[spark-assembly-1.6.2-hadoop2.6.0.jar:1.6.2]
+        at org.apache.hadoop.util.RunJar.main(RunJar.java:136) ~[spark-assembly-1.6.2-hadoop2.6.0.jar:1.6.2]
+2017-02-08T09:52:04,346 ERROR [b723c85d-2a7b-469e-bab1-9c165b25e656 main] status.SparkJobMonitor: Failed to monitor Job[ 2] with exception 'java.lang.IllegalStateException(RPC channel is closed.)'
+java.lang.IllegalStateException: RPC channel is closed.
+        at com.google.common.base.Preconditions.checkState(Preconditions.java:149) ~[guava-14.0.1.jar:?]
+        at org.apache.hive.spark.client.rpc.Rpc.call(Rpc.java:276) ~[hive-exec-2.2.0-SNAPSHOT.jar:2.2.0-SNAPSHOT]
+
+also in container's log, I find Driver still request for executors:
+
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Driver requested a total number of 77 executor(s).
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Canceling requests for 2 executor containers
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Driver requested a total number of 76 executor(s).
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Canceling requests for 1 executor containers
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Driver requested a total number of 75 executor(s).
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Canceling requests for 1 executor containers
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Driver requested a total number of 74 executor(s).
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Canceling requests for 1 executor containers
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Driver requested a total number of 73 executor(s).
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Canceling requests for 1 executor containers
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Driver requested a total number of 71 executor(s).
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Canceling requests for 2 executor containers
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Driver requested a total number of 70 executor(s).
+17/02/08 09:51:00 INFO yarn.YarnAllocator: Canceling requests for 1 executor containers
+17/02/08 09:51:04 INFO yarn.YarnAllocator: Driver requested a total number of 50 executor(s).
+17/02/08 09:51:04 INFO yarn.YarnAllocator: Canceling requests for 0 executor containers
+17/02/08 09:51:04 WARN yarn.YarnAllocator: Expected to find pending requests, but found none.
+17/02/08 09:51:04 INFO yarn.YarnAllocator: Driver requested a total number of 0 executor(s).
+17/02/08 09:51:04 INFO yarn.YarnAllocator: Canceling requests for 0 executor containers
+17/02/08 09:51:04 WARN yarn.YarnAllocator: Expected to find pending requests, but found none.
+17/02/08 09:51:04 INFO yarn.ApplicationMaster$AMEndpoint: Driver terminated or disconnected! Shutting down. 192.168.1.1:42777
+17/02/08 09:51:04 INFO yarn.ApplicationMaster$AMEndpoint: Driver terminated or disconnected! Shutting down. hsx-node1:42777
+17/02/08 09:51:04 INFO yarn.ApplicationMaster: Final app status: SUCCEEDED, exitCode: 0
+17/02/08 09:51:04 INFO yarn.ApplicationMaster: Unregistering ApplicationMaster with SUCCEEDED
+17/02/08 09:51:04 INFO impl.AMRMClientImpl: Waiting for application to be successfully unregistered.
+17/02/08 09:51:04 INFO yarn.ApplicationMaster: Deleting staging directory .sparkStaging/application_1486453422616_0150
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Shutdown hook called
+
+
+So, is this situation the client to server timeout? I only set hive.spark.job.monitor.timeout=3600s;, I am also very confused about these timeouts., [~KaiXu], your case might be different. The connection is explicitly closed due to 
+{code}
+2017-02-08T09:51:04,346 INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 WARN rpc.RpcDispatcher: [DriverProtocol] Expected RPC header, got org.apache.hive.spark.client.rpc.Rpc$NullMessage instead.
+2017-02-08T09:51:04,347 INFO [stderr-redir-1] client.SparkClientImpl: 17/02/08 09:51:04 INFO rpc.RpcDispatcher: [DriverProtocol] Closing channel due to exception in pipeline (null).
+2017-02-08T09:51:04,347 INFO [RPC-Handler-3] rpc.RpcDispatcher: [ClientProtocol] Closing channel due to exception in pipeline (Connection reset by peer).
+{code}
+I haven't seen this kind of exception, so am not sure how it happens. If this can be reproduced, complete logs (driver, hive, yarn) would be helpful., this error occurs when several queries run at the same time with large data scale, in fact it would not occur when running the query separately, but it can frequently occur when running together again.
+
+the connection is closed suddenly, seems to be killed manually.  
+2017-02-08 09:51:01,338 Stage-2_0: 1041/1041 Finished   Stage-3_0: 961(+383)/1520       Stage-4_0: 0/2021       Stage-5_0: 0/1009       Stage-6_0: 0/1
+Failed to monitor Job[ 2] with exception 'java.lang.IllegalStateException(RPC channel is closed.)'
+FAILED: Execution Error, return code 1 from org.apache.hadoop.hive.ql.exec.spark.SparkTask
+
+found only one ERROR in yarn application log, it seems the driver was closed but not know what caused it close, above comment is hive's log, any suggestions shall be appreciated!
+
+17/02/08 09:51:00 INFO executor.Executor: Finished task 1492.0 in stage 3.0 (TID 2168). 3294 bytes result sent to driver
+17/02/08 09:51:00 INFO executor.Executor: Finished task 556.0 in stage 3.0 (TID 1587). 3312 bytes result sent to driver
+17/02/08 09:51:00 INFO executor.Executor: Finished task 1412.0 in stage 3.0 (TID 2136). 3294 bytes result sent to driver
+17/02/08 09:51:00 INFO executor.Executor: Finished task 1236.0 in stage 3.0 (TID 2007). 3294 bytes result sent to driver
+17/02/08 09:51:04 INFO executor.CoarseGrainedExecutorBackend: Driver commanded a shutdown
+17/02/08 09:51:04 INFO storage.MemoryStore: MemoryStore cleared
+17/02/08 09:51:04 INFO storage.BlockManager: BlockManager stopped
+17/02/08 09:51:04 WARN executor.CoarseGrainedExecutorBackend: An unknown (hsx-node1:42777) driver disconnected.
+17/02/08 09:51:04 ERROR executor.CoarseGrainedExecutorBackend: Driver 192.168.1.1:42777 disassociated! Shutting down.
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Shutdown hook called
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Deleting directory /mnt/disk8/yarn/nm/usercache/root/appcache/application_1486453422616_0150/spark-a8167f0b-f3c3-458f-ad51-8a0f4bcda4f3
+17/02/08 09:51:04 INFO remote.RemoteActorRefProvider$RemotingTerminator: Shutting down remote daemon.
+17/02/08 09:51:04 INFO util.ShutdownHookManager: Deleting directory /mnt/disk1/yarn/nm/usercache/root/appcache/application_1486453422616_0150/spark-26cba445-66d2-4b78-a428-17881c92f0f6
+17/02/08 09:51:04 INFO remote.RemoteActorRefProvider$RemotingTerminator: Remote daemon shut down; proceeding with flushing remote transports.
+17/02/08 09:51:04 INFO remote.RemoteActorRefProvider$RemotingTerminator: Remoting shut down., Hi [~xuefuz], can you get a thread dump of HS2/CLI when you hit the 2nd problem? Then we can find out how the JVM is hanging.
+
+[~KaiXu], I also saw some similar issue before. Please feel free to open a JIRA for it and continue the investigation there. Thanks., Thanks, [~lirui], I will try to reproduce, though it might be hard to do so., Hi [~vanzin], to backtrack a little bit, I have a followup question about your comment.
+{quote}
+That's kinda hard to solve, because the server doesn't know which client connected until two things happen: first the driver has started, second the driver completed the SASL handshake to identify itself. A lot of things can go wrong in that time. There's already some code, IIRC, that fails the session if the spark-submit job dies with an error, but aside from that, it's kinda hard to do more.
+{quote}
+I was talking about server detecting a driver problem after it has connected back to the server. I'm wondering which timeout applies in case of a problem on the driver side, such as long GC, stall connection between the server and the driver, etc. It's kind of long if this timeout is also server.connect.timeout, which is increased to 10m in our case to accommodate for the busy cluster. To me it doesn't seem that such a timeout exist, in absence of a heartbeat mechanism., I created HIVE-15859 for the issue, comments or suggestions are welcomed. Thanks!, bq. I was talking about server detecting a driver problem after it has connected back to the server.
+
+Hmm. That is definitely not any of the "connect" timeouts, which probably means it isn't configured and is just using netty's default (which is probably no timeout?). Would probably need something using {{io.netty.handler.timeout.IdleStateHandler}}, and also some periodic "ping" so that the connection isn't torn down without reason., Thanks for the input, [~vanzin]! For what you suggested, I think it is deemed for more investigation and development. Since Hive will monitor job after the driver connected back, hopefully, the monitoring thread will detect any network/driver issue. With HIVE-15860, the issue might have been resolved.
+
+I will create a separate JIRA for your proposal. In the mean time, I think Patch #1 is still needed as we also like the driver to detect any issue with Hive sooner. What do you think? Thanks., bq.  In the mean time, I think Patch #1 is still needed
+
+Sounds fine to me., +1, Committed to master. Thanks to Marchelo, Jimmy, and Rui for the review.
+Created HIVE-15893 as a followup.]

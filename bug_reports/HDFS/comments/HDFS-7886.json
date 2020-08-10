@@ -1,0 +1,201 @@
+[Some previous comments on this [see here|https://issues.apache.org/jira/browse/HDFS-7740?focusedCommentId=14337715&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14337715], I wouldn't rule out  HDFS-7695 though yet. Both are boiling down to a problem with block reports. TestFileTruncate directly triggers the report, while TestOpenFilesWithSnapshot causes the report by restarting., Hi [~hitliuyi],
+
+I think I have found the problem.
+Two things:
+
+# You trigger block recovery after you already fetch the "newBlock" variable. However, you actually need to wait for block recovery BEFORE the GenerationStamp will change on that block.
+# Also, you trigger block reports before block recovery, this was causing your BlockPool service thread to die because the block was being moved from FINALIZED to RUR state and hit an assertion.
+
+Attaching a small patch that appears to work., Assigning to myself., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12702934/HDFS-7886.patch
+  against trunk revision 952640f.
+
+    {color:red}-1 patch{color}.  Trunk compilation may be broken.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9757//console
+
+This message is automatically generated., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12702934/HDFS-7886.patch
+  against trunk revision 952640f.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.TestFileTruncate
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/9758//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9758//console
+
+This message is automatically generated., I don't think this fixed it. Jenkins build failed and I see the same on some local runs. It starts with the assertion:
+{code}
+2015-03-06 02:01:49,248 WARN  datanode.DataNode (BPServiceActor.java:run(864)) - Unexpected exception in block pool Block pool BP-204559054-67.195.81.144-1425607203396 (Datanode Uuid 4fed10a8-2abc-47e3-abf4-aa9566f2df11) service to localhost/127.0.0.1:8020
+java.lang.AssertionError: Must be under-construction replica.
+	at org.apache.hadoop.hdfs.protocol.BlockListAsLongs.setBlock(BlockListAsLongs.java:318)
+	at org.apache.hadoop.hdfs.protocol.BlockListAsLongs.<init>(BlockListAsLongs.java:112)
+	at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl.getBlockReports(FsDatasetImpl.java:1599)
+	at org.apache.hadoop.hdfs.server.datanode.BPServiceActor.blockReport(BPServiceActor.java:458)
+	at org.apache.hadoop.hdfs.server.datanode.BPServiceActor.offerService(BPServiceActor.java:722)
+	at org.apache.hadoop.hdfs.server.datanode.BPServiceActor.run(BPServiceActor.java:856)
+	at java.lang.Thread.run(Thread.java:745)
+2015-03-06 02:01:49,249 WARN  datanode.DataNode (BPServiceActor.java:run(867)) - Ending block pool service for: Block pool BP-204559054-67.195.81.144-1425607203396 (Datanode Uuid 4fed10a8-2abc-47e3-abf4-aa9566f2df11) service to localhost/127.0.0.1:8020
+2015-03-06 02:01:49,249 INFO  datanode.DataNode (BlockPoolManager.java:remove(103)) - Removed Block pool BP-204559054-67.195.81.144-1425607203396 (Datanode Uuid 4fed10a8-2abc-47e3-abf4-aa9566f2df11)
+2015-03-06 02:01:49,249 INFO  impl.FsDatasetImpl (FsDatasetImpl.java:shutdownBlockPool(2485)) - Removing block pool BP-204559054-67.195.81.144-1425607203396
+{code}
+Then the block pool is removed and the test times out since the replica is never reported as it is in the removed pool., Thanks Plamen for working on it.
+We should trigger block reports immediately after datanode restart. 
+As Konst said, it's not the reason of timeout. Let's get some time to look at it and find the reason., I traced the latest failure with Plamen's fix. It actually points to the next test case {{testTruncateWithDataNodesShutdownImmediately()}}.
+
+1. I think we need to add {{checkBlockRecovery()}} after restarting the DataNodes, and check the file length before deleting. Otherwise {{testTruncateWithDataNodesShutdownImmediately()}} seems incomplete without checking anything.
+
+I did that, but then {{testCopyOnTruncateWithDataNodesRestart()}} fails. The symptom is the same - the assert error, but I think there may be a race condition between block recovery, which starts after the first block report and the second block report, which is explicitly triggered in the test.
+Yi, I don't think we need to trigger block reports as restarting node will send one immediately after restarting. Triggering causes the second block report.
+
+2. I think we can fix the test by removing {{triggerBlockReports()}} after restarting DNs.
+
+But we still need to investigate the potential race between block recovery and block reporting. In a different jira probably.
+So I think Plamen's fix is right it just didn't cover all test cases.
+I know it is time consuming, because you need to run it several times before it fails - the nature of randomized tests. By adding waits on expected conditions we make it more deterministic., Forgot to mention
+
+3. We should keep SEED = 100
+4. Add replica printout to the assert in {{BlockListAsLongs}}, which helps debugging and does not effect runtime
+{{"Must be under-construction replica: " + r;}}, More things that we've been looking at with Plamen. 
+5. The race condition is in {{FsDatasetImpl.getBlockReports()}}, which collects the references to replicas under {{synchronizes}} section, but then constructs {{BlockListAsLongs}} outside of it. So if the recovery is triggered between them, then a replica can change its state. Here it changes from RUR to FINALIZED.
+6. {{testTruncateWithDataNodesRestartImmediately()}} occasionally fails because block is recovered only on two DNs. This happens because NN does not know that two DNs were restarted and can schedule block recovery with a mixture of old (before the restart) and new (after the restart) locations. If the old location is used then recovery fails, because the DN have been restarted under a new address. {{waitActive()}} doesn't help here. We should somehow check that all new DNs have been registered and sent block reports., Thanks Konst for the detailed analyzing, also thanks Plamen.
+
+{quote}
+I think we can fix the test by removing {{triggerBlockReports()}} after restarting DNs.
+{quote}
+I use {{testTruncateWithDataNodesRestart}} as example to explain my concern.
+For non copy-on-truncate, we should make sure the old block replica on restarted dn (for example dn0) is replaced with the truncated one, right?  The new truncated block id is the same as old one, but the GS(generationStamp) increases, we trigger block report for dn0 after it restarts, since the GS of replica for the last block is old on dn0, then the reported last block from dn0 will be marked corrupt on nn and replicas of last block should decrease 1 on nn, then the truncated block will be replicated to dn0.
+
+If we remove {{triggerBlockReports()}}, not sure {{testTruncateWithDataNodesRestart}} will occasionally fail? Since {{checkBlockRecovery}} can success without block report or even without dn0 restarted, then following assertions may fail since the old block replica on dn0 is still not replaced with truncated one (block reports have not happened yet)？, Hi Yi,
+
+I understand the problem a little better now.
+ 
+Removing triggerBlockReports() doesn't fix the tests entirely; it causes the AssertionError to happen less frequently but does not otherwise fix the tests.
+
+The problem comes down to this assert error.
+
+Prior to truncate, a replica, under normal operations, never changed state from FINALIZED to RUR. I understand that it COULD happen, but as far as test cases go I could not find one that tested such a case nor could I find a specification of such a case in the design doc in HDFS-265, which Konstantin referred me to.
+
+What is happening is that in the following code from FsDataSetImpl, the RUR's original replica points to a FINALIZED replica, because it is a truncate recovery operation:
+{code}
+case RUR:
+            ReplicaUnderRecovery rur = (ReplicaUnderRecovery)b;
+            uc.get(rur.getVolume().getStorageID()).add(rur.getOriginalReplica());
+            break;
+{code}
+
+We should open up a new issue to discuss the change, but in short, due to truncate, this assertion is no longer valid because a RUR can now point to a FINALIZED original replica., Yi, when DN restarts it sends a block report. Right after registering. If you call {{triggerBlockReports()}}, it will send the block report again, but this is not necessary, because block report already happened. Or I didn't understand why second block report is needed.
+Plamen, I agree we should investigate the race in HDFS-7906.
+For this jira can we fix the test. We need something different from {{waitActive()}} to ensure that DNs have indeed restarted., Thanks Konst and Plamen for the comments. Following is reply to Konst, and I will reply to Plamen later.
+{quote}
+when DN restarts it sends a block report. Right after registering. If you call triggerBlockReports(), it will send the block report again, but this is not necessary, because block report already happened. Or I didn't understand why second block report is needed
+{quote}
+We don't need two block reports, and we only want to ensure block report does happen after datanode restart and before we verify the old replica on dn0 is replaced with truncated one.
+
+{code}
+cluster.triggerBlockReports()
+{code}
+Above test code will wait until block report is sent.  
+Yes, DN restarts it sends a block report, but {{restartDataNode}} will return and will not wait for block report finishes, so in this situation we can't ensure block report does happen before we check replica on dn0.
+
+
+{{waitActive}} only check datanode is registered and sent heartbeat to NN. 
+Maybe we can wait block report is sent after {{restartDataNode}} instead of trigger a new block report and wait it?, Thanks for clarifying Yi, I see it now: even though {{triggerBlockReports()}} causes second block report it also waits until it actually happens.
+
+Looking through other tests I think we should do the following:
+# {{stopDataNode()}}
+# On the NameNode mark the DN as dead, by calling {{DatanodeDescriptor.setLastUpdate(0)}} directly or using {{BlockManagerTestUtil.noticeDeadDatanode()}}
+# {{startDataNode()}}
+# Verify that DN reported via {{DatanodeDescriptor.getLastUpdate() > 0}}
+
+This will ensure the DN actually restarted and reported the blocks, before the recovery is triggered. Also NN will know that DN is dead and will not schedule the recovery on it while it is down. Will that work?
+Potentially we can incorporate those checks into {{MiniDFSCluster.restartDataNode()}}., Yes Konst, I agree with you, thanks., Here is the patch with changes as described.
+I think it fixes the test. Ran 12 times without failures locally., Thanks Konst for the patch, let me take a look at it now., Konst, the patch looks good to me, just one nit:
+In {{testTruncateWithDataNodesRestartImmediately}}, we can also remove the {{cluster.triggerBlockReports()}}, +1 after addressing., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12704297/HDFS-7886-01.patch
+  against trunk revision 8212877.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The following test timeouts occurred in hadoop-hdfs-project/hadoop-hdfs:
+
+org.apache.hadoop.hdfs.server.namenode.ha.TestHAAppend
+org.apache.hadoop.hdfs.server.blockmanagement.TestDatanodeManager
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/9866//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9866//console
+
+This message is automatically generated., Konstantin I ran your patch locally multiple times, with the triggerBlockReports() commented out, as Yi had asked for, and everything passed.
+
++1 pending Yi's suggestion addressed., Hey guys, thanks for the reviews.
+Cannot remove {{triggerBlockReports()}}, though. Just reran on my laptop without triggering and it failed. This is actually where I spent most of the time. The problem is in {{commitBlockSync()}}, which I was about to file a jira for, but will explain here first.
+In short {{commitBlockSync()}} does not remove locations from the block, which were not confirmed, that is not reducing them to {{newTargets}}.
+In the test truncate recovery is happening _while_ DNs are restarting.  If recovery is handled _after_ the initial block reports from restarting DNs, the recovery will have only one new target, the node that was not restarted, but {{commitBlockSync()}} will not remove the other two. So {{waitReplication()}} will incorrectly show 3 replicas, but {{cluster.getBlockFile().length}} on the restarted node will show the old length 4, while it should be 3. So I had to trigger block reports after the recovery, which  removes the two invalid replicas from NN, then replication is triggered, and the test passes.
+Now, if truncate recovery happens _before_ the initial block reports from restarting nodes, then everything is fine and {{triggerBlockReports()}} is redundant.  When you see TestFileTruncate succeeds, look for block {{blk_1073742100}}, you should see that {{initReplicaRecovery}} for it is happening before {{processReport}} and succeeds on all three nodes. While in the failure case {{initReplicaRecovery}} throws exceptions on two DNs out of three.
+We should remove {{triggerBlockReports()}} when we fix the {{commitBlockSync()}} problem., Thanks Konst for the explanation, you are right. We still need to use {{triggerBlockReports}} here, {{replicas}} could not be updated and it's similar reason as we discussed before. 
+I have made a fix for HDFS-7930, please take a look.
+
++1 for the latest patch (Seems you need to rebase again). You can commit it, or wait for HDFS-7930 in, it's up to you., Rebased the patch. Removed the assertion change, because HDFS-7435 eliminated the assert along with the {{setBlock()}} method.
+Will commit without waiting for Jenkins, as the diff with previous patch is trivial., branch-2 patch., I just committed this. Thanks everybody., FAILURE: Integrated in Hadoop-trunk-Commit #7335 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/7335/])
+HDFS-7886. Fix TestFileTruncate falures. Contributed by Plamen Jeliazkov and Konstantin Shvachko. (shv: rev ce5de93a5837e115e1f0b7d3c5a67ace25385a63)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #869 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/869/])
+HDFS-7886. Fix TestFileTruncate falures. Contributed by Plamen Jeliazkov and Konstantin Shvachko. (shv: rev ce5de93a5837e115e1f0b7d3c5a67ace25385a63)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #135 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/135/])
+HDFS-7886. Fix TestFileTruncate falures. Contributed by Plamen Jeliazkov and Konstantin Shvachko. (shv: rev ce5de93a5837e115e1f0b7d3c5a67ace25385a63)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #126 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/126/])
+HDFS-7886. Fix TestFileTruncate falures. Contributed by Plamen Jeliazkov and Konstantin Shvachko. (shv: rev ce5de93a5837e115e1f0b7d3c5a67ace25385a63)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #2067 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2067/])
+HDFS-7886. Fix TestFileTruncate falures. Contributed by Plamen Jeliazkov and Konstantin Shvachko. (shv: rev ce5de93a5837e115e1f0b7d3c5a67ace25385a63)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #135 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/135/])
+HDFS-7886. Fix TestFileTruncate falures. Contributed by Plamen Jeliazkov and Konstantin Shvachko. (shv: rev ce5de93a5837e115e1f0b7d3c5a67ace25385a63)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2085 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2085/])
+HDFS-7886. Fix TestFileTruncate falures. Contributed by Plamen Jeliazkov and Konstantin Shvachko. (shv: rev ce5de93a5837e115e1f0b7d3c5a67ace25385a63)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFileTruncate.java
+]

@@ -1,0 +1,535 @@
+[For reference, the stack trace when du is obviously blocking on disk I/O
+{noformat}
+[<ffffffff811bf1a0>] sync_buffer+0x40/0x50
+[<ffffffff811bf156>] __wait_on_buffer+0x26/0x30
+[<ffffffffa02fd9a4>] ext4_bread+0x64/0x80 [ext4]
+[<ffffffffa0302aa8>] htree_dirblock_to_tree+0x38/0x190 [ext4]
+[<ffffffffa0303548>] ext4_htree_fill_tree+0xa8/0x260 [ext4]
+[<ffffffffa02f43c7>] ext4_readdir+0x127/0x700 [ext4]
+[<ffffffff8119f030>] vfs_readdir+0xc0/0xe0
+[<ffffffff8119f1b9>] sys_getdents+0x89/0xf0
+[<ffffffff8100b072>] system_call_fastpath+0x16/0x1b
+{noformat}, [~nroberts] is it possible you could check how many of your directories are empty? One failing of the blockID-based scheme is that it doesn't prune empty directories as blocks are deleted. Might help a bit with this issue., Sure. Randomly sampled node had 4 4TB drives, each had right around 38250 directories with at least one block, so 64K-38250 were empty. The drives were about 80% full. 
+
+I see how there might be an optimization there, but I think we need to find a way to solve it for the more general case. Either the DN must never scan (or at least scan at a rate that will not be intrusive), or maybe we should reconsider the 64K breadth - a small number of files per directory is probably going to cause performance issues on many filesystems. 
+, We could certainly make the sharding configurable.  Newer filesystems such as ext4 can handle quite a large number of files per directory efficiently, so we could bump up that number.  People using ext2 or ext3 would probably want to stick with the current configuration, though.  This would also be a somewhat complex change since we'd have to put the sharding into the VERSION file so that the DN could figure out where to look for blocks.  Also, this would obviously be a DN layout version change.
+
+In the long term, I think doing a full du is going to get more and more expensive over time as our data volumes continue to increase and the amount of cold data increases.  We shouldn't be assuming this is an operation we can do synchronously or quickly.  We should be rate-limiting our calls to checkDirs so that we don't swamp the actual workload on the cluster.  Currently, we also kick off a du on all hard drives if we spot an error on just one hard drive-- this is a behavior we should fix, because it doesn't really make sense.  I think fixing the directory scanner to be rate-limited and to do less unnecessary work would be an easier fix than another layout version change., Just a thought: [~nroberts], this may sound weird, but have you tried reducing {{fs.du.interval}}?  It seems to be 10 minutes by default, but perhaps you could reduce it.  That might prevent these inodes from falling out of the cache., Hi [~cmccabe]. Thanks for the idea. Yes, I had actually tried something like that. I actually just kept a loop of DU's running on the node (outside of the datanode process for simplicity sake). I thought this would prevent it from happening but it turns out it still gets into this situation. I suspect the reason is that when there is memory pressure, it will start to seek a little, and then once it starts to seek a little the system quickly degrades because buffers are being thrown away faster than the disks can seek. , I forgot to mention that I'm pretty confident it's not the inodes, but rather the directory blocks. inodes have their own cache that I can control with vfs_cache_pressure. directory blocks however are just cached via the buffer cache (afaik), and the buffer cache is much more difficult to have any control over., I agree we should optimize all the potential scans (du, checkDirs, directoryScanner, etc)
+
+I also think we need to do something more general because I feel like people will trip on this in all sorts of ways. Even tools outside of the DN process that do periodic scans will be affected and will in-turn adversely affect the datenode's performance. Also, it's hard to see this problem until you're running at scale so it will be difficult to catch jiras that introduce yet another scan, because they run really fast when everything is in memory.
+
+I'm wondering if we shouldn't move to a hashing scheme that is more dynamic and grows/shrinks based on the number of blocks in the volume. A consistent hash to minimize renames, plus some logic that knows how to look in two places (old hash, new hash), seems like it might work. We could set a threshold of avg 100 blocks per directory, when we cross that threshold then we add enough subdirs to bring the avg down to 95. 
+
+I think ext2 and ext3 will see a similar problem. Are you seeing something different? I'll admit that my understanding of the differences isn't exhaustive, but it sure seems like all of them rely on the buffer cache to maintain directory blocks and all of them try to spread directories across the disk, so they'd all be subject to the same sort of thing. 
+, bq. I think ext2 and ext3 will see a similar problem. Are you seeing something different? I'll admit that my understanding of the differences isn't exhaustive, but it sure seems like all of them rely on the buffer cache to maintain directory blocks and all of them try to spread directories across the disk, so they'd all be subject to the same sort of thing.
+
+ext2 is more or less extinct in production, at least for us.  ext3 is still in use on some older clusters, but it has known performance issues compared with ext4, so we're trying to phase it out as well.  We haven't seen the very long startup times you're describing, although the back-of-the-envelope math related to disk seeks during startup is concerning.
+
+bq. I forgot to mention that I'm pretty confident it's not the inodes, but rather the directory blocks. inodes have their own cache that I can control with vfs_cache_pressure. directory blocks however are just cached via the buffer cache (afaik), and the buffer cache is much more difficult to have any control over.
+
+I'm having trouble understanding these kernel settings. http://www.gluster.org/community/documentation/index.php/Linux_Kernel_Tuning says that  "When vfs_cache_pressure=0, the kernel will never reclaim dentries and inodes due to memory pressure and this can easily lead to out-of-memory conditions. Increasing vfs_cache_pressure beyond 100 causes the kernel to prefer to reclaim dentries and inodes."  So that would seem to indicate that vfs_cache_pressure does have control over dentries (i.e. the "directory blocks" which contain the list of child inodes).  What settings have you used for {{vfs_cache_pressure}} so far?
+
+bq. I'm wondering if we shouldn't move to a hashing scheme that is more dynamic and grows/shrinks based on the number of blocks in the volume...
+
+The problem that we have is that we have a tension between two things:
+* If directories get too big, the readdir() needed to find the genstamp file of each block file gets very expensive.
+* If directories get too small, they tend to drop out of the cache since they are rarely accessed.
+
+I think if we're going to change the on-disk layout format again, we should change the way we name meta files.  Currently, we encode the genstamp in the file name, like {{blk_1073741915_1091.meta}}.  This means that to look up the meta file for block {{1073741915}}, we have to iterate through every file in the subdirectory until we find it.  Instead, we could simply name the meta file as {{blk_107374191.meta}} and put the genstamp number in the meta file header.  This would allow us to move to a scheme which had a very large number of blocks in each directory (perhaps a simple 1-level hashing scheme) and the dentries would always be "hot".  ext4 and other modern Linux filesystems deal very effectively with large directories-- it's only ext2 and ext3 without certain options enabled that had problems.
+
+Since a layout version change is such a heavy hammer, though, I wonder if there's some simple tweak we can make that will avoid this issue.  Have you tried using xfs instead of ext4?  Perhaps it handles caching differently.  I think at some point we should pull out systemtap or LTTng and really find out what specifically is falling out of the cache and why., bq. I'm having trouble understanding these kernel settings. http://www.gluster.org/community/documentation/index.php/Linux_Kernel_Tuning says that "When vfs_cache_pressure=0, the kernel will never reclaim dentries and inodes due to memory pressure and this can easily lead to out-of-memory conditions. Increasing vfs_cache_pressure beyond 100 causes the kernel to prefer to reclaim dentries and inodes." So that would seem to indicate that vfs_cache_pressure does have control over dentries (i.e. the "directory blocks" which contain the list of child inodes). What settings have you used for vfs_cache_pressure so far?
+
+Not a linux filesystem expert, but here's where I think the confusion is:
+- inodes are cached in ext4_inode slab
+- dentries are cached in dentry slab
+- directory blocks are cached in the buffer cache
+- lookups (e.g. stat /subdir1/subdir2/blk_00000) can be satisfied with the dentry+inode cache
+- readdir cannot be satisfied by the dentry cache, it needs to see the blocks from the disk (hence the buffer cache)
+
+I can somewhat protect the inode+dentry by setting vfs_cache_pressure to 1 (setting to 0 can be very bad because negative dentries can fill up your entire memory, I think). I tried setting vfs_cache_pressure to 0, and it didn't seem to help the case we are seeing.
+
+I used blktrace to capture what was happening when a node was doing this. I then dumped the raw data at the offsets captured by blktrace. The data showed that the seeks were all the result of reading directory blocks, not inodes.
+
+bq. I think if we're going to change the on-disk layout format again, we should change the way we name meta files. Currently, we encode the genstamp in the file name, like blk_1073741915_1091.meta. This means that to look up the meta file for block 1073741915, we have to iterate through every file in the subdirectory until we find it. Instead, we could simply name the meta file as blk_107374191.meta and put the genstamp number in the meta file header. This would allow us to move to a scheme which had a very large number of blocks in each directory (perhaps a simple 1-level hashing scheme) and the dentries would always be "hot". ext4 and other modern Linux filesystems deal very effectively with large directories-- it's only ext2 and ext3 without certain options enabled that had problems.
+
+I'm a little confused about iterating to find the meta file. Don't we already keep track of the genstamp we discovered during startup? If so, it seems like a simple stat is sufficient.
+
+I haven't tried xfs, but that would also be a REALLY heavy hammer in our case;)  
+
+
+
+, bq. Not a linux filesystem expert, but here's where I think the confusion is...
+
+Thanks for the explanation.  It is great that you used blktrace as well... very good information.
+
+bq. I'm a little confused about iterating to find the meta file. Don't we already keep track of the genstamp we discovered during startup? If so, it seems like a simple stat is sufficient.
+
+That's a fair point.  There are a lot of cases where we don't scan the directory because we have cached the genstamp value.  This corresponds to calls to {{FsDatasetUtil#getMetaFile}}.  However, there are a few other cases like {{DataNode#transferReplicaForPipelineRecovery}} and {{VolumeScanner#scanBlock}} which do end up calling {{FsDatasetUtil#findMetaFile}}.  If we moved to really big directories, we might need to somehow avoid all of those cases.
+
+bq. I haven't tried xfs, but that would also be a REALLY heavy hammer in our case
+
+I think most people would consider a layout version upgrade a "heavier hammer" than using XFS... but maybe I'm wrong :)  I would actually really like to know if this problem affects XFS too, or if it manages the cache in a different way.  I guess that information might be tough to get, since you'd have to reformat everything.
+
+If you want to experiment with changing the HDFS sharding, you should be able to just change {{DatanodeUtil#idToBlockDir}}.  I am curious how well a simple 1-level sharding scheme would work on ext4.  Of course, you'd also have to come up with an upgrade process to the new layout version..., Curious what folks would think about going back to previous layout? I understand there was some benefit to the new layout but maybe there are nearly equivalent and less-intrusive ways to achieve the same benefits. I'm confident the current layout is going to cause significant performance issues for HDFS, and latency sensitive applications (e.g. Hbase) are going to feel this in a big way.
+
+, The motivation behind the new layout was to eventually free the DataNode of the need to keep all block metadata in memory at all times.  Basically, we are entering a world where hard drive storage capacities double every year, but CPU and network increase at a relatively slower pace.  So keeping around information about every replica permanently paged into memory looks antiquated.  The new layout lets us avoid this by being able to find any block just based on its ID.  It is basically the equivalent of paged metadata, but for the DN.
+
+We didn't think about the "du problem" when discussing the new layout.  It looks like HDFS ends up running a du on all of the replica files quite a lot.  It's something we do after every I/O error, and also something we do on startup.  I think it's pretty silly that we run du after every I/O error-- we could certainly change that-- and the fact that it's not rate-limited is even worse.  We don't even confine the "du" to the drive where the I/O error occurred, but do it on every drive... I don't think anyone can give a good reason for that and it should certainly be changed as well.
+
+The startup issue is more difficult to avoid.  If we have to do a "du" on all files during startup, then it could cause very long startup times if that involves a lot of seeks.  It seems like both the old and the new layout would have major problems with this scenario-- if you look out a year or two and multiply the current number of replicas by 8 or 16.
+
+If we are going to bump layout version again we might want to consider something like keeping the replica metadata in leveldb.  This would avoid the need to do a "du" on startup and allow us to control our own caching.  It could also cut the number of ext4 files in half since we wouldn't need {{meta}} any more., My preference would be to take a smaller incremental step.
+
+How about:
+- New layout where n x m levels are configurable (today 256x256)
+- n x m is recorded in version file
+- Upgrade path is taken if configured n x m is different from n x m in VERSION file
+
+Seems like most of the code will work without too much modification (and the risk that comes with it).
+
+I fear if we try to take too much of a step at this point, it will take significant time to settle on the new layout, and then it will end up being either extremely close to what we have now OR it will be radically different and require a lot of investment of time and resources to even get there.
+
+In other words, I think we need a short term layout change that is low-risk and quick to integrate.
+
+, Seems related to (or perhaps dup of) HADOOP-10434., Concern of impact of this issue is blocking us from rolling 2.6 to production clusters at the moment.
+Federation and having 12 disks will likely make this worse. 
+256*256 directories * 4 namespaces * 12 disks = 3.1M directories, with only some directories with 1 or perhaps 2 blocks in them seems to really not be a good idea.
+
+Have a sense that workaround of just not doing du and hope for the best will suffice. Find and similar commands will have same impact. 
+
+Similarly I think that we need a command-line tool to take a block (file) name and spit out the target directory. Administrators were able to move a block from any machine to any other one in any random directory and the DN would pick it up. That is no longer the case with the new layout.
+
+[~ctrezzo] is looking further into how this is impacting performance in our environment., Assigning this JIRA to me as I have been testing this internally at Twitter. I will post a preliminary patch for a slightly modified data node layout with a 32x32 directory structure. I will also post some data around data node start-up time that we have seen in cluster testing., [~andrew.wang] [~cmccabe] [~nroberts]
+
+Attached is a v1 patch for a 32x32 data node layout. It is just a preliminary patch, so I can add more unit tests if there is consensus that we want to move forward with this new layout.
+
+I have also attached a document where I outline the testing that I have done around data node startup time for this new layout. We have also functionally tested the upgrade paths from pre-block id based layouts and the 256x256 layout to the 32x32 layout.
+
+Please let me know if you have any questions about the testing or the patch. 
+Thanks!, Thanks for working on this, [~ctrezzo].  I think 32x32 will be a more reasonable layout because it will avoid small directory sizes.  Do you have any performance numbers you could share?  Can you add a unit test of converting the old blockid based layout to the new one?, Thanks [~cmccabe] for the response. I can add upgrade path unit tests to the patch.
+
+Also please see the [attached document|https://issues.apache.org/jira/secure/attachment/12772917/32x32DatanodeLayoutTesting-v1.pdf] for some performance numbers around data node startup time. I performed 4 tests with setups varying the number of namespaces and block density. Hopefully these tests give a feeling for the startup performance improvement with the 32x32 layout in the worst case scenario where the dentries for the directory structure have fallen out of the cache. This could happen, for example, after a hard reboot of the data node (i.e. rolling restart due to OS upgrade). During the tests I also used iostat to verify that there was indeed a large amount of disk I/O (reads) happening during the long startup times with the 256x256 layout. This is presumably the persisted information needed for all of the dentries.
+
+I have also set up a test to verify the scenario where scans over the finalized directory structure (i.e. du, find or other commands) could impact the IO performance of user level containers running on the machine. I do not see a meaningful performance impact to user level jobs on our test clusters with the 32x32 layout. I am continuing to monitor this closely as we roll this out to more and more clusters.
+
+Let me know if there is any other specific performance data that you would like to see., Thanks [~ctrezzo] for the patch! Nice writeup on the verification/performance measurements.
++1 (non-binding) on the patch. It's nice how concise it was able to be. 
+, Probably not-surprisingly I'm a +1 (non-binding) for the patch and to thanking [~ctrezzo] for his work to verify, measure and write up the findings for this.
+
+Not to pile on, but here is another mechanism by which heavy disk IO can impact a JVM: http://www.evanjones.ca/jvm-mmap-pause.html (disclaimer: we have not observed this exact interaction with the JVM writing hsperfdata and the disk layout in the wild, I just want to point out the possible connection)., Thanks, [~ctrezzo].  I took a look at the document.
+
+bq. ... since the current layout does not support deleting unused subdirs...
+Technically, the layout supports it, we just never implemented it.  I suppose with 32x32 there is no need to remove unused subdirectories, which is nice.
+
+When using sequential block IDs, after about 16777216 (16 million) blocks have been created, we'll be in the case you described where all directories are created in the 256x256 layout.  I guess this is more likely to happen when blocks are created and destroyed rapidly than if they linger for a long time.  It is interesting that having the directories present but empty consumes so much time.
+
+In the section on "upgrade testing": how long did these upgrades take in the 0.5 million, 1.2 million, and 2.7 million block cases?  Perhaps we should parallelize the upgrade process between multiple directories like we talked about in the past, to minimize this time.  Or perhaps this change needs a full (non-rolling) upgrade, and hence should go only in trunk?
+
+I am +1 for this in trunk if a unit test is added.  I think we should hold off on committing it to branch-2 for now., I think this is fine for rolling upgrade, it doesn't change wire compatibility at all. So I'm fine for branch-2. Unit test is important though too as Colin mentioned., I've also tested this in a small cluster. The upgrade seems to work fine in both 2.6 to 2.7 and 2.7 to 2.7 cases. But I noticed that {{previous}} directories contain the old (correct) VERSION file, but the content is in the new layout., Thanks all for the comments.
+
+[~cmccabe]
+bq. how long did these upgrades take in the 0.5 million, 1.2 million, and 2.7 million block cases?
+I have attached a [new version|https://issues.apache.org/jira/secure/attachment/12774454/32x32DatanodeLayoutTesting-v2.pdf] of the testing document with more details around the upgrade testing. The upgrade for the above case was a setup with very low block density and the data node upgraded with a startup time of 1 minute. I did do an upgrade test with a data node that had around 2 million blocks in total. In that case the hard linking alone took around 9 minutes.
+
+[~andrew.wang] Agreed. I think it would be awesome if we could get this into branch-2 and I am currently in the process of adding unit tests.
+
+[~kihwal] I took a look at a node during upgrade, and it seemed like the {{previous.tmp}} directory did indeed have the old layout like it should. Maybe I am misunderstanding which directory you are looking at, so I will continue to investigate.
+
+As a side note: I am still early in my search, but I can't seem to find where in a unit test we actually verify that the {{finalized}} directory does indeed have the correct layout after an upgrade. The same goes for if the {{previous.tmp}} directory actually has the old format during an upgrade that isn't finalized yet. I see {{TestDatanodeLayoutUpgrade#testUpgradeToIdBasedLayout}}, but a {{null}} verifier is passed in to the {{upgradeAndVerify}} method. Additionally, all of the other tests (i.e. TestDFSFinalize, TestRollingUpgradeRollback, TestRollingUpgrade) seem to either be layout agnostic or simply check the {{VERSION}} file. I will continue to investigate., This is what I saw on the upgraded node before it got finalized.  Before upgrade, {{current/finalized}} contained many sub directories.
+{noformat}
+-bash-4.1$ ls -l /xxx/data/current/BP-xxxxx/previous/finalized
+total 4
+drwxr-xr-x 115 hdfs users 4096 Nov 24 23:01 subdir0
+{noformat}
+
+This is what I saw in the log.
+{noformat}
+2015-11-24 23:06:09,980 INFO common.Storage: Upgrading block pool storage directory /xxx/data/current/BP-xxxxx.
+   old LV = -56; old CTime = 0.
+   new LV = -57; new CTime = 0
+2015-11-24 23:06:11,625 INFO common.Storage: HardLinkStats: 116 Directories, including 3 Empty Directories, 57282 single
+ Link operations, 0 multi-Link operations, linking 0 files, total 57282 linkable files.  Also physically copied 0 other files.
+2015-11-24 23:06:11,671 INFO common.Storage: Upgrade of block pool BP-xxxxx at /xxx/data/current/BP-xxxxx is complete
+{noformat}
+
+I just noticed the time stamp of {{subdir0}} is old, so empty directories were removed? I will test it again if that is the case. But I thought {{current}} eventually becomes {{previous}} after creating hard links, so even the empty dirs left intact., bq.  I will test it again if that is the case. 
+Retesting shows {{previous}} containing the valid content. I guess I somehow messed up the testing first time. 
++1 from me., Marking it as a critical bug of 2.6.3.
+
+I think it's important to cherry-pick this patch to the 2.6 line to avoid serious performance degradation.
+
+[~djp] what do you think?
+, bq. I think it's important to cherry-pick this patch to the 2.6 line to avoid serious performance degradation. Junping Du what do you think?
++1. In case we don't have any compatible issue., bq. Marking it as a critical bug of 2.6.3.
+If you want to pull this in 2.6.3, it might make sense to push it for 2.7.2. If 2.6.3 comes out earlier than 2.7.3, we will be creating a version of 2.6 that cannot be upgraded to the latest 2.7. [~vinodkv], I think 2.6 and 2.7 release managers should coordinate., Thanks, guys. +1 for this in trunk and branch-2.
+
+Putting this in branch-2.6 would be a little unusual since it requires a layout version upgrade, which I thought we had agreed not to do in bugfix releases.  But I will leave that decision up to the release manager for the 2.6 branch.
+
+Also, I would really like to see a unit test.  If necessary we can get this in and then open a JIRA for that, but it should be on our radar., I am finishing up the unit test and will post it later today., [~cmccabe] Attached is v2 of the patch which includes a new unit test that tests a -56 to -57 upgrade. The existing unit test in {{TestDatanodeLayoutUpgrade}} tests the >-56 to -57 scenario. Also attached is the binary tgz file associated with the test.
+
+Submitting patch for a test run. I expect the new {{TestDatanodeLayoutUpgrade#testUpgradeFrom256To32Layout}} test to fail since it will not be able to find the tgz file., Resubmitting the patch. The precommit ran, but it grabbed the tar ball because that was the lastest file.  https://builds.apache.org/job/PreCommit-HDFS-Build/13702/console, Attaching a patch that includes the tar ball. It worked last time..., Deleted the post by aborted precommit., This ran for 5 hours and got aborted (jenkins timeout). It ran the tests with jdk8, but jdk7 test took a very long time. May be it hung. 
+https://builds.apache.org/job/PreCommit-HDFS-Build/13709/artifact/, I re-kicked another build: https://builds.apache.org/job/PreCommit-HDFS-Build/13722/, bq. If you want to pull this in 2.6.3, it might make sense to push it for 2.7.2. If 2.6.3 comes out earlier than 2.7.3, we will be creating a version of 2.6 that cannot be upgraded to the latest 2.7. Vinod Kumar Vavilapalli, I think 2.6 and 2.7 release managers should coordinate.
++1. [~vinodkv], if we don't have plan to include this in 2.7.2. Let's move it out of 2.6.3 but into 2.6.4 instead., I really don't think we should include this in any maintenance releases since it involves a DN layout upgrade. My recommendation is to wait for the next minor release, like we do with other layout upgrades., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 9m 4s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 10m 51s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 10m 39s {color} | {color:green} trunk passed with JDK v1.7.0_85 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 13s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 11m 34s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 56s {color} | {color:green} trunk passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red} 24m 35s {color} | {color:red} root in trunk failed. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 7m 19s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 10m 57s {color} | {color:green} trunk passed with JDK v1.7.0_85 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 8m 59s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 10m 41s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 10m 41s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 10m 40s {color} | {color:green} the patch passed with JDK v1.7.0_85 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 10m 40s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 12s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 11m 12s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 45s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 5 line(s) with tabs. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red} 24m 50s {color} | {color:red} root in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 7m 29s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 11m 0s {color} | {color:green} the patch passed with JDK v1.7.0_85 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 12m 53s {color} | {color:red} root in the patch failed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 12m 56s {color} | {color:red} root in the patch failed with JDK v1.7.0_85. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 25s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 201m 24s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.fs.shell.TestCopyPreserveFlag |
+|   | hadoop.ipc.TestIPC |
+|   | hadoop.test.TestTimedOutTestsListener |
+| JDK v1.7.0_85 Failed junit tests | hadoop.fs.viewfs.TestViewFileSystemLocalFileSystem |
+|   | hadoop.fs.TestFsShellReturnCode |
+|   | hadoop.metrics2.impl.TestGangliaMetrics |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12775044/HDFS-8791-trunk-v2-bin.patch |
+| JIRA Issue | HDFS-8791 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 7fe1bdd9a726 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 830eb25 |
+| findbugs | https://builds.apache.org/job/PreCommit-HDFS-Build/13722/artifact/patchprocess/branch-findbugs-root.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/13722/artifact/patchprocess/whitespace-tabs.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-HDFS-Build/13722/artifact/patchprocess/patch-findbugs-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/13722/artifact/patchprocess/patch-unit-root-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/13722/artifact/patchprocess/patch-unit-root-jdk1.7.0_85.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/13722/artifact/patchprocess/patch-unit-root-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-HDFS-Build/13722/artifact/patchprocess/patch-unit-root-jdk1.7.0_85.txt |
+| JDK v1.7.0_85  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/13722/testReport/ |
+| modules | C: . U: . |
+| Max memory used | 116MB |
+| Powered by | Apache Yetus   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/13722/console |
+
+
+This message was automatically generated.
+
+, Totally agree that if the patch goes into 2.6.3 it should go into 2.7.2 as well.
+
+While I appreciate the sentiment that layout format changes would normally warrant a new minor release (2.8.0 in this case?), this approach leaves us with a dilemma.
+We feel that we cannot move from 2.4 to 2.6 despite all if the efforts to validate and test without this fix. Luckily we're in the position that we roll out own internal build, so technically we're not blocked on this.
+We're already happy this fix will go in upstream.
+That said, it would block us from rolling cleanly to 2.7.2+ without manually applying this patch.
+
+Similarly, what do we tell other users? Don't use 2.6.3 or 2.6.4 because it has a fundamental perf problem? Then why even do a 2.6.3 maintenance release? Isn't the point of these releases that you can avoid trade-off beteren manually applying a list of patches on top of a release?
+
+Similarly, do we tell the HBase community to not use this version of Hadoop and just wait for a 2.8.x release and perhaps longer until that has been stabilized to the point where folks can run that comfortably in production knowing it has been battle tested?
+
+A format release between dot releases is perhaps not ideal either, but if a release manager is willing to pull it in, and coordinate with the release of an equivalent maintenance release with a newer minor version, then is that not a practical workable outcome?
+
+Sent from my iPhone
+
+, bq. I really don't think we should include this in any maintenance releases since it involves a DN layout upgrade.
+Normally I would agree without hesitation because layout changes are usually associated with new features. This change is different in that it is FIXING the severe performance regression. The performance degradation results in elevated level of permanent write failures and 2.6/2.7 is almost unusable for some use cases. 
+
+If we decide to put it in 2.7 and possibly in 2.6, we should think about the consequences to users and make it clear in the release note., Mark this as blocker per comments from [~jrottinghuis] and [~kihwal]., If I have my Twitter hat on, like [~jrottinghuis] said, we have already gained the benefits of this patch internally because we have back-ported it to our 2.6.2 branch. From that perspective, I would be happy if this patch simply made it into the next branch-2 minor release.
+
+On the other hand, if I have my community hat on, I am wondering how many hadoop users would want this patch and, if that group is large enough, what is the best way to get the patch to them on a stable release.
+
+1. How many people would want this patch?: I think this will affect all hadoop clusters that have seen over 16 million blocks written to the entire cluster over its lifespan and are running ext4. As a reminder, data node startup time and potentially IO perf of user level containers will start to degrade before this point (as the directory structure grows, the impact becomes greater). I would say that most large hadoop users fall into this category. My guess is that a non-trivial number of production hadoop clusters for medium size users would fall into this category as well. [~andrew.wang] I am sure you would have a better sense for how many production clusters this would affect.
+
+2. How do we get this patch out to users on a stable release?: I definitely understand the desire to avoid a layout change as part of a maintenance release, but I also think it would be nice to have a stable release that users could deploy with this patch. Here is one potential solution:
+* Since 2.8 is cut but not released, rename the 2.8 branch to 2.9 and continue with the release schedule it is currently on.
+* Cut a new 2.8 branch off of 2.7.3 and apply this patch to this "new" 2.8.
+* Going forward:
+** People that are adverse to making the layout change can continue doing maintenance releases on the 2.7 line. My guess is that this is a small group and that the 2.7 branch will essentially die.
+** Maintenance releases can continue on the new 2.8 branch as they would have for the 2.7 branch. People that were on 2.7 should be able to easily move to 2.8 because it is essentially a maintenance release plus the new layout.
+* I would say that there is no need to back-port the layout change to the 2.6 branch if we have a stable 2.8 that users can upgrade to.
+
+With this scenario we get a stable release with the new layout (i.e. the new 2.8 branch) and we avoid making a layout change in a maintenance release. Thoughts?, So I won't block anything if the 2.6 or 2.7 RMs really want this included, but I do like Chris' proposal about a new 2.8 the most. I think it'd be very surprising to 2.6.2 users that 2.6.3 will do an upgrade. Our upstream compat guidelines leave this up in the air, but there's some expectation of being able to downgrade between maintenance releases, e.g. just swapping JARs back and forth.
+
+I've also only seen one or two upgrade issues caused by the 256x256 layout, and a good chunk of Cloudera users are on it now. So there's a threshold where this kicks in which most Cloudera users aren't hitting. I think that's representative of small to medium sized Hadoop users.
+
+Last few questions, for users who are already on the 256x256 layout and are affected by this issue, is the upgrade to 32x32 going to again be painful? This would also make me very wary of including this in a maintenance release. Does the same apply to finalizing the upgrade, as we rm -rf previous? These would be good details to have in the release notes., Thanks [~ctrezzo], that seems like a reasonable compromise.
+Thanks for the additional data points [~andrew.wang], that gives at least some comfort that 2.6.x without the patch isn't completely dead for adoption (although still at risk).
+
+Aside from 2.6.2->2.6.3 being a surprising layout upgrade with this patch in 2.6.3, we would also have to make it clear that you would not be able to go from 2.6.3 to 2.7.1 because the layout version would go backwards., bq. I've also only seen one or two upgrade issues caused by the 256x256 layout, and a good chunk of Cloudera users are on it now. So there's a threshold where this kicks in which most Cloudera users aren't hitting. I think that's representative of small to medium sized Hadoop users.
+
+I have seen significant amount of Hortonwork customers haven hit this issue during upgrades.
+
+I agree with [~kihwal] and other folks here that 2.6 / 2.7 are effectively unusable in some use cases without this fix. IMO the issue is significant enough that needs to be cherry-picked to active maintenance releases. How to ensure the upgrade story works and properly documenting them is a second order issue  compared to not having a usable release in production clusters., [~wheat9] [~kihwal] are y'all okay with [~ctrezzo]'s proposal? It gets a production release out, and avoids the aforementioned issues with non-monotonic layout versions, downgrade, and other expectations about maintenance releases (which include open questions around upgrade and finalize from [my last comment|https://issues.apache.org/jira/secure/EditComment!default.jspa?id=12845740&commentId=15036331])., This is not regarding the release planning, but the patch itself.
+
+We tried a rolling upgrade of a sandbox/test cluster and it didn't go well.  We pulled in the layout fix and the hard-linking was taking about 6-9 minutes per drive. The following is an example of 9 minute upgrade. I think it still is the cost of scanning the old layout.
+
+{noformat}
+2015-12-02 19:10:13,384 INFO common.Storage: Upgrading block pool storage directory
+ /xxx/current/BP-1586417773-98.139.153.156-1363377856192.
+   old LV = -56; old CTime = 1416360571152.
+   new LV = -57; new CTime = 1416360571152
+2015-12-02 19:19:02,184 INFO common.Storage: HardLinkStats: 64735 Directories, including 48966 Empty Directories,
+ 43842 single Link operations, 1 multi-Link operations, linking 12 files, total 43854 linkable files.  Also physically copied 0 other files.
+{noformat}
+
+At minimum, we need to make the upgrade (storage initialization) parallel as suggested by [~cmccabe] before., Agree with Kihwal that the release discussion is besides the point.
+
+The question is what will happen to existing users' clusters be they are based off 2.7.x or 2.8.x or 2.9.x.
+
+Dumbing it down, I think there are (1) users who care about the perf issue and can manage the resulting storage layout change and (2) there will be those who won't. Making the upgrade (as well as downgrade?) seamlessly work as part of our code pretty much seems like a blocker in order to avoid surprises for unsuspecting users who are not in need of this change.
+
+Forcing a manual step for a 2.6.x / 2.7.x user when he/she upgrades to 2.6.4, 2.7.3 or 2.8.0 seems like a non-starter to me., Thanks [~kihwal] for the testing info!
+I definitely saw the longer upgrade time between 256x256 to 32x32 layout (a more detailed breakdown can be found in the "(­-56) to (­-57) with high block density" section of the [testing doc|https://issues.apache.org/jira/secure/attachment/12774454/32x32DatanodeLayoutTesting-v2.pdf]), but not quite as long as the hard-linking time that you saw.
+
+[~vinodkv] I also agree we need to make the upgrade path smooth regardless of which release this patch goes in to.
+
+[~kihwal] How long did it take to scan all the block pools (i.e. was hard-linking the majority of the upgrade time)?
+
+Thanks all for the comments!, bq.  How long did it take to scan all the block pools (i.e. was hard-linking the majority of the upgrade time)?
+I don't think hard-linking was the major contributor to the long upgrade time. Scanning didn't take too long with the new layout.
+
+{noformat}
+INFO impl.FsDatasetImpl:Time taken to scan block pool BP-xxxx on /xxx/hdfs/data/current: 92ms
+...
+INFO impl.FsDatasetImpl: Time to add replicas to map for block pool BP-xxxx on volume /xxx/hdfs/data/current: 2274ms
+{noformat}, As for making it run parallel, we could do it in {{DataStorage#addStorageLocations()}}. We can borrow the code from {{FsVolumeList#addBlockPool()}}., [~kihwal]
+For the sake of completeness, we upgraded another test cluster this afternoon from 256x256 to 32x32. During this upgrade, we did see the long upgrade times that you were seeing. One of the data nodes took 1 hour and 25 min from start of upgrade until the last namespace was finalized. Here is the [upgrade log|https://issues.apache.org/jira/secure/attachment/12775501/test-node-upgrade.txt]. This data node was not an outlier. As you can see for this node, the hard-linking for all 12 disks took an hour by itself.
+
+I will look at {{DataStorage#addStorageLocations()}} and {{FsVolumeList#addBlockPool()}}. I will spend some effort to see if I can put together a patch that will parallelize the upgrade. , As a side note: I see that there are already multiple jiras around making the upgrade parallel. I see HDFS-8782 and HDFS-8578. I will investigate more., HDFS-8578 looks promising. Let's push it forward., Thanks [~ctrezzo] and [~kihwal] for bringing up HDFS-8578.
+Its pending from quite sometime.
+
+Updated the patch just now in HDFS-8578. Please have a look at the updated patch.
+Thanks., Linking HDFS-8578 as a blocker for this jira. Although the two are independent, we don't want this jira without HDFS-8578., Reviewing HDFS-8578., Setting tentative target-versions 2.8.0, 2.7.3 for tracking., Working on 2.6.3-RC0 now, move it out to 2.6.4., For those who are interested, we have upgraded a 2000+ node busy cluster with this patch.  We had to do something extra to speed up the rolling upgrade process.
+- Tune the kernel to be less aggressive on evicting vfs-related slab entries.
+{noformat}
+echo 2 > /proc/sys/vm/vfs_cache_pressure
+Wait 6 hours for the DirectoryScanner to run and warm up the cache.
+{noformat}
+- Use a custom tool to upgrade the volumes offline in parallel without scanning.  This tool utilizes the replica cache file that is created during upgrade-shutdown.
+
+If a node was going through the slow (regular) upgrade path, it could have taken over an hour (9-11 minutes * n drives). Via the "fast" path, the layout upgrade finished in 2-3 minutes, depending on the size of drives. The offline layout upgrade was done in 3-4 seconds on a non-busy cluster.  Scanning blocks in the new layout was taking about 2 seconds (this is done in parallel), so datanodes were registering with the NNs in 6 seconds after startup.
+, Thanks [~kihwal] for the info! For the sake of completeness, we also have this patch deployed on a busy multi-thousand node cluster. Our upgrade was from a pre-id-based layout to the 32x32 layout, so we did not use an additional tool., Move this out of 2.6.4 to 2.6.5 as haven't updated for a while., bq. Attaching a patch that includes the tar ball. It worked last time...
+
+In the future, create a binary patch using git format-patch., Attaching rebased v3-bin patch.
+
+Now that HDFS-8578 is committed, this patch should be ready to commit for at least trunk and 2.8. Thoughts? [~andrew.wang] [~kihwal] [~szetszwo] [~vinayrpet], | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} docker {color} | {color:red} 0m 3s {color} | {color:red} Docker failed to build yetus/hadoop:0ca8df7. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12790584/HDFS-8791-trunk-v3-bin.patch |
+| JIRA Issue | HDFS-8791 |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14661/console |
+| Powered by | Apache Yetus 0.3.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Just a (stupid) question:
+- The 256x256 layout is known to be bad while 32x32 is working.  Have we consider that the values in-between, i.e. 64x64 and 128x128?  I think we should pick the highest value which has no performance degradation so that datanode can scale to store more blocks., With the 32x32 layout, ext3 would be able to store a bit more than 30M blocks per storage. ext4 doesn't have this limit, so will go much further.  Ignoring other limitations, storing more than 1B per node is quite possible., {code}
+Pulling repository docker.io/library/ubuntu
+Could not reach any registry endpoint
+{code}
+
+Looks like the usual "Jenkins slaves lose access to the network" thing that hits a few times a week. I'll retrigger., Thanks for the question [~szetszwo]! To echo [~kihwal]:
+
+I did not explicitly test a layout that had 64x64 or 128x128. That being said, with 32x32 each blockpool on each disk has 1024 directories which allows a data node to host a large number of blocks. Here is a table with some simple calculations on the number of local files per directory given different configurations (note: the directory distribution will change based on how block ids are distributed between data nodes):
+
+||Number of blockpools||Number of disks||Number of HDFS blocks per datanode||Number of data sub-directories per datanode||Number of local files per datanode||Number of local files per directory||
+|1|1|1 million|1,024|2 million|1953|
+|1|6|1 million|6,144|2 million|325|
+|1|12|1 million|12,288|2 million|162|
+|1|12|13 million|12,288|26 million|2115|
+|3|12|1 million|36,864|2 million|54|
+|3|12|13 million|36,864|26 million|705|
+
+My understanding is that ext4 should be fine in the low thousands of files per directory range. This layout should be able to easily scale. I think we will run into other problems before directory density becomes an issue. If we go to 64x64, the number of directories starts to get a little scary in the federation case. Consider 3 block pools and 12 disks would give you 147,456 data sub-directories per datanode., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 12s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 53s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 39s {color} | {color:green} trunk passed with JDK v1.8.0_72 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 41s {color} | {color:green} trunk passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 20s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 51s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 13s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 53s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 5s {color} | {color:green} trunk passed with JDK v1.8.0_72 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 46s {color} | {color:green} trunk passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 45s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 38s {color} | {color:green} the patch passed with JDK v1.8.0_72 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 38s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 37s {color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 37s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 19s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 49s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 11s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 5 line(s) with tabs. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 2m 7s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 3s {color} | {color:green} the patch passed with JDK v1.8.0_72 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 47s {color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 52m 54s {color} | {color:green} hadoop-hdfs in the patch passed with JDK v1.8.0_72. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 53m 2s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_95. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 20s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 131m 13s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.7.0_95 Failed junit tests | hadoop.hdfs.server.namenode.ha.TestEditLogTailer |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12790584/HDFS-8791-trunk-v3-bin.patch |
+| JIRA Issue | HDFS-8791 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 7292f00d2f15 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 2151716 |
+| Default Java | 1.7.0_95 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_72 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_95 |
+| findbugs | v3.0.0 |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/14665/artifact/patchprocess/whitespace-tabs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/14665/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_95.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/14665/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_95.txt |
+| JDK v1.7.0_95  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/14665/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/14665/console |
+| Powered by | Apache Yetus 0.3.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, [~szetszwo], do you have any further concerns?  If not, +1 for the patch.  
+
+We have been running with this patch in production with good results. Almost all clusters are now on the new layout. The parallel layout upgrade typically took 3-5 minutes per node for us. # of blocks on each storage was roughly 100k to 200k. Once you are over the layout upgrade hurdle, it is all green pasture. du runs faster and scanning a block pool slice finished in a couple of seconds.  As mentioned before, our parallel upgrade was done offline using a custom tool, which took advantage of replica cache files (HDFS-7928) created during shutdown. This avoids the discovery phase of the upgrade., It seems that the 32x32 layout is already well tested.  Let use it unless someone wants to test the 64x64 or other layouts.
+
++1 for the patch., Thanks for working on the fix, [~ctrezzo] and thank you all for reviews and discussions. I've committed it from trunk through branch-2.7.  I didn't put in branch-2.6 because it does not have the parallel upgrade fix.  I will leave it up to the 2.6 release manager and the interested party., FAILURE: Integrated in Hadoop-trunk-Commit #9403 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/9403/])
+HDFS-8791. block ID-based DN storage layout can be very slow for (kihwal: rev 2c8496ebf3b7b31c2e18fdf8d4cb2a0115f43112)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-to-57-dn-layout-dir.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DatanodeUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeLayoutVersion.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-56-layout-datanode-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDatanodeLayoutUpgrade.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
+, Thanks [~kihwal] and everyone else!, [~kihwal] Should I add a blurb in the jira release notes since this is a data node layout change?, Yes, we should do that. Thanks, Chris., Please expand the release note to state that should something go wrong, rolling downgrade will not be possible and a rollback (which requires downtime) will be needed.
+
+Has someone tested that rollback works after upgrading to a version with this patch? I saw someone manually examined a non-finalized {{previous}} directory, but I'm wondering if someone walked through the entire process., I commented on the JIRA way back (see https://issues.apache.org/jira/browse/HDFS-8791?focusedCommentId=15036666&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15036666), saying what I said below. Unfortunately, I haven’t followed the patch along after my initial comment. 
+
+This isn’t about any specific release - starting 2.6 we declared support for rolling upgrades and downgrades. Any patch that breaks this should not be in branch-2.
+
+Two options from where I stand
+ # For folks who worked on the patch: Is there a way to make (a) the upgrade-downgrade seamless for people who don’t care about this (b) and have explicit documentation for people who care to switch this behavior on and are willing to risk not having downgrades. If this means a new configuration property, so be it. It’s a necessary evil.
+ # Just let specific users backport this into specific 2.x branches they need and leave it only on trunk.
+
+Unless this behavior stops breaking rolling upgrades/downgrades, I think we should just revert it from branch-2 and definitely 2.7.3 as it stands today., Do we actually support downgrade between 2.7 and 2.6? We changed the NameNode LayoutVersion, so I don't think so. These branches don't have HDFS-8432 either., Hmm.  My understanding was that this patch adds a new DataNode layout version which should be more efficient.  I didn't think that it broke rolling upgrade (you should still be able to upgrade from an earlier layout version to this one).  Did I miss something?  On the other hand, clearly, with a new layout version you will not be able to downgrade, but will have to rollback, which is a definite tradeoff-- and maybe a reason to keep it out of "dot releases" (but not minor releases), bq. Please expand the release note to state that should something go wrong, rolling downgrade will not be possible and a rollback (which requires downtime) will be needed.
+
+Done. To be clear, this new layout uses all of the same code paths as the first block-id based layout, the only change is the number of directories. It should support the same mechanisms that the previous layout supported. From looking at the code, my understanding is that it supports rolling upgrades and rollbacks (i.e. downgrades are not supported).
+
+bq. Has someone tested that rollback works after upgrading to a version with this patch? I saw someone manually examined a non-finalized previous directory, but I'm wondering if someone walked through the entire process.
+
+I personally did not test the full rollback path. There is some minimal test coverage ensuring that the contents of the previous directory is as expected (see TestDataNodeRollingUpgrade#testWithLayoutChangeAndFinalize). The new layout should be very similar to the old layout, but I agree that is still no excuse not to test it., bq. My understanding was that this patch adds a new DataNode layout version which should be more efficient. I didn't think that it broke rolling upgrade (you should still be able to upgrade from an earlier layout version to this one). Did I miss something?
+
+You are correct. This does not break rolling upgrade. This code path has been tested. The major concern is over the fact that you can not downgrade and have to do a rollback., [~busbey] That being said, I did manually verify the previous directory contained the correct content on multiple datanodes (similar to what the above test case does). The rollback functionality seems to simply rename the previous directory back to current. As stated above, this functionality should be identical to the previous layout (and was presumably tested)., bq.  I didn't think that it broke rolling upgrade (you should still be able to upgrade from an earlier layout version to this one). Did I miss something?
+My point was mainly about rolling downgrade. Just used upgrade/downgrade together in my comment because in my mind the expectations are the same.
+
+bq. Do we actually support downgrade between 2.7 and 2.6? We changed the NameNode LayoutVersion, so I don't think so. These branches don't have HDFS-8432 either.
+[~andrew.wang], tx for this info.
+
+This is really unfortunate. Can you give a reference to the NameNode LayoutVersion change?
+
+Did we ever establish clear rules about downgrades? We need to layout out our story around supporting downgrades continuously and codify it. I'd vote for keeping strict rules for downgrades too, otherwise users are left to fend for themselves in deciding the risk associated with every version upgrade - are we in a place where we can support this?
+
+For upgrades, there is tribal knowledge amongst committers/reviewers in the minimum. And on YARN side, we've proposed (but made little progress) for tools to automatically catch some of it - YARN-3292.
+
+To conclude, is the consensus to document all these downgrade related breakages but keep them in 2.7.x and 2.8?, Downgrade breakage only in minor versions please, I don't think we ever discussed or documented anywhere the idea that we would support rolling downgrade throughout all of the 2.x releases.  In fact, I think almost every new minor 2.x release we've ever made has involved a layout version upgrade (maybe someone can think of some exceptions?).  And one major goal of HDFS-5535 was making such upgrades easier.
+
+On the other hand, I tend to agree with [~busbey] that rolling downgrade should be supported in stability branches, and that's currently the discussion we're having with the stable branch maintainers., bq. This is really unfortunate. Can you give a reference to the NameNode LayoutVersion change?
+
+[~vinodkv] we made a few changes in 2.6 -> 2.7, you can look at NameNodeLayoutVersion.java for the short summary. Most of them are adding new edit log ops, but truncate is a bigger one.
+
+bq. Did we ever establish clear rules about downgrades? We need to layout out our story around supporting downgrades continuously and codify it.
+
+We've never addressed downgrade in our compatibility policy, so officially we don't have anything.
+
+bq. I'd vote for keeping strict rules for downgrades too, otherwise users are left to fend for themselves in deciding the risk associated with every version upgrade - are we in a place where we can support this?
+
+We aren't yet, unless we want to exclude most larger features from branch-2. Long ago HDFS-5223 was filed to add feature flags to HDFS, which would enable downgrade in more scenarios. We never reached consensus though, and it stalled out since people seemed to like rolling upgrade (HDFS-5535) more. It can be revived, but it does mean additional testing complexity though, and new features need to be developed with feature flags in mind.
+
+I like this sentiment in general though, and would be in favor of requiring upgrade and downgrade within a major version, once we have HDFS-5223 in. It can be added compatibly to branch-2 since Colin did the groundwork in HDFS-5784.
+
+bq. To conclude, is the consensus to document all these downgrade related breakages but keep them in 2.7.x and 2.8?
+
+Unless we have new energy to pursue HDFS-5223, I think we'll keep doing LV changes. We've been doing them almost every 2.x release, so I think user expectations should be in line. AFAIK we've never announced a change in our support for downgrade in the 2.x line.
+
+It's also worth noting that HDFS-5223 was thinking about NN LV changes, it predates the NN and DN LV split. Thus I'm not sure the feature flags work at HDFS-5784 would work for this particular JIRA., Although we have probably not been really good at following what we agreed up on, the following is in the rolling upgrades design doc (HDFS-5535).
+{panel}
+<req-6> It MUST be possible to downgrade to the previous dot release version without data loss.
+  <req-6.1> NN downgrade must be independent of other NN, DNs and JNs.
+  <req-6.2> DN downgrade must be independent of other DNs, NNs and JNs.
+{panel}
+
+For future 2.7 release to meet this requirement,  we could release 2.7.3 that is 2.7.2 plus the DN layout downgrade feature. This is not hard to do. The new layout will be then in effect in 2.7.4 release, which can be downgraded to 2.7.3., We often see that the layout version has to bump just to support new edit log transactions for new features.  (Truncate is a great example.)  With HDFS-8432 (introducing the notion of "minimum compatible layout version"), it's possible to code these features so that while the upgrade is in progress (unfinalized), attempts to use the new features are rejected.  Therefore, the new edit log transactions never get written.  Therefore, after a downgrade, the edit log is still readable by the prior software version.  (No unrecognized/invalid edit log ops.)  The new features only become usable after the upgrade has been finalized.  At that point, the admin is announcing intent to stay on "this version" or later.  HDFS-5223 (feature flags) is not required to achieve this.
+
+HDFS-8432 won't ship until 2.8.0, so unfortunately, it doesn't make our lives easier within the 2.7 line.  It will help for future major release lines though.
+
+bq. For future 2.7 release to meet this requirement, we could release 2.7.3 that is 2.7.2 plus the DN layout downgrade feature. This is not hard to do.
+
+Maybe I'm missing something, but a DataNode layout downgrade sounds pretty challenging if it would have to restore older block directory structures by renaming a lot of block and meta files., If the downgrade is only between these two datanode layout versions, I think it can be done. The actual code that does heavy lifting is already there. We just need to add a way to trigger it.  May be I am making it sound too easy.  Anyway, I am not suggesting we come up with a generic layout downgrade mechanism.  I am just saying if people still want to see this in 2.7, we can probably make it happen.
+
+, [~kihwal], I understand now.  I mistook the earlier comment to mean a generalized DataNode layout downgrade mechanism instead of something specific to this one.  Thanks!, > ... The actual code that does heavy lifting is already there. We just need to add a way to trigger it. May be I am making it sound too easy. ...
+
+I agree that it does sound too easy.  :)   We have several layout versions.  Let's call them
+- Older-Layout
+- LDir
+- 256x256
+- 32x32
+
+User can upgrade from one of the layout to a newer layout.  Then we need to support downgrading from 32x32 to all of 256x256, LDir and Older-Layout.  It seems not easy.
+
+> ... The new layout will be then in effect in 2.7.4 release, which can be downgraded to 2.7.3.
+
+Suppose a cluster is running 2.7.2.  It needs to be first upgraded to 2.7.3 and then has a second upgrade to 2.7.4.  If it is directly upgraded from 2.7.2 to 2.7.4, downgrade is not supported.  In both cases, the cluster cannot be downgraded to 2.7.2., Again, if the following is what need to honor, we only need to make it downgradable from 2.7.n to 2.7.(n-1), 2.7.n being the first 2.7 dot release with the new layout.
+{panel}
+ It MUST be possible to downgrade to the previous dot release version without data loss.
+{panel}
+
+In this case, it only involves going from 32x32 to 256x256. All other layout is irrelevant. Actually, the conversion code does not care about existing layout. It scans the storage to get the list and hard-links them to the new layout.
+
+But "make it downgradable from 2.7.n to 2.7.(n-1)" may not be that helpful in reality since users can skip versions.  If this is believed to be true, our only option will be to introduce the new layout in 2.8.0., I am struggling to understand all of the possible permutations for supported/unsupported upgrade+downgrade within the minor release, so I expect this will be a struggle for users too.  Overall, I prefer the proposal to move the layout version change to 2.8.0 and then change the subsequent version numbers as needed., Per discussion in the mailing lists and the comments in this jira, I am reverting it from branch-2.7. 
+I am the one who committed this. While it was in branch-2.7, it caught an upgrade bug. So the commit wasn't completely useless. :), [~kihwal], thanks for reverting it.  +1
+
+BTW, you are right that downgrading from 32x32 to LDir and Older-Layout is irrelevant since they are not in 2.7.x., Thanks [~kihwal]!, Tx [~kihwal]!
+
+As [~kihwal] pointed out [here|https://issues.apache.org/jira/browse/HDFS-8791?focusedCommentId=15226253&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15226253], we had downgrades even in dot releases as a requirement in the original design doc, but we haven't been respecting those.
+
+Before we move on, I think we should converge to a plan of action for future changes that may affect downgrade scenarios - perhaps as a different JIRA - [~cnauroth] / [~kihwal] / [~szetszwo], is it possible for one of you to take charge on this? Thanks!]

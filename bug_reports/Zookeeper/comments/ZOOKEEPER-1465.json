@@ -1,0 +1,241 @@
+[When there are no uncommitted proposals and no diff between leader and follower, leader will send a snap due to the fact that this logic:
+{quote}
+ if (peerLastZxid == leaderLastZxid) {
+                    LOG.debug("Leader and follower are in sync, sending empty diff. zxid=0x{}",
+                            Long.toHexString(leaderLastZxid));
+                    // We are in sync so we'll do an empty diff
+                    packetToSend = Leader.DIFF;
+                    zxidToSend = leaderLastZxid;
+                }
+{quote}
+Will never return true. I'm trying to figure out a test for this now., One basic attempt. The Zab1_0 tests should be changed to reflect that we send DIFFs not SNAP. Might want additional tests though., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12528348/ZOOKEEPER-1465.patch
+  against trunk revision 1337029.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1082//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1082//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1082//console
+
+This message is automatically generated., How confident are we in the fix for this bug? I'm patching our local zookeeper and we've definitely observed this bug ourselves. Would like to incorporate it into our next patched version but would love some feedback on this fix...Thanks!, I think it's pretty decent, but it would be good if someone else double-checked my work. Ben or Flavio maybe, do either of you have time to check this out? 
+It'd also be great if you tried running this in staging and see if it helps Marshall, and I would appreciate your eyes on the code if you want to take a look., I'll have a look into it., Even if there are committed proposal but learner is already in-sync, we still have bug due to this line
+// skip the proposals the peer already has
+if (propose.packet.getZxid() <= peerLastZxid) {
+  prevProposalZxid = propose.packet.getZxid();
+  continue;
+}
+
+If this is the last proposal, it will exit the loop and never setup the DIFF packet. So it will send out the entire snapshot. 
+
+This patch seems to work in this case as well. 
+, Here is a summary of my progress so far. The patch essentially proposes this change:
+
+{noformat}
+-                if (peerLastZxid == leaderLastZxid) {
++                if (peerLastZxid == leaderLastZxid || peerLastZxid == maxCommittedLog) {
+{noformat}
+
+This tells me that the problem is that we need to set packetToSend to Leader.DIFF when "peerLastZxid == maxCommittedLog", but "peerLastZxid == leaderLastZxid" does not hold and packetToSend is set to Leader.SNAP. If peerLastZxid <> leaderLastZxid, then the leader possibly has proposals that the learner doesn't, but I can't convince myself that it must be the case. If it does have proposals that the learner doesn't, then packetToSend should have been set to DIFF in the previous if/for block, no? 
+
+I'll keep looking, but if anyone sees a flaw here or has extra information that might help, please let me know.   , Here is my current understanding of the problem. Essentially, the leader uses 3 lists to sync with follower: committedLog, toBeApplied and outstandingProposals.
+
+What I believe that the existing logic intend to do is that, if follower missed the committedLog (either committedLog is empty or peerLastZxid is not in range), then we send snapshot and follow by transactions in toBeApplied and outstandingProposals.
+
+However, the problem that we see here is that the follower doesn’t missed the committedLog, but the logic below fail to setup DIFF packet correctly because peerLastZxid == maxCommittedLog (last element in commitedLog).
+{noformat}
+                        for (Proposal propose: proposals) {
+                            // skip the proposals the peer already has
+                            if (propose.packet.getZxid() <= peerLastZxid) {
+                                prevProposalZxid = propose.packet.getZxid();
+                                continue;
+                            } else {
+                                // If we are sending the first packet, figure out whether to trunc
+                                // in case the follower has some proposals that the leader doesn't
+                                if (firstPacket) {
+                                    firstPacket = false;
+                                    // Does the peer have some proposals that the leader hasn't seen yet
+                                    if (prevProposalZxid < peerLastZxid) {
+                                        // send a trunc message before sending the diff
+                                        packetToSend = Leader.TRUNC;
+                                        LOG.info("Sending TRUNC");
+                                        zxidToSend = prevProposalZxid;
+                                        updates = zxidToSend;
+                                    }
+                                    else {
+                                        // Just send the diff
+                                        packetToSend = Leader.DIFF;
+                                        LOG.info("Sending diff");
+                                        zxidToSend = maxCommittedLog;
+                                    }
+
+                                }
+                                queuePacket(propose.packet);
+                                QuorumPacket qcommit = new QuorumPacket(Leader.COMMIT, propose.packet.getZxid(),
+                                        null, null);
+                                queuePacket(qcommit);
+                            }
+                        }
+{noformat} 
+
+I believe that if we fix the problem at the root cause, we can remove the code below completely since deciding whether to send DIFF packet is based on the fact that follower miss the committedLog or not. The startForwarding() method should handle inflight transactions correctly.
+{noformat}
+                if (peerLastZxid == leaderLastZxid) {
+                    LOG.debug("Leader and follower are in sync, sending empty diff. zxid=0x{}",
+                            Long.toHexString(leaderLastZxid));
+                    // We are in sync so we'll do an empty diff
+                    packetToSend = Leader.DIFF;
+                    zxidToSend = leaderLastZxid;
+                }
+{noformat}
+
+The proposed fix minimizes code changes, but should we fix the problem at the root?, I was wondering the same thing, if that "if" block is needed in the case the decision logic for SNAP, DIFF, TRUNC is correct. Once we determine that "(maxCommittedLog >= peerLastZxid) && (minCommittedLog <= peerLastZxid)" holds, then we know that it is either DIFF or TRUNC, so we should not leave that if block with packetToSend = Leader.SNAP. If we fix that, I believe that we will be fixing the issue of this jira. Does it sound right?
+
+I also trying to think if there is a case in which "proposals.size() == 0" and we end up sending a snapshot unnecessarily. "proposals" will be empty if the log is empty, but I think we could have the situation in which the leader and the follower have the same snapshot, but the transaction log of the leader has been pruned. Does it make sense? If it does, then we need to keep that last block. 
+, More about "proposals" being empty. It sounds like it can happen if dt.lastProcessedZxid is the last logged transaction. In this case, "listener.onTxnLoaded(hdr, itr.getTxn())" won't be called in "FileTxnSnapLog.restore()" and "ZKDatabase.addCommittedProposal()" won't be invoked, leaving the committedLog empty upon a restore. Recall that "proposals = leader.zk.getZKDatabase().getCommittedLog()".
+
+If this is right, then I'm actually thinking that there might be a corner case to this change:
+
+{noformat}
++                if (peerLastZxid == leaderLastZxid || peerLastZxid == maxCommittedLog) {
+{noformat}
+
+Suppose that:
+# peerLastZxid == 0;
+# committed log is empty (maxCommittedLog==0);
+# leaderLastZxid > 0 and leader has a snapshot to send.
+
+If this case can happen, then the leader would fail to send the snapshot. Do you see a problem with the scenario I'm suggesting, Thawan, Camille?, Thawan, that's a good idea. It's not a bigger change to change the packetToSend=DIFF when we enter the if((maxCommittedLog >=peerLastZxid) && (minCommittedLog <= peerLastZxid)) instead of putting the hack where I stuck it. Do you want to modify my patch and see if it still works?
+
+
+Flavio, I'm not sure how we can have a snapshot to send when we don't have a committedLog. Can you clarify? Either the requests are committed, or they should be in the toBeApplied list on the Leader and so the peer will get them when startForwarding is called with the peer's last zxid., I must say that I haven't been able to convince myself completely that it can happen, but this is how I see it at the moment. The leader restores its database from a snapshot and the last transaction in the log is the same as the last processed, so committedLog is empty. If there are operations in flight when the learner handler code we are talking about is executed, then the ones in toBeApplied will be sent, but the learner might still need the snapshot. 
+, My version of the patch, This introduces a lot more changes. I found that there are 2 conditions that we will incorrectly send a snap even though it is not necessary
+
+1. lastPeerZxid == maxCommittedLog
+2. committedLog is empty but both leader and follower db is already sync. This can happen when the leader restart after it just take a snapshot. Easy case to produce this is to restart the quorum 2 times in row.
+
+I am also working a patch ZOOKEEPER-1413 that will allow the leader to look back into on-disk txnlog, so that the need for doing snapshot transfer is further reduced.  , +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12530600/ZOOKEEPER-1465.patch
+  against trunk revision 1337029.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1085//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1085//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1085//console
+
+This message is automatically generated., Thanks, it looks good in general, Thawan. One question, if you remove this "if (peerLastZxid == leaderLastZxid)" block, then are we going to be sending a snapshot in the case that committedLog is empty (proposals is empty) and peerLastZxid == leaderLastZxid? leaderLastZxid is not necessarily equal to leader.zk.getZKDatabase().getDataTreeLastProcessedZxid().
+
+bq. 2. committedLog is empty but both leader and follower db is already sync. This can happen when the leader restart after it just take a snapshot. Easy case to produce this is to restart the quorum 2 times in row.
+
+This case is essentially the same I was pointing out above. if it is simple to reproduce, it might be a good idea to have a test., Cancelling until we sort out comments., This is my current understanding:
+leaderLastZxid is essentially lastProposed on the leader. (peerLastZxid == leaderLastZxid) will be true only if there is no in-flight txn on the leader when follower is syncing. 
+
+As I explained earlier, the decision to decided whether to send a DIFF is based solely if follower miss the committedLog or not. Other case is just a special case that should be covered if we got that logic right. Please correct me if this assumption is not true.
+
+On the other hand, when committedLog is empty there is nothing we can do except the special case that I added in (2)
+
+
+, I agree with this case, but I'm asking about this one:
+
+# committedLog is empty
+# leaderLastZxid > leader.zk.getZKDatabase().getDataTreeLastProcessedZxid()
+
+leaderLastZxid is lastProposed as you say, but it can be greater than leader.zk.getZKDatabase().getDataTreeLastProcessedZxid(), right?, About my previous comment, even though leaderLastZxid can be greater than leader.zk.getZKDatabase().getDataTreeLastProcessedZxid(), in the case that leaderLastZxid == peerLastZxid, it must be the case that leaderLastZxid == leader.zk.getZKDatabase().getDataTreeLastProcessedZxid().
+
+I believe we have this invariant that it can't be that "leaderLastZxid >= peerLastZxid > leader.zk.getZKDatabase().getDataTreeLastProcessedZxid()". The case that "leaderLastZxid >= peerLastZxid == leader.zk.getZKDatabase().getDataTreeLastProcessedZxid()" is allowed, though, but already covered in your patch.
+
+bq. As I explained earlier, the decision to decided whether to send a DIFF is based solely if follower miss the committedLog or not. Other case is just a special case that should be covered if we got that logic right. Please correct me if this assumption is not true.
+
+The assumption is correct.
+
+About a test for your second case, do you think you can work on one? I can try to think of one as well., Please feel free to add a test if you have time to work on it
+, New patch adds a new test case as dicussed., I've added a test case to reproduce the case of commitedLog being empty and follower and leader being in sync. Please have a look and let me know if it works for you., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12532186/ZOOKEEPER-1465.patch
+  against trunk revision 1337029.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1096//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1096//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1096//console
+
+This message is automatically generated., Improvements over the previous patch. The essence is still the same, though. I have simply generalized the method to populate the database., Rerun Jenkins..., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12532193/ZOOKEEPER-1465.patch
+  against trunk revision 1337029.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1097//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1097//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1097//console
+
+This message is automatically generated., Where are we with this? Consensus is that it's ready or should we push it out to 3.4.5 to allow it to bake more? Anyone has tested this to any extent outside of the unit tests?, I'm not aware of anyone trying this in a real setting, but the issue is legitimate and we have verified both through reasoning and tests. It is +1 for me., lastProcessedZxid==peerZxid is quite a common issue that we see in our production. We are planning to deploy a variant of this patch in our production soon., Thawan, Out of curiosity, why a variant and not this patch?, Our internal version also use on-disk txnlog together with committedLog to sync with follower. So the logic for learner handler is our version is a bit different. , Now that I can finally get onto jira I'm going to run this in a small testing env I have here to make sure it looks good., So I'm seeing a log message that one of the followers is snapshotting twice in rapid succession, and I'm worried that it's caused by this patch. Tracking it down now., OK this appears to be an unrelated minor bug in the new Zab1.0 logic. Other than that, my testing looks good for this patch., Camille you tried this with trunk or branch3.4? Could you verify it against branch3.4 as well? Thanks!, Actually just tried it with 3.4, didn't try trunk at all., OK I tried this with both trunk and 3.4 and it's looking pretty good to me. I am going to check this in today., Integrated in ZooKeeper-trunk #1604 (See [https://builds.apache.org/job/ZooKeeper-trunk/1604/])
+    ZOOKEEPER-1465. Cluster availability following new leader election 
+    takes a long time with large datasets - is correlated to dataset size
+    (fpj and Thawan Kooburat via camille) (Revision 1357711)
+
+     Result = SUCCESS
+camille : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1357711
+Files : 
+* /zookeeper/trunk/CHANGES.txt
+* /zookeeper/trunk/src/java/main/org/apache/zookeeper/server/quorum/Leader.java
+* /zookeeper/trunk/src/java/main/org/apache/zookeeper/server/quorum/LearnerHandler.java
+* /zookeeper/trunk/src/java/test/org/apache/zookeeper/server/quorum/Zab1_0Test.java
+, Checked in to trunk and 3.4., patch from the 3.4 branch]

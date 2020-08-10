@@ -1,0 +1,85 @@
+[Still leaking after removing the vmcursors as suggested by dejanb., I created a canary build of the broker and removed the dispatched array from org.apache.activemq.broker.region.TopicSubscription , the heap has more or less dropped to the old baseline but I will follow up later as it still may be too early to tell. The dispatched array is cleaned via org.apache.activemq.broker.region.TopicSubscription#updateStatsOnAck(org.apache.activemq.command.MessageAck) which is invoked every x thousand messages, the problem here is that in our cluster we have roughly 7300 consumers and 900 producers which is clearly not going to scale as well as it did in 5.8.0.., Confirmed the regression is caused by https://issues.apache.org/jira/browse/AMQ-5837, The reason why this has never come up is because you are running on a very small JVM for the number of consumers and producers you have.  600 megabytes of memory is pretty small given the number of producers and consumers is over 8000.  So yes the feature is not going to scale without proper memory allocation. The short term solution is to simply increase your heap size.
+
+A more permanent fix is to add a flag to the policy configuration to disable the inflight statistics on TopicSubscription so that the dispatched array doesn't collect objects anymore (basically what you already did).  This is something that can be added for the next patch release so you can disable the statistics.
+
+ 
+
+ , I strongly disagree that 600 megabytes of memory is too little for over 8k producers and consumers, prior to 5.15.3 the JVM took an average of 100mb of heap (150mb max).
+
+To be brutally honest I believe the implementation is broken, apart from it taking so much memory, it should not be storing the actual messages and their payloads for so long (or even at all for that matter) even if it is a non persistent topic, the consumer is not slow and the messages have been delivered the messages remain in the dispatched array until updateStatsOnAck is invoked which is seldom.., In addition, how are the inflight stats even remotely accurate if the broker keeps processed messages in memory..? They should be removed immediately to be usable., In flight messages by definition are messages that have not been processed but have simply been dispatched to a consumer.  Messages are not "processed" until a consumer acknowledges the message so the broker does not drop a message until then.  
+
+This dispatched list is not new.  It is only new for a TopicSubscription.  It has been used for 10 years for Queue subscriptions and Durable subscriptions to track in flight messages.  See https://github.com/apache/activemq/blame/master/activemq-broker/src/main/java/org/apache/activemq/broker/region/PrefetchSubscription.java#L217, The other option that should reduce the amount of messages in that list would be to lower your prefetch configuration for your consumers., {quote}In flight messages by definition are messages that have not been processed but have simply been dispatched to a consumer. Messages are not "processed" until a consumer acknowledges the message so the broker does not drop a message until then.{quote}
+
+So based on your definition shouldn't updateStatsOnAck be invoked in here? (just a shot in the dark haven't had time to test it)
+
+org.apache.activemq.broker.region.TopicSubscription#acknowledge
+
+{code:java}
+} else if (ack.isDeliveredAck()) {
+    // Message was delivered but not acknowledged: update pre-fetch counters.
+    expandPrefetchExtension(ack.getMessageCount());
+    // missing call to updateStatsOnAck?
+} else if (ack.isRedeliveredAck()) {
+{code}, No because that method is only updating stats when the ack signals the message is being dropped because it was handled properly which means either a standard/individual ack (consumer processed it) or expired ack (broker is dropping it because it expired).  For delivered acks it's just saying that a client received it but is acking later so the inflight stats are not processed (as the message is still in flight and not actually acked) and only the prefetch is adjusted.  I think that happens when using acknowledge batch mode.
+
+I'm working on a patch now to disable tracking of those messages in the pendingList because it's not necessary for TopicSubscriptions except for the metrics case so it can be optionally disabled., Given the only thing the dispatched list is used for is metrics why not just store the message id and payload size?  , I think that should be doable.  I think we would need to include the Destination as well but basically could store a list of a new type of object for dispatched messages and that new object would just contain the message id, size, and destination reference (which is already tracked in memory in another map).  I'll work on a patch., Also it's only going to be possible for now TopicSubscriptions.  For Queue and Durable subscriptions the message reference is used in a lot more cases from that dispatched list and is not going to be simple to remove it.  But since this is only a problem for you in the TopicSubscription case that should be ok., Commit f69fd6f0020290752a7424479821c22d94f9b8b7 in activemq's branch refs/heads/master from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=f69fd6f ]
+
+AMQ-6940 - Reduce memory footprint for inflight statistics
+
+For the TopicSubscription case we can reduce the inflight statistics
+memory footprint by not storing the entire message reference for in
+flight messages and instead just a subset of the information needed.
+, Commit cae382063eb296eb6aef6e0952f691aa80c33031 in activemq's branch refs/heads/activemq-5.15.x from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=cae3820 ]
+
+AMQ-6940 - Reduce memory footprint for inflight statistics
+
+For the TopicSubscription case we can reduce the inflight statistics
+memory footprint by not storing the entire message reference for in
+flight messages and instead just a subset of the information needed.
+
+(cherry picked from commit f69fd6f0020290752a7424479821c22d94f9b8b7)
+, [~cshannon] I think that makes sense, we heavily use TopicSubscription for highspeed pubsub and this performance regression is blocking us from upgrading., Now that we've determined the actual cause I will try and create a standalone reproducer to verify the patch works as expected or if we also require the config to disable inflight stats., [~johno] - Sounds good, hopefully this patch reduces the memory usage enough for your use case.  Otherwise I have a patch I created to disable the stats tracking that I can also commit., [~cshannon] could I trouble you for the patch so I can test that too? Unfortunately even with the latest changes to reduce the inflight statistics memory footprint the memory is not ideal., I attached the reproducer and yourkit profiler screenshots showing the heap usage., Commit 65b0f2ad0d48845ad54681ac0eff832de122e2a9 in activemq's branch refs/heads/master from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=65b0f2a ]
+
+AMQ-6940 - Add flag to disable TopicSubscription in flight stats
+
+To save memory usage in some use cases add a new flag to PolicyEntry
+called useTopicSubscriptionInflightStats to allow disabling the
+inflight stats
+, Commit 21a594c8e817ebb2090c1de016c5bb1f4f905e08 in activemq's branch refs/heads/activemq-5.15.x from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=21a594c ]
+
+AMQ-6940 - Add flag to disable TopicSubscription in flight stats
+
+To save memory usage in some use cases add a new flag to PolicyEntry
+called useTopicSubscriptionInflightStats to allow disabling the
+inflight stats
+
+(cherry picked from commit 65b0f2ad0d48845ad54681ac0eff832de122e2a9)
+, There's a new flag on a policy that you can set called useTopicSubscriptionInflightStats.  It defaults to true but if you set it to false then it will not store those objects in the dispatched list and skip that metric., -Does the xsd need to be updated too or is that generated automatically?- I'll create another snapshot and check it out., It gets generated automatically during the maven build., [~cshannon] confirmed disabling inflight stats does the trick, thanks for the quick fix!, Do you have a rough idea of when 5.15.4 will be cut?, There's not really a definitive date but there's enough fixes that we could probably do one in the next week or two., [~cshannon] looks like an extra bracket snuck into PolicyEntry (line 1104) and missing closing bracket for setUseTopicSubscriptionInflightStats on the activemq-5.15.x branch which causes a compile error., Commit 9346fb3638f293b585560051cd57ef7e513c0d4a in activemq's branch refs/heads/activemq-5.15.x from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=9346fb3 ]
+
+AMQ-6940 - Fix compilation
+, Commit a0a240372fda05675055cc29f35cb60a4a0311af in activemq's branch refs/heads/activemq-5.15.x from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=a0a2403 ]
+
+AMQ-6940 - fix compilation attempt 2
+, Commit 84126d8a7a7eb9faf44bef687dcf647e84173f22 in activemq's branch refs/heads/master from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=84126d8 ]
+
+AMQ-6940 - test fix for AMQ6477 test
+
+Need to remove the portion of the test that looks at the dispatched list
+for TopicSubscription as that class no longer tracks message references
+, Commit 9683ae3f5dacdbcde470e9bc8cbb5263e465560c in activemq's branch refs/heads/activemq-5.15.x from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=9683ae3 ]
+
+AMQ-6940 - test fix for AMQ6477 test
+
+Need to remove the portion of the test that looks at the dispatched list
+for TopicSubscription as that class no longer tracks message references
+
+(cherry picked from commit 84126d8a7a7eb9faf44bef687dcf647e84173f22)
+, [~johno] - Should be fixed now, Jenkins also caught a test failure that I fixed that was a side effect from the path, [~cshannon] thanks again!]

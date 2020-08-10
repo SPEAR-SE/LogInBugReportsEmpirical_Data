@@ -1,0 +1,116 @@
+[I was able to reproduce this using speculative execution and killing the job at the right point when it has speculative tasks running.  , Moved to 1.1.1 upon release of 1.1.0., Oof this was a grueling one, but I think I've figured out the problem.  At the start of a job, waiting tasks is incremented by the number of tasks, but then decremented each time an attempt launches, even if the attempt is speculative.  Also, waiting tasks was incremented whenever a task failed, even if it was a speculative one that failed after a job had completed.  This could cause a positive number of waiting tasks to stick around after the job completed.  Uploading a patch that fully excludes speculative tasks from waiting tasks. , Verified this on a cluster with a job that triggers speculative execution and ran TestJobInProgress, bq. Oof this was a grueling one
+
+[~sandyr] Thanks for getting to the bottom of this one.
+
+The patch looks good, couple of nits:
+
+{noformat}
+@@ -3019,14 +3016,24 @@ public class JobInProgress {
+       // hence we are decrementing the same set.
+       // Except after garbageCollect in a different thread.
+       if (!tip.isJobCleanupTask() && !tip.isJobSetupTask()) {
++        boolean incWaiting = !isComplete && !isComplete() &&
++            tip.getActiveTasks().isEmpty();
++        boolean wasSpeculative = wasComplete || !tip.getActiveTasks().isEmpty();
++
+{noformat}
+
+This hunk - maybe we should rename the local variable to 'isTipComplete' ? That threw me off! :)
+
+Next, the change to move decrement of speculative(Map,Reduce)Tasks - can you please help me understand why that was required?
+
+----
+
+Once again, thanks!
+, Thanks for looking it over, Arun.  I'll upload a new patch that renames that local variable.
+
+I was coming up against the following situation: an attempt that had a speculative attempt running completes, causing the job to complete.  speculative(Map|Reduce)Tasks would be decremented because there were other running attempts.  When a job completes, the number of waiting tasks is decremented by pendingMaps (initialTasks=10 + speculativeTasks=0 - runningTasks=1 - finishedTasks=10 - failedTasks=0) = -1.  Thus, after the job had completed, there would still be 1 task counted as waiting for it.
+
+There didn't seem to be a clear definition of speculative(Map|Reduce)Tasks, so the one I came up with is that the number of speculative(Map|Reduce)Tasks is the number of attempts running that are not on the critical path of the job completing.  This makes sense in the context of computing pending(Map|Reduce)s, which is the only place the variable is used.
+
+I removed the decrement of speculative(Map|Reduce)Tasks on task completion because, by definition, an attempt that completes a task is on the critical path.  Any remaining running attempts will be failed and counted as speculative.  Similarly, the decrement is added where an attempt has failed, because an attempt that fails is only on the critical path if the task hasn't completed and there are no other speculative attempts.
+
+Does that make sense?, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12581730/MAPREDUCE-4366-branch-1-1.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3570//console
+
+This message is automatically generated., Uploaded a new patch that makes the variable naming more clear.  [~acmurthy], is that a satisfactory explanation?, +1, LGTM. [~acmurthy]?, Changed Target Version to 1.3.0 upon release of 1.2.0. Please change to 1.2.1 if you intend to submit a fix for branch-1.2., Sorry, I've had a hard time coming around to this.
+
+{quote}
+There didn't seem to be a clear definition of speculative(Map|Reduce)Tasks, so the one I came up with is that the number of speculative(Map|Reduce)Tasks is the number of attempts running that are not on the critical path of the job completing. This makes sense in the context of computing pending(Map|Reduce)s, which is the only place the variable is used.
+{quote}
+
+Thanks for the explanation.
+
+The definition of speculative(Map|Reduce)Tasks, at least in my head, has been the number of task-attempts have an alternate... no, it's not a great one, or a documented one! *smile* 
+
+However, this has been the basis for a number of assumptions related to computing pending tasks etc. in various schedulers. (See call hierarchy for JIP.pendingTasks).
+
+Since your change re-defines this, I'm afraid it breaks schedulers e.g. CapacityScheduler. Hence, I'm against the change.
+
+I fully agree it isn't ideal, but I'd rather not make invasive changes in MR1 - the JT/JIP/Scheduler nexus scares me a lot... in fact, I'm officially terrified of it! *smile*
+
+Now, to get around the metrics problem, how about making a more local change in JIP.garbageCollect? 
+
+An option is to just call decWaiting(Maps|Reduces) in JIP.garbageCollect with JIP.num(Maps|Reduces)... currently if you follow the opposite side i.e addWaiting(Maps|Reduces), they are just static and are done at JIP.initTasks with num(Maps|Reduces). That would solve the immediate problem at hand?
+
+Thoughts?
+
+----
+
+Thanks again for checking in with me, and being patient in working through the mess we have!, Thanks delving into this with me Arun.  First, please excuse in advance any errors I'm about to make here.  Trying to be careful, but the counting code is subtle and has been hard to think about.
+
+bq. An option is to just call decWaiting(Maps|Reduces) in JIP.garbageCollect with JIP.num(Maps|Reduces)... currently if you follow the opposite side i.e addWaiting(Maps|Reduces), they are just static and are done at JIP.initTasks with num(Maps|Reduces). That would solve the immediate problem at hand?
+
+Waiting maps and reduces are updated in the job tracker metrics every time that a task is launched is fails/completes, so this would not work unless I am missing something.
+
+bq. The definition of speculative(Map|Reduce)Tasks, at least in my head, has been the number of task-attempts have an alternate...
+
+This definition can lead to thinking there are fewer pending tasks than there actually are.  Consider the following situation:
+My job has two maps.  Attempts are run for both of them.  One map gets a speculative attempt because it's running slow.  The other map's attempt fails.  The speculative one completes.  initialMaps=2 + speculativeMaps=0 - runningMaps=1 - finishedMaps=1 - failedMaps=0.  So pendingMaps is now 0 even though we have a pending map task.  The way this has not caused jobs to starve is that the running speculative map will fail later on and bring pendingMaps back up to 1.
+
+Wanted to make sure it was clear that the current behavior is wrong in an objective way.  If your stance is still that the code has been working so far and messing with it is just a bad idea, I trust your experience.  In that case, we could keep speculativeMapTasks how it is and have a separate variable, nonCriticalRunningTasks, that is used for updating the metrics?, bq. Waiting maps and reduces are updated in the job tracker metrics every time that a task is launched is fails/completes, so this would not work unless I am missing something.
+
+We are both right and wrong, simultaneously.
+
+The problem is that I was following call-heirarchy for JT metrics (JIP.jobtracker.getInstrumentation), as opposed to queue metrics (JIP.queueMetrics).
+
+JIP.jobtracker metrics are borked - a bigger bug, sigh. These aren't updated ala JIP.queueMetrics for task launch & fail/completion.
+
+Another thing to fix?
+
+----
+
+{quote}
+My job has two maps. Attempts are run for both of them. One map gets a speculative attempt because it's running slow. The other map's attempt fails. The speculative one completes. initialMaps=2 + speculativeMaps=0 - runningMaps=1 - finishedMaps=1 - failedMaps=0. So pendingMaps is now 0 ...
+{quote}
+
+No, speculativeMaps == 1, by which we get pendingMaps as 1 since initialMaps=2 + speculativeMaps=1 - runningMaps=1 - finishedMaps=1 - failedMaps=0. Correct? Am I missing something else? I may well be...
+, {quote}
+JIP.jobtracker metrics are borked - a bigger bug, sigh. These aren't updated ala JIP.queueMetrics for task launch & fail/completion.
+Another thing to fix?
+{quote}
+
+Arguably, that's an equally nasty bug if not worse. No? Sigh!, {quote}
+No, speculativeMaps == 1, by which we get pendingMaps as 1 since initialMaps=2 + speculativeMaps=1 - runningMaps=1 - finishedMaps=1 - failedMaps=0. Correct? 
+{quote}
+
+To be clear - the reason is that the case you outlined speculativeMaps and runningMaps should track each other correctly. I believe that is the case... I hate myself for remembering this code! *smile*, Sigh, too late in the night...
+
+bq. No, speculativeMaps == 1, by which we get pendingMaps as 1 since initialMaps=2 + speculativeMaps=1 - runningMaps=1 - finishedMaps=1 - failedMaps=0. Correct? 
+
+I take it back - that is incorrect since speculativeMaps will be 0, not 1. So pendingMaps will be wrong till the unnecessary speculative task is killed at which point we go back to runningMaps = 0 and 'correct' the value for pendingMaps.
+
+----
+
+I can think of a couple of hacky ways to fix this, but I think I need some sleep right now.
+
+Maybe the decrement of speculativeTasks shouldn't be done until the cause for the speculation is marked as KILLED, that is a whole new can of worms. Sigh.
+
+----
+
+Maybe, we should just live with this bug or comb through rest of the codebase to understand what your original change will need fixing. Nasty., [~acmurthy], any further thoughts on this?  From going through the code, the only place this is used is in the Capacity Scheduler.  My reading of that code is that this change will not be harmful and that the code essentially expected things to work this way in the first place.  In some rare situations it will allow tasks to be assigned earlier than they previously had been able to, and this will be correct., [~acmurthy], if you don't have any further comments/concerns, I'll commit this later this week., The patch looks reasonable to me as well. It'd be nice to get this into 1.3., Thanks Sandy. Committed to branch-1.]

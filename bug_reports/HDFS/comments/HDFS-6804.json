@@ -1,0 +1,306 @@
+[After checking the code of Datanode block transferring, I found some race condition during transferring the block to the other datanode. And the race condition causes the source datanode transfers the wrong checksum of the last chunk in replica.
+
+Here is the root cause.
+# Datanode DN1 receives transfer block command from NameNode, say, the command needs DN1 to transfer block B1 to DataNode DN2.
+# DN1 creates a new DataTransfer thread, which is responsible for transferring B1 to DN2.
+# When DataTransfer thread is created, the replica of B1 is in Finalized state. Then, DataTransfer reads replica content and checksum directly from disk, sends them to DN2.
+# During DataTransfer is sending data to DN2. The block B1 is opened for appending. If the last data chunk of B1 is not full, the last checksum will be overwritten by the BlockReceiver thread.
+# In DataTransfer thread, it records the block length as the length before appending. Then, here comes the problem. When DataTransfer thread sends the last data chunk to ND2, it reads the checksum of the last chunk from the disk and sends the checksum too. But at this time, the last checksum is changed, because some more data is appended in the last data chunk.
+# When DN2 receives the last data chunk and checksum, it will throw the checksum mismatch exception.
+
+The reproduce steps
+Prerequisites
+# change the code in DataNode.java, sleep a while before sending the block. Make these change in DataTransfer.run method.
+{code}
+        //hack code here
+        try {
+          LOG.warn("sleep 10 seconds before transfer the block:" + b);
+          Thread.sleep(1000L * 10);
+        }catch (InterruptedException ie) {
+          LOG.error("exception caught.");
+        }
+        //hack code end
+
+        // send data & checksum
+        blockSender.sendBlock(out, unbufOut, null);
+{code}
+
+Steps
+# Create a HDFS cluster which has 1 NameNode NN and 1 DataNode DN1.
+# Create a file F1 whose expected replica factor is 3. Writes some data to the file and close it.
+# start a new DataNode DN2 to join the cluster.
+# grep the log of DN1, when the DataTransfer thread is sleeping, open F1 to appends some data, hflush the data to the DN1.
+
+Then, you can find that DN2 throws checksum mismatch exception when receiving the last block of file F1., Some thoughts about how to fix this issue. In my mind, there are 2 ways to fix this.
+* Option1
+When the block is opened for appending, check if there are some DataTransfer threads which are transferring block to other DNs. Stop these DataTransferring threads. 
+We can stop these threads because the generation timestamp of the block is increased because it is opened for appending. So, the DataTransfer threads are sending outdated blocks. 
+
+* Option2
+In DataTransfer thread, if the replica of the block is finalized, the DataTransfer thread can read the last data chunk checksum into the memory, record the replica length in memory too. Then, when sending the last data chunk,  use the checksum in memory instead of reading it from the disk. 
+This is similar to what we deal with a RBW replica in DataTransfer.
+
+For Option1, it is hard to stop the DataTransfer thread unless we add some code in DataNode to manage DataTransfer threads.
+For Option2, we should lock FsDatasetImpl object in DataNode when reading the last chunk checksum from disk. Otherwise, the last block might be overwritten. But reading from the disk needs time, putting the expensive disk IO operations during locking FsDatasetImpl might cause some performance downgrade in DataNodes.
+
+Any opinions or comments are welcome!
+Thanks., We can confirm this in a 3-node cluster with replication-factor=2.
+
+The Exception happend, following this stacktrace, when accessing the corrupt file:
+
+Caused by: org.apache.hadoop.ipc.RemoteException(java.io.IOException): append: lastBlock=blk_1073742163_2852 of src=testfile is not sufficiently replica
+ted yet.
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.appendFileInternal(FSNamesystem.java:2692)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.appendFileInt(FSNamesystem.java:2985)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.appendFile(FSNamesystem.java:2952)
+        at org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer.append(NameNodeRpcServer.java:653)
+        at org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolServerSideTranslatorPB.append(ClientNamenodeProtocolServerSideTranslatorPB.java:421)
+        at org.apache.hadoop.hdfs.protocol.proto.ClientNamenodeProtocolProtos$ClientNamenodeProtocol$2.callBlockingMethod(ClientNamenodeProtocolProtos.java)
+        at org.apache.hadoop.ipc.ProtobufRpcEngine$Server$ProtoBufRpcInvoker.call(ProtobufRpcEngine.java:616)
+        at org.apache.hadoop.ipc.RPC$Server.call(RPC.java:969)
+        at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:2049)
+        at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:2045)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:422)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1657)
+        at org.apache.hadoop.ipc.Server$Handler.run(Server.java:2043)
+
+        at org.apache.hadoop.ipc.Client.call(Client.java:1476)
+        at org.apache.hadoop.ipc.Client.call(Client.java:1407)
+        at org.apache.hadoop.ipc.ProtobufRpcEngine$Invoker.invoke(ProtobufRpcEngine.java:229)
+        at com.sun.proxy.$Proxy9.append(Unknown Source)
+        at org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolTranslatorPB.append(ClientNamenodeProtocolTranslatorPB.java:328)
+        at sun.reflect.GeneratedMethodAccessor57.invoke(Unknown Source)
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+        at java.lang.reflect.Method.invoke(Method.java:497)
+        at org.apache.hadoop.io.retry.RetryInvocationHandler.invokeMethod(RetryInvocationHandler.java:187)
+        at org.apache.hadoop.io.retry.RetryInvocationHandler.invoke(RetryInvocationHandler.java:102)
+        at com.sun.proxy.$Proxy10.append(Unknown Source)
+        at org.apache.hadoop.hdfs.DFSClient.callAppend(DFSClient.java:1822)
+        at org.apache.hadoop.hdfs.DFSClient.append(DFSClient.java:1885)
+        at org.apache.hadoop.hdfs.DFSClient.append(DFSClient.java:1855)
+        at org.apache.hadoop.hdfs.DistributedFileSystem$4.doCall(DistributedFileSystem.java:340)
+        at org.apache.hadoop.hdfs.DistributedFileSystem$4.doCall(DistributedFileSystem.java:336)
+        at org.apache.hadoop.fs.FileSystemLinkResolver.resolve(FileSystemLinkResolver.java:81)
+        at org.apache.hadoop.hdfs.DistributedFileSystem.append(DistributedFileSystem.java:348)
+        at org.apache.hadoop.hdfs.DistributedFileSystem.append(DistributedFileSystem.java:318)
+        at org.apache.hadoop.fs.FileSystem.append(FileSystem.java:1164)
+        at io.datapath.ps.FileAccessWriteImpl.<init>(FileAccessWriteImpl.java:29)
+        ... 8 more
+
+
+Is there a way to manually replicate the file?, [~max_datapath] - what version of Hadoop did you repro this on?, Hadoop version is 2.7.1 used on Ubuntu 14.04.3 LTS., Thanks [~wangg23] for reporting this issue. I've seen the same issue and would like to work on a fix., I have been working on this for quite some time. However, I have not been able to reproduce it following the steps described by [~wangg23]. I am thinking whether it is the same bug as HDFS-4660. If so, it could explain why I couldn't reproduce it because it's fixed., Thanks for working on [~jojochuang].
+
+For HDFS-10652, I was able to see HDFS-4660 symptom after reverting the HDFS-4660 / HDFS-9220 fix. If doing that help reproducing the issue here, maybe it's worth a trial.
+, I am pretty sure this is the same bug described in HDFS-11056 where I have a fix pending review., It looks like HDFS-11056 doesn't fix this bug.
+I found VolumeScanner has a similar bug and filed HDFS-11160 where I have a unit test to reproduce a similar bug.
+
+[~yzhangal] When I worked on this initially, I set file length too short, in which case checksum input stream buffer may be pre-filled, and therefore BlockSender read checksum before appender update the checksum. This is probably why I wasn't able to reproduce in the past., any update on this..?, [~brahmareddy] HDFS-11160 pretty much implemented the fix proposed by [~wangg23] in this thread.
+So I am going to close this out as a dup., [~jojochuang] thanks for info..
+
+can we've testcase for this case since the scenario is different from HDFS-11160..?
+, Attaching the reproduce patch for this scenario.., [~brahmareddy] I haven't run the patch, but if you attach a patch I am happy to review it. Assigning the jira to you, thanks!, [~jojochuang] As you mentioned , issue was fixed by HDFS-11160..Just I updated the testcase for this particular scenario which is very race.Verified by reverting HDFS-11160 and HDFS-11056., [~brahmareddy]
+I like the approach in the patch. In fact the test case in HDFS-11160 is fragile.
+Two nits:
+* can you rebase the code to trunk? There seems to be minor conflict.
+* Would you be able to remove the hard coded sleep time? Like 
+{code}
+        // STEP 2: Wait till the transfer happens.
+        Thread.sleep(5000);
+{code}
+Use the existing test apis such as {{GenericTestUtils#waitFor}} might help.
+
+Thanks!, Uploading testcase for branch-2.8..Testcase will not applicable to {{trunk}} and {{branch-2}} since transfer will fail after HDFS-10958 and  HDFS-11337. Please check trace for same.
+
+After reverting the HDFS-11060, testcase will fail.
+
+ *Trunk* 
+{noformat}
+ getBlockURI()     = file:/D:/OSCode/hadoop-trunk/hadoop/hadoop-hdfs-project/hadoop-hdfs/target/test/data/dfs/data/data1/current/BP-1559881164-10.18.246.125-1496746386088/current/finalized/subdir0/subdir0/blk_1073741825 reopen failed.  Unable to move meta file  D:\OSCode\hadoop-trunk\hadoop\hadoop-hdfs-project\hadoop-hdfs\target\test\data\dfs\data\data1\current\BP-1559881164-10.18.246.125-1496746386088\current\finalized\subdir0\subdir0\blk_1073741825_1001.meta to rbw dir D:\OSCode\hadoop-trunk\hadoop\hadoop-hdfs-project\hadoop-hdfs\target\test\data\dfs\data\data1\current\BP-1559881164-10.18.246.125-1496746386088\current\rbw\blk_1073741825_1002.meta
+	at org.apache.hadoop.hdfs.server.datanode.LocalReplicaInPipeline.moveReplicaFrom(LocalReplicaInPipeline.java:388)
+	at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsVolumeImpl.append(FsVolumeImpl.java:1194)
+	at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl.append(FsDatasetImpl.java:1176)
+
+{noformat}
+
+ *branch-2* 
+{noformat}
+2017-06-06 20:01:40,314 WARN  datanode.DataNode (DataNode.java:run(2488)) - DatanodeRegistration(127.0.0.1:52070, datanodeUuid=4fd53a59-936b-4e14-836d-83c30c530c1c, infoPort=52106, infoSecurePort=0, ipcPort=52107, storageInfo=lv=-57;cid=testClusterID;nsid=2117479843;c=1496750487571):Failed to transfer BP-974715696-10.18.246.125-1496750487571:blk_1073741825_1001 to 127.0.0.1:52121 got 
+java.io.IOException: Block BP-974715696-10.18.246.125-1496750487571:blk_1073741825_1001 is not valid. Expected block file at null does not exist.
+	at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl.getBlockInputStream(FsDatasetImpl.java:810)
+	at org.apache.hadoop.hdfs.server.datanode.BlockSender.<init>(BlockSender.java:417)
+	at org.apache.hadoop.hdfs.server.datanode.DataNode$DataTransfer.run(DataNode.java:2442)
+{noformat}
+
+[~jojochuang] Kindly review the testcase. Sorry,for delayed response.I missed this., Sorry for coming to it late. I wasn't aware of the last comment.
+
+There's a minor conflict in the patch. You could also use try () {} syntax to create FSDataOutputStream and that takes care of closing the output stream. But that's more of a personal taste.
+
+Other than that the last patch looks good to me., [~jojochuang] thanks for taking a look.
+bq.There's a minor conflict in the patch.
+Uploaded the patch.Kindly review., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 13m 42s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} branch-2.8 Compile Tests {color} ||
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red}  3m 48s{color} | {color:red} root in branch-2.8 failed. {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 53s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 23s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 59s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  8s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  6s{color} | {color:green} branch-2.8 passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 50s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  0m 50s{color} | {color:red} hadoop-hdfs-project_hadoop-hdfs generated 1 new + 49 unchanged - 0 fixed = 50 total (was 49) {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  3s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 27s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  7s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 75m 54s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  1m  7s{color} | {color:red} The patch generated 400 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}108m 32s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Unreaped Processes | hadoop-hdfs:17 |
+| Failed junit tests | hadoop.hdfs.TestReplaceDatanodeOnFailure |
+|   | hadoop.hdfs.TestSafeMode |
+|   | hadoop.hdfs.TestHdfsAdmin |
+|   | hadoop.hdfs.crypto.TestHdfsCryptoStreams |
+|   | hadoop.hdfs.TestSetrepDecreasing |
+| Timed out junit tests | org.apache.hadoop.hdfs.TestLeaseRecovery2 |
+|   | org.apache.hadoop.hdfs.TestReservedRawPaths |
+|   | org.apache.hadoop.hdfs.TestDatanodeDeath |
+|   | org.apache.hadoop.hdfs.TestPread |
+|   | org.apache.hadoop.hdfs.TestDFSFinalize |
+|   | org.apache.hadoop.hdfs.TestDatanodeLayoutUpgrade |
+|   | org.apache.hadoop.hdfs.TestEncryptionZonesWithKMS |
+|   | org.apache.hadoop.hdfs.protocol.datatransfer.sasl.TestSaslDataTransfer |
+|   | org.apache.hadoop.hdfs.TestBlockStoragePolicy |
+|   | org.apache.hadoop.hdfs.TestEncryptedTransfer |
+|   | org.apache.hadoop.hdfs.TestClientReportBadBlock |
+|   | org.apache.hadoop.hdfs.TestAbandonBlock |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:c2d96dd |
+| JIRA Issue | HDFS-6804 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12904211/HDFS-6804-branch-2.8-002.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 08c01742b211 3.13.0-129-generic #178-Ubuntu SMP Fri Aug 11 12:48:20 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / 19f518d |
+| maven | version: Apache Maven 3.0.5 |
+| Default Java | 1.7.0_151 |
+| mvninstall | https://builds.apache.org/job/PreCommit-HDFS-Build/22528/artifact/out/branch-mvninstall-root.txt |
+| findbugs | v3.0.0 |
+| javac | https://builds.apache.org/job/PreCommit-HDFS-Build/22528/artifact/out/diff-compile-javac-hadoop-hdfs-project_hadoop-hdfs.txt |
+| Unreaped Processes Log | https://builds.apache.org/job/PreCommit-HDFS-Build/22528/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs-reaper.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/22528/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/22528/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/22528/artifact/out/patch-asflicense-problems.txt |
+| Max. process+thread count | 4938 (vs. ulimit of 5000) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/22528/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, jenkins failures are unrelated,even I raised HADOOP-15153 to track this. Re-uploading the patch with javadoc error fix to re-trigger jenkins., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 17m 16s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} branch-2.8 Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 53s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 47s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 24s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 54s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  9s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  6s{color} | {color:green} branch-2.8 passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 15s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  2s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}107m 33s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  1m 18s{color} | {color:red} The patch generated 2 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}146m 16s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Unreaped Processes | hadoop-hdfs:26 |
+| Failed junit tests | hadoop.hdfs.TestWriteConfigurationToDFS |
+|   | hadoop.hdfs.TestDFSRollback |
+|   | hadoop.hdfs.TestSetrepIncreasing |
+|   | hadoop.hdfs.TestTrashWithSecureEncryptionZones |
+|   | hadoop.hdfs.TestBalancerBandwidth |
+|   | hadoop.hdfs.TestDFSClientRetries |
+| Timed out junit tests | org.apache.hadoop.hdfs.TestLeaseRecovery2 |
+|   | org.apache.hadoop.hdfs.TestDatanodeRegistration |
+|   | org.apache.hadoop.hdfs.TestBlocksScheduledCounter |
+|   | org.apache.hadoop.hdfs.TestDFSClientFailover |
+|   | org.apache.hadoop.hdfs.TestListFilesInDFS |
+|   | org.apache.hadoop.hdfs.web.TestWebHdfsTokens |
+|   | org.apache.hadoop.hdfs.TestDatanodeLayoutUpgrade |
+|   | org.apache.hadoop.hdfs.TestFileAppendRestart |
+|   | org.apache.hadoop.hdfs.web.TestWebHdfsWithRestCsrfPreventionFilter |
+|   | org.apache.hadoop.hdfs.TestSeekBug |
+|   | org.apache.hadoop.hdfs.TestDFSMkdirs |
+|   | org.apache.hadoop.hdfs.TestDatanodeReport |
+|   | org.apache.hadoop.hdfs.web.TestWebHDFS |
+|   | org.apache.hadoop.hdfs.web.TestWebHDFSXAttr |
+|   | org.apache.hadoop.hdfs.web.TestWebHdfsWithMultipleNameNodes |
+|   | org.apache.hadoop.hdfs.TestMiniDFSCluster |
+|   | org.apache.hadoop.hdfs.TestDistributedFileSystem |
+|   | org.apache.hadoop.hdfs.web.TestWebHDFSForHA |
+|   | org.apache.hadoop.hdfs.TestTrashWithEncryptionZones |
+|   | org.apache.hadoop.hdfs.TestSetTimes |
+|   | org.apache.hadoop.hdfs.TestReplaceDatanodeFailureReplication |
+|   | org.apache.hadoop.hdfs.TestDFSShell |
+|   | org.apache.hadoop.hdfs.web.TestWebHDFSAcl |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:c2d96dd |
+| JIRA Issue | HDFS-6804 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12904410/HDFS-6804-branch-2.8-003.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 7a9ae630a9dc 3.13.0-135-generic #184-Ubuntu SMP Wed Oct 18 11:55:51 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / 19f518d |
+| maven | version: Apache Maven 3.0.5 |
+| Default Java | 1.7.0_151 |
+| findbugs | v3.0.0 |
+| Unreaped Processes Log | https://builds.apache.org/job/PreCommit-HDFS-Build/22544/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs-reaper.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/22544/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/22544/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/22544/artifact/out/patch-asflicense-problems.txt |
+| Max. process+thread count | 4898 (vs. ulimit of 5000) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/22544/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, [~jojochuang]if you get chance,can you check once..? Hope it's ready for commit., Thanks [~brahmareddy] for the patch!
+Committed it to branch-2.8 (2.8.4) I updated the summary to reflect that this is a test-only change., [~jojochuang] thanks for review and commit. [~wangg23] thanks for reporting this.]

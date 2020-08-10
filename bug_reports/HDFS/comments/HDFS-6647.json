@@ -1,0 +1,141 @@
+[I'm attaching a test case which illustrates the problem. When this problem occurs, the NN will fail to be able to read the edit log and will fail to start with an error like the following:
+
+{noformat}
+java.io.FileNotFoundException: File does not exist: /test-file
+  at org.apache.hadoop.hdfs.server.namenode.INodeFile.valueOf(INodeFile.java:64)
+  at org.apache.hadoop.hdfs.server.namenode.INodeFile.valueOf(INodeFile.java:54)
+  at org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.applyEditLogOp(FSEditLogLoader.java:444)
+  at org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.loadEditRecords(FSEditLogLoader.java:227)  
+  at org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.loadFSEdits(FSEditLogLoader.java:136)
+  at org.apache.hadoop.hdfs.server.namenode.FSImage.loadEdits(FSImage.java:816)
+  at org.apache.hadoop.hdfs.server.namenode.FSImage.loadFSImage(FSImage.java:676)
+  at org.apache.hadoop.hdfs.server.namenode.FSImage.recoverTransitionRead(FSImage.java:279)
+  at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.loadFSImage(FSNamesystem.java:964)
+  at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.loadFromDisk(FSNamesystem.java:711)
+  at org.apache.hadoop.hdfs.server.namenode.NameNode.loadNamesystem(NameNode.java:530)
+  at org.apache.hadoop.hdfs.server.namenode.NameNode.initialize(NameNode.java:586)
+  at org.apache.hadoop.hdfs.server.namenode.NameNode.<init>(NameNode.java:752)
+  at org.apache.hadoop.hdfs.server.namenode.NameNode.<init>(NameNode.java:736)
+  at org.apache.hadoop.hdfs.server.namenode.NameNode.createNameNode(NameNode.java:1412)
+{noformat}
+
+The sequence of events that I've identified that can cause this are the following:
+
+# A file is opened for write and some data has been written/flushed to it, causing a block to be allocated.
+# A snapshot is taken which includes the file.
+# The file is deleted from the present file system, though the client has not yet closed the file. This will log an OP_DELETE to the edit log.
+# Some error happens triggering pipeline recovery, which log an OP_UPDATE_BLOCKS to the edit log.
+
+The reason it's possible for this to happen is basically because the {{updatePipeline}} RPC never checks if the file actually exists, but instead just finds the file INode based on the block ID being replaced in the pipeline. Later, when we're reading the {{OP_UPDATE_BLOCKS}} from the edit log, however, we try to find the file INode based on the path name of the file, which no longer exists because of the previous delete.
+
+It's not entirely obvious to me what the right solution to this issue should be. It shouldn't be difficult to change the {{FSEditLogLoader}} to be able to read the {{OP_UPDATE_BLOCKS}} op if we just change it to look up the INode by block ID. On the other hand, however, I'm not entirely sure we should even be allowing this sequence of edit log ops in the first place. It doesn't seem unreasonable to me that we might check that the file actually exists in the present file system in the {{updatePipeline}} RPC call and throw an error if it doesn't, since continuing to write to a file that only exists in a snapshot doesn't make much sense. Along similar lines, it seems a little odd to me that an INode that only exists in the snapshot would continue to be considered under-construction, but perhaps that's not unreasonable in itself.
+
+Would love to hear others' thoughts on this., The simplest thing is probably just to have {{updatePipeline}} throw an exception if the file doesn't exist (or exists only in snapshots).
+
+bq. It shouldn't be difficult to change the FSEditLogLoader to be able to read the OP_UPDATE_BLOCKS op if we just change it to look up the INode by block ID.
+
+We could do that when recovery mode is on.  I don't think we want to do that normally since snapshotted blocks are not supposed to be mutable, In HDFS-6527 we do not allow users to get an additional block if the file has been deleted (but can be in a snapshot). Maybe here we should also fail the {{updatePipeline}} call to make it consistent?
+
+But in the meanwhile, I think in the future it will be better to weaken the dependency between the states of blocks and files, e.g., letting RPC calls like {{updatePipeline}} only update and check the state of blocks. This can make work like separating block management out as a service (HDFS-5477) easier., It is already checking if the file is deleted. It's just that the check is incomplete., The patch adds {{isFileDeleted()}} method. This depends to HDFS-6618. I also made checkLease() call this method. The Aaron's test case has been slightly modified. , Marking HDFS-6618 as a dependency. I won't submit the patch until it is committed., Thanks for all the comments, y'all. I agree with what everyone has said here.
+
+While we're on the subject, does it not seem strange to anyone that we allow the INode to still be considered under construction in a snapshot after it's been deleted from the present FS? I'm thinking that perhaps in addition to this change that Kihwal has in this patch we should make delete finalize the INode as well. I think that would've prevented this issue as well, since the current check in {{checkUCBlock}} would have failed. We could of course do that as a separate JIRA, or perhaps not at all if we think this is sufficient as-is.
+
+The patch that Kihwal provided looks good to me. One small comment is that it'd be good to use {{GenericTestUtils#assertExceptionContains}} in the test case to ensure the correct exception is thrown, but that's pretty minor. +1 once that's addressed, either by changing the patch or by telling me I'm being too pedantic.
+
+Kihwal - can I go ahead and assign this JIRA to you?, Oh,  sorry, Kihwal - shouldn't this code also be checking to ensure that the file is under construction as well?
+
+{code}
+-    if (file == null || !file.isUnderConstruction()) {
++    if (file == null || isFileDeleted(file)) {
+{code}
+
+i.e. I think it should be:
+
+{code}
+    if (file == null || !file.isUnderConstruction() || isFileDeleted(file)) {
+{code}, bq. does it not seem strange to anyone that we allow the INode to still be considered under construction in a snapshot after it's been deleted from the present FS.
+It does. But I think closing the file in this case is a bit complicated. I can think of many corner cases.  The snapshot experts should chime in.
+
+I will address the review comment., bq. It does. But I think closing the file in this case is a bit complicated. I can think of many corner cases. The snapshot experts should chime in.
+
+Yea, I figured that'd be more complex. Totally fine to punt on that for now.
+
+Thanks, Kihwal., bq. Oh, sorry, Kihwal - shouldn't this code also be checking to ensure that the file is under construction as well?
+Yes, you have passed the test, Aaron. :)  :) I will get it fixed., You're the man, Kihwal. :), The latest patch looks good to me. +1 pending HDFS-6618 being committed and the Jenkins seal of approval., Thanks, Kihwal.  These fixes are super important.  +1 from me as well, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12654884/HDFS-6647.v2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.web.TestWebHDFSXAttr
+                  org.apache.hadoop.hdfs.server.namenode.TestDeleteRace
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/7318//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/7318//console
+
+This message is automatically generated., The new patch adds {{file.getParent() == null}} back to the deletion check.
+
+This is actually not necessary after HDFS-6618 and also TestDeleteRace is simulating a condition that no longer happens. But rather than removing the test, I am adding the check and keep the test for potential future breakages.
+
+, The latest patch looks good to me. +1 pending Jenkins., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12654994/HDFS-6647.v3.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/7323//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/7323//console
+
+This message is automatically generated., I've committed this to trunk, branch-2 and branch-2.5.  Thank you for reporting this problem Aaron and thank you all for the reviews., FAILURE: Integrated in Hadoop-trunk-Commit #5860 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/5860/])
+HDFS-6647. Edit log corruption when pipeline recovery occurs for deleted file present in snapshot. Contributed by Kihwal Lee. (kihwal: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1609543)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestUpdatePipelineWithSnapshots.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #610 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/610/])
+HDFS-6647. Edit log corruption when pipeline recovery occurs for deleted file present in snapshot. Contributed by Kihwal Lee. (kihwal: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1609543)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestUpdatePipelineWithSnapshots.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1828 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1828/])
+HDFS-6647. Edit log corruption when pipeline recovery occurs for deleted file present in snapshot. Contributed by Kihwal Lee. (kihwal: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1609543)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestUpdatePipelineWithSnapshots.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #1801 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1801/])
+HDFS-6647. Edit log corruption when pipeline recovery occurs for deleted file present in snapshot. Contributed by Kihwal Lee. (kihwal: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1609543)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestUpdatePipelineWithSnapshots.java
+]

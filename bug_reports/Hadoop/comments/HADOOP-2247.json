@@ -1,0 +1,133 @@
+[Srikanth, as it stands today a mapper is failed when a minimum of 15 attempts to fetch is failed - it's basically {{MAX_FETCH_RETRIES_PER_MAP}} * {{MAX_FETCH_FAILURES_NOTIFICATIONS}}.
+
+But yes, we've been debating ways to improve upto this, including tuning backoff period between fetches etc. (HADOOP-1894)
+
+, I think you are right 15 retries are being done but 5 of them fail in a bunch, really as one failure. Backoff should help in that. However the cluster size should also play a part as there will be lot more fetches and hence higher probability of failure. A ratio would help in considering that aspect. There may be better metrics for that., Changed this to blocker for 0.15.2, in concert with HADOOP-2220., _THE *WAIT-KILL* DILEMMA_
+Following are the issues to be considered while deciding whether a map should be killed or not. Earlier the backoff function used to backoff by a random amount between 1min-6min. Now after HADOOP-1984, the backoff function is exponential in nature. The total amount to time spent by a reducer on fetching a map output before giving up is {{max-backoff}} in total. In all ({{3* max-backoff}}) time is required to kill a map task by a reducer. So first thing to do is to adjust the {{mapred.reduce.max.backoff}} parameter so that the map is not killed early. Other parameters which we are working on is as follows
+* *Reducer-health* : There should a way to decide how is the reducer performing. One such parameter is ({{num-fail-fetches/num-fetches}}). Roughly this ratio > 50% conveys that the reducer is not performing well enough.
+* *Reducer-progress* : There should a way to decide how is the reducer progressing. One such parameter is ({{num-outputs-fetched/num-maps}}). Roughly this ratio > 50% conveys that the reducer has made considerable progress.
+* *Avg map completion time* : This time should determine when the fetch attempt should be considered as failed hence JT should be reported.
+* *Num-reducers* : The number of reducers in a particular job might provide some insight on how the contented the resources might be. (Low the number of reducers + failing output fetch a single map) indicate that the problem is map-sided. If the reducer is not able to fetch any map then the problem is reducer-sided. If there are many reducers and failures in map fetch then there is a high chance of congestion.
+
+One thing to notice is that
+* it requires ({{max-backoff*3}}) amount of time to kill a map.
+* it requires 5 minutes (in worst case) to kill a reducer when there are 5 fetches fail simultaneously.
+
+A better strategy would be to make
+* *avg-map-completion-time* as a parameter in deciding the time to report failure. {{max-backoff}} should also be dependent on avg map completion time.
+* *num-reducers* as a parameter in deciding how much to backoff and whether the map should be killed or the reducer should backoff(wait).
+* *(num-maps - num-finished)* and *(num-fetch-fail / num-fetched)* as a parameter in deciding the time to kill the reducer. A good strategy would be to kill a reducer if it fails to fetch output of 50% of the maps and not many map output are fetched. It could be a case that the reducer has fetched the map outputs but with some failures. In that case the fetch-fail ratio will be higher but the progress will also be considerable. We don't want to penalize a reducer which has fetched many map outputs with lot of failures.
+* *ratio-based-map-killing* : JT should also kill a map based on some % along with the hard coded number 3. For example kill a map if 50% of the reducers report failures and num-reports >= 3. Also it might help the JT to have a global idea of what all map-outputs are being tried so that the scheduling of new tasks and killing of maps can be decided.
+* *fetch-success event notification* : JT should be informed by a reducer about a successful map-output-fetch event as a result of which the counters regarding the killing of that map should be reset. In a highly congested system finding 3 reducers that fail in the first attempt for a particular map is easy.
+ ----
+Comments ?, I think the max backoff should be set to a high value for apps where a high load on the cluster is expected. Apart from that, I think basing the decision whether to send a notification to the JT on a map should be based on the ratio of the number of failed attempts to the total number of attempts. The higher the ratio the lesser the probability that the map is faulty. It's highly probable that the reducer is faulty and/or the cluster is too busy ..
+
+, I am submitting a common patch for HADOOP-2220 and HADOOP-2247 since the combined effect of the strategy for map-kill and reducer-kill is what is desired. Following are the things that this patch proposes to change
+- _Map Killing_ : Following are the conditions that will now determine the killing of a map
+  1. {{num-fetch-fail-notifications >= 3}}
+  2. ({{num-fetch-fail-notifications/num-reducers) >= max-allowed}}, here {{max-allowed = 0.5}}
+- _Reducer Killing_ :  Following are the conditions that will now determine the killing of a reducer
+  1. {{num-unique-failures >= 5}}
+  2. {{num-failed-attempt/num-attempts >= max-allowed}}, {{max-allowed = 0.5}}
+  3. {{num-copied/num-maps <= min-required}}, {{num-required = 0.5}} _OR_  {{time-without-progress >= (min-shuffle-exec-time/2)}}
+
+
+Here are the details and insights for this design
+- In the map case, a vote is considered before killing the map. If more than 50% of the reducers fail to fetch the map output then the map should be re-executed. If some reducer continuously reports failure for a map causing the count to be >= num-reducers/2 also means that the map-host lately encountered a problem and had sufficient time to come out of it. This makes sure that the map is not killed too early and also that the map gets killed/re-executed sometime or the other.
+   *_CASE_* : Consider a case where the first 2 attempts by 2 reducers result into fetch-failures and subsequent attempts succeed. This can cause the map to be re-executed if the 3rd reducer fails for the first time. This addition overcomes this flaw. 
+- In the reducer case, _num failed attempts_, _progress made_ and _stalled time_ are also taken into consideration. The reason for doing this is 
+  1. _num failed attempts_ : It helps in cases where the reducer fails on unique maps but very few times and thus give some more time to the reducer. 
+  2. _progress made_ : it helps to avoid reducer killing if the reducer has progressed a lot and killing it would be a big overhead. 
+        *_CASE_* : Consider a case where the reducer has failed on every attempt once before being successful. In this case, the _failure rate_ is 50%, _unique failures_ is also more than 3 but the progress made is more than 50%. So _progress made_ balances _num failed attempts_ and _unique failures_ in some cases.  
+  3.  _stalled time_ : It helps in cases where the reducer has made a lot of progress but encountered a problem in the final steps. Now since the _progress made_ is more than 50% there should be a way to kill the reducer.  Stalled time is calculated based on the {{max-map-completion-time}} and {{duration of shuffle phase before stalling}}. So the reducer will have {{min-shuffle-exec-time}} as {{max(max-map-completion-time, duration-before-stall)}} and the reducer is considered stalled if it shows no progress for {{min-shuffle-exec-time/2}} amount of time.
+  In the above case {{uniq-fetch-failure}} gives the head start while the others help maintain the balance towards the rest of the shuffle phase.
+- {{max-backoff}} is now set to {{max(default-max-backoff, map-completion-time)}}. This allows a granular approach for map killing. So larger the map more the time required to kill it while faster maps will be killed faster. This parameter decides both the map killing and reducer killing (hence a common patch).
+ ----
+Srikanth and  Christian could you plz try this out and comment? Any comments on the strategy and the default %?, -1 overall.  Here are the results of testing the latest attachment 
+http://issues.apache.org/jira/secure/attachment/12371591/HADOOP-2220.patch
+against trunk revision r603824.
+
+    @author +1.  The patch does not contain any @author tags.
+
+    javadoc +1.  The javadoc tool did not generate any warning messages.
+
+    javac +1.  The applied patch does not generate any new compiler warnings.
+
+    findbugs -1.  The patch appears to introduce 1 new Findbugs warnings.
+
+    core tests +1.  The patch passed core unit tests.
+
+    contrib tests -1.  The patch failed contrib unit tests.
+
+Test results: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/1335/testReport/
+Findbugs warnings: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/1335/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/1335/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/1335/console
+
+This message is automatically generated., +1 overall.  Here are the results of testing the latest attachment 
+http://issues.apache.org/jira/secure/attachment/12371601/HADOOP-2220.patch
+against trunk revision r603824.
+
+    @author +1.  The patch does not contain any @author tags.
+
+    javadoc +1.  The javadoc tool did not generate any warning messages.
+
+    javac +1.  The applied patch does not generate any new compiler warnings.
+
+    findbugs +1.  The patch does not introduce any new Findbugs warnings.
+
+    core tests +1.  The patch passed core unit tests.
+
+    contrib tests +1.  The patch passed contrib unit tests.
+
+Test results: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/1337/testReport/
+Findbugs warnings: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/1337/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/1337/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/1337/console
+
+This message is automatically generated., > So the reducer will have min-shuffle-exec-time as max(max-map-completion-time, duration-before-stall) 
+how large is duration-before-stall
+should min-shuffle-exec-time be max-map-completion-time + duration-before-stall
+
+>time-without-progress >= (min-shuffle-exec-time/2)
+is there any reason for the /2 factor?
+
+Rest all seems good to me, - {{duration-before-stall}} is computed as 
+{{shuffle-start-time - last-successful-map-output-copy-time}}. In most of the cases {{duration-before-stall}} should dominate but we also consider {{max-map-completion-time}} as to make sure that we wait at least {{max-map-completion-time}} amount of time and not kill the reducer to before that. 
+- {{/2}} is just a measure to distinguish between the cases where  the reducer has developed some faults and network/jetty congestions. 
+----
+Comments? Any better measures? Any strong opinions on the usage of {{max}} or {{+}} operator in the {{min-shuffle-exec}} computation?, Couple of comments:
+
+1. To kill maps:
+
+bq. 2. (num-fetch-fail-notifications/num-reducers) >= max-allowed, here max-allowed = 0.5
+
+should be (num-fetch-fail-notifications / *num-currently_running-reducers* ) >= max-allowed. This is to ensure that long-tails do not hold up the job. For e.g. if we had a lost TT and a bad map, we will need to wait too long for the last couple of reduces to finish; and hence the idea is to use *num-currently_running-reducers*. 
+For cases where the maps are long-lived and non-trivial the _max-completion-time_ of the mapper used to gate the notifications to the JT from the reducer should help.
+
+2. We don't need to maintain a mapping from mapId -> maxRetries, just a global variable should work i.e. we don't need to customize it per mapId.
+
+3. Please change all hard-coded factors (such as divide-by-two) to final variables. (I see at least one instance: *minShuffleRunDuration / 2*), Submitting a new patch incorporating Arun's comment., +1 overall.  Here are the results of testing the latest attachment 
+http://issues.apache.org/jira/secure/attachment/12372075/HADOOP-2220.patch
+against trunk revision r606058.
+
+    @author +1.  The patch does not contain any @author tags.
+
+    javadoc +1.  The javadoc tool did not generate any warning messages.
+
+    javac +1.  The applied patch does not generate any new compiler warnings.
+
+    findbugs +1.  The patch does not introduce any new Findbugs warnings.
+
+    core tests +1.  The patch passed core unit tests.
+
+    contrib tests +1.  The patch passed contrib unit tests.
+
+Test results: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/1417/testReport/
+Findbugs warnings: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/1417/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/1417/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://lucene.zones.apache.org:8080/hudson/job/Hadoop-Patch/1417/console
+
+This message is automatically generated., I just committed this. Thanks, Amar!, I realised (a tad late) that this can't be scheduled for 0.15.2 unless we put in HADOOP-1984 into it too... either that or we schedule this for 0.16.0. 
+
+Thoughts?, Talked to Arun and agreed to move it to 0.16.0, Ok, I've moved this to 0.16.0 after talking to Christian.]

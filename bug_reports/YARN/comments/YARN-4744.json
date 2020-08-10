@@ -1,0 +1,246 @@
+[Hi [~bibinchundatt],
+
+Could you provide some additional information here : Is security enabled ? Is this problem reproducible with included apps - e.g distributed shell ? Is it possible the container exited before the signal was delivered (exit code 9 is possible in this scenario) ?
+
+thanks,
+-Sidharta, Hi [~sidharta-s]
+Thank you for looking into the issue.
+# Is security enabled ? Yes
+# Is this problem reproducible ? Yes always , submit mapreduce job from cli
+
+{noformat}
+2014-03-02 09:20:43,073 INFO org.apache.hadoop.yarn.server.nodemanager.containermanager.launcher.ContainerLaunch: Cleaning up container container_e02_1393731146548_0001_01_000009
+{noformat}
+Container cleanup is getting called for containers already EXITED_WITH_SUCCESS too.
+
+Update the description logs too., Thanks, I'll assign the issue to myself - I hope to be able to get to this soon., /cc [~vvasudev]
+
+It looks like this is an artifact of existing NM behavior - the NM appears to signal containers that have already exited ( as a part of {{ContainerLaunch.cleanupContainer()}} ) .  This signal operation fails because the process has already exited. These failures were not logged before but they are being logged now because of the centralization of container-executor operations via {{PrivilegedOperationExecutor}} - which logs all container-executor failures. , [~sidharta-s]
+
+Can we use similar check like {{LinuxContainerExecutor#isContainerAlive(ContainerLivenessContext ctx)}}.
+, Actually, there are two warn statements that are logged. One is in executePrivilegedOperation() in PrivilegedOperationExecutor and the second one is in signalContainer() in DefaultLinuxContainerRuntime. 
+
+I'm unsure of how to handle this. My feeling is that the PrivilegedOperationExecutor should log failures irrespective of the error code but that the DefaultLinuxContainerRuntime shouldn't log the warning for invalid pids(similar to what LinuxContainerExecutor used to do before the refactoring).
+
+[~jlowe], [~vinodkv], [~rohithsharma] - what do you think?, bq. Can we use similar check like LinuxContainerExecutor#isContainerAlive(ContainerLivenessContext ctx).
+
+That function is implemented in terms of signalContainer (so we have the same issue), and the process could exit between the check and the subsequent kill attempt.
+
+bq. My feeling is that the PrivilegedOperationExecutor should log failures irrespective of the error code
+
+There's always going to be a race where a container can exit before it gets killed, and I'm not sure we accomplish much besides alarming users when we log warnings when that occurs.  IMHO PrivilegedOperationExecutor should not be the one that decides what should and shouldn't be logged, since it doesn't have any context on whether the error is severe enough to warrant it.  Instead I think we should ensure the same data is present in the PrivilegedOperationException and let the code handling that error perform the logging if it is appropriate to do so.
+, bq. the NM appears to signal containers that have already exited ( as a part of ContainerLaunch.cleanupContainer() )
+This is by design. We did this originally so as to ensure cleaning up of any orphaned child-processes or process-groups - even if the root-process exits., [~jlowe]/[~vinodkv]
+
+Confused with the {{exit code 9}} also. From one of the documentation i read ,below are the exit code for container executor
+{noformat}
+exit code      | NAME                                    | Description
+-----------------------------------------------------------------------------------------------
+8             |      UNABLE_TO_SIGNAL_CONTAINER  | The container-executor could not signal the container it was passed.
+9              |    INVALID_CONTAINER_PID                    | The PID passed to the container-executor was negative or 0.
+{noformat}
+
+The  exit code returned when container doesn't exist should have been {{8}} rt?
+We should recheck the exit code from container-executor and also based on exit code might be able to handle the errors too..
+
+, Before {{PrivilegedOperationExecutor}} existed, there were several cases where not enough information was being logged about container-executor failures. Centralizing this provided useful information like invocation arguments, shell output etc - which has proved useful for debugging. In all cases except 'invalid pid', an error returned by container-executor is an error. IMO, we shouldn't remove the error logging.
+
+It looks like {{signalContainer}} in {{LinuxContainerExecutor}} ignores the exception for the 'invalid pid' case. We could do something this this :
+
+ * Change {{DefaultContainerRuntime}} to ignore the 'invalid pid' error as well. 
+ * Change {{PrivilegedOperationExecutor}} / {{PrivilegedOperation}} to add the notion of 'ignore failures' for certain kinds of operations  . Use this only for {{signalContainer}} and let the runtime/executor decide what they want to do. 
+
+I'll submit a patch with these changes. , [~bibinchundatt],
+
+Those two error codes are used differently. INVALID_CONTAINER_PID is used with errno ESRCH . UNABLE_TO_SIGNAL_CONTAINER is used in other cases. See code below :
+
+{code}
+int signal_container_as_user(const char *user, int pid, int sig) {
+  if(pid <= 0) {
+    return INVALID_CONTAINER_PID;
+  }
+
+  if (change_user(user_detail->pw_uid, user_detail->pw_gid) != 0) {
+    return SETUID_OPER_FAILED;
+  }
+
+  //Don't continue if the process-group is not alive anymore.
+  int has_group = 1;
+  if (kill(-pid,0) < 0) {
+    if (kill(pid, 0) < 0) {
+      if (errno == ESRCH) {
+        return INVALID_CONTAINER_PID;
+      }
+      fprintf(LOGFILE, "Error signalling container %d with %d - %s\n",
+	      pid, sig, strerror(errno));
+      return -1;
+    } else {
+      has_group = 0;
+    }
+  }
+
+  if (kill((has_group ? -1 : 1) * pid, sig) < 0) {
+    if(errno != ESRCH) {
+      fprintf(LOGFILE, 
+              "Error signalling process group %d with signal %d - %s\n", 
+              -pid, sig, strerror(errno));
+      fprintf(stderr, 
+              "Error signalling process group %d with signal %d - %s\n", 
+              -pid, sig, strerror(errno));
+      fflush(LOGFILE);
+      return UNABLE_TO_SIGNAL_CONTAINER;
+    } else {
+      return INVALID_CONTAINER_PID;
+    }
+  }
+  fprintf(LOGFILE, "Killing process %s%d with %d\n",
+	  (has_group ? "group " :""), pid, sig);
+  return 0;
+}
+{code}, As long as we're not logging a bunch of warningsf for benign events I'm good.  I still think the log-then-throw idiom can be problematic in practice as it tends to lead to double-logging (both by the thrower and by the catcher).  I understand the concern to miss logs, and it's safer to double-log than not log at all.
+, [~jlowe] That was my thinking as well - double logging is better than missed logs. In addition, logging in {{PrivilegedOperationExecutor}} includes information that isn't necessarily available when the exception is propagated. 
+
+I'll upload a patch soon, thanks., Uploaded a patch that removes 'invalid pid' signal failure logging. [~jlowe], could you please take a look?, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 11s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red} 0m 0s {color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 42s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 22s {color} | {color:green} trunk passed with JDK v1.8.0_72 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 27s {color} | {color:green} trunk passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 16s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 28s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 13s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 49s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 23s {color} | {color:green} trunk passed with JDK v1.8.0_72 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 23s {color} | {color:green} trunk passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 25s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 30s {color} | {color:green} the patch passed with JDK v1.8.0_72 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 24s {color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 24s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 26s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 10s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 59s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 16s {color} | {color:green} the patch passed with JDK v1.8.0_72 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 20s {color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 9m 30s {color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed with JDK v1.8.0_72. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 9m 47s {color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed with JDK v1.7.0_95. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 19s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 34m 29s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12791050/YARN-4744.001.patch |
+| JIRA Issue | YARN-4744 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux bfc907ba6af7 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 67880cc |
+| Default Java | 1.7.0_95 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_72 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_95 |
+| findbugs | v3.0.0 |
+| JDK v1.7.0_95  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/10691/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/10691/console |
+| Powered by | Apache Yetus 0.3.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Testing note : This patch makes minor logging changes - I tested the patch manually using distributed shell. , Thanks for the patch!
+
+bq. In addition, logging in PrivilegedOperationExecutor includes information that isn't necessarily available when the exception is propagated. 
+
+That problem is solved by having the throwing code either encode that information in the exception message or adding necessary fields to the exception class, allowing the error handler to retrieve them as needed.  If the throwing code can create an appropriate log message then it can put that same information in the exception.  There's already a custom exception for these errors, so it would be easy to add things like full command line, etc.  I still think the code handling the error is the real problem if we're missing appropriate logs, but I don't feel so strongly to block it if others prefer leaving the log-then-throw logic in place.
+
+Comments on the patch:
+
+Don't we need to update DockerLinuxContainerRuntime in a similar manner?  I think we'll have the same issue there.
+
+PrivilegedOperation should have a constructor that just takes an opType parameter and the other constructors should be implemented in terms of it.  That eliminates the duplicate code maintenance pitfalls and avoids doing odd things like passing nulls as standard practice.
+, Thanks, [~jlowe]. I would prefer to leave the log-then-throw in place right now (or at least keep it outside the scope of this JIRA ). 
+
+About the patch : I didn't modify DockerLinuxContainerRuntime because the signaling there needs additional work - needs to be reimplemented in terms of docker operations. Not sure if I filed a JIRA for that yet, I'll check. I'll fix the PrivilegedOperation constructor. 
+
+
+, Even if the Docker stuff doesn't work totally, it has the same logic and will have the same issue at a high level (i.e.: will always be a race between kill and container exiting on its own) -- so why wouldn't we want to make the change at least for doc purposes for those coming along later to fix it?, Ah, ignore my previous comment -- I see now that we don't have the docker tools in place to know whether or not the kill failed in that way., Uploaded a new patch - added a new PrivilegedOperation constructor and fixed all instances that had a null second argument to use this new constructor. 
+
+Also filed YARN-4759 to revisit signal handling for docker containers. 
+
+[~jlowe], please take a look? Thanks!, Thanks for updating the patch!
+
++1, pending Jenkins., | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 12m 54s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 7s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 24s {color} | {color:green} trunk passed with JDK v1.8.0_74 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 28s {color} | {color:green} trunk passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 15s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 30s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 13s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 55s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 19s {color} | {color:green} trunk passed with JDK v1.8.0_74 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 22s {color} | {color:green} trunk passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 26s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 22s {color} | {color:green} the patch passed with JDK v1.8.0_74 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 22s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 24s {color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 24s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 12s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 6s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed with JDK v1.8.0_74 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 20s {color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 9m 23s {color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed with JDK v1.8.0_74. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 9m 48s {color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed with JDK v1.7.0_95. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 18s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 47m 47s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:0ca8df7 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12791259/YARN-4744.002.patch |
+| JIRA Issue | YARN-4744 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 526b1198d34e 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 0a9f00a |
+| Default Java | 1.7.0_95 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_74 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_95 |
+| findbugs | v3.0.0 |
+| JDK v1.7.0_95  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/10704/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/10704/console |
+| Powered by | Apache Yetus 0.3.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks, [~jlowe] !, hi [~jlowe], could you please commit this patch when possible? Thanks!, Sorry for the delay, as I was out the last few days.
+
+Thanks to Sidharta for the contribution and to Bibin and Varun for additional review!  I committed this to trunk, branch-2, and branch-2.8., FAILURE: Integrated in Hadoop-trunk-Commit #9434 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/9434/])
+YARN-4744. Too many signal to container failure in case of LCE. (jlowe: rev 059caf99891943d9587cac19b48e82efbed06b2d)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/privileged/TestPrivilegedOperationExecutor.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/privileged/PrivilegedOperation.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/TrafficController.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/CGroupsHandlerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/privileged/PrivilegedOperationExecutor.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/LinuxContainerExecutor.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/runtime/DefaultLinuxContainerRuntime.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/resources/TestCGroupsHandlerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/runtime/DockerLinuxContainerRuntime.java
+]

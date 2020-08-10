@@ -1,0 +1,147 @@
+[Most users I am aware of who use replication factor 1 do it because they don't want the overhead of a multi-datanode pipeline that writes to multiple datanodes.  If we give them such a pipeline anyway, it's contrary to what replication factor 1 has always meant.
+
+If your proposed solution works for you, there is a way to do it without modifying HDFS at all.  Simply write with replication=2, and then call setReplication on the file after closing it.
+
+It seems like maybe your concern has more to do with how gracefully we handle pipeline failures (currently, not very gracefully).  But that's a separate issue (see HDFS-4504 for details.), We are proposing the default for {{dfs.namenode.minPipelineSize}} be 1 so existing clients would be unaffected.
+
+Yes, we've considered (and prototyped) the algorithm you suggested.  However, we are seeing environments where Hadoop Admins want to provide repcount=1 (with resilient writes) transparently to Hadoop applications - in particular, those for which it is not feasible to modify the file creation process (HBase, etc.).  Having a server-side configuration parameter seems like a cleaner way to accomplish this.  Server-side enforcement of pipeline size also seems somewhat more complementary to where HDFS is headed with server-side tiered storage policies (HDFS-4672).
+
+Would you be more amenable to a patch that exposed the {{minPipelineSize}} as a _client_ property ({{dfs.client.minPipelineSize}}) that implements the algorithm you suggest above?  This would give the us the end application transparency we need, but still allow clients ultimate control of the pipeline depth.  This approach does have a few downsides compared to the server-side approach:
+* Does not allow the temporary replicas can be pruned incrementally as the file is written (must wait until the file is closed)
+* The replication remains at 2 if the client crashes before the file is closed
+, I think having a client-side config is reasonable.  We need to document well the scenarios when this would be useful, and I definitely wouldn't want it to be on by default, but in some use cases it makes sense., Eric, what is the advantage of retaining only one replica? Unless it is temporary data that can be easily regenerated, having one replica guarantees data loss in quick order. e.g. on a 5000-disk cluster with an AFR of 4% you'd expect at least one disk failure every other day. This setting sounds somewhat dangerous setting as it could give users a false sense of reliability., I sort of assumed when I read this JIRA that Eric was considering situations where the admin "knows" that the storage is reliable despite having only one replica.  For example, if there is RAID and we trust it, or if the backend storage system which the DataNode is using is doing replication underneath HDFS.  This is definitely a little bit outside the normal Hadoop use-case, but it's something we can support without too much difficulty with a client-side config., Thanks for the explanation, I didn't think of that.
+
+If the target storage is reliable then what do we gain by adding an extra replica in the pipeline? Just want to understand the use case., bq. If the target storage is reliable then what do we gain by adding an extra replica in the pipeline? Just want to understand the use case.
+
+Resiliency against transient network errors., bq. I sort of assumed when I read this JIRA that Eric was considering situations where the admin "knows" that the storage is reliable despite having only one replica.
+Correct - thanks for jumping in.
+
+bq. If the target storage is reliable then what do we gain by adding an extra replica in the pipeline?
+bq. Resiliency against transient network errors.
+
+Yes, network errors, but also host failure.  In the architecture we are targeting, we use:
+* RAID for resiliency to disk failure 
+* Shared storage for resiliency to host failure (this is enabled via an {{FsDatasetSpi}} plugin that my team is developing)
+
+These combine to make replicaCount=1 a viable alternative for some use cases.  However, the host failure resiliency via shared storage is only applicable once the block is finalized after the initial write.  Therefore, for a being-written block, this architecture is still susceptible to data loss via host failure.  The solution proposed by this JIRA is to _temporarily_ use replicaCount=2 during the initial write pipeline (for host failure resiliency) and then drop back to replicaCount=1 post-block-finalize (for storage efficiency).  
+
+The initial proposal was to control this in the NameNode by vending a pipeline of length 2 even if the client requested replicaCount=1.  In many ways, this is a cleaner solution as it more directly models the desired architecture (replicaCount is always 1, but pipeline length is forced to be > 1) .  However, Colin expressed some concerns about "overriding" the client's request at the NameNode.  We are considering at a client-side only approach as a fallback alternative.  Arpit - do you share Colin's concerns with the server-side approach?, Nice update, thanks.
+
+
+, Some comments:
+bq. Server-side enforcement of pipeline size also seems somewhat more complementary to where HDFS is headed with server-side tiered storage policies (HDFS-4672).
+I am not sure what you mean here. Can you add more details?
+
+bq.  sort of assumed when I read this JIRA that Eric was considering situations where the admin "knows" that the storage is reliable despite having only one replica. For example, if there is RAID and we trust it, or if the backend storage system which the DataNode is using is doing replication underneath HDFS.
+I think if HDFS claims support for this, RAID setup without spare disks to rebuild the array could cause more data loss.
+
+I feel that this looks more like a hack. Perhaps this configuration should be for now hidden. Also I want to see a patch to make sure that this does not add unnecessary complexity to the HDFS code, given this is not the use case that is common for HDFS. I know that you have already commented that it is not ideal, but doing this is as client only (hopefully this can be made pluggable) functionality, where client on file closure reduces the replication count to 1 may be workable., Thanks for the explanation, Colin and Eric.
+
+In addition to what Suresh said above,
+Have you considered using BlockPlacementPolicy? We could give additional state to BlockPlacementPolicy (whether new block allocation  existing). From a quick look, the client and NN will use any extra replicas returned by BlockPlacementPolicy. Excess finalized replicas will get pruned via existing mechanisms. I volunteer to help if this sounds like a reasonable alternative to explore.
+
+To summarize my thoughts - I am okay with the client side setting if a more elegant/general solution is not easily doable., I meant by using a _custom_ BlockPlacementPolicy., Thanks everyone for all the good technical feedback.  A few comments...
+
+bq. Server-side enforcement of pipeline size also seems somewhat more complementary to where HDFS is headed with server-side tiered storage policies (HDFS-4672).
+bq. I am not sure what you mean here. Can you add more details?
+
+My observation was that HDFS-4672 seems to imply/propose moving towards having the client specifying the desired service level of a file in terms of the _"what"_ (e.g. a  class of storage/service) instead of the _"how"_ (replication count, disk type, caching).  With this backdrop, it seems reasonable for the server to guarantee a certain degree of write resiliency (the "what") independent of the replication count (the "how").  Perhaps I'm misinterpreting where things are headed, but moving to a more "policy based" model seems like step in the right direction.
+
+bq. RAID setup without spare disks to rebuild the array could cause more data loss.
+bq. I feel that this looks more like a hack
+Let's try to decouple the enhancement suggested in this JIRA from the sensibility of running with replicaCount = 1.  We probably shouldn't have titled the JIRA the way we did.
+
+At its core, we are proposing decoupling the replication factor from the pipeline length.  This does not seem like a hack to me.  There are legitimate uses cases for having them be controllable independently, as each attribute can provide different protection and performance characteristics.  For example:
+* For the MapReduce job files, a short pipeline is wanted in tandem with a high replication factor (to keep writes fast, but have many replicas available for the job definition file).  Currently this is implemented by a client side workaround (which, incidentally, doesn't work quite right for files larger than 1 block (which probably never occurs for JAR files anyway)).
+* In the repCount=1 use case, the client wants a low replication factor for the file (for storage efficiency), but does not want ingest to fail due to a host failure.
+
+With this perspective, another potential fix for this JIRA would be to add an optional {{pipelineSize}} parameter to {{ClientProtocol.create()}} and default it to the same as the {{replication}}.  Not sure there is appetite for this as it would involve a protocol change, but I wanted to throw this idea out there for consideration.  Thoughts?
+
+bq. Have you considered using BlockPlacementPolicy? We could give additional state to BlockPlacementPolicy (whether new block allocation existing). From a quick look, the client and NN will use any extra replicas returned by BlockPlacementPolicy.
+This looks promising and we will investigate this.  Thanks Arpit!, Here is a patch for the suggestion of adding a new minPipeline config property and using that in the name node. Seems pretty straightforward. The default is to use the replica count as the min pipeline - i.e. same as today., Arpit, that was a good idea about BlockPlacementPolicy. I implemented and attached two new policies that honor the minPipelineSize, one that extends the Default policy and one that extends the NodeGroup policy.
+
+I think that this will work as well as the name node patch.
+I personally prefer the name node patch because it seems cleaner to me. 
+Determining the number of nodes in the pipeline seems independent of deciding which nodes to pick for the pipeline. If new block placement policies are implemented we may need to extend them to add this feature. (Would we be able to add these block placement policies to trunk?)
+
+What do you guys think? Are we coming to any consensus on the best approach to solving this problem? We are definitely planning on supporting customers with replica count of 1 with the 2.4 release and do not want them to lose data, especially during a large ingest.
+, Buddy, I will take a look at the new BlockPlacementPolicy files. I think we will need to pass some additional state to {{chooseTarget}} for new vs existing replicas and I can make a fix for that.
+
+I would prefer this over the NameNode patch as it is pluggable and requires no new NameNode settings., Buddy/Eric, how do you plan to handle append to an existing block with a single replica?, Good question!  To be frank, we haven't fully implemented append yet.  Our current design approach relies on shared storage (see HDFS-5318) in our {{FsDatasetSpi}} plugin in order to provide a multi-node pipeline in the append case for {{repcount=1}}.  With shared storage, the single physical replica is reported via _multiple_ DataNodes to the NameNode.  For append, the NameNode should include _all_ those DataNodes in the append pipeline (see caveat below).  Note that this requires some _out-of-band_ coordination in our {{FsDatasetSpi}} plugin in order to actually persist the appended data to the shared replica in a consistent manner.
+
+So, to summarize, we would not rely on the {{BlockPlacementPolicy}} extension to enforce a multiinode append pipeline with {{repcount=1}}.  Instead, we would rely on shared storage and multiple replica reporting to accomplish this.  I realize that this asymmetry somewhat invalidates my earlier assertion that a general solution for divorcing the repcount from the pipeline length is achievable.
+
+Let me know if this makes sense or if any clarifications are needed - I may be assuming too much context here.
+
+h5. Caveat:
+Actually only those on Storages reported as {{READ_WRITE}} should be included in the append pipeline.  This may be a gap in the current NameNode append code - I'll follow up on this.  This also illustrates why your suggestion on HDFS-5318 of reporting only a _single_ {{READ_WRITE}} node for a given shared replica may be problematic - we wouldn't get a multi-node pipeline for append in this case.
+, bq.  To be frank, we haven't fully implemented append yet.
+But the propose solution should work in that case as well right?
+
+bq. Actually only those on Storages reported as READ_WRITE should be included in the append pipeline. This may be a gap in the current NameNode append code - I'll follow up on this.
+Without looking at the code, I recall adding only RW replicas to the append pipeline., bq. But the propose solution should work in that case as well right?
+I assume you are referring to the proposal to use a custom {{BlockPlacementPolicy}}?  Since {{BlockPlacementPolicy}} is not used to construct the append pipeline, I don't see how that solution affects the append case.  Am I misunderstanding?
+At any rate, I think we should have this JIRA be for the initial write pipeline and treat the append case as separate., bq. I assume you are referring to the proposal to use a custom BlockPlacementPolicy?...
+It is an implementation detail. What I am talking about is, for write resiliency for blocks with replica count 1, the proposed solution is to use two replicas. That does not solve the append scenario. My concern is, we should think comprehensively about all the issues and solutions. This will avoid having to make adhoc changes to solve the issues we will run into.
+, bq. But the propose solution should work in that case as well right?
+OK - I see the misunderstanding.  I interpreted above comment to mean that "*this* proposed solution *will* work in the append case" (which it won't :))
+
+bq.  the proposed solution is to use two replicas. That does not solve the append scenario. My concern is, we should think comprehensively about all the issues and solutions.
+I agree.  Having a pipeline with length >1 in the append case with repcount=1 seems to intrinsically require having that single replica be shared, right?  To solve the initial write in the same manner, we would need the initial write pipeline to also be setup in a "shared storage aware" manner.  This might be possible in a {{BlockPlacementPolicy}} plugin by using {{NodeGroup}}s to demarcate groups of DataNodes that share storage., It looks like the consensus for 2.4 is to implement this with block placement policies. And these policies will not be part of the standard apache release. 
+
+Unfortunately the default block placement policies are not currently extensible outside of the package. I've attached a patch that makes the constructors protected.
+
+
+, Buddy - I think this will be handled by the approach [~sirianni] and I discussed on HDFS-5318 for the 'shared storage' scenario., Arpit - after some discussion, Buddy and I realized that the approach in HDFS-5769 can't be applied to solve the pipeline recovery problem.  In a shared-storage environment, the R/O node only has access to the {{hsync()}}-ed data (the data actually flushed to the shared storage device).  However, pipeline recovery must guarantee that all data that has been {{ACK}}'d can be recovered.  Therefore, recruiting a R/O node into a pipeline (as HDFS-5769 suggests) will not work for this case.
+
+Is our understanding correct?  (If so I will also update HDFS-5769 accordingly), I think you are right, good catch. , Arpit, do you think we can make the default block placement policies protected (see attachment) as part of this JIRA or should I file a new JIRA?
+, +1 for the patch. I will commit it today., Buddy, I think we can just use this Jira to make the change., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12623487/HDFS-5434-branch-2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5925//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5925//console
+
+This message is automatically generated., I committed the latest (5434-branch-2.patch) to trunk and branch-2 for inclusion in 2.4.
+
+Resolving the Jira as I believe this change allows overriding default placement for write resiliency., SUCCESS: Integrated in Hadoop-trunk-Commit #5031 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/5031/])
+HDFS-5434. Change block placement policy constructors from package private to protected. (Buddy Taylor via Arpit Agarwal) (arp: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1560217)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyWithNodeGroup.java
+, SUCCESS: Integrated in Hadoop-Yarn-trunk #460 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/460/])
+HDFS-5434. Change block placement policy constructors from package private to protected. (Buddy Taylor via Arpit Agarwal) (arp: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1560217)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyWithNodeGroup.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1677 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1677/])
+HDFS-5434. Change block placement policy constructors from package private to protected. (Buddy Taylor via Arpit Agarwal) (arp: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1560217)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyWithNodeGroup.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #1652 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1652/])
+HDFS-5434. Change block placement policy constructors from package private to protected. (Buddy Taylor via Arpit Agarwal) (arp: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1560217)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyWithNodeGroup.java
+]

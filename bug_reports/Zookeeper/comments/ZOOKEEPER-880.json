@@ -1,0 +1,310 @@
+[Attaching the logs of the problematic server (sv4borg9) that I restarted this afternoon and the logs from one of the other servers from that point. Also attaching the jstack of first server., Also we checked dmesg, syslog, df, ifconfig, ethtool, and ifstat for anything unusual and nothing obvious comes out., Oh but it looks like the process on sv4borg9 is generating a lot of IO (50% on one CPU on average according to top). Seems to be mostly writes., J-D, Has it happened just once or it is reproducible? Does it also happen with 3.3?, It's currently happening (currently at 344 threads and growing, was at 76 when I created this jira), it's still there when I bounce the peer, and it does happen on 3.3.1 too., bq. one server in the ensemble has a steady growing number of QuorumCnxManager$SendWorker threads 
+
+to be overly clear - this is happening on just 1 server, the other servers on the cluster are not seeing this, is that right?
+
+any insight on GC and JVM activity. Are there significant pauses on the GC, or perhaps swapping of that jvm?  How active is the JVM? How active (cpu) are the other processes on this host? You mentioned they are using 50% disk, what about cpu? 
+
+Is there a way you could move the ZK datadir on that host to an unused spindle and see if that helps at all?
+
+If I understood correctly the JVM hosting the ZK server is hosting other code as well, is that right? You mentioned something about hbase managing the ZK server, could you elaborate on that as well?
+
+, bq. to be overly clear - this is happening on just 1 server, the other servers on the cluster are not seeing this, is that right?
+
+Yes, sv4borg9.
+
+bq. any insight on GC and JVM activity. Are there significant pauses on the GC, or perhaps swapping of that jvm? How active is the JVM? How active (cpu) are the other processes on this host? You mentioned they are using 50% disk, what about cpu?
+
+No swapping, GC activity is normal as far as I can tell by the GC log, 1 active CPU for that process according to top (the rest of the cpus are idle most of the time).  
+
+bq. If I understood correctly the JVM hosting the ZK server is hosting other code as well, is that right? You mentioned something about hbase managing the ZK server, could you elaborate on that as well?
+
+That machine is also the Namenode, JobTracker and HBase master (all in their own JVMs). The only thing special is that the quorum peers are started by HBase.
+
+bq. Is there a way you could move the ZK datadir on that host to an unused spindle and see if that helps at all?
+
+I'll look into that., JD tried moving the datadirectory to another disk (new datadir), that didn't help, same problem. Also note: the snapshot file is ~2mb in size., Here's a new run, at TRACE-level, starting from a fresh log and a cleaned up dataDir on a different disk., is there an easy way to reproduce this?, bq. is there an easy way to reproduce this?
+
+Unfortunately none I can see... we have 5 clusters that use the same hardware and ZK configurations and we only find this issue on this cluster, on this specific node, although all the other nodes of that cluster have the same InterruptedExceptions (but aren't leaking SendWorkers)., I tried reproducing this with 5 servers on my laptop and using check_tcp that I compiled. I can't get it to happen. However I do notice a large number of connections (from nagios to election port) in the SYN_RECV state (some in close_wait as well).
+
+JD - can you turn off nagios, restart the effected server (clear the log4j logs as well), then look to see if the problem is still occuring? update this jira with the logs from the "bad" server and one other (at least) would be helpful. Thanks!, This issue sounds very similar to ZOOKEEPER-883 -- they are also using Nagios to monitor the election port in that case as well., While debugging for https://issues.apache.org/jira/browse/ZOOKEEPER-822 I found that senderWorkerMap would not have an entry for a server, but there will be a RecvWorker and SendWorker thread running for the server. In my case, this was seen when the leader died (i.e., during leader election). However, I think this can happen when a peer disconnects from another peer. The cause was incorrect handling of add/remove of entries from senderWorkerMap, which is exposed due to race conditions in QuorumCnxManager. There is a patch available for ZOOKEEPER-822.
+
+I am not sure if the ZOOKEEPER-822 is causing trouble here as well. I just wanted to point out the possibility.
+, Bumping up the severity.  This took down one of our clusters again., Benoit, just to clarify, is this also due to monitoring or scanning?, Hi Benoit,
+
+May I suggest to see if you can reproduce this problem with 3.3.3
+(with patch for ZOOKEEPER-822)? I was going through
+QuorumCnxManager.java for 3.2.2. It clearly leaks a SendWorker thread
+for every other connection.
+
+After receiving a connection from a peer, it creates a new thread and
+inserts its reference in senderWorkerMap.
+
+            SendWorker sw = new SendWorker(s, sid);
+            RecvWorker rw = new RecvWorker(s, sid);
+            sw.setRecv(rw);
+
+            SendWorker vsw = senderWorkerMap.get(sid);
+            senderWorkerMap.put(sid, sw);
+
+Then it kills the old thread for the peer (created from earlier
+connection)
+
+            if(vsw != null)
+                vsw.finish();
+
+However, the SendWorker.finish method removes an entry from
+            senderWorkerMap. This results in removing a reference for
+            recently created SendWorker thread.
+            senderWorkerMap.remove(sid);
+
+
+Thus, it will end up removing both the entries. As a result, one thread
+will be leaked for every other connection.
+
+If you count the number of error messages in
+hbase-hadoop-zookeeper-sv4borg9.log, you will see that messages from
+RecvWorker is approximately twice of SendWorker. I think this proves
+the point.
+
+$:/tmp/hadoop # grep "RecvWorker"  hbase-hadoop-zookeeper-sv4borg9.log | wc -l
+60
+$:/tmp/hadoop # grep "SendWorker"  hbase-hadoop-zookeeper-sv4borg9.log | wc -l
+32
+
+-Vishal, One problem here is that we had some discussions over IRC and the information is not reflected here. 
+
+If you have a look at the logs, you'll observe this:
+
+{noformat}
+
+2010-09-28 10:31:22,227 DEBUG org.apache.zookeeper.server.quorum.QuorumCnxManager: Connection request /10.10.20.5:41861
+2010-09-28 10:31:22,227 DEBUG org.apache.zookeeper.server.quorum.QuorumCnxManager: Connection request: 0
+2010-09-28 10:31:22,227 DEBUG org.apache.zookeeper.server.quorum.QuorumCnxManager: Address of remote peer: 0
+2010-09-28 10:31:22,229 WARN org.apache.zookeeper.server.quorum.QuorumCnxManager: Connection broken:
+java.io.IOException: Channel eof
+        at org.apache.zookeeper.server.quorum.QuorumCnxManager$RecvWorker.run(QuorumCnxManager.java:595)
+{noformat}
+
+If I remember the discussion with J-D correctly, that node trying to connect is running Nagios. My conjecture at the time was that the IOException was killing the receiver thread, but not the sender thread (RecvWorker.finish() does not close its SendWorker counterpart).
+
+Your point is good, but it sounds like that the race you mention would have to be triggered continuously to cause the number of SendWorker threads to grow steadily. It sounds unlikely to me., Hi Flavio,
+
+You are right.  We can see RecvWorker leaving but no messages from SendWorker.
+
+2010-09-27 16:02:59,111 WARN org.apache.zookeeper.server.quorum.QuorumCnxManager: Connection broken:
+java.io.IOException: Channel eof
+    at org.apache.zookeeper.server.quorum.QuorumCnxManager$RecvWorker.run(QuorumCnxManager.java:595)
+2010-09-27 16:02:59,162 WARN org.apache.zookeeper.server.quorum.QuorumCnxManager: Connection broken:
+java.io.IOException: Channel eof
+    at org.apache.zookeeper.server.quorum.QuorumCnxManager$RecvWorker.run(QuorumCnxManager.java:595)
+2010-09-27 16:03:14,269 WARN org.apache.zookeeper.server.quorum.QuorumCnxManager: Connection broken:
+java.io.IOException: Channel eof
+    at org.apache.zookeeper.server.quorum.QuorumCnxManager$RecvWorker.run(QuorumCnxManager.java:595)
+
+I thought that RecvWorker in  3.3.1 called sw.finish() before exiting. Adding this call in RecvWorker should fix this problem.
+
+
+-Vishal, Leader has the same problem as well. LearnerHandler expects a QuorumPacket to be received as the first packet after connection. However, if Nagios was monitoring server port as well, then one would expect to see a lot of such messages:
+                LOG.error("First packet " + qp.toString()
+                        + " is not FOLLOWERINFO or OBSERVERINFO!");
+
+Is Nagios not monitoring the server port?
+, Nagios is monitoring all 5 ensemble members the exact same way (checking connectivity on all 3 ports), although only 1 machine shows the issue. We tried stopping the monitoring on the problematic machine, but still got a growing number of threads., Flavio (and others) we should update the docs to include details on which ports can/should be monitored, and which ports should NOT be monitored (or if monitoring is supported any conditions).
+
+Can we update the docs as part of any patch/fix? Thanks., Do we agree that monitoring wasn't causing the issue?  As JD said, even after we stopped it, the problem re-occurred., I think we agree that monitoring alone was not causing the issue. But, your logs indicate that there were some orphan threads due to the monitoring, and we can see it from excerpts of your logs like the one I posted above. Without the monitoring, the same problem is being triggered, though, but apparently in a different way and it is not clear why. You can see it from all the "Channel eof" messages on the log. 
+
+To solve this issue, we need to understand the following:
+
+# What's causing those IOExceptions?
+# Why are we even starting a new connection if there is no leader election going on? 
+
+Do you folks have any idea if there is anything in your environment that could be causing those TCP connections to break? , 
+
+The root cause of frequent disconnect needs to be resolved. In the mean time, I have fixed the problem that was causing the leak of every other thread of SendWorker.
+
+I tested the patch by connecting to 3888 on one of the servers using telnet.
+
+2010-11-19 14:51:10,081 - INFO  [/10.17.119.101:3888:QuorumCnxManager$Listener@477] - Received connection request /10.16.251.39:2074
+2010-11-19 14:51:14,364 - DEBUG [/10.17.119.101:3888:QuorumCnxManager$SendWorker@553] - Address of remote peer: 8103510703875099187
+2010-11-19 14:51:19,440 - WARN  [Thread-7:QuorumCnxManager$RecvWorker@726] - Connection broken for id 8103510703875099187, my id = 1, error = 
+java.io.IOException: Received packet with invalid packet: 218824692
+	at org.apache.zookeeper.server.quorum.QuorumCnxManager$RecvWorker.run(QuorumCnxManager.java:711)
+2010-11-19 14:51:19,441 - WARN  [Thread-7:QuorumCnxManager$RecvWorker@730] - Interrupting SendWorker   <============= SendWorker is getting killed.
+2010-11-19 14:51:19,442 - DEBUG [Thread-7:QuorumCnxManager$SendWorker@571] - Calling finish for 8103510703875099187
+2010-11-19 14:51:19,443 - DEBUG [Thread-7:QuorumCnxManager$SendWorker@591] - Removing entry from senderWorkerMap sid=8103510703875099187
+2010-11-19 14:51:19,443 - WARN  [Thread-6:QuorumCnxManager$SendWorker@643] - Interrupted while waiting for message on queue
+java.lang.InterruptedException
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.reportInterruptAfterWait(AbstractQueuedSynchronizer.java:1899)
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.awaitNanos(AbstractQueuedSynchronizer.java:1976)
+	at java.util.concurrent.ArrayBlockingQueue.poll(ArrayBlockingQueue.java:342)
+	at org.apache.zookeeper.server.quorum.QuorumCnxManager$SendWorker.run(QuorumCnxManager.java:631)
+2010-11-19 14:51:19,456 - DEBUG [Thread-6:QuorumCnxManager$SendWorker@571] - Calling finish for 8103510703875099187
+2010-11-19 14:51:19,457 - WARN  [Thread-6:QuorumCnxManager$SendWorker@652] - Send worker leaving thread
+
+Can you see if this fixes the problem?, patch for trunk, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12460041/ZOOKEEPER-880.patch
+  against trunk revision 1036967.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    -1 findbugs.  The patch appears to introduce 8 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/39//testReport/
+Findbugs warnings: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/39//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/39//console
+
+This message is automatically generated., We really should have a test for this case. Vishal can you add it? (the more the better), JD said he saw this even with monitoring confirmed off. So that's the acid test. JD said he would test this patch soonest. (thanks all!) , +1 It fixes the leak. Thanks!, Thanks for verifying the patch. Do you know why the servers kept disconnecting from each other?
+
+Patrick - I will attach a patch with a test shortly. How do I get around the findbugs issues. I haven't touch any of the reported code., @Vishal We haven't figured that out yet... , Submitting patch with a test.
+
+, with junit. haven't fixed eariler findbugs  since they are not in the related code path., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12464977/ZOOKEEPER-880.patch
+  against trunk revision 1038827.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    -1 findbugs.  The patch appears to introduce 7 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/57//testReport/
+Findbugs warnings: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/57//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/57//console
+
+This message is automatically generated., I dont think the test failure is realted to my changes.
+     [exec]      [exec] /grid/0/hudson/hudson-slave/workspace/PreCommit-ZOOKEEPER-Build/trunk/src/c/tests/TestClient.cc:363: Assertion: equality assertion failed [Expected: -101, Actual  : -4]
+     [exec]      [exec] Failures !!!
+     [exec]      [exec] Run: 33   Failure total: 1   Failures: 1   Errors: 0
+
+The tests that I added seemed to pass
+     [exec]     [junit] 2010-11-30 19:19:52,796 [myid:] - INFO  [main:JUnit4ZKTestRunner$LoggedInvokeMethod@56] - FINISHED TEST METHOD testWorkerThreads
+     [exec]     [junit] 2010-11-30 19:19:52,796 [myid:] - INFO  [main:ZKTestCase$1@59] - SUCCEEDED testWorkerThreads
+     [exec]     [junit] 2010-11-30 19:19:52,796 [myid:] - INFO  [main:ZKTestCase$1@54] - FINISHED testWorkerThreads
+     [exec]     [junit] Tests run: 5, Failures: 0, Errors: 0, Time elapsed: 202.307 sec
+
+
+, Reattaching  patch after minor changes. Can someone review it and help with findbugs issue?
+
+Thanks., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12465666/ZOOKEEPER-880.patch
+  against trunk revision 1040752.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    -1 findbugs.  The patch appears to introduce 7 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/62//testReport/
+Findbugs warnings: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/62//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/62//console
+
+This message is automatically generated., Can someone review this patch and help with findbugs issue?   Jean-Daniel has already given +1 to the patch. Thanks., +1, the patch looks good.
+, Vishal, Ill just run ant test on 3.3.3 and will commit it today., Sorry, I just saw that flavio had already reviewed the patch. Vishal/Flavio, can you guys please comment on the jira when you add a review board request and when you review it? Its easier to track on a jira than the mailing list.
+, also the links to it ., the patch does not apply to 3.3.3 branch. Vishal can you please generate a patch against 3.3.3 as well incorporating flavios comments? This should be a blocker for 3.3.3 release., Mahadev, Thanks for reviewing the patch. I believe you are referring to the patch for 932 on the reviewboard.
+932 includes the fix for this bug as well (it is in the same code path that I reworked and the tests are similar as well). How about we wait till 932 is approved (it is in the final review stages)?, Mahadev,
+
+I am not sure which review comments you are referring to. Flavio is yet to review this particular patch. Considering that we are looking to get 3.3.3 out, do you want me to port this patch to 3.3.3 or do you want to wait till Flavio reviews 932. Both (932 and this patch) touch the same code. 932 also includes a fix for this bug. Ideally, I prefer 932 to be reviewed so that we will get both the bugs fixed in 3.3.3.
+, Mahadev,
+
+How do I generate a patch for "branch 3.3.3"? Do you mean 3.3 (http://svn.apache.org/repos/asf/zookeeper/branches/branch-3.3/)?, vishal,
+ Sorry i meant, 3.3 branch., Patch for ZOOKEEPER-900 is not applied to 3.3. Without this patch QuorumCnxManager can block indefinitely in SocketChannel.read() (see ZOOKEEPER-900 for more details). I would suggest to include this patch in 3.3.3 as well. If you agree, I will integrate patches for ZOOKEEPER-900 and ZOOKEEPER-880 and submit for review. Let me know., Hi Vishal, Let me see I'm getting the flow of patches right. ZOOKEEPER-880 will probably conflict with ZOOKEEPER-932, right? You're suggesting then that we have ZOOKEEPER-880 in 3.3.3, and that you regenerate ZOOKEEPER-932 for trunk? In this case, we have that:
+
+# We need two patches for ZOOKEEPER-880, one for 3.3.3 and one for 3.4.0;
+# We need one patch for ZOOKEEPER-932 for 3.4.0;
+# The 3.4.0 patch for ZOOKEEPER-932 depends on the patch for 3.4.0 for ZOOKEEPER-880.
+
+I'm just trying to understand what we have to commit for which release and the order. If what I describe matches your proposal, then it is is good for me. , Hi flavio,
+
+Ideally, I would like to have 932 part of 3.3.3 as well. But since 932 is not a blocker (and not approved yet), I understand if it doesn't get in 3.3.3.
+
+The order/dependency of patches that you have described is correct. Patch for 932 in a way depends on 880, but it will override 880 since it includes a fix for 880 as well. So we won't have to do any additional "merge" of 880 with 932. We will first commit 880 and then 932 to trunk.
+
+Also, I think patch for 900 needs to go in 3.3.3., vishal, 
+  for 3.3 is it possible to have a patch for this issue? (Just 880)? I think we can move ZOOKEEPER-932, ZOOKEEPER-900 to trunk. 
+, Hi Mahadev,
+
+Sure. I will send out the patch for 3.3. asap., thanks vishal., Submitting patch for 3.3 branch.
+Testing done:
+- ant test-core-java
+- Ran CnxManagerTest 15 times
+- Created 3 node cluster. Rebooted leader several times. Verified thread count.
+- systest, thanks Vishal!, submitting patch, +1 the patch looks good to me. Ill leave the committing to ben!, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12471761/ZOOKEEPER-880-3.3.patch
+  against trunk revision 1072085.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/156//console
+
+This message is automatically generated., thanx for backporting vishal!, Committed revision 1073983.
+, For some reason the patch didn't get committed to trunk. Reopening to submit patch to trunk., Changing version tags., Submitting patch for trunk., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12473063/ZOOKEEPER-trunk-880
+  against trunk revision 1074995.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/187//testReport/
+Findbugs warnings: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/187//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://hudson.apache.org/hudson/job/PreCommit-ZOOKEEPER-Build/187//console
+
+This message is automatically generated., +1 looks good vishal. does this patch fix other issues as well? (like ZOOKEEPER-939?), Committed revision 1082260.
+, Integrated in ZooKeeper-trunk #1124 (See [https://hudson.apache.org/hudson/job/ZooKeeper-trunk/1124/])
+    ZOOKEEPER-880. QuorumCnxManager$SendWorker grows without bounds
+, Hi Ben,
+
+The patch might fix ZOOKEEPER-939. However, ZOOKEEPER-939 does not describe how they ran into this situation (and has not attached logs). ZOOKEEPER-939  can be closed if the problem is not seen after this patch.
+
+-Vishal]

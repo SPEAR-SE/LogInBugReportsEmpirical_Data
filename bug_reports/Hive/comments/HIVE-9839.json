@@ -1,0 +1,213 @@
+[The piece of code in org.apache.hive.service.cli.session.HiveSessionImpl.java that causing this issue:
+{code}
+        private OperationHandle executeStatementInternal(String statement, Map<String, String> confOverlay,
+370	      boolean runAsync)
+371	          throws HiveSQLException {
+372	    acquire(true);
+373	
+374	    OperationManager operationManager = getOperationManager();
+375	    ExecuteStatementOperation operation = operationManager
+376	        .newExecuteStatementOperation(getSession(), statement, confOverlay, runAsync);
+377	    OperationHandle opHandle = operation.getHandle();
+378	    try {
+379	      operation.run();
+380	      opHandleSet.add(opHandle);
+381	      return opHandle;
+382	    } catch (HiveSQLException e) {
+383	      // Cleanup opHandle in case the query is synchronous
+384	      // Async query needs to retain and pass back the opHandle for error reporting
+385	      if (!runAsync) {
+386	        operationManager.closeOperation(opHandle);
+387	      }
+388	      throw e;
+389	    } finally {
+390	      release(true);
+391	    }
+392	  }
+{code}
+When a HiveSQLException throw from line 379,the opHandle is not closed due to async mode and is not been put into opHandleSet for future clean up.
+Async query is the default query mode in hiveserver2 clients., The simple way to fix this issue is just removing line 385 and line 387.That means ,always clean up OperationHandle when HiveSQlException occurs duing query., [~nemon] On a quick pass, this won't be an acceptable solution, as for async queries, HiveSessionImpl#executeStatementInternal will return immediately but the opHandle is required for later error reporting/operation status check. Let me go over the code a bit more though to add more comments. , One possible solution was implemented here: HIVE-5799, which periodically cleans up expired/timed-out operation handles., I've created HIVE-9842 to enable session/op timeout by default. Shall upload a patch shortly., Thanks [~vgumashta] for your comments.
+Correct me if i am wrong:
+For failed async queries,opHandle never pass back to client side for now.Only HiveSQLException's message is passed back.So client side can not use opHandle  for later error reporting/operation status check.
+ HIVE-5799 is a possible solution,when opHandle expired/timed-out internal is carefully configured .If the creation of orphan opHandles is much faster than opHandle expired internal,we still need a complete fix (or fix the failed queries in time).
+Anyway,it's will be good to fix this issue directly.Though the way to fix it is not clear for me now., I attached a patch for HIVE-9601 which should be able to handle such orphan sessions. [~nemon], can you give it a try?, For failed async queries,opHandle never pass back to client side for now.
+--Here i mean only for failed async queries which fail at compile phase., For failed async queries,opHandle never pass back to client side for now.
+--Here i mean only for failed async queries which fail at compile phase., For failed async queries,opHandle never pass back to client side for now.
+--Here i mean only for failed async queries which fail at compile phase., For failed async queries,opHandle never pass back to client side for now.
+--Here i mean only for failed async queries which fail at compile phase., For failed async queries,opHandle never pass back to client side for now.
+--Here i mean only for failed async queries which fail at compile phase., For failed async queries,opHandle never pass back to client side for now.
+--Here i mean only for failed async queries which fail at compile phase., For failed async queries,opHandle never pass back to client side for now.
+--Here i mean only for failed async queries which fail at compile phase., For failed async queries,opHandle never pass back to client side for now.
+--Here i mean only for failed async queries which fail at compile phase., [~jxiang] Thanks for the information.I think they are different scenarios.In HIVE-9839,OperationHandle is never been closed even after session is closed., I see. That means HIVE-9842 can not fix the leakage either since the opHandler is not put in the set at all in this case. I agree it should fix the problem by removing line 385 and 387. We can also just switch line 379 and 380., Uploading a Btrace script which can catch this leak ., Hi, any progress in this issue? Thanks.
+If OperationHandle has to be returned to report the error in Async mode, maybe we can do following, then client can close it; If not, [~jxiang]'s patch should be fine.
+
+{code}
+
+  private OperationHandle executeStatementInternal(String statement, Map<String, String> confOverlay,
+      boolean runAsync)
+          throws HiveSQLException {
+    acquire(true);
+
+    OperationManager operationManager = getOperationManager();
+    ExecuteStatementOperation operation = operationManager
+        .newExecuteStatementOperation(getSession(), statement, confOverlay, runAsync);
+    OperationHandle opHandle = operation.getHandle();
+    try {
+      operation.run();
+      opHandleSet.add(opHandle);
+      return opHandle;
+    } catch (HiveSQLException e) {
+      // Cleanup opHandle in case the query is synchronous
+      // Async query needs to retain and pass back the opHandle for error reporting
+      if (!runAsync) {
+        operationManager.closeOperation(opHandle);
+        throw e;
+      }
+      else {
+        opHandleSet.add(opHandle);
+        return opHandle;
+      }
+      
+    } finally {
+      release(true);
+    }
+  }
+{code}, Refering to SQLOperation.java,there is no chance that a HiveSQLException throws and the asyn background operation submits to thread pool successfully at the same time.Only line 181 and line 244 can causing  HiveSQLException.
+So the answer to "If OperationHandle has to be returned to report the error in Async mode" is no.
+{code}
+ @Override
+178	  public void runInternal() throws HiveSQLException {
+179	    setState(OperationState.PENDING);
+180	    final HiveConf opConfig = getConfigForOperation();
+181	    prepare(opConfig);
+182	    if (!shouldRunAsync()) {
+183	      runQuery(opConfig);
+184	    } else {
+185	      // We'll pass ThreadLocals in the background thread from the foreground (handler) thread
+186	      final SessionState parentSessionState = SessionState.get();
+187	      // ThreadLocal Hive object needs to be set in background thread.
+188	      // The metastore client in Hive is associated with right user.
+189	      final Hive parentHive = getSessionHive();
+190	      // Current UGI will get used by metastore when metsatore is in embedded mode
+191	      // So this needs to get passed to the new background thread
+192	      final UserGroupInformation currentUGI = getCurrentUGI(opConfig);
+193	      // Runnable impl to call runInternal asynchronously,
+194	      // from a different thread
+195	      Runnable backgroundOperation = new Runnable() {
+196	        @Override
+197	        public void run() {
+198	          PrivilegedExceptionAction<Object> doAsAction = new PrivilegedExceptionAction<Object>() {
+199	            @Override
+200	            public Object run() throws HiveSQLException {
+201	              Hive.set(parentHive);
+202	              SessionState.setCurrentSessionState(parentSessionState);
+203	              // Set current OperationLog in this async thread for keeping on saving query log.
+204	              registerCurrentOperationLog();
+205	              try {
+206	                runQuery(opConfig);
+207	              } catch (HiveSQLException e) {
+208	                setOperationException(e);
+209	                LOG.error("Error running hive query: ", e);
+210	              } finally {
+211	                unregisterOperationLog();
+212	              }
+213	              return null;
+214	            }
+215	          };
+216	
+217	          try {
+218	            currentUGI.doAs(doAsAction);
+219	          } catch (Exception e) {
+220	            setOperationException(new HiveSQLException(e));
+221	            LOG.error("Error running hive query as user : " + currentUGI.getShortUserName(), e);
+222	          }
+223	          finally {
+224	            /**
+225	             * We'll cache the ThreadLocal RawStore object for this background thread for an orderly cleanup
+226	             * when this thread is garbage collected later.
+227	             * @see org.apache.hive.service.server.ThreadWithGarbageCleanup#finalize()
+228	             */
+229	            if (ThreadWithGarbageCleanup.currentThread() instanceof ThreadWithGarbageCleanup) {
+230	              ThreadWithGarbageCleanup currentThread =
+231	                  (ThreadWithGarbageCleanup) ThreadWithGarbageCleanup.currentThread();
+232	              currentThread.cacheThreadLocalRawStore();
+233	            }
+234	          }
+235	        }
+236	      };
+237	      try {
+238	        // This submit blocks if no background threads are available to run this operation
+239	        Future<?> backgroundHandle =
+240	            getParentSession().getSessionManager().submitBackgroundOperation(backgroundOperation);
+241	        setBackgroundHandle(backgroundHandle);
+242	      } catch (RejectedExecutionException rejected) {
+243	        setState(OperationState.ERROR);
+244	        throw new HiveSQLException("The background threadpool cannot accept" +
+245	            " new task for execution, please retry the operation", rejected);
+246	      }
+247	    }
+248	  }
+{code}
+
+, Thanks [~nemon]. So, should [~jxiang] submit his patch and resolve the issue after review?, [~ychena], to clarify, I submitted a patch for HIVE-9601, not for this one. As [~nemon] pointed out, this is a different issue (from HIVE-9601). I agree with Nemon and like his patch (for this issue)., Sorry [~nemon], I thought Jimmy added the patch. So could you submit the patch and solve the issue? Thanks, Adding an test case., 
+
+{color:green}Overall{color}: +1 all checks pass
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12706848/HIVE-9839.patch
+
+{color:green}SUCCESS:{color} +1 7825 tests passed
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/3130/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/3130/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-TRUNK-Build-3130/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12706848 - PreCommit-HIVE-TRUNK-Build, This patch is ready for review.Thanks, The patch looks good to me. However, the test is confusing. Perhaps it is because the static importing of those Mockito functions. Could you fix that? The test doesn't need to extend TestCase any more, right?, Updating the patch addressing Jimmy's comments.
+The test case is mainly verifying that OperationManager.closeOperation(opHandle) is invoked when
+getting a HiveSQLException during sync query., I was wondering if we can use Mockito.mock instead of using static import. The same for other Mockito methods. Another thing, instead of introducing a new class HiveSessionImplForTest, should we use an anonymous inner class in creating? Thanks., Updating again.Thanks for your advice., Thanks for making the change. +1 pending on test., 
+
+{color:red}Overall{color}: -1 at least one tests failed
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12707139/HIVE-9839.patch
+
+{color:red}ERROR:{color} -1 due to 1 failed/errored test(s), 8338 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestMinimrCliDriver.testCliDriver_schemeAuthority
+{noformat}
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/3150/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-TRUNK-Build/3150/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-TRUNK-Build-3150/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 1 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12707139 - PreCommit-HIVE-TRUNK-Build, Seems that the failure is unrelated.
+Running this on my local computer doesn't fail:
+{quote}
+"mvn test -Phadoop-2 -Dtest=TestCliDriver -Dqfile=schemeAuthority.q" 
+{quote}
+The result:
+{quote}
+Running org.apache.hadoop.hive.cli.TestCliDriver
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 66.08 sec - in org.apache.hadoop.hive.cli.TestCliDriver
+{quote}
+Submit again., Committed to trunk. Thanks Nemon for working on this, and Jimmy for reviewing!, This issue has been fixed and released as part of the 1.2.0 release. If you find an issue which seems to be related to this one, please create a new jira and link this one with new jira.]

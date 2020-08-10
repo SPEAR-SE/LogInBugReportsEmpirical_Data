@@ -1,0 +1,75 @@
+[I'm seeing the same kind of error when I hit Ctrl-C to kill a client, but also occasionally in tasks that write out sideband data via MultipleOutputs.java. The ClientFinalizer is called as a Shutdown hook, and my suspicion is that it's some kind of race condition with perhaps the filesystem finalizer or some other method that is responsible for closing the filesystem. 
+
+I'm running the following JVM:
+
+java version "1.6.0_10"
+Java(TM) SE Runtime Environment (build 1.6.0_10-b33)
+Java HotSpot(TM) 64-Bit Server VM (build 11.0-b15, mixed mode)
+
+On CentOS 5., I see this happening frequently whenever I type Ctrl-C on the command line to terminate an application that has open handles HDFS file(s)., I see that when a user types "Ctrl-C", it invokes the finalizer. The finalizer tries to close all open files inside leaseChecker.close(). But before that, the code marks clientRunning=false. This causes the DFSOutputSteam.close() call to fail. The fix is to first invoke leaseChecker.close() to close all open dfs file handles and then set clientRunning to false., The fix is to close the leaseRenewal thread before shutting down the client. Otherwise the lease renewal thread invokes close() on all the open file descriptors, then the close() method throws an exception beucase clientRunning  was already set to false. Also, fixing the above bug exposed the case when the client does not exit if all datanode(s) in the pipeline are bad., The patch looks good and solves the problem of infinite loop. But when a recoverBlock fails, I guess in some cases it may not be the fault of the primary datanode. Blindly removing the primary from the recovery pipeline seems too cruel. In case of the error reported in HADOOP-5133, the client does not need to retry at all and can simply declare a failure. , Tahnks for the review. Can you pl explain in greater detail the alternative that you propose. , I am not very familiar with Datanode.recoverBlock code. But in the case reported in HADOOP-5133, if the client knows that the recovery failure is caused by a non-existent block, it does not need to retry at all because any retry will get the same error. , I think the client cannot detect why the failure occured. It could be that the primary datanode is really dead, or it coudl be that the block does not exist,. But the client does not know why it failed, isn't it?, The primary datanode can return failure even if it is unable to communicate with all downstrteam datanode(s). Then the client has to eliminate the primary and continue recovery from the remaining ones. It will be somewhat error prone code to detect each of these failures differently, don't u think so? Also, my thinking is not to introduce code complexity while optimizing for the error case., If the datanode is really dead, the client should not get RemoteException. The question is if there are cases that require retry when a client receives RemoteException.
+
+One correction: the jira that I referred to in previous comments should be HADOOP-5311. Dhruba, would it be better to discuss lease recovery at HADOOP-5311? This jira seems to be about client close order., I think the client can get a RemoteException even if the primary is alive. The client makes a RPC to the primary. Now, if the primary is unable to contact any of the secondary datanode(s), then it throws an RemoteException to the client. In this case, the primary is as good as dead because it has been partitioned off from the secondary datanodes. The client should now retry the recoverBlock with the remaining datanode(s).
+
+> Dhruba, would it be better to discuss lease recovery at HADOOP-5311? This jira seems to be about client close order.
+
+I agree. However, this fix cannot be separated into two parts. otherwise unit tests will fail (sometimes). , If an IOException(block + " is already commited ...") is thrown by FSNamesystem.nextGenerationStampForBlock(..), then the client should not retry anymore because the retry is impossible to success., I like the suggestion that Nicholas makes. I can introduce a new expection called AlreadyCommitted that is a subclass of RemoteException. if the client encounters this execption, then it can bail out immediately, otherwise it can retry.
+
+@Hairong: does this approach sound acceptable to you?, From HADOOP-5311 point of view, that sounds good. But you might not be able to make AlreadyCommitted be a subclass of RemoteException. It will be double wrapped by RemoteException.
+
+The solution will be cleaner if the client does not retry if recoverBlock throws RemoteException; retry otherwise. Isn't the network partition case you mentioned very rare? Even if this happens, if the client is also part of the cluster, it is most likely in the same partition as the primary datanode. It won't be able to talk to secondary datanodes as well. Retries won't work., Blocker, says Hairong., I read the recoverBlock code a little bit. It seems to me that it is a must that the client needs to handle no-retry cases. It is not just an optimization. The very beginning of the code checks if there is an ongoing pipeline recovery on the same block. If yes, it throws an exception. In this case, the client definitely should not retry., My thinking is that it is bad if the client gives up too early and does not retry. The application will encounter an IO error if the client gives up prematurely.
+
+>an ongoing pipeline recovery on the same block.
+
+It is possible that the first attempt from the client encountered a ongoing-pipeline-recovery on the primary datanode. But that does not mean that if the client retries the recoverBlock on the newly selected primary (originally, the second datanode in the pipeline) that it too will encounter an ongoing-pipeline recovery! It is possible that the original primary is network partitioned from the remaining datanodes in the pipiline and the original-pipeline recovery never succeeded. Isn's this situation possible?
+
+I am wondering why the need to not retry? Not retryign means that the client IO will fail. This is very bad, isn't it? I am assuming that ss long as there is some possibility of recovery, the system should try all those opportunities to not make the client IO fail. Especially when the tradeoff is negligible extra RPC overhead and that too only in error cases.
+
+However, I like the idea of the client seeing if it is AlreadyCommitted execption and not retrying in that case., This patch throws a BlockAlreadyCommittedException if the block is already recovered. In this case, the client does not retry, and bails out., Dhruba, it makes very common sense to stop the second pipeline recovery if there is one ongoing. We do not want to get into two concurrent pipeline recoveries on purpose, right, although I believe the current design may be able to handle this situation. If the first initiated recovery can not succeed, I do not see a good chance of success for the second recovery., I agree with you that there is only a very slim chance that the second recovery attempt will succeed if the first recovery attempt failed. 
+
+The point of contention is whether to stop the retries if a competing pipeline-recovery is detected to be *inprogress* or whether to stop the retries when a competing pipeline-recovery has successfully *completed*. If you look at this problem form this angle, doesn't it make sense to do the latter?, > whether to stop the retries if a competing pipeline-recovery is detected to be inprogress or ..
+I still think that a second recovery should stop if there is an recovery in progress. First of all, the code is safer. We should intentionally avoid concurrent recoveries. Secondly, in this case the first recovery must have been initiated by NameNode on lease expiration. The client must not send lease renewal to NN for a while so its lease expires. There must be something wrong with the client. Keeping on retrying simply delays the failure of the client., Incorporated Hairong's review comments. In particular, the client bails out if it encounters that the datanode is already doing a lease recovery. , The new patch is not able to detect the case that NN first initiates a block recovery and then client initiates a block recovery on the same block but uses a different primary datanode.
+
+The jira seems to get into the details of detecting concurrent block recoveries. It is probably my fault. But the detection seems to me need more thoughts on it. I also concern that such a big patch may bring more bugs into the system.
+
+To do a quick fix in 0.20 to resolve the infinite client retries, I propose to have a simple fix as follow:
+1. client does not retry if the primary datanode fails to recover the block;
+2. client retries a different primary datanode if the chosen primary datanode is dead.
+
+It seems to me that this fix does not degrade what's in the 0.20 branch. Setting of the last recovery time in INodeFileUnderConstrustion makes any retry to fail. We could do the simple fix on hadoop-5311 and continue concurrent block recoveries detection discussion here, or vice versa, whichever Dhruba prefers., > 1. client does not retry if the primary datanode fails to recover the block;
+
+I think client should retry if it got an IOException("All datanodes failed: block=" ..).  I will check whether there are other cases that client should retry.
+, If that is the case, I think this JIRA should not try to change any "retry" policies at all. The minimum is to remove a datanode from the pipeline when appropriate. I am referring to the patch posted on 23rd feb. I would really like the retry policies to be modified as part of another JIRA., I would like to go with the version of the patch uploaded on Feb 23rd. It prevents the client from going into an infinite loop while at the same time not introducing any more complexity in the retry logic., Using the version of the patch uploaded on Feb 23rd sounds good to me.
+
+One more comment: It seems to me retry on recoverBlock and retry on pipeline creation failure (ceateBlockOutputStream) are handled differently. The first one implements retry by exit from processDatanodeError and the later does the same by continuing the while loop within processDatanodeError. Is it possible to make the handling the same? Is it possible to reuse the part of the code "taking one node out of the pipleline"?
+
+Other than this, +1 on the patch., Thanks for the review Hairong. A single invocation of processDatanodeError returns after either recovery is complete or the primary datanode is removed from the pipeline. I agree that the processDatanodeError can be re-written with the retry logic changed.  Is it ok if we delay it to another JIRA? , Also, this patch probably should go into 0.19 and 0.20 as well., Attached patch for testing by Hudson., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12401658/closeAll3.patch
+  against trunk revision 751823.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/59/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/59/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/59/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/59/console
+
+This message is automatically generated., @Hairong: would you like to review this again?, +1. The patch looks good to me. Could you please upload a patch to 0.18?, I think we do not need this fix for 0.18 branch. The DFSClient.close() method actually invokes the DFSOutputStream.close() on all existing open fle descriptors before setting DFSClient.clientRunning to false. So, this is not a problem.
+
+Similarly, the 0.18 version of processDatanodeError() always removes the datanode that caused the error  form the pipeline (irrespective of whether the primary datanode datanode that did the leaseRecovery suceeded or not). , I just committed this., Integrated in Hadoop-trunk #778 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/778/])
+    ]

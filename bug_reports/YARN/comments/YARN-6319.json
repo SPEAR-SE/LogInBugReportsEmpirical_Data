@@ -1,0 +1,38 @@
+[The race condition could be reproduced by below script:
+{code}
+USER=xxx
+GRP=yyy
+CE=/PATH/TO/container-executor
+SIZE=200
+
+mkdir app
+mkdir -p app/container
+dd if=/dev/zero of=app/container/a count=$SIZE bs=1M
+dd if=/dev/zero of=app/container/b count=$SIZE bs=1M
+dd if=/dev/zero of=app/container/c count=$SIZE bs=1M
+dd if=/dev/zero of=app/container/d count=$SIZE bs=1M
+dd if=/dev/zero of=app/container/e count=$SIZE bs=1M
+chown $USER:$GRP -R app/
+
+$CE $USER 3 ./app/container &
+$CE $USER 3 ./app
+{code}
+, The "app dir cleanup" is triggered in ApplicationImpl.AppFinishTriggeredTransition or ApplicationImpl.AppFinishTransition. There's pre-condition that all container dirs are cleaned up.
+{code}
+if (app.containers.isEmpty()) {
+        // No container to cleanup. Cleanup app level resources.
+        app.handleAppFinishWithContainersCleanedup();
+        return ApplicationState.APPLICATION_RESOURCES_CLEANINGUP;
+}
+{code}
+
+But this doesn't work. Because in ResourceLocalizationService.handleCleanupContainerResources, only async "container dir cleanup" is triggered, and then CONTAINER_RESOURCES_CLEANEDUP event is sent out, which then leads to ApplicationImpl.AppFinishTransition and ApplicationImpl.containers.Remove(...). So ApplicationImpl.containers could be empty but  "container dir cleanup"  is still in fly.
+
+, One "locking" solution:
+Add a post-callback to FileDeletionTask. And CONTAINER_RESOURCES_CLEANEDUP event is only sent by that callback.
+
+Comments please., Thanks [~zhiguohong] for the analysis! This seems an important issue to fix. Just to make sure we are looking at the same code, was this found in trunk (3.0-alpha3)? I think solution 1 is the best given that the files that need to deleted have been deleted anyway, so it is safe to ignore the error. I have not, however, checked how clean it is to check for file-not-exist error in the app-cleanup process.  Solution 2, or adding post-callback to FileDeletionTask makes FileDeletionTask more complicated. Solution 3 is even more so. , [~haibochen], thanks for your comments. I found solution 1 may need be done with each ContainerExecutor. Solution 2 is general.
+, [~zhiguohong] Sorry for my misunderstanding of the issue. So this is a problem for both LCE and DefautContainerExecutor?
+I suppose the callback only needs to be added to the last container cleanup task, which immediately requires some special case checking code. In addition, relying the callback can also lead to the possibility of leaving out application dir. Say for some reason, the deletion call back is not executed, then we are gonna have the application folder not cleaned up. Having an independent and robust deletion task for application folder will serve as a safety net, should any container dir cleanup fail. , [~haibochen], the CONTAINER_RESOURCES_CLEANEDUP event should be sent by every container, not only the last one. No need for special logic to choose the last one.
+The post-callback could be called without checking deletion success or failure.  Just make sure it's sent **after** the "container cleanup" to avoid race condition. This will not decrease the robustness.
+, Thanks [~zhiguohong] for more explanation on option 2. While I agree with you that post-callback can completely avoid race condition, linearizing container cleanup and app cleanup will unnecessarily slow down the application state transition process which other tasks, such as log aggregation, depend on. Especially when you have a lot of containers for a given application, previously the app dir cleanup task can be running concurrently with all container cleanup tasks, now it will need to wait for all container cleanup tasks to finish. The point I wan to make is that the race condition is safe to have as long as we ignore the fileNotException error during deletion. I notice YARN-2902 add the code to ignore FileNotExistent error code for LCE. Is it included in the version where you ran into this issue?, [~haibochen], the post-callback will not linearize container cleanup. They are still parellel., By linearizing container cleanup and app cleanup, I mean that application cleanup has to wait for all container cleanup to finish before it can start, i.e., application cleanup can only happen after the last container cleanup finishes, not to say that container cleanups need to be done one after another. In cases where deletion threads are occupied/delayed, it can take some time to finish the last container cleanup task. Again, I don't think this is a dependency that we need to have. Even though we may potentially need to change two containerExecutors for option 1, the change should be fairly self-contained and does not change the rest of the flow. BTW, can you please set the affect version just so that we are talking about the same version?]

@@ -1,0 +1,155 @@
+[Attaching the jstack output from the Namenode process., Analysis from [~cnauroth]:
+
+"From a very quick scan, it looks to me like it's related to HADOOP-9880.  With this patch, we now have a lock ordering conflict around the namesystem lock and synchronized methods on the DelegationTokenSecretManager.  Example:
+
+RPC handler thread 1 is running a cancelDelegationToken:
+1. Acquire FSNamesystem write lock in FSNamesystem.cancelDelegationToken.
+2. Call DelegationTokenSecretManager.cancelToken, which is synchronized.
+
+RPC handler thread 2 is negotiating SASL for a message:
+1. Call DelegationTokenSecretManager.retrievePassword, which is synchronized.
+2. Acquire FSNamesystem read lock in DelegationTokenSecretManager.retrievePassword.
+
+(Same instance of FSNamesystem lock and DelegationTokenSecretManager accessed in both threads, with different locking orders.)", Linking to HADOOP-9880, which introduced the deadlock., Initial fix for review., Looks good to me, except, {{ checkAvailableForRead()}} could have been outside block synchronized on secret manager., +1 from me.  Thanks, Jing!, Thanks for the review, Suresh and Chris! Update the patch to move checkAvailableForRead out of the synchronized block., +1 for the patch., I manually triggered a Jenkins run here:
+
+https://builds.apache.org/job/PreCommit-HDFS-Build/4869/
+, Do we even need a read lock on the namespace at all?  Token verification has nothing to do with the namespace.  On HADOOP-9880, I contemplated taking out the locking in {{checkAvailableForRead}} because the pattern is used for critical sections.  However I decided to make the minimal change so I didn't get called again on vacation. :)
+
+As an aside, I'm currently trying to test a complete desync of the DTSM that will parallelize token verification, acquisition, renewal, and cancellation which will negate the read for this patch but it's probably a few days off., Our nightly QA also found a related issue.  When the NN is transitioning from standby, it grabs the namespace write lock and adds tokens to the DTSM using another synch'ed method.  So token verification gets synch'ed in the DTSM, then deadlocks trying to get the namespace read lock.
+
+I'll post the patch I was planning to put up for this specific method., Not stress tested, but here's an example of what I believe should work., We saw a dead lock last night too. I think it's caused by the same issue. It happened on a SBN transitioning to active.
+
+{noformat}
+"IPC Server handler 16 on 8020":
+        at org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSecretManager.updatePersistedMasterKey(DelegationTokenSecretManager.java:213)
+        - waiting to lock <0x000000054fe26a10> (a org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSecretManager)
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.applyEditLogOp(FSEditLogLoader.java:553)
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.loadEditRecords(FSEditLogLoader.java:198)
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.loadFSEdits(FSEditLogLoader.java:111)
+        at org.apache.hadoop.hdfs.server.namenode.FSImage.loadEdits(FSImage.java:733)
+        at org.apache.hadoop.hdfs.server.namenode.ha.EditLogTailer.doTailEdits(EditLogTailer.java:227)
+        at org.apache.hadoop.hdfs.server.namenode.ha.EditLogTailer$1.run(EditLogTailer.java:183)
+        at org.apache.hadoop.hdfs.server.namenode.ha.EditLogTailer$1.run(EditLogTailer.java:179)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:415)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1509)
+        at org.apache.hadoop.security.SecurityUtil.doAsUser(SecurityUtil.java:489)
+        at org.apache.hadoop.security.SecurityUtil.doAsLoginUser(SecurityUtil.java:470)
+        at org.apache.hadoop.hdfs.server.namenode.ha.EditLogTailer.catchupDuringFailover(EditLogTailer.java:179)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.startActiveServices(FSNamesystem.java:891)
+        at org.apache.hadoop.hdfs.server.namenode.NameNode$NameNodeHAContext.startActiveServices(NameNode.java:1455)
+        at org.apache.hadoop.hdfs.server.namenode.ha.ActiveState.enterState(ActiveState.java:61)
+        at org.apache.hadoop.hdfs.server.namenode.ha.HAState.setStateInternal(HAState.java:63)
+        at org.apache.hadoop.hdfs.server.namenode.ha.StandbyState.setState(StandbyState.java:49)
+        at org.apache.hadoop.hdfs.server.namenode.NameNode.transitionToActive(NameNode.java:1333)
+        - locked <0x000000054fe2b110> (a org.apache.hadoop.hdfs.server.namenode.NameNode)
+        at org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer.transitionToActive(NameNodeRpcServer.java:1057)
+        - locked <0x000000054fe253c0> (a org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer)
+        at org.apache.hadoop.ha.protocolPB.HAServiceProtocolServerSideTranslatorPB.transitionToActive(HAServiceProtocolServerSideTranslatorPB.java:107)
+        at org.apache.hadoop.ha.proto.HAServiceProtocolProtos$HAServiceProtocolService$2.callBlockingMethod(HAServiceProtocolProtos.java:4460)
+        at org.apache.hadoop.ipc.ProtobufRpcEngine$Server$ProtoBufRpcInvoker.call(ProtobufRpcEngine.java:585)
+        at org.apache.hadoop.ipc.RPC$Server.call(RPC.java:928)
+        at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:2048)
+        at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:2044)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:415)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1509)
+        at org.apache.hadoop.ipc.Server$Handler.run(Server.java:2042)
+"Socket Reader #2 for port 8020":
+        at sun.misc.Unsafe.park(Native Method)
+        - parking to wait for  <0x000000054fe68830> (a java.util.concurrent.locks.ReentrantReadWriteLock$FairSync)
+        at java.util.concurrent.locks.LockSupport.park(LockSupport.java:186)
+        at java.util.concurrent.locks.AbstractQueuedSynchronizer.parkAndCheckInterrupt(AbstractQueuedSynchronizer.java:834)
+        at java.util.concurrent.locks.AbstractQueuedSynchronizer.doAcquireShared(AbstractQueuedSynchronizer.java:964)
+        at java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireShared(AbstractQueuedSynchronizer.java:1282)
+        at java.util.concurrent.locks.ReentrantReadWriteLock$ReadLock.lock(ReentrantReadWriteLock.java:731)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.readLock(FSNamesystem.java:1149)
+        at org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSecretManager.checkAvailableForRead(DelegationTokenSecretManager.java:109)
+        at org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSecretManager.retrievePassword(DelegationTokenSecretManager.java:94)
+        - locked <0x000000054fe26a10> (a org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSecretManager)
+        at org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSecretManager.retrievePassword(DelegationTokenSecretManager.java:53)
+        at org.apache.hadoop.security.SaslRpcServer$SaslDigestCallbackHandler.getPassword(SaslRpcServer.java:271)
+        at org.apache.hadoop.security.SaslRpcServer$SaslDigestCallbackHandler.handle(SaslRpcServer.java:296)
+        at com.sun.security.sasl.digest.DigestMD5Server.validateClientResponse(DigestMD5Server.java:585)
+        at com.sun.security.sasl.digest.DigestMD5Server.evaluateResponse(DigestMD5Server.java:244)
+        at org.apache.hadoop.ipc.Server$Connection.processSaslMessage(Server.java:1419)
+        at org.apache.hadoop.ipc.Server$Connection.saslProcess(Server.java:1305)
+        at org.apache.hadoop.ipc.Server$Connection.saslReadAndProcess(Server.java:1291)
+        at org.apache.hadoop.ipc.Server$Connection.processRpcOutOfBandRequest(Server.java:1917)
+        at org.apache.hadoop.ipc.Server$Connection.processOneRpc(Server.java:1794)
+{noformat}, bq. Do we even need a read lock on the namespace at all? Token verification has nothing to do with the namespace.
+
+The only potential problem I see with removing the namesystem read lock is that failover acquires the write lock in {{HAState#setStateInternal}}.  If this NN is in the middle of transitioning from standby to active, then holding the read lock in {{DelegationTokenSecretManager#retrievePassword}} blocks clients until the transition to active has completed.  Without the read lock, clients will get an immediate {{StandbyException}} even though this NN is about to become active.  If this happens rapidly enough, then the client could exhaust its max retries and get an RPC error before the transition to active completes.
+
+I kicked off a Jenkins run for the new patch:
+
+https://builds.apache.org/job/PreCommit-HDFS-Build/4870/
+, bq. If this happens rapidly enough, then the client could exhaust its max retries and get an RPC error before the transition to active completes.
+
+Agree. Without the read lock it should be OK when the NN is transitioning from active to standby, but as Chris said the RPC can fail if the NN is transitioning to active (the other NN should have been in standby now)., I think you may have more problems blocking the clients on the FSN lock during standby transition instead of throwing an exception immediately.
+
+The RPC server only has a limited number of sockets readers (default I think is 5).  Once those 5 jam up waiting on the FSN lock, the listener thread is going to keep accepting sockets as fast as he can - at least until an OOM when it tries to forcibly close sockets and then sleeps for 1 minute.  Hopefully the OOM didn't cripple some other subsystem...
+
+Meanwhile clients will have their connection accepted, but get no response for the server.  One saving grace is the clients don't create their ping stream until after SASL auth has completed, so they are going abort the connection after a read timeout while waiting for a response to the connection header.  The ping stream would normally keep the connection alive.
+
+I've tested this patch and I no longer have deadlocks., Let's add a comment.  It's non-obvious that we're holding the namesystem lock to coordinate with an HA failover, especially considering that there is no actual namesystem manipulation like Daryn pointed out.  :-), bq. Once those 5 jam up waiting on the FSN lock, the listener thread is going to keep accepting sockets as fast as he can - at least until an OOM
+
+This is the first time I noticed this logic.  Thanks for pointing it out.  Shouldn't a properly tuned listen backlog prevent OOM though?  Or have you seen one of those cases where the OS doesn't really enforce the listen backlog you requested?
+
+At this point, I'm really torn on whether or not to hold the namesystem lock.  (Damned if we do, damned if we don't.)  Risk of OOM could tip the scale though.
+, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12599437/HADOOP-5124.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4870//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4870//console
+
+This message is automatically generated., bq. I think you may have more problems blocking the clients on the FSN lock during standby transition instead of throwing an exception immediately.
+
+For one, if all reader threads are blocked on FSN lock, no more RPC calls will get through, even HA admin commands such as HA state transition. For example, if SBN was checkpointing holding the write lock and sufficient number of token-based rpc connections are made during this, HA admin command will get blocked until checkpointing is done. Such command is supposed to interrupt on-going checkpointing and initiate transition right away., bq. Shouldn't a properly tuned listen backlog prevent OOM though? Or have you seen one of those cases where the OS doesn't really enforce the listen backlog you requested?
+
+The OS backlog will just artificially throttle the RPC server a bit.  The listener thread is draining the backlog as fast as it can, and the OS is in turn filling it.  The server does try to close some connections on each loop, but on each loop it's sucking the listen queue dry and creating {{Connection}} objects for every accepted connection and assigning them to socket readers blocked on the FSN lock - which will prevent even admin commands from getting in., Can we keep the scope of this Jira small and fix the bug and follow it up with another Jira to make the other lock changes? Currently this issue is holding up our testing. 
+
+, [~daryn] or [~kihwal], can you please respond back to my previous comment?, The more I look at this, HADOOP-9880 did not cause this issue.  The deadlocks are a pre-existing bug resulting from HDFS-3083 adding {{checkAvailableForRead}}.
+
+I've fully tested the small patch I've posted since we've seen a number of variants of this deadlock.  The larger locking changes I alluded to are intended for a different jira., The big issue with leaving the FSN locking in place: 5 token connections will block all connections, including kerberos connections, from being processed.  The socket readers will not process any incoming connections.  Admin commands will not be able to run.
+
+I should note the concern over token auth clients not blocking during a standy to active transition is not an issue.  Kerberos clients currently enter the FSN and immediately receive a {{StandbyException}} so token clients should conceptually behave no differently.  If the failover proxy cannot handle this condition, it needs to be fixed., Thanks for the explanation and analysis Daryn! +1 for your patch. I will commit it to 2.1-beta soon.
+
+In the meanwhile we will continue our secure HA test and we can address remaining issues in new jiras., I've committed this to trunk, branch-2 and branch-2.1-beta., SUCCESS: Integrated in Hadoop-trunk-Commit #4314 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/4314/])
+HDFS-5124. DelegationTokenSecretManager#retrievePassword can cause deadlock in NameNode. Contributed by Daryn Sharp. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1516671)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenSecretManager.java
+, SUCCESS: Integrated in Hadoop-Yarn-trunk #310 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/310/])
+HDFS-5124. DelegationTokenSecretManager#retrievePassword can cause deadlock in NameNode. Contributed by Daryn Sharp. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1516671)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenSecretManager.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #1500 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1500/])
+HDFS-5124. DelegationTokenSecretManager#retrievePassword can cause deadlock in NameNode. Contributed by Daryn Sharp. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1516671)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenSecretManager.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1527 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1527/])
+HDFS-5124. DelegationTokenSecretManager#retrievePassword can cause deadlock in NameNode. Contributed by Daryn Sharp. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1516671)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/delegation/DelegationTokenSecretManager.java
+]

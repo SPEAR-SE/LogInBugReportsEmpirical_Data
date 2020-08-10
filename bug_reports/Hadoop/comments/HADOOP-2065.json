@@ -1,0 +1,149 @@
+[#2 above will be handled in HADOOP-2012. When it detects a corrupt block, it just asks the Namenode to delete it (same interface is used by client when it detects a bad block). In this case, namenode deletes the block as long as there are more replicas. So it does not really make sure that there is at least one _good_ replica.
+, bq. #2 above will be handled in HADOOP-2012. When it detects a corrupt block, it just asks the Namenode to delete it (same interface is used by client when it detects a bad block). In this case, namenode deletes the block as long as there are more replicas. So it does not really make sure that there is at least one good replica.
+That was a premeture comment. Actually HADOOP-2012 won't do that.
+, Talked to Raghu regarding this.
+
+bq For (2), it'll be nice if the namenode can delete the corrupted block if there's a good replica on other nodes.
+
+Right now, if there are good replicas, then namenode does replicate the good blocks after it times out while trying to replicate corrupt block. This was fixed by HADOOP-2012 , but if all replicas were corrupt, then namenodes keeps on trying. It was decided that, this is desired behavior because one should find out such corruptions.
+
+bq For (3), I prefer if the namenode can still replicate the block.
+bq To make the matters worse, if the corrupted file is accessed, all the corrupted replicas would be deleted except for one and stay as replication factor of 1 forever.
+
+With the current policy, if all blocks are corrupted, namenode would delete 2 of them and since it fails to replicate, it keep on trying as mentioned in HADOOP-2012
+
+Now, do we want that single replica to be replicated? In that case it is similar to namenode not looping while replicating.  
+, Had a discussion with Dhruba and Raghu regarding the organization of blocks and how best the situation described in this JIRA could be addressed. 
+
+To summarize: A block could have all of its replicas corrupted at any point of time in HDFS. By default, HDFS detects this and deletes corrupted blocks until the last copy. The last copy is never deleted. The request of this JIRA is to allow replication of this corrupted single replica so that we have more than one copy of this block even if it is corrupt. Another way to look at the problem is that when all replicas are corrupt, lets not delete any of them.
+
+Initially, we thought we should somehow mark a block as corrupt if we identify its replicas are bad, but without checking (by reading or datanode reporting as bad block), we do not know if all replicas of the block are corrupt. Consider the case when HDFS is up and running and one of the datanode reports that the replica it holds is corrupt. The current behavior is that we delete this block and request for replication. 
+
+One proposed idea is as follows. When we get a notification from Datanode that the block is corrupt, we mark the block associated with this datanode to be corrupt and store it in DatanodeDescriptor as a list possibly. We also request a replication of this block but do not deleted this replica yet. At this point, if we have another good replica, it would get replicated and eventually we would get the additional addBlock request. Now, we check if this is an additonal copy and if this block has corrupt replica, if so, we add this new block and delete the corrupt replica. If a block has all of its copies as corrupt, then in some time, we do come to know about this and we havnt requested them to be deleted any of them. We should thinking about how to filter this copy (similar to decommission flag) and how best such blocks could be reported.  
+
+Thoughts?, When a datanode reports block as corrupt, instead of deleting we mark the (datanode-block) to be corrupt and request replication of this block
+
+- Add a new synchronized method something like FSNameSystem.markAsCorrupt(Block, DatanodeDescriptor) which could mark replica of the this particular Datanode to be corrupt. It would also add this block to neededReplication queue.
+- Each DatanodeDescriptor hold a set of corrupt blocks and provide methods to lookup given a block.
+- Modify NumReplicas class to filter out nodes with such replica copies and report them via corruptReplicas() similar to decommissionedReplicas()
+- While choosing the src node for replication in chooseSourceDatanode() we use the copies which are not yet marked as corrupt
+- Inside addStoredBlock() whenever we add a new node(replica) we also check, if we already have a corrupt copy. If we have reached the desired replication for this block and the corrupt block is in excess, we invalidate it here.
+
+I think this would take care of retaining all corrupt copies, but one case when I see a problem is pendingReplication thread which would keep on looping to replicate corrupt blocks. We could have a check here to see if number of pending replicas for block is equal to the number of corrupt copies and remove from pendingReplication thread. , bq. one case when I see a problem is pendingReplication thread which would keep on looping to replicate corrupt blocks. 
+Inside FSNameSystem.processPendingReplications() we fetch the timedOutItems, a list of blocks. We could check if all copies of such blocks are corrupt, if so, just log it and do not added it to neededReplication queue.
+
+Anything else I should consider? Thoughts?, +1. I like this approach., This initial patch addresses all the above points. , After talking to dhruba, here are some more things which needs to be taken care of to complete this 
+
+- When we detect that all replicas of a block are corrupt, we could replace the BlockInfo with another class called CorrupteBlockInfo which basically says that the block is corrupt and then remove the list of corrupt Block from all DatanodeDescriptors. This CorruptBlockInfo would have a flag which says if the block is corrupt/not and would provide api to get and set this flag. If in future we do encounter another good replica, then we should unset this flag. By default BlockInfo would return false for call. In this way we would not be wasting space in BlocksMap by having this flag for all Blocks.
+- We should also provide a way to get the details of all corrupt blocks. This might require few API changes with possibly an additional flag. 
+- Similar change should also go into getBlockLocations so that we should be able to get corrupt block information if such a flag is specified.
+
+One way to implement this is
+- Once we detect that all replicas of a block are corrupt and there are no live or good copy, we could do this synchronized operation of replacing the BlockInfo with CorruptBlockInfo. We should remove this block from BlocksMap and add new Block. This could be either called CorruptBlockInfo or ExtendedBlockInfo in which case later we could add not information to such an extended Block.
+- In each addStoreBlock, we might have to check for type of block, if it is already a type of CorruptBlockInfo, we need to rest the flag and treat it as good copy and possibly add it to neededReplication queue
+- getBlockLocations should be able to tell which replicas are corrupt, we might have to use the same CorruptBlockInfo/ExtendedBlockInfo for this
+
+This is being done to get ride of the corruptList in DatanodeDescriptor. Anything we might have missed?, another approach suggested by Konstantin is to have a global map of corruptBlocks. This has 2 advantages
+- in NumReplicas instead of looking up for corruptBlocks for each DatanodeDescriptor we fetch list of nodes which hold corrupt replicas from the global map and match the list locally with NodeIterator returned by blocksMap
+- In case we need to know the list of corruptBlocks in the FileSystem, we have all the information at one place
+
+Extending BlockInfo and replacing it back seems complicated. If we move the list to be a globalList, all we have to handle is a new DataStructure returned via getBlockLocations. We could have something like LocatedReplicas instead of DatanodeInfo inside LocatedBlock.  I think this solves the whole problem, Thoughts? , This patch is based on approach discussed above.
+
+- We maintain a global corruptBlocksMap which has a mapping from Block->TreeSet<DatanodeDescriptor> holding set of datanodes which hold a corrupt replica of a block 
+- Block reporting is handled in the same way as done now. On trunk if there are one/few corrupt replicas we deleted them thus reducing the replication. This patch also does the same, it reduces the replication, but instead of deleting it stores the replica in the global corruptBlocksMap.
+- Once we detect all the replicas are corrupt, we set a flag indicating the whole block is corrupt whenever getBlockLocations is called. This is the same behavior on trunk, if we have just one copy of corrupt replica, we return it to the client and let the client handle it. Thus we have retained all the corrupt replicas and also provide a way to identify them.
+- Added a new flag in LocatedBlock to indicate if this is a corrupt copy or not.
+- Added a test case. Which first corrupts one replica and expects the block to be good and also expect the corrupt replica to be filtered. Later, we corrupt all replicas and expect the block returned to be of type corrupt block, but return all corrupt replicas and let the client deal with corrupt copies, +1 overall.  Here are the results of testing the latest attachment 
+http://issues.apache.org/jira/secure/attachment/12380906/HADOOP-2065-2.patch
+against trunk revision 645773.
+
+    @author +1.  The patch does not contain any @author tags.
+
+    tests included +1.  The patch appears to include 4 new or modified tests.
+
+    javadoc +1.  The javadoc tool did not generate any warning messages.
+
+    javac +1.  The applied patch does not generate any new javac compiler warnings.
+
+    release audit +1.  The applied patch does not generate any new release audit warnings.
+
+    findbugs +1.  The patch does not introduce any new Findbugs warnings.
+
+    core tests +1.  The patch passed core unit tests.
+
+    contrib tests +1.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2325/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2325/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2325/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2325/console
+
+This message is automatically generated., Attaching the patch against trunk., # When removing a stored block you should also remove all of its corrupt replicas.
+# Do I understand correctly the definition of a corrupt block is that all its replicas are bad?
+Could you please put a comment in the code with the exact definition. 
+This is especially important in classes that are used in the client code like LocatedBlock.
+# A suggestion:
+{code}
+boolean blockCorrupt = (numCorruptNodes == numNodes);
+boolean replicaCorrupt = ((nodesCorrupt != null) && nodesCorrupt.contains(dn));
+{code}
+, Thanks Konstantin, this new patch adds all the changes you suggested., Attached is the patch against trunk., Had missed adding comments. , When adding entrys to corruptReplicasMap, it might be good to get a BlockInfo object and use it as a key.  This idea can be found in HADOOP-3272., :) yes, but this map would be quite small, so I think it should be fine. Good that we have the comment in JIRA for future use. , +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12381635/HADOOP-2065-6.patch
+  against trunk revision 654315.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 4 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2425/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2425/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2425/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2425/console
+
+This message is automatically generated., This looks correct.
+I have a concern that we probably need to move this into a separate data-structure. So that not to refactor it later as we did with other block collections. So,
+- I'd highly recommend to create a separate class say CorruptedReplicaMap or CorruptedReplicas or CorruptedBlocks.
+The important thing that all members and methods related to corrupted replicas currently populated in FSNamesystem like invalidateCorruptReplicas(), markBlockAsCorrupt()  should belong to this class as well as add(), get(), remove(), isCorrupt().
+This is simialr to PendingReplicationBlocks, BlocksMap and UnderReplicatedBlocks.
+- The method of the new class should clearly distinguish between Block and BlockInfo parameters. I presume most parameters will be BlockInfo, because this collection holds only those blocks that belong to the BlocksMap.
+- processPendingReplications()
+  if (num.liveReplicas == 0) continue;    is not necessary, because neededReplications.add() does that inside.
+  This code should just be removed.
+, Thanks Konstantine. Attached patch adds a separate class CorruptReplicasMap as you suggested, +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12381849/HADOOP-2065-7.patch
+  against trunk revision 655337.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 4 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2448/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2448/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2448/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2448/console
+
+This message is automatically generated., I just committed this. Thanks Lohit., Integrated in Hadoop-trunk #489 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/489/]), This seems related to HADOOP-4351.]

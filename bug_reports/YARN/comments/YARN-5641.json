@@ -1,0 +1,862 @@
+[Here is an example log of the failure. The localizer attempts to clean up its localized directories and fails, thus leaving the directories behind. 
+{noformat}
+2016-09-09 00:11:10,483 [LocalizerRunner for container_e01_1469258802232_9766291_01_000505] INFO localizer.ResourceLocalizationService: Localizer failed
+java.io.IOException: java.lang.InterruptedException
+        at org.apache.hadoop.util.Shell.runCommand(Shell.java:565)
+        at org.apache.hadoop.util.Shell.run(Shell.java:459)
+        at org.apache.hadoop.util.Shell$ShellCommandExecutor.execute(Shell.java:747)
+        at org.apache.hadoop.yarn.server.nodemanager.LinuxContainerExecutor.startLocalizer(LinuxContainerExecutor.java:237)
+        at org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.ResourceLocalizationService$LocalizerRunner.run(ResourceLocalizationService.java:1113)
+2016-09-09 00:11:10,484 [DeletionService #0] INFO nodemanager.LinuxContainerExecutor: Deleting path : /tmp/yarn-local/usercache/foobar/appcache/application_1469258802232_9766291/filecache/13
+2016-09-09 00:11:10,486 [DeletionService #0] INFO nodemanager.LinuxContainerExecutor: Deleting path : /tmp/yarn-local/usercache/foobar/appcache/application_1469258802232_9766291/filecache/13_tmp
+2016-09-09 00:11:10,486 [DeletionService #0] INFO nodemanager.LinuxContainerExecutor: Deleting path : /tmp/yarn-local/usercache/foobar/appcache/application_1469258802232_9766291/filecache/12
+2016-09-09 00:11:10,486 [DeletionService #0] INFO nodemanager.LinuxContainerExecutor: Deleting path : /tmp/yarn-local/usercache/foobar/appcache/application_1469258802232_9766291/filecache/12_tmp
+2016-09-09 00:11:10,491 [DeletionService #0] ERROR nodemanager.LinuxContainerExecutor: DeleteAsUser for /tmp/yarn-local/usercache/foobar/appcache/application_1469258802232_9766291/filecache/13 /tmp/yarn-local/usercache/foobar/appcache/application_1469258802232_9766291/filecache/13_tmp /tmp/yarn-local/usercache/foobar/appcache/application_1469258802232_9766291/filecache/12 /tmp/yarn-local/usercache/foobar/appcache/application_1469258802232_9766291/filecache/12_tmp returned with exit code: 255
+ExitCodeException exitCode=255: 
+        at org.apache.hadoop.util.Shell.runCommand(Shell.java:562)
+        at org.apache.hadoop.util.Shell.run(Shell.java:459)
+        at org.apache.hadoop.util.Shell$ShellCommandExecutor.execute(Shell.java:747)
+        at org.apache.hadoop.yarn.server.nodemanager.LinuxContainerExecutor.deleteAsUser(LinuxContainerExecutor.java:424)
+        at org.apache.hadoop.yarn.server.nodemanager.DeletionService$FileDeletionTask.run(DeletionService.java:295)
+        at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+        at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+        at java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$201(ScheduledThreadPoolExecutor.java:180)
+        at java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:293)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+        at java.lang.Thread.run(Thread.java:745)
+2016-09-09 00:11:10,491 [DeletionService #0] ERROR nodemanager.LinuxContainerExecutor: Output from LinuxContainerExecutor's deleteAsUser follows:
+2016-09-09 00:11:10,491 [DeletionService #0] INFO nodemanager.ContainerExecutor: main : command provided 3
+2016-09-09 00:11:10,491 [DeletionService #0] INFO nodemanager.ContainerExecutor: main : user is foobar
+2016-09-09 00:11:10,491 [DeletionService #0] INFO nodemanager.ContainerExecutor: main : requested yarn user is foobar
+2016-09-09 00:11:10,491 [DeletionService #0] INFO nodemanager.ContainerExecutor: rmdir of the/tmp/yarn-local/usercache/foobar/appcache/application_1469258802232_9766291/filecache/12/ failed - Permission denied
+{noformat}, which version?, [~Naganarasimha], I see the issue in 2.7. I suspect that it is also an issue in 2.6 as well. I'm not aware of any fix in 2.8 or above, but it's possible that this has been fixed. , The problem appears to be a race between FileUtil.java:unTarUsingTar finishing and the DeletionService deleting the localized files. If the container is killed before the untar is finished, then it will immediately try and delete the localized directory. Since tar is running independently of the DeletionService, it will continue to untar even after the directory contents have been deleted. This is why we see localized files even when the DeletionService runs successfully.
+
+I believe that the fix is to kill the untar process when the localize process is killed. If we can't kill it, then we at least need to wait for it to finish so that we can clean up the entire contents of what it untarred., [~jlowe] and I worked on this for some time yesterday and killing the spawned untar shell process is proving to be very difficult. The localizer spawns up the untar shell thread, which invokes a shell exec untar command. Once the container is killed, the next time the localizer heartbeats to the NM, it will be instructed to die. Inside of the 'die' codepath, the localizer interrupts all of its spawned threads using the cancel() method. However, the untar thread is stuck inside of file I/O waiting to parse the result of the shell execution and is uninterruptible. The untar thread won't get the InterruptedException until it is finished, and so we cannot kill it or the untar shell exec before it completes. We can have the localizer process wait for the untar thread to end via awaitTermination() (currently it only uses shutdownNow()), but it won't return until untar finishes on its own, since shutdown() won't have any effect with interrupting the untar thread. 
+
+I tested this by replacing the untar shell command with a sleep command so that there would be no worry about the untar actually finishing. The container was killed and instructed to die after the subsequent NM heartbeat. Then it attempted to shutdown all of its threads, but the untar thread would sit in readBytes instead of getting the InterruptedException. Below is the stack trace of the untar thread just after the localizer calls shutdown(). It never gets the InterruptedException and sits in this stack trace until awaitTermination hits its timeout and the localizer kills the JVM. Since we never catch the InterruptedException, we are unable to destroy the untar shell process and it continues to run after the localizer and untar thread are killed (it became owned by init). 
+
+{noformat}
+"ContainerLocalizer Downloader" #19 prio=5 os_prio=0 tid=0x00007f4315169800 nid=0x1530 runnable [0x00007f42f5217000]
+   java.lang.Thread.State: RUNNABLE
+	at java.io.FileInputStream.readBytes(Native Method)
+	at java.io.FileInputStream.read(FileInputStream.java:255)
+	at java.io.BufferedInputStream.read1(BufferedInputStream.java:284)
+	at java.io.BufferedInputStream.read(BufferedInputStream.java:345)
+	- locked <0x000000076f4fca28> (a java.lang.UNIXProcess$ProcessPipeInputStream)
+	at sun.nio.cs.StreamDecoder.readBytes(StreamDecoder.java:284)
+	at sun.nio.cs.StreamDecoder.implRead(StreamDecoder.java:326)
+	at sun.nio.cs.StreamDecoder.read(StreamDecoder.java:178)
+	- locked <0x000000076f506cf8> (a java.io.InputStreamReader)
+	at java.io.InputStreamReader.read(InputStreamReader.java:184)
+	at java.io.BufferedReader.fill(BufferedReader.java:161)
+	at java.io.BufferedReader.read1(BufferedReader.java:212)
+	at java.io.BufferedReader.read(BufferedReader.java:286)
+	- locked <0x000000076f506cf8> (a java.io.InputStreamReader)
+	at org.apache.hadoop.util.Shell$ShellCommandExecutor.parseExecResult(Shell.java:786)
+	at org.apache.hadoop.util.Shell.runCommand(Shell.java:568)
+	at org.apache.hadoop.util.Shell.run(Shell.java:479)
+	at org.apache.hadoop.util.Shell$ShellCommandExecutor.execute(Shell.java:773)
+	at org.apache.hadoop.fs.FileUtil.unTarUsingTar(FileUtil.java:682)
+	at org.apache.hadoop.fs.FileUtil.unTar(FileUtil.java:651)
+	at org.apache.hadoop.yarn.util.FSDownload.unpack(FSDownload.java:283)
+	at org.apache.hadoop.yarn.util.FSDownload.call(FSDownload.java:364)
+	at org.apache.hadoop.yarn.util.FSDownload.call(FSDownload.java:62)
+	at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+	at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+	at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+	at java.lang.Thread.run(Thread.java:745)
+{noformat}, Attaching a patch that creates a separate thread to read the input stream instead of doing it in the main localizer thread. This way the main thread can get interrupted during process.waitFor() and destroy the child threads in the finally block. I tested this using a sleep command instead of the tar command and it killed the sleep command when the localizer was killed. , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 19s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red} 0m 0s {color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 1m 23s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 10s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 7m 13s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 27s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 27s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 28s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 2m 2s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 6s {color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 14s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 4s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 7m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 7m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 24s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 22s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 26s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 2m 21s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 9s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 7m 54s {color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 14m 21s {color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 22s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 61m 20s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.fs.TestSymlinkLocalFSFileSystem |
+|   | hadoop.fs.TestStat |
+|   | hadoop.fs.TestSymlinkLocalFSFileContext |
+|   | hadoop.util.TestNodeHealthScriptRunner |
+|   | hadoop.fs.TestLocalFileSystem |
+|   | hadoop.yarn.server.nodemanager.TestDefaultContainerExecutor |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12828851/YARN-5641.001.patch |
+| JIRA Issue | YARN-5641 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 8c6ec7f1a068 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / b09a03c |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/13122/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/13122/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/13122/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt https://builds.apache.org/job/PreCommit-YARN-Build/13122/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/13122/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: . |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/13122/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, This new patch should fix most, if not all, of the test failures. The tests were failing because they were unable to get the IOException that came from parseExecResult(). Since it was in a child thread, the parent thread didn't have an exception to throw up the stack to the test. 
+
+It would be cleaner to also include the errThread as an ExecutorService in the thread pool, but I've left it as its own standalone thread for now to keep the size of the patch down. If there is agreement, I can unify them into the same thread pool for consistency. , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 17s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 1s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red} 0m 0s {color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 18s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 7m 41s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 7m 33s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 24s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 22s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 26s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 2m 1s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 1s {color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 14s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 1s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 6m 47s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 6m 47s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 1m 27s {color} | {color:red} root: The patch generated 3 new + 58 unchanged - 0 fixed = 61 total (was 58) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 20s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 25s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 2m 14s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 1s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 15m 57s {color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 14m 1s {color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 21s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 67m 41s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.net.TestDNS |
+|   | hadoop.yarn.server.nodemanager.TestDefaultContainerExecutor |
+| Timed out junit tests | org.apache.hadoop.security.token.delegation.web.TestWebDelegationToken |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12828911/YARN-5641.002.patch |
+| JIRA Issue | YARN-5641 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux b78286454caa 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / cd099a6 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/13130/artifact/patchprocess/diff-checkstyle-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/13130/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/13130/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/13130/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt https://builds.apache.org/job/PreCommit-YARN-Build/13130/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/13130/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: . |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/13130/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, TestDNS and TestWebDelegationToken don't fail for me locally and are irrelevant to this patch.
+
+TestDefaultContainerExecutor was fixed just after this precommit build by [YARN-5657|https://issues.apache.org/jira/browse/YARN-5657]., Attaching new patch that adds in a unit test to make sure that the thread that invokes the ShellCommandExecutor.execute() method is now interruptible. , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 11s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 14s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 42s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 7m 0s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 27s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 24s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 26s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 2m 8s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 3s {color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 14s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 4s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 7m 34s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 7m 34s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 1m 30s {color} | {color:red} root: The patch generated 2 new + 76 unchanged - 0 fixed = 78 total (was 76) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 24s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 27s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 2m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 4s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 7m 31s {color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 14m 47s {color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 20s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 59m 50s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.ha.TestZKFailoverController |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12829279/YARN-5641.003.patch |
+| JIRA Issue | YARN-5641 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 4b8c40b5ef60 3.13.0-93-generic #140-Ubuntu SMP Mon Jul 18 21:21:05 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 7558dbb |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/13155/artifact/patchprocess/diff-checkstyle-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/13155/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/13155/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/13155/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: . |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/13155/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, The test failure is unrelated to this patch and passes for me locally. [~Naganarasimha], [~jlowe], could you review the most recent patch? Thanks!, Thanks for the patch, Eric!
+
+This has primarily become a change to the Shell in hadoop-common to fix a problem with being able to interrupt it and kill the subprocess.  Therefore I think that change needs to be a JIRA in HADOOP rather than YARN along with a better headline description.  I'd move this one over to that project myself, but there's the YARN change that is also needed.  We could either move this or file a JIRA in HADOOP that this depends upon.  My preference is slightly towards the latter but deferring the choice to you.
+
+It would be good to have the error thread treated consistently, since now stderr is handled with a raw thread and stdout is handled with an executor service.
+
+Speaking of executor service, why are we using a scheduled thread executor service?  We don't need the "scheduled" part of that service since we're just using the submit method.
+
+The OutOfMemoryError handling for the error thread isn't being applied to the new stdout handling and should be for consistency.
+
+The error handling of the future is silently eating any exception thrown whose cause isn't an IOException or a RuntimeException.  IMHO if the cause is an IOException we should throw that, otherwise we should wrap it in a RuntimeException.
+, Linking the hadoop-common portion of this fix as [~jlowe] suggested. , Attaching a new patch that includes only the YARN portion of the fix. , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 28s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red} 0m 0s {color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 8m 51s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 21s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 38s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 55s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 23s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 32s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 13s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 0m 55s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 15m 36s {color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 19s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 32m 27s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12832726/YARN-5641.004.patch |
+| JIRA Issue | YARN-5641 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 74e94e712634 3.13.0-95-generic #142-Ubuntu SMP Fri Aug 12 17:00:09 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 2fb392a |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/13351/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/13351/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Given the direction HADOOP-13709 is taking, I don't think this change is appropriate.  Since the executor threads executing commands via Shell will not be interruptible in practice, this change will simply make most localizers hang for an extra 10 seconds if there is an outstanding shell process.  It would be faster to do the existing shutdownNow call and let the shell cleanup shutdown hook kill the underlying processes.
+
+One thought to make this more robust: if the localizer could explicitly invoke the "kill all active shell processes" hook manually, then it could do more of the cleanup itself like this:
+{code}
+  exec.shutdown();
+  kill_all_active_shells_here();
+  exec.awaitTermination(10, TimeUnit.SECONDS);
+{code}
+
+So either this JIRA should be marked as a duplicate of HADOOP-13709 or updated per above., Given the comments on HADOOP-13709, we will add the process bookkeeping and destroying methods in that JIRA. We can add in the Localizer-specific shutdown hook in this JIRA. This way we won't force unexpected behavior on those who assume that processes would still be running after shutdown (e.g. work-preserving restart). , [~jlowe], since HADOOP-13709 was committed, we can add in the localizer-specific piece. Here's a patch that attempts to shutdown the thread pool threads, kills all subprocesses, and then waits for the thread pool threads to terminate. If they do not terminate in 10 seconds, then we will call System.exit() to force the shutdown hook to be invoked, which will call destroyAllProcesses() again to make sure that all of the spawned subprocesses have been killed. , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 11s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red}  0m  0s{color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 14m 23s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 30s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 18s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 49s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 17s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 27s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 15s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 14m 39s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 36m 24s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.nodemanager.containermanager.TestContainerManager |
+|   | hadoop.yarn.server.nodemanager.containermanager.monitor.TestContainersMonitor |
+|   | hadoop.yarn.server.nodemanager.containermanager.launcher.TestContainerLaunch |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | YARN-5641 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12843617/YARN-5641.005.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 1a6d3b6de260 3.13.0-105-generic #152-Ubuntu SMP Fri Dec 2 15:37:11 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / f121645 |
+| Default Java | 1.8.0_111 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/14349/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/14349/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/14349/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Putting up a new patch with a different direction. The previous patch used a single map to keep track of all subprocesses that were spawned via shell and then killed all of them upon the localizer being shutdown. This was fine under the assumption that there is only a single shell process being run. However, in the case of the tests that failed or multiple localizers running on a single NM, there could be multiple shell subprocesses being run via the same parent process. Having one process blindly kill all other running subprocesses would allow for one localizer to kill the subprocesses of another localizer. 
+
+So, instead, this new patch will have the localizer keep track of which subprocesses were spawned by it and only act on those. The new patch still uses a single static Map in {{Shell}} ({{CHILD_SHELLS}}) to keep track of all shells, but adds in the support to keep track of their associated parent thread. The idea is that the {{Shell}} map will simply return all subprocesses to the caller (localizer) instead of actively killing them. This gives the control over what to do back to the caller. The threads from the localizer threadpool that started the subprocesses log themselves in a Set ({{localizingThreads}}) that is a member variable of each {{ContainerLocalizer}}. Then, once the localizer is shutting down, it can match the parent threads of all of the shells from the {{Shell}} Map ({{CHILD_SHELLS}}) against the Set of threads for the current localizer ({{localizingThreads}}). The localizer gets to choose what it wants to do with the matching shells and in this case it will kill them.
+
+There is also a new unit test added that starts up 2 localizers and kills one of them. It checks to make sure that the subprocess of the first localizer was killed, while the subprocess of the second localizer is still running. 
+
+[~jlowe], could you review this?, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 27s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  2m 10s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 22m  7s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 18m 15s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 40s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m  6s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 29s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 21s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 27s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 12m 27s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 46s{color} | {color:orange} root: The patch generated 33 new + 103 unchanged - 0 fixed = 136 total (was 103) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 40s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  9m 48s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 14m 12s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 47s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}125m 21s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.ha.TestZKFailoverController |
+|   | hadoop.yarn.server.nodemanager.containermanager.localizer.TestContainerLocalizer$FakeTestContainerLocalizer |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | YARN-5641 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12847419/YARN-5641.006.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 1ec4223db446 3.13.0-105-generic #152-Ubuntu SMP Fri Dec 2 15:37:11 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / d3170f9 |
+| Default Java | 1.8.0_111 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/14653/artifact/patchprocess/diff-checkstyle-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/14653/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/14653/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/14653/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: . |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/14653/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Previous patch did some things that JUnit didn't like. This patch fixes those issues. However, it requires changes to existing tests. , | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 12s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 59s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 13m 20s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 10m  8s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 35s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 20s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 16s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  5s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  9m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  9m 40s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 38s{color} | {color:orange} root: The patch generated 43 new + 103 unchanged - 0 fixed = 146 total (was 103) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  7m 41s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 13m  8s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 37s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 97m 20s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | YARN-5641 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12847872/YARN-5641.007.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux b720c1acb45c 3.13.0-107-generic #154-Ubuntu SMP Tue Dec 20 09:57:27 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 8a0fa0f |
+| Default Java | 1.8.0_111 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/14691/artifact/patchprocess/diff-checkstyle-root.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/14691/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: . |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/14691/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks for updating the patch!
+
+I think getThread and the description is a little vague.  It would be more clear if the method were called something like getWaitingThread to indicate this is the thread waiting for the shell command to return, and the Javadoc should be more clear that it is the thread in the runCommand method or null if no thread is waiting for a shell command to complete.
+
+runCommand needs to set the waiting thread field to null after the subprocess completes.
+
+removeShell does not seem to be appropriate to be public or even necessary.  Shell instances should automatically remove themselves when the subprocess exits, and if the subprocess hasn't exited then they shouldn't be removed otherwise.  I don't think it's appropriate for the ContainerLocalizer to be removing shells, or am I missing something?
+
+FSDownloadWrapper should be package-private.
+
+HashSet is not thread safe, and multiple threads can be accessing it at the same time (e.g.: one thread in the executor pool may be trying to add itself to the set just as another is trying to call the set's contains method).  This needs to either be a synchronized set or a concurrent set.
+
+Why doesn't the ContainerLocalizerWrapper constructor initialize the spylfs member?  It's odd to call the constructor then always have to poke fields in it.
+
+To help reduce the changes in the patch, I'd recommend creating {{spylfs}}, {{random}}, and {{nmProxy}} local variables to eliminate all the changes that are simply adding the 'wrapper.' prefix.
+
+Nit: Please use a much smaller check interval on the waitFor calls in the unit test.
+
+Style Nit: Typically there is no space between the generic class name and the type specifier (e.g.: {{Map <>}} should be {{Map<>}})
+Style Nit: Please do not use wildcard imports
+, Thanks for the review, [~jlowe]! I agree with all of your comments and nits and fixed them in this new patch. I also attempted to fix the checkstyle errors that showed up in the previous Jenkins run. Hopefully I caught all of them. , | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 13s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 19s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 14m 29s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 13m  4s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 41s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 40s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 42s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 21s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 19s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 11m 31s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 40s{color} | {color:orange} root: The patch generated 7 new + 103 unchanged - 0 fixed = 110 total (was 103) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m  3s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 31s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 13m 19s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 37s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}104m 16s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | YARN-5641 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12848426/YARN-5641.008.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 2d8f4bf5170e 3.13.0-107-generic #154-Ubuntu SMP Tue Dec 20 09:57:27 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 5d8b80e |
+| Default Java | 1.8.0_111 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/14716/artifact/patchprocess/diff-checkstyle-root.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/14716/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: . |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/14716/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, We should not be using org.eclipse.jetty.util.ConcurrentHashSet.  That's a dependency we do not want here.  It should be either java.util.concurrent.ConcurrentHashMap (and store something bogus for the value) or just wrap it in a SynchronizedSet.  The latter is probably preferable since I think concurrent is overkill here.  It's not super performance sensitive.
+
+I'm curious why the random and localDirs fields of ContainerLocalizerWrapper are marked protected but the others are not?  Do they need to be marked protected?, bq. It should be either java.util.concurrent.ConcurrentHashMap (and store something bogus for the value) or just wrap it in a SynchronizedSet.
+Wrapped the HashSet inside of a SynchronizedSet.
+
+bq. I'm curious why the random and localDirs fields of ContainerLocalizerWrapper are marked protected but the others are not? Do they need to be marked protected?
+This was a relic of when I was moving things around trying to limit scope. They don't need to be protected. 
+
+Checkstyle also wants me to make all of the variables private and give them accessor methods instead of doing the wrapper.* access. I can fix this if you want. 
+
+Attaching new patch, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 14s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 12m 35s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  9m 35s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 35s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 40s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 18s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 18s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 10m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 10m 43s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 37s{color} | {color:orange} root: The patch generated 6 new + 103 unchanged - 0 fixed = 109 total (was 103) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 40s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 13m 16s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 39s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 97m 14s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | YARN-5641 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12848590/YARN-5641.009.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 6c10a83a4777 3.13.0-95-generic #142-Ubuntu SMP Fri Aug 12 17:00:09 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / e015b56 |
+| Default Java | 1.8.0_111 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/14722/artifact/patchprocess/diff-checkstyle-root.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/14722/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: . |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/14722/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks for updating the patch!  There's another unnecessary dependency triggered by using SynchronizedSet from org.apache.commons.collections instead of the Java built-in available in java.util.Collections.  It would be preferable to use the built-in so we don't add another unnecessary dependency reference.
+, Removed unnecessary import and fixed checkstyle, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 13s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 12m 43s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 17s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 31s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 38s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 14s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 14s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  4s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 10m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 10m 41s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 37s{color} | {color:orange} root: The patch generated 6 new + 103 unchanged - 0 fixed = 109 total (was 103) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 36s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 36s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  7m 50s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 13m 18s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 38s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 98m 59s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | YARN-5641 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12849134/YARN-5641.009.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux a9b9a34db3c5 3.13.0-95-generic #142-Ubuntu SMP Fri Aug 12 17:00:09 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / a33ce45 |
+| Default Java | 1.8.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/14742/artifact/patchprocess/diff-checkstyle-root.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/14742/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: . |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/14742/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Somehow change didn't get into last patch. Double checked that it's in this one. , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 14s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  2m  7s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 13m 35s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 33s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 38s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 16s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 15s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  4s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 11m 25s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  3m 17s{color} | {color:orange} root: The patch generated 5 new + 103 unchanged - 0 fixed = 108 total (was 103) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  4m 28s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 24s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 12m  1s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 17m 41s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 43s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}116m 21s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.fs.TestTrash |
+|   | hadoop.yarn.server.nodemanager.TestNodeManagerResync |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | YARN-5641 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12849153/YARN-5641.010.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 8b132c61d0ca 3.13.0-95-generic #142-Ubuntu SMP Fri Aug 12 17:00:09 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / a33ce45 |
+| Default Java | 1.8.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/14744/artifact/patchprocess/diff-checkstyle-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/14744/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/14744/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/14744/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: . |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/14744/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 30s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 27s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 12m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 20m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  3m 31s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m 19s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 14s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  6s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 11m 48s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 41s{color} | {color:orange} root: The patch generated 5 new + 103 unchanged - 0 fixed = 108 total (was 103) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 27s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  8m 13s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 13m 30s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 39s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}113m 30s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.ha.TestZKFailoverController |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | YARN-5641 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12849153/YARN-5641.010.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux c8371f6d1622 3.13.0-95-generic #142-Ubuntu SMP Fri Aug 12 17:00:09 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 5a56520 |
+| Default Java | 1.8.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/14752/artifact/patchprocess/diff-checkstyle-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/14752/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/14752/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: . |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/14752/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, +1 for the latest patch.  The unit test failures are unrelated.  Committing this.
+, Thanks, Eric!  I committed this to trunk and branch-2., SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #11174 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/11174/])
+YARN-5641. Localizer leaves behind tarballs after container is complete. (jlowe: rev 9e19f758c1950cbcfcd1969461a8a910efca0767)
+* (edit) hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/Shell.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/ContainerLocalizer.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/localizer/TestContainerLocalizer.java
+* (edit) hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/util/TestShell.java
+, It seems this commit broke branch-2 compilation. Could you take a look? Thanks.
+
+https://builds.apache.org/job/PreCommit-HADOOP-Build/11511/artifact/patchprocess/branch-compile-root-jdk1.7.0_121.txt, My apologies, I missed the isAlive method calls on Process which are only available in JDK8.  This has been reverted from branch-2.  [~ebadger] please provide a separate patch for branch-2 that works with JDK7., Apologies for the bad Java 7 patch! I'll be sure to compile against Java 7 for anything that's targeted to anything other than trunk from now on. Here's a new patch for branch-2 that fixes the issues. , The branch-2 patch looks reasonable to me.  Nit: the new isAlive method should be private.  When fixing this, please post the patch according to the recommended [patch naming conventions|https://wiki.apache.org/hadoop/HowToContribute#Naming_your_patch] so we can reopen the JIRA and get the QA bot to run the standard tests on it., Thanks for the prompt response.
+I think the failure is understandable since the backport was clean. Thanks for working on the branch-2 patch. :), Changed isAlive() method to private, Reopening to run Jenkins on the branch-2 patch., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 14m 16s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m  9s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 43s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  9m 13s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 20s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 45s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 52s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 34s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 26s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 11s{color} | {color:green} branch-2 passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 24s{color} | {color:green} branch-2 passed with JDK v1.7.0_121 {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 18s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 15s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 12s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  7m 12s{color} | {color:red} root-jdk1.8.0_121 with JDK v1.8.0_121 generated 1 new + 879 unchanged - 1 fixed = 880 total (was 880) {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 57s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  7m 57s{color} | {color:red} root-jdk1.7.0_121 with JDK v1.7.0_121 generated 1 new + 974 unchanged - 1 fixed = 975 total (was 975) {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 36s{color} | {color:orange} root: The patch generated 6 new + 101 unchanged - 0 fixed = 107 total (was 101) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 38s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m  2s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 28s{color} | {color:green} the patch passed with JDK v1.8.0_121 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 39s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 14m  5s{color} | {color:green} hadoop-common in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 14m 18s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 30s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}156m 11s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_121 Failed junit tests | hadoop.ha.TestZKFailoverController |
+|   | hadoop.fs.TestTrash |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:b59b8b7 |
+| JIRA Issue | YARN-5641 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12849552/YARN-5641-branch-2.011.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 7e0d028ba2d6 3.13.0-105-generic #152-Ubuntu SMP Fri Dec 2 15:37:11 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 4a48f0e |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_121 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/14761/artifact/patchprocess/diff-compile-javac-root-jdk1.8.0_121.txt |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/14761/artifact/patchprocess/diff-compile-javac-root-jdk1.7.0_121.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/14761/artifact/patchprocess/diff-checkstyle-root.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/14761/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: . |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/14761/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, The test failures are unrelated. However, since I got rid of the waitFor() parameters (not supported in Java 7), there is an unused TimeUnit import. The warnings are from a piece of code that wasn't touched. , +1 for the latest branch-2 patch.  I'll fixup the extra import during the commit., Thanks, Eric!  I committed this to branch-2., Thanks, [~jlowe]!]

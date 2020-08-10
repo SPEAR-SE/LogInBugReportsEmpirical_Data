@@ -1,0 +1,190 @@
+[I was able to repro the problem by looking at JMX metrics thru jconsole. See attached screenshot.
+
+The bug appears to be coming from how the JMX metrics cache is managed in MetricsSourceAdapter.java. To be more specific:
+a) MetricsSourceAdapter keeps track of the latest metrics records obtained from the call into MetricsSource#getMetrics (see MetricsSourceAdapter#getMetrics)
+b) Metrics system timer thread which periodically polls on all sources, only polls for the metrics that have changed (not all metrics)
+
+Scenario from this bug (JobTracker metrics):
+ - Let's assume that the timer runs once per minute
+ - At time 0, there were 0 jobs_submitted and 0 jobs_completed, and internal JMX cache reflects this state
+ - At time t1, MetricsSystem timer thread runs and there were 1 jobs_submitted, and 0 jobs_completed. Internal JMX cache is not updated.
+ - At time t1 + 0.5 minutes, above job is completed, and jobs_completed counter is set to 1.
+ - At time t1 + 1 minute, MetricsSystem timer thread runs, and only jobs_completed metric changes from 0 to 1. Internal MetricsSourceAdapter {{lastRecs}} contains only jobs_completed metric.
+ - At time t1 + 1 minute + delta, JMX is polled for the current metrics, the current cache is updated using the current {{lastRecs}}, and the final outcome is jobs_submitted = 0, jobs_completed = 1.
+
+Since it is not obvious to me what is the intended behavior around metrics reported thru JMX is, I see two possible directions for the fix:
+# JMX always reports the latest snapshot obtained by the MetricsSystem timer thread. This means that JMX does not report the fresh/current metrics state. Each time metrics are fetched from the timer thread, internal MetricsSourceAdapter JMX cache would be refreshed to keep the state in sync.
+# JMX always reports the current metric values (with small TTL on the internal cache). In this design, MetricsSourceAdapter would (almost) always have to poll on the source for JMX. Additionally, there would have to be means to mark the source as dirty internally when this happens, to guarantee that the next time timer thread polls for metrics, all metrics are returned (see b. from above).
+
+Option 2 is definitely nicer from users perspective as JMX reflects the current in-memory state of servers. 
+
+Please comment back with your thoughts/recommendations.
+, Another possibility could be to change {{MetricsSourceAdapter#getMetrics}} to combine the prior elements of a non-null {{lastRecs}} with the new values.  Right now, it's just a complete overwrite, so "unconsumed" values from the prior run get dropped.  If we combine, then we might need to de-duplicate (not simply append), and I haven't yet thought about whether or not this brings additional complexity., Thinking about this some more, I'm in favor of Ivan's proposal #2.  This would have the side effect of lower cache hit rate/higher frequency of pulling metrics from their sources.  From what I can tell, this is acceptable, because JMX queries haven't been a source of bottlenecks or high load.  (Others, please comment if you know otherwise.), [~vicaya], can we get your opinion on this before we proceed with a patch?  Thanks!, I was aware of the suboptimal behavior and hoped it'd be OK for metrics, which don't require strong consistency.
+
+#1 incurs unnecessary overhead (updating jmx cache) for people who don't use JMX. This is the reason of the current cache logic.
+#2 is risky, as we don't know all existing jmx query patterns (especially due to HDFS-5333). User (admins) actually already has a choice to use a small JMX cache TTL for refreshness.
+
+How about #3: we only initialize and update the JMX cache when JMX is first used and stops updating after a period inactivity and reinitialize and update JMX cache upon activity. Initialize/reinitialize is a "dense" update, while "update" means the "sparse" update with the current lastRecs mechanisms. I think #3 is should be a fairly straightforward patch and more flexible than #1 and #2.
+, Thanks a lot Chris and Luke for commenting!
+
+bq. How about #3: we only initialize and update the JMX cache when JMX is first used and stops updating after a period inactivity and reinitialize and update JMX cache upon activity. Initialize/reinitialize is a "dense" update, while "update" means the "sparse" update with the current lastRecs mechanisms. I think #3 is should be a fairly straightforward patch and more flexible than #1 and #2.
+Luke, I'm not sure where #3 differs from #2. #2 basically says that each time JMX is queried, if TTL has exceeded, we update the internal cache and return the values. If TTL is not exceeded, we return the cached values. There are no updates in scenarios where users do not query JMX (metrics system timer thread does not trigger a cache update). We just have to make sure that when JMX is indeed queried, the next time the timer thread runs, we poll for all metric values (not just the ones that have changed -- I think this is the current behavior as well).
+
+bq. Thinking about this some more, I'm in favor of Ivan's proposal #2. This would have the side effect of lower cache hit rate/higher frequency of pulling metrics from their sources. From what I can tell, this is acceptable, because JMX queries haven't been a source of bottlenecks or high load. (Others, please comment if you know otherwise.)
+Thanks Chris. I am also leaning in this direction, assuming that there aren't any gotchas that I did not know about :), Hi Chris, Luke,
+
+I am attaching the fix for the #2 approach. The patch includes a unittest that catches the problem.
+
+This fix relaxes the "inconsistent result" issue, however it does not eliminate it completely. JMX will always return complete result, but the sink might miss some changes. The problem is that MetricsSourceAdapter must synchronize its calls to MetricsSource#getMetrics, otherwise, we can have two concurrent threads snapshotting the metrics, leading to one of them not getting all metrics that had changed (if "all" is not specified, like in the sink case). Because of the issue described in HADOOP-8050 it is not possible to just add a lock as it can introduce a deadlock (we would also have to eliminate the system source issue).
+
+Let me know what you think. , bq. I'm not sure where #3 differs from #2.
+
+#3 is an improvement of #2, where cache TTL > regular snapshot interval, where jmx will get at least the same freshness of sinks, even with a longer TTL. Anyway, it appears #2 is easier to understand and serves typical use case (cache TTL < regular snapshot interval) well enough. 
+
+bq. JMX will always return complete result, but the sink might miss some changes
+
+You patch already introduced forceAllMetricsOnSource _after_ TTL expiry, it might be able to eliminate the problem with following changes?
+
+Comments on the patch:
+# forceAllMetricsOnSource doesn't need to be volatile as it's always read/written in synchronized sections.
+# updateJmxCache now copies some logic of getMetrics and doesn't work with source metrics filtering (a feature regression). It seems to me that you can still reuse getMetrics by adding a check {{if (!calledWithAll)}} for resetting forceAllMetricsOnSource to false, so that next sink update will be consistent?
+, Here is a thought regarding the system source issue and reintroducing synchronization around {{MetricsSource#getMetrics}} calls.
+
+My understanding of the HADOOP-8050 deadlock is that we had a lock ordering conflict between a JMX thread (locking {{MetricsSourceAdapter}} and then {{MetricsSystemImpl}}) and a snapshotting thread (locking {{MetricsSystemImpl}} and then {{MetricsSourceAdapter}}).  HADOOP-8050 resolved the deadlock by releasing the lock on the {{MetricsSourceAdapter}} before calling {{MetricsSource#getMetrics}}.
+
+What if instead we do the following:
+
+# Change {{MetricsSourceAdapter#getMetrics}} as follows:
+{code}
+  Iterable<MetricsRecordImpl> getMetrics(MetricsBuilderImpl builder,
+                                         boolean all) {
+    synchronized (source) {
+      synchronized (this) {
+        // existing method logic here
+      }
+    }
+  }
+{code}
+# Change {{MetricsSystemImpl}} so that it implements {{MetricsSource}} directly instead of using an anonymous inner class.
+
+The first part synchronizes {{getMetrics}} calls using a locking order that's consistent with the snapshotting threads.  The second part is required so that the first part's synchronization on the source is really synchronizing on the {{MetricsSystemImpl}} instance instead of the separate anonymous inner class instance., [~cnauroth]: That's a good idea. I actually thought about doing that for HADOOP-8050, as MetricsSystemImpl is already implementing MetricsSource in trunk.
+
+OTOH, this seems to be no longer an issue in trunk due to YARN-1043, which disabled sparse update completely. I was not aware of that until now. In retrospect, I probably should've done that by default, as all the sinks except the first (and then sole) production sink that the system was designed for cannot handle sparse updates anyway. I still cringe at wasting resource snapshotting all the "failure" metrics that don't change much. Maybe I'll scratch that itch one day. , Thanks folks, this sounds promising. Let me take a look and try to code this up.
+
+Luke, do you think we should backport YARN-1043? Looks like an incompatible change so not sure whether we want it back to 1.0 line., Attaching the updated patch which implements what was discussed above. All metrics unittests are passing. Will do a bit more testing separately. , Thanks, Ivan.  This looks right to me.  Thanks for catching the locking order in {{updateJmxCache}} too.  (I had forgotten that this would be trying to take the lock on {{this}} before calling {{getMetrics}}, which would have invalidated the logic I described above.)  I verified that the new test is passing on Mac.
+
+Just one very minor nit: {{TestMetricsSourceAdapter#testJmx}} could say {{throws Exception}} instead of listing the various exception types.  Since it's a test, and any exception is unexpected, I think throwing the base {{Exception}} class is acceptable, and it shrinks the code size a little.
+
+Shall we do a trunk patch too?  Like Luke said, this seems to be a moot point due to YARN-1043, but perhaps it's best to keep the code lines in sync as much as possible.
+, I now recalled some hesitation of extra lock on source:
+
+* It could adversely affect the application performance buy holding the source lock while doing a snapshot. Currently source have a choice on whether and how the snapshot should be synchronized or not depending on the nature of the metrics involved. In many cases, source is implemented by a real object the has application locking logic. Holding a lock doing a potentially large snapshot (many metrics) _could_ increase lock contention significantly.
+* Locking far away from the object is consider an anti-pattern that makes it hard to reason about locking by looking at the source only.
+
+bq. do you think we should backport YARN-1043? Looks like an incompatible change so not sure whether we want it back to 1.0 line.
+
+Always update all should be a compatible change, semantic wise, besides extra objects for non-changing metrics.  It seems that simply backporting the one line change (all is true always) from YARN-1043 (and keeping the test) is less risky to change the locking mechanisms., Thanks Chris and Luke.
+
+Luke, I tend to agree with the risk part.
+
+I guess we have a couple of options on the table:
+#1: We lock the source and use this to guarantee consistency of metrics reported thru sinks.
+#2. We go with my first patch attached (I just have address the feedback). This will guarantee that JMX returns back consistent state. Sinks on the other hand can get back partial results (same as what we have today in branch-1).
+#3. We go with my first patch + YARN-1043. This will address the problem from this Jira + consistent results for sinks. 
+
+Given our conversation from above, my preference is to go with #2. If we believe that YARN-1043 makes sense for branch-1, I would prefer to do it as a separate Jira.
+
+Thoughts?
+
+It's definitely not easy to make the call... at least on my side... :)
+
+PS. Shall we do a trunk patch too?
+I believe we'll want to do a trunk patch too. Haven't tried to repro the problem there yet though. , I think Ivan's last proposal sounds good: get in the JMX part of the patch now, including changes for Luke's last round of feedback, and then queue up a separate jira for consistency around the sinks.  Consistency around the sinks seems like the riskier change, so this is a good way to manage the risk., It seems to me that just porting the one line change from YARN-1043 will fix the problem and less risky? The unit test in the current patch is still useful.
+
+Consistent issue should be fixed in trunk due to YARN-1043., Attaching a patch that goes with option #2 and addresses all the comments.
+
+Luke, doing only the backport is not enough, the bug from this Jira will remain. 
+
+Now we have to decide whether to do the backport in this Jira or not. Whether we do it now or separately, I'd recommend that we change MetricsSourceAdapter#getMetrics signature only to accept MetricsBuilderImpl parameter. This is a package private method so this change should be ok. Thoughts?
+
+, bq. doing only the backport is not enough, the bug from this Jira will remain. 
+
+I must be missing something obvious. Why would the bug remain if lastRecs always contains a complete snapshot?, I think you are right Luke, my mistake. Let me check again. Do you think we should keep the current interfaces intact?, Attaching a new patch that backports YARN-1043. Will also prepare a trunk patch with a unittest if this looks good.
+, +1 for version 4 of the branch-1 patch.
+
+I also was mistaken in thinking there were 2 separate race conditions: one around the JMX cache and another around the update from the metrics sources.  If always pushing all metrics is sufficient to fix the problem in Ivan's tests, then I think we're good., Thanks Chris!
+
+[~vicaya] do you mind taking a quick look?, The 1.4 patch lgtm. +1. , Thanks Luke for the review.
+
+Attaching the updated version of the patch that modifies the test case such that it makes more sense given the current implementation. 
+
+Will also forward port the test case to trunk, and commit once I receive a +1 from Jenkins. , Attaching the trunk patch., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12620392/HADOOP-10090.trunk.5.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+        {color:red}-1 release audit{color}.  The applied patch generated 1 release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/3379//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-HADOOP-Build/3379//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/3379//console
+
+This message is automatically generated., Fixing the audit warning., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12620400/HADOOP-10090.trunk.6.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/3380//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/3380//console
+
+This message is automatically generated., Patch committed to branch-1, branch-1-win, trunk and branch-2.
+
+Thank you Chris and Luke for the review!, SUCCESS: Integrated in Hadoop-trunk-Commit #4928 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/4928/])
+HADOOP-10090. Jobtracker metrics not updated properly after execution of a mapreduce job. Contributed by Ivan Mitic. (ivanmi: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1553561)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/metrics2/impl/TestMetricsSourceAdapter.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #434 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/434/])
+HADOOP-10090. Jobtracker metrics not updated properly after execution of a mapreduce job. Contributed by Ivan Mitic. (ivanmi: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1553561)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/metrics2/impl/TestMetricsSourceAdapter.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #1625 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1625/])
+HADOOP-10090. Jobtracker metrics not updated properly after execution of a mapreduce job. Contributed by Ivan Mitic. (ivanmi: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1553561)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/metrics2/impl/TestMetricsSourceAdapter.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1651 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1651/])
+HADOOP-10090. Jobtracker metrics not updated properly after execution of a mapreduce job. Contributed by Ivan Mitic. (ivanmi: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1553561)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/metrics2/impl/TestMetricsSourceAdapter.java
+]

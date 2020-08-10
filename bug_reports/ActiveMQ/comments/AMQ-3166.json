@@ -1,0 +1,293 @@
+[Research found the following:
+   - The exceptions are being sent over the transport from the broker to the client
+   - Client handling does not propogate the exception back through send() or commit() calls
+
+It appears this is caused by the producer using async sends.  Looking at ActiveMQSession:
+
+            if (sendTimeout <= 0 && !msg.isResponseRequired() && !connection.isAlwaysSyncSend() &&
+                (!msg.isPersistent() || connection.isUseAsyncSend() || txid != null)) {
+                this.connection.asyncSendPacket(msg);
+
+msg.isResponseRequire() defaults to false for most transport commands, including Message.  Taking advantage of the "isAlwaysSyncSend()" logic above, the following works-around the issue (when clients can be modified to use it):
+
+                org.apache.activemq.ActiveMQConnectionFactory   conn_fact;
+                ...
+                conn_fact.setAlwaysSyncSend(true);
+
+Attempts to use URI parameters, and searches through the code for URI parameters, have yielded no working solutions there.  If the connection URL could include a setting such as "?connection.alwaysSyncSend=true" would make this problem easier to solve since most clients use a configurable connection string.
+
+However, with all of that said, it seems that transacted sends - as well as creating producers - should be synchronous.  That can be solved by taking out the "txid != null" logic.
+
+For further performance improvement over transacted sends, if a client wants batch sending, which is not part of the JMS standard, it makes sense to require clients to use ActiveMQ-specific features.  Perhaps a batchSend() method followed by batchComplete().
+, JUnit test program with 3 test cases:
+   1. Transacted sends which illustrate the problem
+   2. Transacted sends using a work-around
+   3. Non-transacted sends which do not have this problem, Corrected source.  The previous one contained a typo., Confirmed with 5.5.0 as well.  Note that an activemq-cpp client was tested with the same results., I finally walked through the entire IntrospectionSupport and query handling for an ActiveMQConnection and found that the following on the URL works around the issue as well:
+
+{code}
+...?jms.alwaysSyncSend=true         (JAVA CLIENT)
+...?connection.alwaysSyncSend=true  (C++ CLIENT: activemq-cpp)
+{code}
+
+For TRANSACTIONS, I recommend that the extra logic be added to use sync sends by default because that matches the the JMS standard - and what I believe clients expect across all JMS providers - but with a setting that allows clients to override that operation.  Perhaps the following:
+
+{code}
+...?jms.transactionAsyncSend=false    => (default) don't use async sends with transactions
+...?jms.transactionAsyncSend=true     => use async sends with transactions
+{code}
+
+By the way, shouldn't the activemq-cpp library support "jms." as the prefix for connection parameters in the same way the Java code does?  Otherwise, we have to make sure URL's are client-implementation-specific.
+
+The subset of logic for async sends on transactions would be as follows:
+
+{code}
+IF (session IS transacted ) AND ( not alwaysSyncSend ) AND ( transactionAsyncSend )
+THEN
+  SEND async
+ELSE
+  SEND sync
+END IF
+{code}
+
+A patch with this update will be coming soon., I agree, it would be better if the cpp client respected the same naming convention, not sure why that is not the case.
+
+The logic for async send with transactions follows from a commit/rollback being sent sync. There is no real work done on the broker till the transaction completes, this sort of batching is expected with multiple message sends in a transaction.
+For the use case where a broker filter throws an exception, having commit fail would make some sense for the transacted case.
+For a producer, I am not sure of the value of local transactions unless there is batching.
+Having said that, having a transacted send respect alwaysSyncSend is no harm as it defaults to false. , The C\+\+ client doesn't respect the jms option prefix for a few reasons, foremost being that its not a JMS client it implements CMS a JMS-like API that can and does vary somewhat from the JMS spec.  Also because the options vary between the C\+\+, .NET and Java client having the URI syntax be identical presents a false equivalence about what behaviour your URI options will produce in the case where you specify options that don't currently exist in the client of your choosing.   In the .NET client we prefix URI options with nms.* for the same reason.  It could be argued that the C\+\+ client should offer its options as cms.* and that would be fine with me, however nobody has stepped up to do the work involved in writing a better URI option parser so its remained as it is now., Broker Filter which remembers failures on transactions and fails all subsequent operations (except rollbacks), including commit()., BrokerPlugin for the filter., Sorry for the slow response.
+
+I think the fail-on-commit is a feasible solution and have attached a Broker Filter which makes that happen.  There are a couple of non-optimal aspects to this solution, but I wanted to put it out for consideration/feedback.
+
+The two concerns I have with this solution are:
+* Only failures that occur after the filter in the broker's filter chain will be detected and handled.
+* Clients may continue for a while after a failure, likely performing throw-away work.
+** I would like to address this with a new message back to the client specifically indicating the transaction failure.
+** Client logic would then be needed to check the transaction on send() and receive()/acknowledge() calls.
+
+Please let me know.  If this looks like a feasible solution, I'll create JUnit tests that incorporate this feature., Corrected the package name., Corrected the package name., AMQ-4213 - This resolves the complaint that the createProducer should be sync.  , Let's get this fixed.  It's a violation of the JMS spec that transactions are not reliable.
+
+I see two options.
+
+* Make the client libraries perform sends synchronously.
+* Have the broker retain state of failures and propogate failed sends to failed commits.
+** Consider a way to propogate failures quickly so that a producer with large numbers of messages does not waste all that effort only to have the commit fail a long time later.
+
+The downside of the first option is a likely loss of performance.  However, the second option is more complex to code and prevents possible intelligence in clients to perform better handling of issues like individual failed sends in a transaction (consider a client wanting to have logic to recover from a single failed send in a larger transaction).
+, Anyone with thoughts on (a) the best approach to resolving this, and (b) avoiding reduced performance, please speak up., thinking just in terms of sends and acks, if a request (sync or sync) results in an exception, then the transaction should be marked rollbackOnly. There may be wasted work but at least the outcome will be deterministic. all of nothing.
+this can probably be handled in org.apache.activemq.broker.TransportConnection#service with some additional rollbackOnly logic in transaction. Or maybe just a rollback immediately will do it., Thanks Gary - I'll look at TransportConnection's service method.
+
+While I tend to agree the extra work may not be a problem, I'd like to see if there's a simple, straight-forward way to solve it.  I've seen this lead to thousands of errors logged in an application for a single request.  One idea is to propogate the failure by sending a transport command back to the client that says the transaction failed so the client library can then respond immediately to any subsequent operations on the transaction.  The biggest downside I see is the added transport command and iterating the protocol., I tried forcing a rollback on the transaction and that causes the commit to fail, but the exception seems misleading to me, stating transaction has not been started:
+
+{noformat}
+javax.jms.JMSException: Transaction 'TX:ID:Arthur-Naseefs-MacBook-Pro.local-58321-1393821595757-5:1:1' has not been started.
+{noformat}
+
+Here's my patch:
+{noformat}
+diff --git a/activemq-broker/src/main/java/org/apache/activemq/broker/TransportConnection.java b/activemq-broker/src/mai
+index 65d044b..fc4a674 100755
+--- a/activemq-broker/src/main/java/org/apache/activemq/broker/TransportConnection.java
++++ b/activemq-broker/src/main/java/org/apache/activemq/broker/TransportConnection.java
+@@ -306,6 +306,9 @@ public class TransportConnection implements Connection, Task, CommandVisitor {
+                 responseRequired = false;
+             }
+ 
++            // AMQ-3166: remember and propogate transaction failures.
++            serviceTransactionExceptions(command, e);
++
+             if (responseRequired) {
+                 response = new ExceptionResponse(e);
+             } else {
+@@ -1608,4 +1611,44 @@ public class TransportConnection implements Connection, Task, CommandVisitor {
+     public WireFormatInfo getRemoteWireFormatInfo() {
+         return wireFormatInfo;
+     }
++
++    protected void  serviceTransactionExceptions(Command command, Throwable thrown) {
++        if ( command instanceof Message ) {
++            Message msg = (Message) command;
++
++            if ( msg.isInTransaction() ) {
++                LOG.debug("marking transaction {} failed on message {} due to {}", msg.getTransactionId(),
++                          msg.getMessageId(), thrown.getMessage());
++                this.markTransactionFailure(msg.getConnection().getConnectionInfo().getConnectionId(),
++                                            msg.getTransactionId(), thrown);
++            }
++        } else if ( command instanceof MessageAck ) {
++            MessageAck ack = (MessageAck) command;
++
++            if ( ack.isInTransaction() ) {
++                LOG.debug("marking transaction {} failed on ack for messages {}..{} due to {}", ack.getTransactionId(),
++                          ack.getFirstMessageId(), ack.getLastMessageId(), thrown.getMessage());
++                this.markTransactionFailure(ack.getConsumerId().getParentId().getParentId(), ack.getTransactionId(),
++                                            thrown);
++            }
++        }
++
++        // TBD: any other commands?  MessagePull doesn't contain transaction info, and I suspect that it doesn't need
++        // it since it must be synchronous.
++    }
++
++    protected void  markTransactionFailure(ConnectionId connId, TransactionId tId, Throwable thrown) {
++        TransactionInfo rollback = new TransactionInfo();
++        rollback.setConnectionId(connId);
++        rollback.setTransactionId(tId);
++        rollback.setType(TransactionInfo.ROLLBACK);
++
++        try {
++            // Reuse the rollback existing logic.
++            this.processRollbackTransaction(rollback);
++        } catch ( Throwable err ) {
++            LOG.warn("failed to force rollack on transaction {} after initial failure {}", tId, thrown.getMessage(),
++                     err);
++        }
++    }
+ }
+{noformat}
+
+I'm looking at adding a "failed" status to TransactionState - that appears to be a feasible approach, and seems more correct as well., the behaviour makes sense b/c of the use of the rollback logic so the transaction goes away.
+I was thinking more along the lines of a new rollbackOnly flag/state in transaction. that would only kick in on commit in the event of a previous failure.
+tracking send/create producer-consumer failures should use syncSends and exception handlers clients side. Broker side they would flip the rollbackOnly flag. So any broker side failure that occurs within a transaction would set the rollbackonly flag and optionally a client can trap individual failures and call rollback. In any event, the transaction aborts., If transacted-sends were always sent Synchronously from the client to the broker, this problem would go away as the clients would immediately receive the exception on the send.  In that case, I wouldn't bother with marking the transaction as failed since (a) there's really no need, and (b) the client could easily decide to go forward and commit in spite of the single send failure (i.e. more complex transacted use-cases would be supported).
+
+My only concern with making that change is the potential impact to performance.  I'll give it a try and see how much impact it has., Doing a quick test, I found {{alwaysSyncSend}} on the connection drops performance for message production.
+
+In fact, the benefit of using a transaction for faster throughput appears to be eliminated.
+
+Here's the test and results.  Note that increasing transaction sizes improves throughput in the async-case (desirable) but not the sync case.
+
+*Test*
+{noformat}
+# Transacted async send of 1000 persistent messages with 100 messages per transaction to queue asn.test
+echo "=== TRANSACTED ASYNC SEND ==="
+time javarun Flood -t -m 1000 -o 250 -c 100 -u 'tcp://localhost:61616' queue asn.test
+
+# Transacted sync send of 1000 persistent messages with 100 messages per transaction to queue asn.test
+echo
+echo "=== TRANSACTED SYNC SEND ==="
+time javarun Flood -t -m 1000 -o 250 -c 100 -u 'tcp://localhost:61616?jms.alwaysSyncSend=true' queue asn.test
+
+# Non-transacted send of 1000 persistent messages to queue asn.test
+echo
+echo "=== NON-TRANSACTED SEND ==="
+time javarun Flood -m 1000 -o 250 -u 'tcp://localhost:61616' queue asn.test
+{noformat}
+
+*Results*
+{noformat}
+=== TRANSACTED ASYNC SEND ===
+log4j:WARN No appenders could be found for logger (org.apache.activemq.transport.WireFormatNegotiator).
+log4j:WARN Please initialize the log4j system properly.
+Set producer window size to 0
+Running Producer
+250
+500
+750
+1000
+Producer Terminating
+
+real    0m0.927s
+user    0m0.030s
+sys     0m0.060s
+
+=== TRANSACTED SYNC SEND ===
+log4j:WARN No appenders could be found for logger (org.apache.activemq.transport.WireFormatNegotiator).
+log4j:WARN Please initialize the log4j system properly.
+Set producer window size to 0
+Running Producer
+250
+500
+750
+1000
+Producer Terminating
+
+real    0m2.403s
+user    0m0.015s
+sys     0m0.061s
+
+=== NON-TRANSACTED SEND ===
+log4j:WARN No appenders could be found for logger (org.apache.activemq.transport.WireFormatNegotiator).
+log4j:WARN Please initialize the log4j system properly.
+Set producer window size to 0
+Running Producer
+250
+500
+750
+1000
+Producer Terminating
+
+real    0m2.508s
+user    0m0.015s
+sys     0m0.045s
+{noformat}
+
+
+Based on this, I won't force all transacted sends to be synchronous., I'm out of the office and will return on Monday, Mar. 10th.
+
+
+
+
+, We had an issue in production with lost messages in a transacted batch, due to server memory limit settings (producer flow control). Setting an exception handler on the connection factory is not enough to be on the safe side, as we were able to construct a test case that builds a race condition between the producer thread and the exception handler thread such that the commit is done before the asynchronous exception callback is fired by the server response.
+
+E.g. set server memory limit to 1 MB only, send batch of 100 messages, server can handle only 95 messages, commit is done before callback is triggered: 5 messages are lost, 95 messages appear in the queue.
+
+As lost messages within a transaction are really a bad thing we would appreciate Gary Tully's approach of setting a flag in the transaction context, so that any exception will always and reliably yield a JMS rollback. Besides that, an exception should be thrown in the commit thread such that there is no chance of having a silent failure from the client perspective. Otherwise the rollback may go unnoticed.
+Transaction handling should also be safe for those users that forget to set the exception handler at all.
+
+I do not favor the option of doing a commit for only a part of my message batch, i.e. when you have a failure after message 101 you should not be able to commit messages 1 to 100. For me transactions are always an all-or-nothing matter. As with asynchronous sends you have a delay of several send operations until the exception handler gets fired it would require significant client logic to determine which messages survived and which got lost., I'm out of the office and will return on Monday, Apr. 13th.
+
+
+
+, Commit fe9d99e7a071c4c09c78dfd95630036b86a8a05b in activemq's branch refs/heads/master from [~gtully]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=fe9d99e ]
+
+AMQ-3166 - implement rollbackOnlyOnAsyncException such that async exceptions on transactional sends or acks result in the transaction being marked rollback only and commit failing with an exception. Test that shows current state of play using alwaySendSync or AsyncCallback. rollbackOnlyOnAsyncException enabled by default.
+, async exceptions on transactional ops - message send and message ack will result in the transaction being marked rollback-only. Commit will fail with an exception.
+In the event that folks want to have partial transactions in the event of failures, the behaviour can be disabled with {code}<broker rollbackOnlyOnAsyncException="false" ... >{code}
+
+using setAlwaysSyncSend or using the AsyncCallback api variants provide workarounds for the current code base., [~gtully] just curious, is there a reason that the Transaction does not remember the original cause in setRollbackOnly and include that on the resulting XAException?  I ran into this bug when using producer flow control on a jms transacted connection (on an older version of activemq).  the patch for this bug fixes the problem, however, you have to dig through the logs to find the ultimate cause of the send failure (a ResourceAllocationException).  seems like it would be useful to include that in the failure returned to the client?  
+
+e.g.:
+{code}
+diff --git a/activemq-broker/src/main/java/org/apache/activemq/transaction/Transaction.java b/activemq-broker/src/main/j
+index f891c89..99b8c1f 100755
+--- a/activemq-broker/src/main/java/org/apache/activemq/transaction/Transaction.java
++++ b/activemq-broker/src/main/java/org/apache/activemq/transaction/Transaction.java
+@@ -45,6 +45,7 @@ public abstract class Transaction {
+     public static final byte FINISHED_STATE = 3;
+     boolean committed = false;
+     boolean rollbackOnly = false;
++    private Throwable rollbackOnlyCause;
+ 
+     private final ArrayList<Synchronization> synchronizations = new ArrayList<Synchronization>();
+     private byte state = START_STATE;
+@@ -112,6 +113,9 @@ public abstract class Transaction {
+         if (rollbackOnly) {
+             XAException xae = newXAException("COMMIT FAILED: Transaction marked rollback only", XAException.XA_RBROLLBA
+             TransactionRolledBackException transactionRolledBackException = new TransactionRolledBackException(xae.getL
++            if(rollbackOnlyCause != null) {
++                transactionRolledBackException.initCause(rollbackOnlyCause);
++            }
+             xae.initCause(transactionRolledBackException);
+             throw xae;
+         }
+@@ -216,6 +220,7 @@ public abstract class Transaction {
+         if (!rollbackOnly) {
+             getLog().trace("setting rollback only, cause:", cause);
+             rollbackOnly = true;
++            rollbackOnlyCause = cause;
+         }
+     }
+{code}, I'm out of the office and will return on Wed, Nov 16th.
+[https://www.netcracker.com/assets/img/netcracker-social-final.png] ƕ
+
+
+
+, Commit 7077d2b910405dea7a60c5140824966ffebc66a8 in activemq's branch refs/heads/master from [~gtully]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=7077d2b ]
+
+[AMQ-3166] init rollbackonly exception cause such that xaexception has meaning, thanks to james (jtahlborn) for the suggestion
+, [~jahlborn] thanks for the suggestion. I swapped the boolean for a throwable and now capture the root cause. , Commit 99b7a28ccbb5435ef5bdba3ceac9995996dfbbed in activemq's branch refs/heads/master from [~gtully]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=99b7a28 ]
+
+[AMQ-3166] fix typo that removed class name, sorry
+]

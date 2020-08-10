@@ -1,0 +1,70 @@
+[The more close investigation of the problem shows the balancer needs additional improvements:
+
+(1) The balancer needs to better handle block move timeout well. Currently it simply assumes that
+the timeouted move is failed but does not take the effort to make sure the move is interrupted and the resources the
+move takes is released. The next phase of scheduling may schedule more blocks to move from the same DataNode thus using
+more and more resources.
+
+(2) Resource control for the balancing purpose at DataNodes should use a fair Semaphore. Currently
+it uses an unfair Semaphore that makes no guarantees about the order in which threads acquire permits. A
+thread invoking acquire() can be allocated a permit ahead of a thread that has been waiting. Therefore, if a dfs
+cluster has many DataNodes that has a long queue of block move requests, it is very likely to enter the
+following state: A thread in DataNode A holding a permit and asks DataNode B to receive a block, while DataNode B has a
+thread holding a Semaphore and asking DataNode A to receive a block. Although the block move from B to A was scheduled
+much later than the move from A to B, they may be executed simultaneously. Both block receives are blocks on acquiring
+a permit assuming only one permit can be issued. Therefore, a deadlock occurs., Thanks for the detailed analysis Hairong. I filed the original jira just looking at one symptom., Proposed changes to the Balancer:
+1. Remove the use of Semaphor at DataNodes. Instead a DataNode uses a counter to manages the number of concurrent block moves. On receiving a block move request while maximum block moves are in progress, reject the request immediately.
+2. Let the receiver initiate the block move; The sender rejects the request when the maximum number has already reached. As a result when either the sender or the receiver does not have resource to handle block move, the block content will not get transfered across network.
+3. The balancer does not set a timeout on a socket. Instead, it sets the option KeepAlive on the socket. So a block move does not timeout no matter how slow it goes and next phrase of scheduling does not get started when there is a pending block move. , A patch for review., Hi Hairong,  I'm interested in testing out your fix - is there, by any chance, a patch against the 0.18.x series?
+
+I've only been able to partially apply your patch to to the official 0.18.1 release and it seems there was a major code reorg between 0.18 and 0.19 branches., - I do not understand what was the reason for changing the push block model to the pull model.
+Previously balancer would send OP_COPY_BLOCK request to the proxy node, which then sent OP_REPLACE_BLOCK to the target.
+Now it is reversed: the balancer sends OP_REPLACE_BLOCK to the target, which sends OP_COPY_BLOCK to the proxy.
+In both cases DataXceiver is supposed to check the XceiverCount and throw an exception if it is exceeded.
+So in both cases the transfer will fail if any of the two data-nodes are busy.
+I don't see a mistake here, but don't see a reason for this rather radical change either, may be I am missing something.
+- BalanceManager 
+-- should probably be called {{BlockBalanceThrottler}}.
+-- It makes sense to derive it from {{BlockTransferThrottler}}.
+-- It should be a static class.
+-- And it should rather be a member of {{DataXceiveServer}} than {{DataNode}}., In the push model, if the proxy is allowed to transfer the block but the destination does not allow to receive it. The whole/partial block will still be transferred to the destination's system buffer but then be thrown away. Although the block is not delivered to the target's datanode buffer, network resources are still wasted.
+
+Bo, I will create a patch to 0.18 the first thing when I get to the office tomorrow., The patch incorporates Konstantin's comments., > 3. The balancer does not set a timeout on a socket. Instead, it sets the option KeepAlive on the socket. So a block move does not timeout no matter how slow it goes and next phrase of scheduling does not get started when there is a pending block move.
+
+How does keep-alive matter? TCP has no inherent timeout for a connection in normal state. , As I said, my intention is that receiveResponse never times out in normal state no matter how slow the other side is. Setting KeepAlive is for detecting the other side's machine gets crashed suddenly so it won't wait there forever. But for all other cases, it will return eventually. Does it make sense?, Oh.. it is to detect if the other side has crashed. It make sense. The keepalive might be in the order of hours I guess.
+, Yes, the default is 2 hours. My argument is that the performance of Balancer is not of importance comparing to using too many resources. Anyway the administrator can stop the balancer anytime if she sees that the balancer has not made any progress for hours., Yes. I think hours is fine in this case. thanks for the clarification., +1., keepAlives are a fairly weak way of assessing "liveness" because 
+ -it works at the network stack level, so your app may still be dead but the KA packets are happy
+ -if there are a lot of (idle) connections between two hosts, a lot of KA traffic can be generated, rather than one packet per host, which is how a lot of protocols (CORBA and DCOM, for example) communicate "we are still alive". 
+
+I think this proposal is better than nothing, but we need to be aware of limitations. It will detect a network partition, but not a hung far end if the network stack is still up, I agree that KA does not detect dead apps on the other side. Besides timeouts, is there any good solution to this problem?
+
+Balancer limits at most 5 concurrent connections from itself to a DataNode, so too many KAs should not be a concern., Here is a patch for branch 18., This is a patch to branch 18 that has fixed the findbug warning., Attach one patch for the trunk, which also has fixed the findbugs warning introduced by the previous trunk patch., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12390875/balancerRM2.patch
+  against trunk revision 698721.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3365/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3365/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3365/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3365/console
+
+This message is automatically generated., The ping operation we are proposing for the lifecycle in HADOOP-3628 and HADOOP-3969 does a better health check, as it asks the far end if it thinks it is happy, and can detect a dead end (with suitable timeouts) and a machine that thinks it is unwell. But the most reliable way to check system health is to give that node real work and see if it completes it within time. That's something that could be done as a low priority job across a cluster: queue work and check the results, though you'd need to direct the work to specific nodes somehow. , Yes, I agree. I did similar stuff in HADOOP-2188 in the context of IPC. For this issue, I do not want to take the effort to add a Ping interface to DataNode. I will use KeepAlive for now.
+
+The failed unit test seems not related to this jira., I've committed this., It is not clear to me that the test (TestDatanodeDeath) failed is not related since the patch changed quite a lot Datanode codes.  Created HADOOP-4278 for TestDatanodeDeath., Integrated in Hadoop-trunk #615 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/615/]), Integrated in Hadoop-trunk #646 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/646/])
+    Fix the change log to reflect that  is reverted in 0.18.2
+, Changed 'fix version' to 0.19.0 since 0.18 change was reverted [later|http://svn.apache.org/viewvc?view=rev&revision=708637].]

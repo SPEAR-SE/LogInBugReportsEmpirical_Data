@@ -1,0 +1,111 @@
+[[~ssmane3.tech]: most likely, this is caused by the hybrid hashtable. Can you try validating that disabling the hybrid join fixes this?
+
+{code}
+set hive.mapjoin.hybridgrace.hashtable=false;
+{code}, [~gopalv] Setting it to false solved my problem. Thanks. 
+Also I more interested in what is happening in this case "hive.mapjoin.hybridgrace.hashtable" ?, Looks like the first partition on your join is > the threshold for spilling.
+
+{code}
+        if (i == 0) { // We unconditionally create a hashmap for the first hash partition
+          hashPartitions[i] = new HashPartition(initialCapacity, loadFactor, writeBufferSize,
+              maxCapacity, true, spillLocalDirs);
+          LOG.info("Each new partition will require memory: " + hashPartitions[0].hashMap.memorySize());
+        } else {
+          // To check whether we have enough memory to allocate for another hash partition,
+          // we need to get the size of the first hash partition to get an idea.
+          hashPartitions[i] = new HashPartition(initialCapacity, loadFactor, writeBufferSize,
+              maxCapacity, memoryUsed + hashPartitions[0].hashMap.memorySize() < memoryThreshold,
+              spillLocalDirs);
+        }
+{code}
+
+while the closeOp() does not handle that scenario where {{memoryUsed + hashPartitions[0].hashMap.memorySize() < memoryThreshold}} is false.
+
+{code}
+                  hybridHtContainer.setTotalInMemRowCount(
+                      hybridHtContainer.getTotalInMemRowCount() -
+                          hashPartitions[i].getHashMapFromMemory().getNumValues());
+                  hashPartitions[i].getHashMapFromMemory().clear();
+{code}
+
+Where {{hashPartitions[i].getHashMapFromMemory() == null}}.
+
+Cc: [~wzheng], I recommend trying out the following patch, but it is untested as of now
+
+{code}
+--- ql/src/java/org/apache/hadoop/hive/ql/exec/MapJoinOperator.java
++++ ql/src/java/org/apache/hadoop/hive/ql/exec/MapJoinOperator.java
+@@ -520,7 +520,8 @@ public void closeOp(boolean abort) throws HiveException {
+               HashPartition[] hashPartitions = hybridHtContainer.getHashPartitions();
+               // Clear all in memory partitions first
+               for (int i = 0; i < hashPartitions.length; i++) {
+-                if (!hashPartitions[i].isHashMapOnDisk()) {
++                if (hashPartitions[i].isHashMapOnDisk() == false
++                    && hashPartitions[i].getHashMapFromMemory() != null) {
+                   hybridHtContainer.setTotalInMemRowCount(
+                       hybridHtContainer.getTotalInMemRowCount() -
+                           hashPartitions[i].getHashMapFromMemory().getNumValues());
+{code}, Thanks you very much. It is much needed help. And i hope patch given will be included in future versions. , Thanks [~gopalv] for the quick analysis. But I think it is either isHashMapOnDisk() is true or we have a in-memory hashmap
+{code}
+    /* It may happen that there's not enough memory to instantiate a hashmap for the partition.
+     * In that case, we don't create the hashmap, but pretend the hashmap is directly "spilled".
+     */
+    public HashPartition(int initialCapacity, float loadFactor, int wbSize, long maxProbeSize,
+                         boolean createHashMap, String spillLocalDirs) {
+      if (createHashMap) {
+        // Probe space should be at least equal to the size of our designated wbSize
+        maxProbeSize = Math.max(maxProbeSize, wbSize);
+        hashMap = new BytesBytesMultiHashMap(initialCapacity, loadFactor, wbSize, maxProbeSize);
+      } else {
+        hashMapSpilledOnCreation = true;
+        hashMapOnDisk = true;
+      }
+      this.spillLocalDirs = spillLocalDirs;
+      this.initialCapacity = initialCapacity;
+      this.loadFactor = loadFactor;
+      this.wbSize = wbSize;
+    }
+{code}
+[~ssmane3.tech] It will be helpful if you can attach the hive.log. Thanks., [~wzheng]: I don't see that happening for a clear(), OK I see what you're saying. In HashPartition.clear() we may have hashMapOnDisk being false, and hashMap being null at the same time, which we didn't guard in MapJoinOperator.closeOp. Please take a look at the attached patch. Thanks., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12844150/HIVE-15194.1.patch
+
+{color:red}ERROR:{color} -1 due to no test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 15 failed/errored test(s), 10825 tests executed
+*Failed tests:*
+{noformat}
+TestDerbyConnector - did not produce a TEST-*.xml file (likely timed out) (batchId=234)
+TestVectorizedColumnReaderBase - did not produce a TEST-*.xml file (likely timed out) (batchId=251)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[dbtxnmgr_showlocks] (batchId=71)
+org.apache.hadoop.hive.cli.TestCliDriver.testCliDriver[str_to_map] (batchId=58)
+org.apache.hadoop.hive.cli.TestMiniLlapCliDriver.testCliDriver[transform_ppr2] (batchId=135)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[columnstats_part_coltype] (batchId=150)
+org.apache.hadoop.hive.cli.TestMiniLlapLocalCliDriver.testCliDriver[stats_based_fetch_decision] (batchId=151)
+org.apache.hadoop.hive.cli.TestMiniTezCliDriver.testCliDriver[explainanalyze_2] (batchId=93)
+org.apache.hadoop.hive.cli.TestMiniTezCliDriver.testCliDriver[tez_union_with_udf] (batchId=93)
+org.apache.hadoop.hive.cli.TestMiniTezCliDriver.testCliDriver[vectorization_div0] (batchId=93)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[exchange_partition_neg_incomplete_partition] (batchId=84)
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testCliDriver[exim_00_unsupported_schema] (batchId=85)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query36] (batchId=222)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query70] (batchId=222)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query86] (batchId=222)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/2661/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/2661/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-2661/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 15 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12844150 - PreCommit-HIVE-Build]

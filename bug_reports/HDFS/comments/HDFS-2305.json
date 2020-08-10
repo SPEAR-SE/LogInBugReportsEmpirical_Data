@@ -1,0 +1,98 @@
+[There are two obvious work-arounds for this issue:
+
+# Explicitly configure the address of the 2NN ({dfs.secondary.http.address}). This would prevent 2NNs from starting up which couldn't bind to that address.
+# Do something else to make sure that there is only ever one 2NN running.
+
+But, we should still harden HDFS to make it so that this scenario is less likely to occur. Right now it's all too easy (with the default configs) to find oneself in this scenario.
+
+I can think of a few possible solutions:
+
+# Don't have a default value for the {{dfs.secondary.http.address}}. Require the user set it, and don't allow the 2NN to start up without it. The NN will reject connections to roll/fetch fsimage/edits from any machine that's not connecting from this configured address.
+# On start-up, the 2NN makes an RPC to the NN to generate a unique token. This token is subsequently used for all NN and 2NN communication. The NN will reject any communication from a 2NN with a different token. This will effectively lock out any previously-started 2NNs from mutating the NN state.
+# Before transferring the fsimage back to the NN, the 2NN computes a checksum of the newly-merged fsimage, and informs the NN of the expected checksum. On download of the new fsimage, the NN verifies the checksum of the downloaded file against the expected checksum from the 2NN.
+
+Of these, I think I'm inclined to go with option 3. Option 1 is dead simple, but has the downside of changing default config options and requiring an extra step to set up a Hadoop cluster. Option 2 seems like overkill to me. Option 3 is relatively simple, and has the added benefit of providing an extra integrity check of the fsimage state during network transfer.
+
+Thoughts?, Also, I should have mentioned that this issue will not affect trunk or 0.23 thanks to HDFS-1073. Even if you did start up multiple 2NNs, their presence would be innocuous., Your option #3 is the same as HDFS-903, right? Though perhaps a subportion of it, since it's only checksumming the transfer?, @Todd - yep, I agree. Option 3 as-described is a subset of HDFS-903.
+
+Perhaps, then, the thing to do for this JIRA is to do a partial back-port HDFS-903 to the security 0.20-security branch in such a way so as to not require a change to the layout version. Since the goal of this JIRA is just to prevent receiving the wrong fsimage during checkpointing, not verify validity of the fsimage coming off disk, there's no need to store the checkpoint in the VERSION file. Rather, we can just compute the checksum on the fly, but still send it with the CheckpointSignature during checkpointing., Sounds like a plan, Aaron, doesn't Checkpoint Signature prevent this problem from happening?, Hey Suresh, unfortunately it does not. Though the {{CheckpointSignature}} object does include the {{editsTime}} and {{checkpointTime}}, {{CheckpointSignature.validateStorageInfo}} only validates the values of {{layoutVersion}}, {{namespaceID}}, and {{cTime}}, none of which change on a checkpoint. So, though the {{CheckpointSignature}} would prevent the NN from grabbing an invalid fsimage from a different file system, the NN can't tell the difference between an old fsimage and an up-to-date fsimage from the same file system.
+
+For reference:
+
+{code}
+void validateStorageInfo(StorageInfo si) throws IOException {
+    if(layoutVersion != si.layoutVersion
+        || namespaceID != si.namespaceID || cTime != si.cTime) {
+      // checkpointTime can change when the image is saved - do not compare
+      throw new IOException("Inconsistent checkpoint fileds. "
+          + "LV = " + layoutVersion + " namespaceID = " + namespaceID
+          + " cTime = " + cTime + ". Expecting respectively: "
+          + si.layoutVersion + "; " + si.namespaceID + "; " + si.cTime);
+    }
+  }
+{code}, Here's a patch (not intended for commit) which contains a test that exercises this case, just to demonstrate the issue. The final assert will fail., I should've mentioned - this patch is for branch-0.20-security., Here's a patch which addresses the issue. This is a full and faithful back-port of HADOOP-7009 and a partial, minimal back-port of HDFS-903 which doesn't change the layout version, and instead calculates checksums for the fsimage on the fly.
+
+This patch is for branch-0.20-security., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12492676/hdfs-2305.0.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1186//console
+
+This message is automatically generated., - Some of the new info messages should probably be debug level
+- Do we also need to add some locking so that only one 2NN could be uploading an image at the same time? eg what about the following interleaving:
+-- 2NN A starts uploading a good checkpoint which is large
+-- 2NN B starts uploading an invalid checkpoint which is small, which overwrites fsimage.ckpt
+-- 2NN B gets the cksum error, leaving its bad fsimage.ckpt in place
+-- 2NN A finishes uploading, and calls checkpointUploadDone - B's fsimage.ckpt is rolled into place
+- getNewChecksum looks like it will leak a file descriptor - need a try/finally close
+- would it be easier to just backport the part of 903 that creates an "imageChecksum" member which is updated whenever the image is merged, by the existing output stream? That would reduce divergence between 20s and trunk. That is to say, backport HDFS-903 except for the part where the checksum is put in the VERSION file., bq. Some of the new info messages should probably be debug level
+
+There were only a few new info messages. I changed one of them to debug, and made one other less verbose, since some of the info is only relevant in the event of an error, and in that case the extra info is printed as part of the exception.
+
+bq. Do we also need to add some locking so that only one 2NN could be uploading an image at the same time?
+
+Agreed. This strictly necessary to fix the issue identified in this JIRA, but I agree that this is a potential for error as well.
+
+bq. getNewChecksum looks like it will leak a file descriptor
+
+Thanks, good catch.
+
+bq. would it be easier to just backport the part of 903 that creates an "imageChecksum" member which is updated whenever the image is merged, by the existing output stream? That would reduce divergence between 20s and trunk. That is to say, backport HDFS-903 except for the part where the checksum is put in the VERSION file.
+
+I thought about doing this. Thought it seems like it would make for a more straight-forward back-port, the back-port isn't easy regardless because of other divergences between trunk and branch-0.20-security. So, we don't seem to be gaining much by doing it this way, and since we wouldn't be storing the previous checksum as part of the VERSION file, we wouldn't be getting the intended benefit of HDFS-903 ("NN should verify images and edit logs on startup.")
+
+I'll upload a patch in a moment which addresses all of these issues, except the last one. Todd, if you feel strongly about it, I can rework the patch as you described to be a more faithful back-port of HDFS-903., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12494158/hdfs-2305.1.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/1232//console
+
+This message is automatically generated., +1, looks good to me., oh, please run at least the following tests before commit:
+
+src/test/org/apache/hadoop/hdfs/TestDFSStorageStateRecovery.java
+src/test/org/apache/hadoop/hdfs/server/namenode/TestStartup.java
+src/test/org/apache/hadoop/hdfs/server/namenode/TestNameEditsConfigs.java
+src/test/org/apache/hadoop/hdfs/server/namenode/TestSaveNamespace.java
+src/test/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+src/test/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+src/test/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+src/test/org/apache/hadoop/hdfs/server/namenode/TestStorageRestore.java
+src/test/org/apache/hadoop/hdfs/server/namenode/TestCheckPointForSecurityTokens.java
+
+Thanks!, I ran the full test suite on my local box. The only test which failed was {{org.apache.hadoop.hdfs.security.TestDelegationToken}}, which per HADOOP-7625 is known to be failing on branch-0.20-security.
+
+I'll commit this to branch-0.20-security in the next hour or so if there are no objections.
+
+Thanks a lot for the review, Todd., I've just committed this. Thanks again for the review, Todd., Closed upon release of Hadoop-1.1.0.]

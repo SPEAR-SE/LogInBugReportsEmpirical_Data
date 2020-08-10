@@ -1,0 +1,221 @@
+[There are two possible immediate fixes that can be implemented.
+- Allow {{commitBlockSynchronization()}} to complete even if a received-IBR is not received (I.e. last block not in COMPLETE state). This is equivalent of allowing closing without the last block being COMPETE.
+- Do not allow {{LeaseManager}} to blindly remove the lease on a lease recovery failure and leave the inode in under-construction state. 
+
+They are all simple changes that will prevent the issues from happening.  However, I haven't been able to root cause how and where NPE is happening.  It is from calling {{getBlockLocations()}}, but so far I have not been able to reproduce it.  I will find other means to RC it., *Details of the NPE:*
+The JVM did produce a stacktrace on the very first occurance of the NPE. Subsequent ones were missing a stack trace.
+
+The NPE is caused by {{commitBlockSynchronization()}} containing a dead node in the new targets.  Since block recoveries are issued based on {{BlockUnderConstructionFeature.replicas}} (aka expected locations), which is not updated on node death, block recovery can include dead nodes.  When {{commitBlockSynchronization()}} is called, the expected locations is also updated. (In fact, the whole BlockUnderConstructionFeature is swapped)  Each expected location is populated by searching for datanode storage using the storage ID string passed in {{commitBlockSynchronization()}}.   If the node is dead, the look up returns null.
+
+(Clarification on dead node: the faulty node did try to come back at times and that actually made the situation worse. On re-registration, the existing storages are removed from the datanode descriptor. If it cannot heatbeat for some reason, storage lookup using a storage ID will return null)
+
+If {{getBlockLocation()}} is called after this, {{newLocatedBlock()}} is called with the expected locations, not with the locations in the blocks map, since it is still under-construction. This calls {{DatanodeStorageInfo.toDatanodeInfos()}}, which blows up, as it tries to call {{getDatanodeDescriptor()}} of the null storage object.
+
+*Proposed solution to the NPE issue:*
+We can have {{commitBlockSynchronization()}} check for valid storage ID before updating data structures.  Even if no valid storage ID is found, we can't fail the operation. One or more node did finalize the block, whether they are dead or alive at this moment. It is like a missing block case.  We can go ahead and commit the block without the dead node/storage and also allow closing of the file, just like {{completeFile()}}.
+
+On closing of the file, {{checkReplication()}} is called and in our example, this will cause the last block (still in committed state) to be reported as missing.  If the dead node comes back, it will include the finalized replica in the block report and that will cause the block to be completed and missing block to be cleared., *Summary:*
+ The observation of the incident resulted in discovery of three flaws.
+
+1) A block recovery can involve dead nodes and it can lead to a corruption of a data structure, which causes NPE.
+2) If a block cannot be completed, {{commitBlockSynchronization()}} will fail, since it requires all blocks to be complete, unlike regular file closings.
+3) If a block has experienced 2) and remains committed (not complete), next lease recovery will result in a lease state corruption. (Removed from LeaseManager, but INode stays under-construction)
+, Attaching supplemental information including stack traces., Thanks for your investigation Kihwal! I am seeing something similar on 2.7.3. A block is holding up decommissioning because recovery failed. (The strace below is from the time when the cluster was 2.7.2) . DN2 and DN3 are no longer part of the cluster. DN1 is the node held up for decomissioning. I checked that the block and meta file indeed are in the finalized directory.
+{code}
+2016-09-19 09:02:25,837 WARN org.apache.hadoop.hdfs.server.datanode.DataNode: recoverBlocks FAILED: RecoveringBlock{BP-<someid>:blk_1094097355_20357090; getBlockSize()=0; corrupt=false; offset=-1; locs=[DatanodeInfoWithStorage[<DN1>:50010,null,null], DatanodeInfoWithStorage[<DN2>:50010,null,null], DatanodeInfoWithStorage[<DN3>:50010,null,null]]}
+org.apache.hadoop.ipc.RemoteException(java.lang.IllegalStateException): Failed to finalize INodeFile <filename> since blocks[0] is non-complete, where blocks=[blk_1094097355_20552508{UCState=COMMITTED, truncateBlock=null, primaryNodeIndex=0, replicas=[ReplicaUC[[DISK]DS-03bed13e-5cdd-4207-91b6-abd83f9eb7d3:NORMAL:<DN1>:50010|RBW]]}].
+        at com.google.common.base.Preconditions.checkState(Preconditions.java:172)
+        at org.apache.hadoop.hdfs.server.namenode.INodeFile.assertAllBlocksComplete(INodeFile.java:222)
+        at org.apache.hadoop.hdfs.server.namenode.INodeFile.toCompleteFile(INodeFile.java:209)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.finalizeINodeFileUnderConstruction(FSNamesystem.java:4218)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.closeFileCommitBlocks(FSNamesystem.java:4457)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.commitBlockSynchronization(FSNamesystem.java:4419)
+        at org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer.commitBlockSynchronization(NameNodeRpcServer.java:837)
+        at org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolServerSideTranslatorPB.commitBlockSynchronization(DatanodeProtocolServerSideTranslatorPB.java:291)
+        at org.apache.hadoop.hdfs.protocol.proto.DatanodeProtocolProtos$DatanodeProtocolService$2.callBlockingMethod(DatanodeProtocolProtos.java:28768)
+        at org.apache.hadoop.ipc.ProtobufRpcEngine$Server$ProtoBufRpcInvoker.call(ProtobufRpcEngine.java:616)
+        at org.apache.hadoop.ipc.RPC$Server.call(RPC.java:969)
+        at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:2049)
+        at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:2045)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:415)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1679)
+        at org.apache.hadoop.ipc.Server$Handler.run(Server.java:2043)
+
+        at org.apache.hadoop.ipc.Client.call(Client.java:1475)
+        at org.apache.hadoop.ipc.Client.call(Client.java:1412)
+        at org.apache.hadoop.ipc.ProtobufRpcEngine$Invoker.invoke(ProtobufRpcEngine.java:229)
+        at com.sun.proxy.$Proxy16.commitBlockSynchronization(Unknown Source)
+        at org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolClientSideTranslatorPB.commitBlockSynchronization(DatanodeProtocolClientSideTranslatorPB.java:312)
+        at org.apache.hadoop.hdfs.server.datanode.DataNode.syncBlock(DataNode.java:2780)
+        at org.apache.hadoop.hdfs.server.datanode.DataNode.recoverBlock(DataNode.java:2642)
+        at org.apache.hadoop.hdfs.server.datanode.DataNode.access$400(DataNode.java:243)
+        at org.apache.hadoop.hdfs.server.datanode.DataNode$5.run(DataNode.java:2519)
+        at java.lang.Thread.run(Thread.java:744)
+{code}
+
+I am not sure what purpose failing {{commitBlockSyncronization()}} in this case fulfills, so I would be agreeable to your proposed solution
+bq. We can have commitBlockSynchronization() check for valid storage ID before updating data structures. Even if no valid storage ID is found, we can't fail the operation, Hi, [~raviprak]. We've seen what you described above. It is not directly related to this jira, but I think we had an internal fix for this. Just a couple of days ago, we were talking about pushing the fix to Apache. Please do file a jira and let me know., Thanks Kihwal! I've filed https://issues.apache.org/jira/browse/HDFS-11852 . , I started the patch for branch-2.8 and branch-2.  The trunk version is not ready yet, but want to run the branch-2 version through precommit before the weekend., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 18s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m  8s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 48s{color} | {color:green} branch-2 passed with JDK v1.8.0_131 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 46s{color} | {color:green} branch-2 passed with JDK v1.7.0_131 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 33s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 56s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 15s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  8s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 41s{color} | {color:green} branch-2 passed with JDK v1.8.0_131 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  2s{color} | {color:green} branch-2 passed with JDK v1.7.0_131 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 49s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 41s{color} | {color:green} the patch passed with JDK v1.8.0_131 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 44s{color} | {color:green} the patch passed with JDK v1.7.0_131 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 29s{color} | {color:orange} hadoop-hdfs-project/hadoop-hdfs: The patch generated 7 new + 272 unchanged - 5 fixed = 279 total (was 277) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 38s{color} | {color:green} the patch passed with JDK v1.8.0_131 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  1s{color} | {color:green} the patch passed with JDK v1.7.0_131 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 56m 20s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_131. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}138m 58s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_131 Failed junit tests | hadoop.hdfs.server.namenode.TestLeaseManager |
+|   | hadoop.hdfs.server.balancer.TestBalancerRPCDelay |
+|   | hadoop.hdfs.server.namenode.ha.TestRetryCacheWithHA |
+| JDK v1.8.0_131 Timed out junit tests | org.apache.hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+| JDK v1.7.0_131 Failed junit tests | hadoop.hdfs.server.namenode.TestLeaseManager |
+|   | hadoop.hdfs.server.blockmanagement.TestReplicationPolicyWithUpgradeDomain |
+|   | hadoop.hdfs.server.namenode.ha.TestRetryCacheWithHA |
+| JDK v1.7.0_131 Timed out junit tests | org.apache.hadoop.hdfs.server.blockmanagement.TestBlockStatsMXBean |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:8515d35 |
+| JIRA Issue | HDFS-11817 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12869068/HDFS-11817.branch-2.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 0657e96c7c2d 3.13.0-107-generic #154-Ubuntu SMP Tue Dec 20 09:57:27 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 2719cc0 |
+| Default Java | 1.7.0_131 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_131 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_131 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/19520/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/19520/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_131.txt |
+| JDK v1.7.0_131  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/19520/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/19520/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Two test failures are real.
+{noformat}
+TestRetryCacheWithHA#testCheckLease
+TestLeaseManager#testCheckLease
+{noformat}
+
+{{TestLeaseManager}} was failing because I made failed lease recoveries to be retried. In the new patch, I made it give up and remove the lease if an IOException is thrown because of a bad path.  For all other cases, it is correct to retry, since they are likely transient conditions.
+
+{{TestRetryCacheWithHA}} was failing because the test passed fake storage IDs to {{updatePipeline()}}, despite it has the real storage IDs available. Updated the test.
+
+I will upload the trunk version shortly with these changes., In trunk, there already is a logic to weed out null StorageInfo before putting one to the expected locations. This was done by as part of HDFS-9040. It too had TestRetryCacheWithHA failed, so it was also fixed as part of HDFS-9040, although I believe my fix is better. As it is a EC-related change, the JIRA cannot be applied to branch-2.   I will back-port the relevant portion in my patch, so that trunk and branch-2/2.8 stays more in sync.  The trunk version of my patch will contain the test case (HDFS-9040 did not add a new test case for this) and the lease manager fix., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  1m 13s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 14m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 50s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 40s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 53s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 16s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 43s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 47s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 47s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 36s{color} | {color:orange} hadoop-hdfs-project/hadoop-hdfs: The patch generated 7 new + 271 unchanged - 4 fixed = 278 total (was 275) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 40s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 72m 11s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 24s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}100m 47s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailure |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure080 |
+|   | hadoop.hdfs.TestDFSRSDefault10x4StripedOutputStreamWithFailure |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:14b5c93 |
+| JIRA Issue | HDFS-11817 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12869359/HDFS-11817.v2.trunk.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux f5667cdf52bd 3.13.0-107-generic #154-Ubuntu SMP Tue Dec 20 09:57:27 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 8e0f83e |
+| Default Java | 1.8.0_131 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/19549/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/19549/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/19549/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/19549/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, +1 I would be nice if this recovery code was cleaned up someday, but this definitely fixes the perma-UC files and NPEs., Thanks for the review, Daryn., Attaching what's committed to 2.8 as reference.  The cherry-pick from branch-2 was clean, but had to update one method call in the test, since the containing class has been changed., SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #11785 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/11785/])
+HDFS-11817. A faulty node can cause a lease leak and NPE on accessing (kihwal: rev 2b5ad48762587abbcd8bdb50d0ae98f8080d926c)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirTruncateOp.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockUnderConstructionFeature.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBlockUnderConstruction.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockUnderConstructionFeature.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCommitBlockSynchronization.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+, I feel, this can be merged to {{branch-2.7}} as well., bq. I feel, this can be merged to branch-2.7 as well.
++1, I'm trying to backport this to branch-2.7.
+
+There are quite a few conflicts, but the biggest change compared to the branch-2.8 patch is
+{code:java|title=BlockInfoContiguousUnderConstruction#addReplicaIfNotPresent}
+void addReplicaIfNotPresent(DatanodeStorageInfo storage,
+                     Block block,
+                     ReplicaState rState) {
+    Iterator<ReplicaUnderConstruction> it = replicas.iterator();
+    while (it.hasNext()) {
+{code}
+because branch-2.7 does not have HDFS-8928. Without the change, replicas could be null and tests fails with NPE., I filed HDFS-13486 to initiate the backport effort. Since the change is non-trivial, I'd like to have a dedicated Jira to get code reviewed and to validate with tests., SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #14057 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/14057/])
+HDFS-11817. A faulty node can cause a lease leak and NPE on accessing (xyao: rev 0dbcd01de54b68142e0e54b2c948eff0c3fdada6)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirTruncateOp.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCommitBlockSynchronization.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockUnderConstructionFeature.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBlockUnderConstruction.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/blockmanagement/TestBlockUnderConstructionFeature.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/LeaseManager.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+]

@@ -1,0 +1,168 @@
+[I've been debugging this with help from Arpit. I think we know the root cause, will update with details soon., We spent almost a full day, hopping between JobTracker and TaskTracker and finally cornered it to the patch at MAPREDUCE-4088., Added Bobby and Ravi onto the watch list as they are linked to MAPREDUCE-4088.
+
+So what is happening is that because of the patch, every clean up action like KillTaskAction, KillJobAction *ALWAYS* wait for 5 seconds before processing. Because of this, all clean up actions delay, and because till TT actually cleans up a task/job, JobTracker keeps on dishing out new duplicate clean-up actions for the same task/job. This causes a avalanche of clean-up actions, even only one task is cleanup, the queue grows continuously and so later, even killing jobs will take for ever (even though clients are not blocked)., We can fix this by not waiting at all. Because we are requeueing the event, other actions won't be blocked so MAPREDUCE-4088 remains fixed.
+
+Existing test will continue to work, we can also verify that killing multiple attempts doesn't take longer. Arpit, want to take this up?, here is the patch i will run test patch, unit tests and try to validate the fix on my cluster, test patch output
+
+{code}
+[exec] BUILD SUCCESSFUL
+     [exec] Total time: 5 minutes 10 seconds
+
+     [exec] 
+     [exec] 
+     [exec] 
+     [exec] 
+     [exec] -1 overall.  
+     [exec] 
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+     [exec] 
+     [exec]     -1 tests included.  The patch doesn't appear to include any new or modified tests.
+     [exec]                         Please justify why no tests are needed for this patch.
+     [exec] 
+     [exec]     +1 javadoc.  The javadoc tool did not generate any warning messages.
+     [exec] 
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+     [exec] 
+     [exec]     -1 findbugs.  The patch appears to introduce 9 new Findbugs (version 1.3.9) warnings.
+     [exec] 
+     [exec] 
+     [exec] 
+     [exec] 
+     [exec] ======================================================================
+     [exec] ======================================================================
+     [exec]     Finished build.
+     [exec] ======================================================================
+     [exec] ======================================================================
+     [exec] 
+     [exec] 
+{code}
+
+unit tests are running and find bugs warnings are not related., With this patch applied killing tasks works as expected as in it the time to kill the attempts no longer increases exponentially. All attempts get killed as soon as when the request gets accepted.
+
+Ran the system tests that were failing a few times and they passed.
+
+Also the ran the full unit tests and there were no failures in the mapred tests., Ok I can see what happened here.
+
+With MAPREDUCE-4088 the code in checkJobStatusAndWait changed from
+
+{code}
+if (rjob != null) {
+  synchronized (rjob) {
+    while (rjob.localizing) {
+      rjob.wait();
+    }
+  }
+}
+{code}
+
+to
+
+{code}
+if (rjob != null) {
+  synchronized (rjob) {
+    rjob.wait(5000);
+    return !rjob.localizing;
+  }
+}
+{code}
+
+The difference is that the while provided a short circuit that skipped the waiting if localizing had already finished.
+
+I think it would be preferable to add in the same sort of thing
+
+{code}
+if (rjob != null) {
+  synchronized (rjob) {
+    if (rjob.localizing) {
+      rjob.wait(5000);
+    }
+    return !rjob.localizing;
+  }
+}
+{code}
+
+without a wait of some sort the loop that processes the actions could get stuck in a tight loop waiting for localization to happen.  Which works, but is not ideal because it needlessly burns CPU cycles and can increase lock contention a lot., Even if we do the wait only for jobs that are localizing, the queue still gets stuck and the bug at MAPREDUCE-4088 reappears.
+
+Let's call actions that correspond to jobs that are localizing as tainted-actions. The tight loop will result only when *ALL* the present actions in the queue are tainted. Which should be a rare case. Even this rare case can be fixed by keeping track of the tainted actions in a separate queue., If there are lots and lots of events for a job that is localizing then there could be a pause for each of these events, and yes it would slow the queue down even to the point prior to MAPREDUCE-4088 when all events would wait for the job to finish localizing. But the common case is much faster then the worst case, not that it is much comfort when you hit the worst case :). We could mitigate this by dropping the wait time to something smaller like 100ms so it would take 50 times as many events to slow it down the same amount.
+
+I also agree that the tight loop will only happen when *ALL* the present actions in the queue are tainted. But I don't agree that it should be rare.  I think it is quite common to have a single event in the queue, or to have all of the events in the queue to be for a single job that is localizing.  Especially if all of the other jobs on this node are done localizing so their events get processed quickly and removed from the queue. The only time the thread would not be running is when the queue is empty.  I have not collected any real world numbers so I don't know how often that actually is in practice, or what percentage of the running time is just for checking.  If you feel that the extra CPU utilization is worth this then go ahead and remove the wait.  I am not opposed to it. I just wanted to point out the consequences of doing so. Also if you remove the wait, we should look at if we can remove the notify calls from the job as well.  If no one is ever going to wait the notifys become dead code. 
+
+That being said, I agree with you Vinod that having separate queues is a better solution over all, but it is also a much larger change.  One that I don't know would provide that much more benefit compared to the risk of such a change., Attached another patch where there are two queues and also make sure duplicate entries did not make it in to the queue. Have not added unit tests yet.
+
+Robert let me know what you think of this approach.
+
+If it works then i can work on adding unit tests for it.
+
+I verified this patch on my cluster and could not reproduce the issue., The approach that is now taken is
+
+There is a queue that holds all active actions and an array list that holds all tainted actions. When the processing starts we traverse over the tainted actions and if they are clean they get added to the active cleanup queue and removed from the tainted list. Then if the active action queue is empty we sleep for 2s and then re process. If not we go ahead and process the action, if the action being processed happens to be localizing then it gets added to the tainted actions list. 
+
+We also use another data structure to keep track of what actions are in the queue in order to avoid duplicates., It has been a while for me in this code so feel free to correct me if I am wrong about something.  The changes look good to me but the TT is huge and I have not looked at it in that much depth.  Can there be multiple kill events for the same task or job?  If so allCleanupActions could be empty when there are still pending events.  I don't think this can happen, but I want to be sure about it.
+
+I don't think isJobLocalising throws an InterruptedException. and the javadocs for that method are wrong.
+
+My other comment would be about the wait and notify. In this patch you have changed the wait to be on the taskCleanupThread itself instead of rjob.  It appears the no one will ever notify the taskCleanupThread.  So please either change the wait to a sleep, or add in a call to taskCleanupThread.notifyAll() at about the same place that rjob.notifyAll() is happening. As part of that too you will need to synchronize with the taskCleanupThread before calling notifyAll.  You will probably also want to synchronize around the wait, but be careful so you get the locking order consistent between rjob and taskCleanupThread, or leave the two notify/lock pairs separate which might be simpler.    , bq. Can there be multiple kill events for the same task or job? If so allCleanupActions could be empty when there are still pending events. I don't think this can happen, but I want to be sure about it.
+
+allCleanUpActions is populated when ever user adds item to the queue and only gets removed when a task/job is killed. So even when you are left with just tainted tasks it wont be empty.
+
+And yes we could have multiple kill events for the same task/job before this patch, now we make sure that is not the case.
+
+bq. I don't think isJobLocalising throws an InterruptedException. and the javadocs for that method are wrong.
+
+Updated the javadoc and removed the throws exception.
+
+bq. My other comment would be about the wait and notify. In this patch you have changed the wait to be on the taskCleanupThread itself instead of rjob. It appears the no one will ever notify the taskCleanupThread. So please either change the wait to a sleep, or add in a call to taskCleanupThread.notifyAll() at about the same place that rjob.notifyAll() is happening. As part of that too you will need to synchronize with the taskCleanupThread before calling notifyAll. You will probably also want to synchronize around the wait, but be careful so you get the locking order consistent between rjob and taskCleanupThread, or leave the two notify/lock pairs separate which might be simpler.
+
+I decided to change the wait to a Thread.sleep in the task clean up and removed the rjob.notifyAll
+
+
+Also I had to restructure the code a bit so that i could write unit tests to cover various scenarios., oops left an un used import., Ran the test that was failing before with this patch attached and it worked. Unit tests and test patch are running. Will post results when available., Test patch results
+
+{code}
+[exec] BUILD SUCCESSFUL
+     [exec] Total time: 5 minutes 6 seconds
+     [exec] 
+     [exec] 
+     [exec] 
+     [exec] 
+     [exec] -1 overall.  
+     [exec] 
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+     [exec] 
+     [exec]     +1 tests included.  The patch appears to include 2 new or modified tests.
+     [exec] 
+     [exec]     +1 javadoc.  The javadoc tool did not generate any warning messages.
+     [exec] 
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+     [exec] 
+     [exec]     -1 findbugs.  The patch appears to introduce 9 new Findbugs (version 1.3.9) warnings.
+     [exec] 
+     [exec] 
+     [exec] 
+     [exec] 
+     [exec] ======================================================================
+     [exec] ======================================================================
+     [exec]     Finished build.
+     [exec] ======================================================================
+     [exec] ======================================================================
+     [exec] 
+     [exec] 
+{code}
+
+Findbugs warnings are not related to this patch.
+
+, I don't think we can remove the rjob.notifyAll().  It is used in the same method just a few lines up when other tasks for the same job are waiting for the first task to finish downloading the distributed cache entries.  They will get stuck without the notifyAll call.  The first time I suggested removing it was before I read through other parts of the code to see who else was using it so it is partly my fault for having suggested it.  
+
+I would be interested in also seeing more than just unit tests for a change like this.  Would it be possible to bring up a small cluster and run through several tests that use the distributed cache? and then kill some of them?, Attached a patch where notifyAll is not removed.
+
+I will try to bring up a cluster run some distributed cache jobs and kill the attempts., @Robert
+
+I ran a distributed cache job and killed all map attempts and it worked. Kill 3 and let the 4th one go and the job passed, and then did the same exercise for reduce tasks and it worked.
+
+The command i ran to run the job is
+
+{code}
+hadoop jar hadoop-streaming.jar -input /tmp/input -file /tmp/arpit/mapper.sh -mapper 'mapper.sh' -file /tmp/arpit/reducer.sh -reducer 'reducer.sh' -output /tmp/output1
+{code}
+
+and the shell scripts had sleep commands in them so i had enough time to kill the attempts., added the test annotation so it runs with ant test, The patch looks good to me. I am +1 on it, although I would like Vinod or someone else to take a look at it too because the TT is very complex and I have not looked at it in depth in a while so another set of eyes would be appreciated., Looks good to me too. The algo is clean. And nice tests too! Checking it in., I just committed this to branch-1 and branch-1.1. Thanks Arpit!, Closed upon release of 1.1.1.]

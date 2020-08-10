@@ -1,0 +1,193 @@
+[On our machines, we create a VIP using a BGP loopback address.  We bind Hadoop services to this VIP.  In the case of the NN trying to reconnect back to the 2NN during edits merge, it continues to use the 2NN's hostname address:
+
+In hdfs-site.xml:
+
+{code}
+  <property>
+    <name>dfs.namenode.secondary.http-address</name>
+    <value>eat1-fiasconn02.grid.linkedin.com:50090</value>
+  </property>
+{code}
+
+On the 2nn itself:
+
+{code}
+[awittena@eat1-hcl4054 ~]$ netstat -a | grep 50090
+tcp        0      0 eat1-fiasconn02.grid.:50090 *:*                         LISTEN      
+[awittena@eat1-hcl4054 ~]$ 
+{code}
+
+yet in the HDFS NN log...
+
+{code}
+2013-07-31 23:53:30,916 INFO org.apache.hadoop.hdfs.server.namenode.TransferFsImage: Opening connection to http://eat1-hcl4054.grid.linkedin.com:50090/getimage?getimage=1&txid=180564&storageInfo=-47:2073800469:1375222008066:CID-1289fa67-537a-4c27-9bba-94770b94644d
+2013-07-31 23:53:30,917 ERROR org.apache.hadoop.security.UserGroupInformation: PriviledgedActionException as:hdfs/eat1-fiasconn01.grid.linkedin.com@GRID.LINKEDIN.COM (auth:KERBEROS) cause:java.net.ConnectException: Connection refused
+2013-07-31 23:53:30,919 WARN org.mortbay.log: /getimage: java.io.IOException: GetImage failed. java.net.ConnectException: Connection refused
+{code}
+
+This is a regression from 1.x behavior., [~aw] Can you post the log corresponding to the following line from snn:
+{code}
+LOG.info("Secondary Web-server up at: " + infoBindAddress + ":" + infoPort);
+{code}
+
+This address is used to construct the secondary namenode URL to download the fsimage from. In this case, from the log snippets you posted, it happens to be:
+http://eat1-hcl4054.grid.linkedin.com:50090/getimage?..., As demonstrated by the netstat output above but also by the log output below, 2NN is bringing up the web interface on the correct hostname:port pair:
+
+{code}
+13/08/01 12:20:47 INFO namenode.SecondaryNameNode: Secondary Web-server up at: eat1-fiasconn02.grid.linkedin.com:50090
+{code}
+
+, This part has changed quite a bit! Spent couple of hours digging this.
+
+In branch-1, the secondary namenode passes the host name to connect to get the image in the http param "machine".
+
+This is no longer passed from the secondary. This change was done in HDFS-3404. Now the remote address is inferred based on the remote host. Here is the snippet of code where this is done:
+{code}
+      machineName = request.getRemoteHost();
+      if (InetAddresses.isInetAddress(machineName)) {
+        machineName = NetUtils.getHostNameOfIP(machineName);
+      }
+{code}
+[~aw], this could that be causing the issue in your setup.
+
+[~atm], can you take a look at this issue?
+
+, Yep, this behavior did indeed change. The issue was exactly what was described in HDFS-4304 - you couldn't set the 2NN HTTP address setting to the wildcard address since if the NN were to use that it obviously couldn't connect to the 2NN unless the two processes were co-located on the same machine.
+
+I think the best solution to this (and other) issues would be to switch to using an HTTP PUT or POST for the 2NN to send the fsimage back to the NN, instead of having the 2NN do a GET which in turn causes the NN to do another GET back to the 2NN. That's what's proposed in this JIRA: HDFS-3405., So it looks like either HDFS-3404 needs to get rolled back or HDFS-3405 needs to get fixed.  As it stands, users can't use certain types of VIPs with the 2NN. , I don't think we can reasonably roll back HDFS-4304. It's been committed for over a year and has been in several releases. Doing so will also serve to break users who use wildcard addresses, of which there are many. , Several *alpha* releases.  HDFS-3404 is a regression from a *stable* one.  stable > alpha., Even still, HDFS-4304 fixes a bug that affected a large number of users. It's obviously unfortunate that it unintentionally introduced another bug, but let's please not revert it. Let's just do something that will work for both cases., I'm pretty much going to revert at least in my local branch to continue testing.  As it stands, I can't deploy HDFS 2.x without this getting fixed., Actually... why is the NN doing a reverse look up if we provided a value for dfs.namenode.secondary.http-address?  Since the config is defined/clearly not wildcarded, it shouldn't be resorting to this behavior (e.g., wildly unpredictable).  This is looking more and more like HDFS-3404 is bugged., bq.  Since the config is defined/clearly not wildcarded, it shouldn't be resorting to this behavior (e.g., wildly unpredictable).
++1. I was thinking along the same lines.
+
+Given that this is a blocker, we need to fix this ASAP. [~atm] do you have bandwidth to fix this? Alternatively we can revert this change and add it back in another dot release?, bq. Since the config is defined/clearly not wildcarded, it shouldn't be resorting to this behavior (e.g., wildly unpredictable).
+
+I'd be fine with changing it so that we fall back to the behavior implemented in HDFS-3404 only in the event that the wildcard address is configured. That seems like a pretty simple fix that would address this issue, right?
+
+bq. Given that this is a blocker, we need to fix this ASAP.
+
+I'm really not sure that this should be considered a blocker. Yes, it's a regression from branch-1, but I suspect it will affect a very small subset of users.
+
+bq. Aaron T. Myers do you have bandwidth to fix this? Alternatively we can revert this change and add it back in another dot release?
+
+I don't really have bandwidth to work on this right now, though I'm certainly interested in implementing HDFS-3405 at some point down the road. I'm not going to try to stop you from reverting it, but if you do I suspect you will be breaking a lot more users than you will be fixing., What is preventing HDFS-3404 from being used an attack vector?  i.e., since the NN will connect back to any host that connects to it, doesn't this mean that I can pop up a service, connect to the NN, and feed it back an empty fsimage?  On next restart (or sooner?)  BOOM, no more hdfs., bq. What is preventing HDFS-3404 from being used an attack vector?
+
+Well, for one thing super user privilege is required on connect in order for the NN to do anything in GetImageServlet#doGet:
+
+{code}
+if (UserGroupInformation.isSecurityEnabled() &&
+    !isValidRequestor(context, request.getUserPrincipal().getName(), conf)) {
+  response.sendError(HttpServletResponse.SC_FORBIDDEN,
+      "Only Namenode, Secondary Namenode, and administrators may access " +
+      "this servlet");
+  LOG.warn("Received non-NN/SNN/administrator request for image or edits from "
+      + request.getUserPrincipal().getName() + " at " + request.getRemoteHost());
+  return;
+}
+{code}
+
+If we're assuming that some attacker has HDFS super user privilege, the jig is already up., Attaching a simple patch to use the behavior of HDFS-3404 only in case of wildcard addresses.
+I hope this solves the issue, I just did a quick test and it seems to work for me.  I'm a little disturbed by the ternary, but that's just my own personal coding quirk. ;)
+
+(Thanks for doing this.  I was in the middle of making my own patch but then got distracted. haha), {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12597434/HDFS-5055.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 2 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4807//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4807//console
+
+This message is automatically generated., [~vinayrpet] Thanks for jumping on this. The patch looks good. I updated the patch with a small change.
+Instead of:
+{code}
+   String machine = imageListenAddress.getHostName();
+   if (machine == null || machine.isEmpty() || machine.equals("0.0.0.0")) {
+     machine = null;
+   }
+{code}
+
+the updated patch has:
+{code}
+   String machine = imageListenAddress.getAddress().isAnyLocalAddress() ? 
+     null : imageListenAddress.getHostName();
+{code}
+, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12597731/HDFS-5055.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4812//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4812//console
+
+This message is automatically generated., new patch appears to be working for me as well., {code}
+String machine = imageListenAddress.getAddress().isAnyLocalAddress() ? 
+     null : imageListenAddress.getHostName();
+{code}
+
+Looks like here if the http address in the configuration is wrong, the UnknownHostException will cause "imageListenAddress.getAddress()" to return null. We thus may need to add an extra check here.
+
+Other than that +1 for the patch., Thanks Jing. Here is the updated patch., The new patch looks pretty good to me. +1., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12598075/HDFS-5055.1.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4824//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4824//console
+
+This message is automatically generated., Committed the patch to trunk, branch-2 and branch-2.1.
+
+Thanks Jing for the review and Allen for verifying it works. Thank you Vinay for the patch!]

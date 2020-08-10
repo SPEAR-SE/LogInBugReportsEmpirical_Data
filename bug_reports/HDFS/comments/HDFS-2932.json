@@ -1,0 +1,94 @@
+[Could you please also elaborate on how this is a bug? As I see it from the steps provided, your write ended successfully with just two DNs in a 3-DN cluster with replication factor of 3, cause one DN was pulled down. This would naturally be the case afterwards -- an underreplication.
+
+Or do you mean to say the underreplication warning isn't passing away; that the NN isn't assigning it to newly living DN3 even after the monitor period has passed?, Initially Three Dn was running ..but while writing the block (block-id-1005) i brought down 3rdDN.so the write was successful to other two DN but the block stamp was changed to (block-id-1006) and the rest of the block was also written successfuly to those two datanodes.
+
+After the write was over ,The 3rd DN was restarted after 5 mins.then when fsck command was issued "block-id_1006 is underreplicatede.Target replicas is 3 but found 2 replicas" message was displayed.
+
+Ever after the replication monitor period is over ,the blocks is still  under replicated only.I checked the same after 10 hrs. , Scenario:
+ 1. Client is writing to a Pipeline DN1--> DN2 -->DN3. Block id Ex; b1k_1_1001
+ 2. DN3 is stopped in between. Now pipeline recovery happens and block id is changed to b1k_1_1002.
+ 3. write is complete, and stream is closed.
+ 4. DN3 is restarted.
+
+*Issue Case 1: DN3 coming back after file is closed.*
+----------------------------------------------------
+>> Now DN3 will send the block reports to NN, which contains b1k_1_1001 report in RBW state.
+>> by this time, Since the file is closed, NN will mark this as replica as corrupt.
+>> Now Replication will not succeed since It cannot find one more datanode.
+
+*Issue Case 2: DN3 coming back before the file closure.*
+------------------------------------------------------
+>> Now DN3 will send the block reports to NN, which contains b1k_1_1001 report in RBW state. but by this time file is not closed, then this DN is just added to targets array.
+>> Replication request sent to Other DN (Ex DN2) to replicate this block to DN3.
+>> Now DN3 will refuse the Replication throwing ReplicaAlreadyExistsException. because while checking for the existence of the Block, generation stamp is not considered.
+	{noformat}2012-03-22 08:30:39,406 ERROR datanode.DataNode (DataXceiver.java:run(171)) - 127.0.0.1:59082:DataXceiver error processing WRITE_BLOCK operation  src: /127.0.0.1:59124 dest: /127.0.0.1:59082
+org.apache.hadoop.hdfs.server.datanode.ReplicaAlreadyExistsException: Block BP-1348337625-169.254.103.145-1332385233856:blk_-4842149393874243436_1003 already exists in state RWR and thus cannot be created.
+	at org.apache.hadoop.hdfs.server.datanode.FSDataset.createTemporary(FSDataset.java:1740)
+	at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.<init>(BlockReceiver.java:151)
+	at org.apache.hadoop.hdfs.server.datanode.DataXceiver.writeBlock(DataXceiver.java:340)
+	at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opWriteBlock(Receiver.java:98)
+	at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:66)
+	at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:167)
+	at java.lang.Thread.run(Unknown Source){noformat}
+
+
+*Basic Queries..?*
+ 1. Why while comparing the Block, Generationstamp is not considered...? 
+       This behaviour is different compare to version 1.0
+    , Further analysing the two cases detailed by Vinay:
+
+*Case 1*. I think the fix given for HDFS-3493 will solve this case as the corrupt replica(result of pipeline failure) will be eventually invalidated, inspite of the fact that total replicas = replication factor. Please confirm.
+
+*Case 2*. If a write-pipeline-failed replica from a restarted DN arrives before the stored block is 'completed', it will not be marked as corrupt. Later when NN computes the replication work it is not aware of the fact that a corrupt replica exists on DN3, so it will keep scheduling replication from say DN2 to DN3 without success till next block report from DN3 is processed.
+
+
+{code}
+//BlockManager#checkReplicaCorrupt
+
+    case RBW:
+    case RWR:
+      if (!storedBlock.isComplete()) {
+        return null; // not corrupt
+      } 
+{code}
+
+There are two exclusive time windows when such a replica can be reported.
+DN restarts and replica is reported before the client finished writing the block, i.e the block is not 'committed'.
+DN restarts and replica is reported after 'commit' but before 'complete'. 
+
+
+Solution is to be able to detect and capture a write-pipeline-failed replica as early as possible. First fix may be to change the check from 'isCompleted' to 'isCommitted'. This will capture write-pipeline-failed replicas reported just after commit and before 'complete' and mark them as corrupt.
+
+Then to capture write-pipeline-failed replicas reported before commit, I am investigating if this can be solved by marking them as corrupt as part of commit. There already exists a check to find any mis-stamped replicas during commit but we only remove them from the blocksMap. In addition can we not mark such replicas as corrupt?
+
+{code}
+//BlockInfoUnderConstruction#commitBlock
+
+    // Sort out invalid replicas.
+    setGenerationStampAndVerifyReplicas(block.getGenerationStamp());
+{code}
+
+Any thoughts/suggestions?, Hi [~usrikanth],
+Thanks for looking into this issue.
+
+1. Case1  is solved in HDFS-3493
+
+2. Case 2: I understand your point,
+    I agree that it will be better to detect the failed replicas as early as possible and delete it. but we cannot do that on the fly while writing itself. It may delete the working copy itself if the report from datanode is little delayed. and this is possible in case of huge cluster. Its better to keep the corrupt replica for sometime instead of loosing the valid replica. Similar cases observed and code has been added to ignore such variations. see below comment in BlockManager.java.
+{code}          // If it's a RBW report for a COMPLETE block, it may just be that
+          // the block report got a little bit delayed after the pipeline
+          // closed. So, ignore this report, assuming we will get a
+          // FINALIZED replica later. See HDFS-2791{code}
+   {quote}
+Solution is to be able to detect and capture a write-pipeline-failed replica as early as possible. First fix may be to change the check from 'isCompleted' to 'isCommitted'. This will capture write-pipeline-failed replicas reported just after commit and before 'complete' and mark them as corrupt.
+    {quote}
+ the timegap between 'isCommitted' and 'isCompleted' is not so huge, so ideally this will not change much.
+
+{quote}
+Then to capture write-pipeline-failed replicas reported before commit, I am investigating if this can be solved by marking them as corrupt as part of commit. There already exists a check to find any mis-stamped replicas during commit but we only remove them from the blocksMap. In addition can we not mark such replicas as corrupt?
+{quote}
+"setGenerationStampAndVerifyReplicas" is just updating the inmemory states of the replicas being written in Namenode. its not changing the blocksMap. I dont think this is the right place to decide about the corrupt replicas.
+
+I think its always better to handle the block validations when reported from datanode, yes it takes time :(, [~vinayrpet], though I really don't see a reason why we should not delete a mis-stamped replica (during block report processing) after the block is committed, I agree with you that this improvement in early detection may be unnecessary (or even slightly risky?) particularly when the benefit is very little.
+
+Can I mark it duplicate of HDFS-3493?, Closed as duplicate of HDFS-3493. ]

@@ -1,0 +1,90 @@
+[The block file of blk_B on DN1 shows that the on-disk block size is 134205440. So the only replica of this block is truncated and therefore corrupted but reading this block does not cause ChecksumException., Currently NameNode does not detect that a replica is truncated and therefore corrupted. One way to solve this is to let block report handling check each block's
+length and mark those truncated blocks as corrupted. Also when NN receives a new block that's truncated, NN should mark it as corrupted instead of adding it to recent invalidates directly. Once NameNode finds out all replicas are corrupted, it will stop replicating/deleting a block.
+
+, This is a duplicate of HADOOP-3314, but this really writes up the problem better... can we close the older ticket?
+
+We've run into this issue locally, and it's rather debilitating because it can result in "silent corruptions": these truncations can accumulate for a long time without anything noticing.  If you are running with 2 replicas (hey, not all of us can afford all that raw disk space...) and lose a data node, then this can result in a nasty surprise if the second copy had this truncation problem.
+
+This in fact has caused corruption for about 500 files locally., When an inconsistently-sized file is found, we need to trigger a block scan of all the possible sources.  This depends on our ability to trigger manual scans, which is precisely what HADOOP-4865 is for., Attached a file which is my first whack of a patch that builds on HADOOP-4865., I'll be able to work on an updated patch tomorrow -- for now, this approach appears to be working., Bah - the approach works to trigger verification, but the verification doesn't catch the fact that there's too little data (the metadata is computed for the truncated block.  In fact, the block does verify just fine!, Another idea is to pass the NN recorded block length when replicating a block. (currently -1 is passed). When sender  sees that its on-disk length is less than the asked leghth, report corrupt block to NN and stop replication., A patch is attached for review., +1 for reporting a block as corrupt to NN.
+Regd implementation :
+
+The patch makes BlockSender to report the corruption (implicitly assuming that null client implies a transfer). I think this approach mixes higher level policy with lower level implementaion. 
+
+My suggestion would be to make BlockSender throw an excection (it throws IOException now, it could throw TruncatedBlockException in stead). Then make the block transfer thread (in DataNode.java) to catch it and report the corrupt block to NN.
+
+, Thanks Raghu for the comment. Yes, I like your suggestion. But still with your approach, BiockSender needs to know if the block reading is for block transfer or not by checking if the client name before throwing TruncateBlockException. Would this be OK?
+
+Another question is what should BlockSender do if the on-disk block length is longer than the NN recorded length? Currently block replication only copies the number of bytes recorded by NN. Is this a good idea?, > BiockSender needs to know if the block reading is for block transfer or not by checking if the client name before throwing TruncateBlockException. Would this be OK? 
+
+I don't think so. Right now it always throws IOException. We just needs to change the exception so that higher levels can distinguish. 
+
+> Another question is what should BlockSender do if the on-disk block length is longer than the NN recorded length? Currently block replication only copies the number of bytes recorded by NN. Is this a good idea?
+
+Copying only the bytes requested by NN is ok (as far as NN is concerned).  Similar to previous comment, I don't think BlockSender should worry about it, but some higher level in DataNode... I am +0 on fixing "extra data" issue. But if we want to, DataTransfer thread could check for the right size before even creating a BlockSender. , > Copying only the bytes requested by NN is ok (as far as NN is concerned).
+
+I am still not sure of this. If the block is being written to, a longer block is also a corrupt block. If the block is being written to, then copying partial data is useless.
+
+Hi Dhruba, could you please clarify if it is possible that ReplicationMonitor may replicate a block that's being written to after the introduction of sync & append?, f the NN and the DN have the same generation stamp, then the file is either not-open or the file is marked as "under construction" at the namenode.
+4:47 so, the NN will not start any new replication requests for these blocks (via HADOOP-5027), > so, the NN will not start any new replication requests for these blocks (via HADOOP-5027) 
+
+NN won't start new requests but what if there are scheduled requests?, Previously scheduled replication requests willl complete and the new destination datanode will send a blockReceived message to the NN. In the meantime, if the file has been opened for "append", then the generation stamp on the namenode should have been bumped. If the blockReceived arrived at the NN after the generation stamp has been bumped, then the blockReceived will not be able to find this block in the blocksMap.
+
+i think this should not cause any issues. Any race condition that I might have missed?, Ok if HADOOP-5027 makes sure that  blocks under construction do not add to blocksMap, I will treat on-disk blocks whose length is inconsistent with NN recorded length as corrupt and datanodes stop replicating them., My understanding is that the NN will send the block length ( as recorded in NN metadata) to the source datanode of the replication request. The source datanode will verify that this length matches the length of the block file on disk. If it does not match, then the source datanode will not replicate the block. Is my understanding correct?, In the current trunk, the source datanode ignores the block length that NN sent and uses the on-disk block length to transfer the block.
+
+What I plan to do is that when receiving a block replication request, datanode first checks if this block is under construction or not by looking at the ongoingCreates list. If yes, stop replicating the block. Otherwise check if the on-disk block length is the same as the block length sent by NN. If no, report NN corrupt blocks and stop replicating. Otherwise, start replicated the block., With this patch, this issue does not depend on HADOOP-5027 any more.,      [exec]
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+     [exec]
+     [exec]     +1 tests included.  The patch appears to include 9 new or modified tests.
+     [exec]
+     [exec]     +1 javadoc.  The javadoc tool did not generate any warning messages.
+     [exec]
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+     [exec]
+     [exec]     +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+     [exec]
+     [exec]     +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+     [exec]
+
+Ant test-core had the following known failures:
+    [junit] Tests run: 1, Failures: 1, Errors: 0, Time elapsed: 1.35 sec
+    [junit] Test org.apache.hadoop.http.TestGlobalFilter FAILED
+    [junit] Running org.apache.hadoop.mapreduce.TestMapReduceLocal
+    [junit] Tests run: 1, Failures: 0, Errors: 1, Time elapsed: 29.481 sec, [See related comment here|https://issues.apache.org/jira/browse/HADOOP-5027#action_12668136], Compared to the last patch, this patch has two changes:
+1. Remove the check isUnderConstruction because isValid return false if a block is still under construction.
+2. If a block's on-disk block size is bigger than the NN recorded length, do not mark it as corrupt. Instead copy the number of bytes that NN asks for.
+
+Change 2 is being cautious. When I work on HADOOP-5133, I realize that in the current trunk, a block's length may not be finalized even when a file is closed. So marking a block to be corrupt using NN recorded length is too dangerous., +1. The patch looks good makes good sense to me. 
+
+Regd correctness and how it fits in the larger context of related fixes like HADOOP-5133, HADOO-5027, I haven't looked into much. That area of HDFS is under lot of flux.
+
+btw, the 'links' for the jira says HADOOP-3314 is a duplicate of this, is it still true? Mostly HADOOP-3314 still needs to be fixed., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12400441/mismatchBlockReplication1.patch
+  against trunk revision 745705.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3880/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3880/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3880/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3880/console
+
+This message is automatically generated., I've just committed this.
+
+Regarding Raghu's concern, this patch is based on the assumption that the length of a block (identified by its block id & generation stamp) recorded on the NN's side can only grow but never shrink. I will keep an eye that HADOOP-5133 and HADOOP-5027 observe this assumption., Integrated in Hadoop-trunk #763 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/763/])
+    ]

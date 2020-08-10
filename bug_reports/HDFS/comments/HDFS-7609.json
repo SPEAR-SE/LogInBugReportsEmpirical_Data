@@ -1,0 +1,300 @@
+[We've also noticed a huge performance degradation (10X+) in 2.x edit processing.  The retry cache is large part of it.
+
+The retry cache isn't "useless" during startup since the concept is a returning client can later receive the response to an operation that completed, but the client didn't receive the answer.  Transient network issue, restart, failover, etc.  While processing edits, whether startup or standby, the NN needs to maintain the cache.  The retry cache is useful but it needs to be optimized., Yes you are right. I know the meaning of retry cache for restart and failover.
+What about recover? How about disable it during recover and let the namenode can return to work quickly., attach a small patch for 2.2.0 just to disable retry cache during recover process., I think there be a separate option to disable populating the cache on startup.  If someone has a NN that can restart reasonably fast before clients give up, it crashes due to corrupt edits, they restart in recovery, they probably would like clients to recover.
+
+[~sureshms], thoughts?, I would rather pursue an optimization solution instead of introducing more configuration flags that trigger subtle changes in behavior.
+
+Unfortunately, I haven't been able to reproduce this locally.  I used {{CreateEditsLog}} to generate edits.  I needed to change it to generate RPC client IDs and call IDs.  (Patch attached in case it's useful to anyone else.)  This is admittedly an artificial workload, but it does log {{OP_ADD}} operations, so I thought it would be sufficient for a repro.  I saw no noticeable difference in startup time whether {{dfs.namenode.enable.retrycache}} was {{true}} or {{false}}.
+
+Profiling showed less than 1% execution time in {{RetryCache}} methods.  I didn't see any huge outliers, but a few minor hotspots were {{FSEditLogOp.AddCloseOp#readFields}}, {{UTF8#readChars}} and {{INodeDirectory#getChild}} calling into {{ReadOnlyList.Util#binarySearch}}.  The latter is probably an artifact of {{CreateEditsLog}} sticking all of the files under the same directory, thus creating a lot of work for the binary search over the children.
+
+Has anyone else seen a consistent repro?, Compared to 0.23, edit replaying in 2.x is 5x-10x slower.  This affects the namenode fail-over latency.   [~mingma] also reported this issue before and saw the retry cahe being the bottleneck., Yeah, we also had this issue. It appears somehow an entry with the same client id and caller id has existed in retryCache; which ended up calling expensive PriorityQueue#remove function. Below is the call stack captured when standby was replaying the edit logs.
+
+{noformat}
+"Edit log tailer" prio=10 tid=0x00007f096d491000 nid=0x533c runnable [0x00007ef05ee7a000]
+   java.lang.Thread.State: RUNNABLE
+        at java.util.PriorityQueue.removeAt(PriorityQueue.java:605)
+        at java.util.PriorityQueue.remove(PriorityQueue.java:364)
+        at org.apache.hadoop.util.LightWeightCache.put(LightWeightCache.java:218)
+        at org.apache.hadoop.ipc.RetryCache.addCacheEntry(RetryCache.java:296)
+        - locked <0x00007ef2fe306978> (a org.apache.hadoop.ipc.RetryCache)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.addCacheEntry(FSNamesystem.java:801)
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.applyEditLogOp(FSEditLogLoader.java:507)
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.loadEditRecords(FSEditLogLoader.java:224)
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.loadFSEdits(FSEditLogLoader.java:133)
+        at org.apache.hadoop.hdfs.server.namenode.FSImage.loadEdits(FSImage.java:804)
+        at org.apache.hadoop.hdfs.server.namenode.FSImage.loadEdits(FSImage.java:785)
+        at org.apache.hadoop.hdfs.server.namenode.ha.EditLogTailer.doTailEdits(EditLogTailer.java:230)
+        at org.apache.hadoop.hdfs.server.namenode.ha.EditLogTailer$EditLogTailerThread.doWork(EditLogTailer.java:324)
+        at org.apache.hadoop.hdfs.server.namenode.ha.EditLogTailer$EditLogTailerThread.access$200(EditLogTailer.java:282)
+        at org.apache.hadoop.hdfs.server.namenode.ha.EditLogTailer$EditLogTailerThread$1.run(EditLogTailer.java:299)
+        at org.apache.hadoop.security.SecurityUtil.doAsLoginUserOrFatal(SecurityUtil.java:415)
+        at org.apache.hadoop.hdfs.server.namenode.ha.EditLogTailer$EditLogTailerThread.run(EditLogTailer.java:295)
+{noformat}
+, If PriorityQueue.remove() took much time, can we utilize PriorityQueue.removeAll(Collection) so that multiple CacheEntry's are removed in one round ?, [~kihwal] and [~mingma], thank you for the additional details.  It looks like in your case, you noticed the slowdown in the standby NN tailing the edits.  I had focused on profiling NN process startup as described in the original problem report.  I'll take a look at the standby too.
+
+{{PriorityQueue#remove}} is O\(n\), so that definitely could be problematic.  It's odd that there would be so many collisions that this would become noticeable though.  Are any of you running a significant number of legacy applications linked to the RPC code before introduction of the retry cache support?  If that were the case, then perhaps a huge number of calls are not supplying a call ID, and then the NN is getting a default call ID value from protobuf decoding, thus causing a lot of collisions.
+
+bq. If PriorityQueue.remove() took much time, can we utilize PriorityQueue.removeAll(Collection) so that multiple CacheEntry's are removed in one round ?
+
+Unfortunately, I don't think our usage pattern is amenable to that change.  We apply transactions one by one.  Switching to {{removeAll}} implies a pretty big code restructuring to batch up retry cache entries before the calls into the retry cache.  Encountering a huge number of collisions is unexpected, so I'd prefer to investigate that., Specifically, the retry cache was added in 2.1.0-beta, so the theory in my last comment would only be valid if you're running RPC clients older than that., same call stack is found in origin problem. sorry for not attaching it at the first moment;
+
+{noformat} 
+"main" prio=10 tid=0x00007f03f800b000 nid=0x47ec runnable [0x00007f03ff10a000]
+   java.lang.Thread.State: RUNNABLE
+        at java.util.PriorityQueue.remove(PriorityQueue.java:305)
+        at org.apache.hadoop.util.LightWeightCache.put(LightWeightCache.java:217)
+        at org.apache.hadoop.ipc.RetryCache.addCacheEntry(RetryCache.java:270)
+        - locked <0x00007ef83c305940> (a org.apache.hadoop.ipc.RetryCache)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.addCacheEntry(FSNamesystem.java:717)
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.applyEditLogOp(FSEditLogLoader.java:406)
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.loadEditRecords(FSEditLogLoader.java:199)
+        at org.apache.hadoop.hdfs.server.namenode.FSEditLogLoader.loadFSEdits(FSEditLogLoader.java:112)
+        at org.apache.hadoop.hdfs.server.namenode.FSImage.loadEdits(FSImage.java:733)
+        at org.apache.hadoop.hdfs.server.namenode.FSImage.loadFSImage(FSImage.java:647)
+        at org.apache.hadoop.hdfs.server.namenode.FSImage.recoverTransitionRead(FSImage.java:264)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.loadFSImage(FSNamesystem.java:787)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.loadFromDisk(FSNamesystem.java:568)
+        at org.apache.hadoop.hdfs.server.namenode.NameNode.doRecovery(NameNode.java:1177)
+        at org.apache.hadoop.hdfs.server.namenode.NameNode.createNameNode(NameNode.java:1249)
+        at org.apache.hadoop.hdfs.server.namenode.NameNode.main(NameNode.java:1320)
+
+   Locked ownable synchronizers:
+        - <0x00007ef83d350788> (a java.util.concurrent.locks.ReentrantReadWriteLock$FairSync)
+        - <0x00007ef83d41f620> (a java.util.concurrent.locks.ReentrantReadWriteLock$FairSync)
+{noformat} , [~cnauroth], we upgraded from hadoop 2.0.5 to hadoop 2.4, so yes, from a version without this feature to the version with the feature. Last time during investigation via code review, it appears {{toAddRetryCache}} should be set to false if standby replays old edit logs generated by hadoop version without retrycache.
+
+{noformat}
+      if (toAddRetryCache) {
+        fsNamesys.addCacheEntry(deleteOp.rpcClientId, deleteOp.rpcCallId);
+      }
+{noformat}, I tried testing an old client without call ID support connecting to a NameNode with retry cache support.  That just fails fast though due to violating the protobuf spec for the message.  (I should have expected that.)  That rules out that theory.
+
+The edit log replaying code looks to be correct for the case of old edits with a layout version before the RPC IDs were logged.  Even if that was a problem, it would just be a one-time slowdown during an upgrade, not an ongoing problem.
+
+My next theory is that perhaps we have another case of thread-local storage biting us.  HDFS-7385 reported edit logs containing incorrect ACLs, and the root cause was that we had failed to reinitialize the thread-local op instance completely each time we used it.  Perhaps we have a similar situation here, where an op instance is getting logged, but some code path failed to update the op with a unique client ID + call ID.  If that's the case, then HDFS-7398 might help.  That patch guarantees the full state of the op gets reset on each use, including the RPC IDs.  I still don't have a repro of my own though, so I can't confirm or deny the theory.
+
+If anyone has an edit log exhibiting the problem that they'd be willing to share, that would be a big help.  I'd be interested in seeing if there is any pattern to the kinds of ops that are hitting duplicate RPC IDs or the actual duplicate RPC ID values.  That could help narrow the problem down to a specific code path., We have seen a related case. In a relatively small cluster, a user created a rogue job that caused a lot of transactions on namenode.  The edit log was rolling on its own by the ANN before reaching the regular rolling period.  Then the SBN was losing datanodes because it took incredibly long to replay the large edit segment. We normally see replay speed of about 30-80k txn/sec (this is still considerably slower compared to 0.23 or 2.x before introduction of RetryCache), but in this case it was down to 2k txns/sec, causing the one huge segment replaying to take several hours.  
+
+In this case, the slowdown was caused by the fact that the cache was too small. Since the cache size is 0.03% of the heap by default, the hash table (GSet) had long chains in each slot during replaying the edit segment. Increasing the cache size would have made it better.  Since the transaction rate is not always a function of the size of namespace, the default cache size may not work in many cases.
+
+Also, if the edit rolling period is greater than the cache expiration time (e.g. 10min), it may make sense to purge the entire cache in more efficient way before replaying the new segment. We could record the time when finished with a segment replay and check the elapsed time in the next segment replay., Small retryCache size can also impact the correctness, given the successful call result might have been removed from the cache by the time the client sends new retry of the same call to the new active NN.
+
+Regarding the earlier call stack showing any entry with the same client id and caller id has existed in retryCache during edit log replay, it could be due to the following scenario.
+
+1. A delete op is processed by nn1 successfully, thus logged to the edit log.
+2. Client doesn't get the response, and nn1 fails over to nn2.
+3. Client will retry the same call on nn2. Even though nn2 is still tailing edit log and not active yet, a new cache entry will be added, because the following code can be called even if nn2 isn't active yet.
+
+{noformat}
+  public boolean delete(String src, boolean recursive) throws IOException {
+    checkNNStartup();
+    if (stateChangeLog.isDebugEnabled()) {
+      stateChangeLog.debug("*DIR* Namenode.delete: src=" + src
+          + ", recursive=" + recursive);
+    }
+    CacheEntry cacheEntry = RetryCache.waitForCompletion(retryCache);
+    if (cacheEntry != null && cacheEntry.isSuccess()) {
+      return true; // Return previous response
+    }
+...
+{noformat}
+4. By the time nn2 gets the call from the edit log and it to the cache, the cache entry is already there.
+
+
+One way to fix this is to modify waitForCompletion not to create cache entry when NN is in standby. Instead, when NN is in standby, it just needs to check if there is a successful cache entry. If there is, return the result. If not, throws StandbyException., Here is the draft patch that prevents client from polluting the retry cache when standby is being transitioned to active. It doesn't cover other possible optimization ideas discussed above. Appreciate any input on this., #3 in the scenario description above should be "Before nn2 starts the transition to active" instead of  "Even though nn2 is still tailing edit log and not active yet", because after nn2 starts tailing edit log, it will lock retryCache until it becomes active and thus prevent the client calls from adding new entry to the retry cache during the transition., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 30s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 24s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 36s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:green}+1{color} | checkstyle |   2m 48s | There were no new checkstyle issues. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 35s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   4m 42s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:green}+1{color} | common tests |  22m 16s | Tests passed in hadoop-common. |
+| {color:red}-1{color} | hdfs tests | 166m 22s | Tests failed in hadoop-hdfs. |
+| | | 230m 14s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.server.blockmanagement.TestBlockTokenWithDFS |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12730225/HDFS-7609.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 8f65c79 |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HDFS-Build/10786/artifact/patchprocess/testrun_hadoop-common.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/10786/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/10786/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf906.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/10786/console |
+
+
+This message was automatically generated., {quote}
+PriorityQueue#remove is O\(n), so that definitely could be problematic. It's odd that there would be so many collisions that this would become noticeable though. Are any of you running a significant number of legacy applications linked to the RPC code before introduction of the retry cache support? If that were the case, then perhaps a huge number of calls are not supplying a call ID, and then the NN is getting a default call ID value from protobuf decoding, thus causing a lot of collisions.
+{quote}
+The priority queue can be improved using a balanced tree as stated in the java comment in LightWeightCache.  We should do it if it could fix the problem.
+{code}
+//LightWeightCache.java
+  /*
+   * The memory footprint for java.util.PriorityQueue is low but the
+   * remove(Object) method runs in linear time. We may improve it by using a
+   * balanced tree. However, we do not yet have a low memory footprint balanced
+   * tree implementation.
+   */
+  private final PriorityQueue<Entry> queue;
+{code}
+BTW, the priority queue is used to evict entries according the expiration time.  All the entries (with any key, i.e. any caller ID) are stored in it., Thanks for working on this, [~mingma]! Your analysis makes sense to me and I can also reproduce the same scenario. Your patch also looks good to me.
+
+One extra issue, which exists before your patch, is that the retry cache may not be hit during the NameNode failover. For example, suppose the following event sequence:
+# a delete request is served by the ANN but the client fails to receive the response 
+# NN failover happens
+# the first retry request gets StandbyException since the old ANN becomes standby
+# the second retry request is sent to the other NN, which at this time has not started the transition yet
+# no cached entry has been found in the retry cache
+# before running {{FSNamesystem#delete}}, the transition starts, which blocks the {{FSNamesystem#delete}} call
+# the {{FSNamesystem#delete}} is called and fails
+
+If the above scenario stands, maybe we can use this chance to fix it? In your patch, if the NN is in standby state, and there is no retry cache entry, should we directly throw StandbyException instead of checking it again in FSNamesystem? , Thanks, [~jingzhao]. In the scenario you described, IIUC, in order for #6 the call to block on {{FSNamesystem#delete}}, it will first need to pass {{checkOperation(OperationCategory.WRITE)}}. But given the new ANN hasn't transitioned to active yet, the call should have received StandbyException already. Regarding throwing StandbyException earlier, we can add it to NameNodeRpcServer; but it seems unnecessary. Suggestions?, Thanks for the response, Ming! Yes I agree that in most of the cases the call should be blocked after checking the {{OperationCategory}}, and the standbyexception will be thrown. But looks like we still cannot 100% rule out the scenario that this check happens after the transition? This scenario should be extremely rare though. , Spent some further time digging into the issue. Besides the scenario that Ming described, the retry cache collision could happen while recording the {{UpdateBlocksOp}} transaction. {{UpdateBlocksOp}} is recorded for multiple APIs: {{fsync}}, {{abandonBlock}}, {{updatePipeline}}, and {{commitBlockSynchronization}}. And before 2.3, {{UpdateBlocksOp}} is recorded for {{addBlock}}. Among these APIs, only {{updatePipeline}} needs to record the callId and clientId into the editlog. However, all other calls failed to reset the callId and clientId to the dummy one thus recorded the same callId and clientId into the journal. Considering {{addBlock}} is called heavily this can cause large amounts of collision.
+
+HDFS-7398 should have fixed this already., [~jingzhao] you are right. It is possible that nn starts the transition right after the retry cache check. Here is the updated patch to cover that scenario. Thanks. BTW, any ideas why the current implementation sets NN to active at the beginning of the transition instead of at the end?, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  15m  1s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 40s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 46s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:green}+1{color} | checkstyle |   2m 41s | There were no new checkstyle issues. |
+| {color:green}+1{color} | whitespace |   0m  1s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 35s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   4m 44s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | common tests |  23m 29s | Tests passed in hadoop-common. |
+| {color:red}-1{color} | hdfs tests | 164m 12s | Tests failed in hadoop-hdfs. |
+| | | 230m  8s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.server.namenode.TestStartup |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12735477/HDFS-7609-2.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / cdbd66b |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11135/artifact/patchprocess/testrun_hadoop-common.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11135/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/11135/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf903.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/11135/console |
+
+
+This message was automatically generated., Thanks Ming! The new patch looks good to me. One minor is that we do not need to throw StandbyException for {{saveNamespace}} since it can also be processed by standby NN. For {{saveNamespace}}, since we do not have editlog for it, I guess we do not need to apply this fix to it?
+
+Maybe another simpler way to fix the issue is to move the {{checkOperation(OperationCategory.WRITE)}} check to the very beginning (i.e., before the retry cache look up). In this way, we miss the chance to get the response directly from standby NN's retry cache and the client has to failover one more time. But looks like this chance is very small. This can only happen when the request has been handled by the active NN, then the client misses the response, then NN failover happens and the client is redirected to the other NN, which has loaded the edits but has not transitioned to active state yet., bq. any ideas why the current implementation sets NN to active at the beginning of the transition instead of at the end
+
+I'm not very sure about the reason of this choice. I created HDFS-5384 before trying to add a new state for the transition stage.., Thanks [~jingzhao]. Good point about saveNamespace.
+
+Regarding moving {{checkOperation(OperationCategory.WRITE)}} from FSNamesystem to NameNodeRpcServer, I considered that before. There are two minor issues.
+
+* Duration when both NNs are in standby should be short. But not sure if there is any failure scenario like ZK issue that can cause long duration. In addition, given the old ANN still keep its retry cache after it becomes standby, the application might get the cached result from the old ANN if we allow cache check when NN is in standby.
+* If we want to move the check, we might also want to move other things like checking if the system supports symlink; such  that UnsupportedOperationException can be thrown before StandbyException. This order might not be important as UnsupportedOperationException will be eventually thrown to the application from the active NN.
+
+Otherwise, completely agree checking standby before retry cache check is simpler. If these issues aren't important, I can update the patch accordingly., Thanks for sharing the thoughts, Ming! Totally agree with your analysis. But for now I still feel to move the standby check before the retry cache look up may be a cleaner way to go: in this way we do not need to expose the mapping between operations and the StandbyException out in the NameNodeRpcServer code. The two standby NameNode scenario can finally still be handled by client side retry/failover in most cases., Jing, I agree with you. Here is the updated patch., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  17m 51s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 32s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 35s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   2m 14s | The applied patch generated  2 new checkstyle issues (total was 321, now 321). |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 36s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 34s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   3m 17s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | native |   3m 15s | Pre-build of native portion |
+| {color:green}+1{color} | hdfs tests | 162m 52s | Tests passed in hadoop-hdfs. |
+| | | 209m 13s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12736039/HDFS-7609-3.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / d725dd8 |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/11158/artifact/patchprocess/diffcheckstylehadoop-hdfs.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11158/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/11158/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf902.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/11158/console |
+
+
+This message was automatically generated., The 03 patch looks good to me. +1. I will commit it shortly., I've committed this to trunk and branch-2. Thanks [~mingma] for the fix and [~CarreyZhan] for the report! And thanks to all for the discussion!, FAILURE: Integrated in Hadoop-trunk-Commit #7926 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/7926/])
+HDFS-7609. Avoid retry cache collision when Standby NameNode loading edits. Contributed by Ming Ma. (jing9: rev 7817674a3a4d097b647dd77f1345787dd376d5ea)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRetryCacheWithHA.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+, Thanks Jing and all other folks., FAILURE: Integrated in Hadoop-Yarn-trunk #943 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/943/])
+HDFS-7609. Avoid retry cache collision when Standby NameNode loading edits. Contributed by Ming Ma. (jing9: rev 7817674a3a4d097b647dd77f1345787dd376d5ea)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRetryCacheWithHA.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+, SUCCESS: Integrated in Hadoop-Yarn-trunk-Java8 #213 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/213/])
+HDFS-7609. Avoid retry cache collision when Standby NameNode loading edits. Contributed by Ming Ma. (jing9: rev 7817674a3a4d097b647dd77f1345787dd376d5ea)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRetryCacheWithHA.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #2141 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2141/])
+HDFS-7609. Avoid retry cache collision when Standby NameNode loading edits. Contributed by Ming Ma. (jing9: rev 7817674a3a4d097b647dd77f1345787dd376d5ea)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRetryCacheWithHA.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk-Java8 #202 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/202/])
+HDFS-7609. Avoid retry cache collision when Standby NameNode loading edits. Contributed by Ming Ma. (jing9: rev 7817674a3a4d097b647dd77f1345787dd376d5ea)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRetryCacheWithHA.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk-Java8 #211 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/211/])
+HDFS-7609. Avoid retry cache collision when Standby NameNode loading edits. Contributed by Ming Ma. (jing9: rev 7817674a3a4d097b647dd77f1345787dd376d5ea)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRetryCacheWithHA.java
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk #2159 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2159/])
+HDFS-7609. Avoid retry cache collision when Standby NameNode loading edits. Contributed by Ming Ma. (jing9: rev 7817674a3a4d097b647dd77f1345787dd376d5ea)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRetryCacheWithHA.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+, [~sjlee0] backported this to 2.6.1 after fixing non-trivial merge conflicts.
+
+I just pushed the commit to 2.6.1 after running compilation and TestRetryCacheWithHA which changed in the patch., Just pulled this into branch-2.7 (release 2.7.2) as it already exists in 2.6.1.
+
+branch-2 patch had merge conflicts. Ran compilation and TestRetryCacheWithHA before the push., Attaching patch that I committed for 2.7.2.]

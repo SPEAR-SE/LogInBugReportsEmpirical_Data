@@ -1,0 +1,167 @@
+[The attach repro patch contains a test that reproduces the issue.  As written, the test fails if a corruption is detected.
+
+It does the following:
+# Start an ensemble of five hosts (SIDs 1-5)
+# If SID 5 is the leader, move leader to any other host
+# Shutdown SID 5 and one other non-leader host
+# Insert some new znodes
+# Turn on forced SNAPs for syncing with the leader
+# Restart SID 5 and validate it sync'd with a snapshot
+# Shutdown current leader; this results in SID 5 becoming the leader
+# Disable forced snap-on-sync (and make DIFF more likely by adjusting the size limit)
+# Restart the second host that was shutdown in step #3 and validate it sync's with a DIFF.
+# Check for mismatched nodes on the leader and the host that was shutdown in step #3 => there should be a mismatch, Changing status to get the build to execute with the patch, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12689378/ZOOKEEPER-2099-repro.patch
+  against trunk revision 1646992.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 5 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    -1 findbugs.  The patch appears to introduce 1 new Findbugs (version 2.0.3) warnings.
+
+    -1 release audit.  The applied patch generated 1 release audit warnings (more than the trunk's current 0 warnings).
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2473//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2473//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2473//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2473//console
+
+This message is automatically generated., In Scenario Step 7, do you mean
+{code}
+Host H2 recovers and connects to H1
+{code}, Thanks [~svoutil] for uploading the repro-patch.
+Regarding the test you added, should the last assert 
+{code}
+Assert.assertNotNull("Node should also exist on target if there is no corruption but it does NOT", gapTargetStat);
+{code}
+be 
+{code}
+Assert.assertNull(...);
+{code}
+
+right?, Okay. I see what you are saying now. Do you have a patch for the problem?, I wrote the test to fail, so assertNotNull is correct since the node will exist on the leader but NOT on the target host., Yeah, nice catch; I've updated it., No, not yet.  We've been discussing options, but haven't settled on a plan.
+
+An extreme option is to truncate/delete all txnlog (and the in-mem committedLog) for zxids < than the start of the snap whenever syncWithLeader results in the SNAP (i.e. this would happen on the learner).  This would work since if this learner became the leader later, then the txnlog would not contain the zxid requested by a stale learner and so a DIFF would not even be possible.  I consider this extreme and more of a last resort because it means deleting txnlog from disk which could impact investigations/backup-scripts/retention-policy/etc.
+
+Another option would be to track the latest received SNAP zxid somewhere. Then LearnerHandler#syncFollower would compare the requested zxid with the last SNAP zxid and if the requested zxid is less then it would force a SNAP even if the requested zxid existed in the txnlog.
+The storage location for the latest received SNAP needs to persist with the txnlogs (since it would still need to be known after a host restart).  This could be done by storing it in a separate file in the same directory as the txnlog, or it could be appended to the txnlog at the time of the SNAP.
+The latter storage option has the benefit that tools like LogFormatter would also see it (and not just the latest but all snap zxids) and be able to handle it. In the case of LogFormatter it could indicate that there is a gap in the txnlog at that point.
+
+I personally prefer appending a special SNAP-OCCURRED record into the txnlog, but have not yet gone through all the investigation to determine whether that would be safe and/or what other changes would be needed since that record should probably use some invalid ZXID in its record (in order to avoid confusion with a valid record with that same zxid on another host). , {quote}
+The storage location for the latest received SNAP needs to persist with the txnlogs (since it would still need to be known after a host restart). This could be done by storing it in a separate file in the same directory as the txnlog, or it could be appended to the txnlog at the time of the SNAP.
+{quote}
+
+Could you clarify the method? I like the second idea because it is more obvious to do., Cancelling patch as the solution is not included. Good to have the reproducible case though., Attached is an initial attempt at fixing this.
+
+I was investigating an issue with massive inconsistency between ZK servers and developed my own test to reproduce the issue. I originally thought our issue was isolated to ephemeral znodes so I didn't find this issue in my searches, but the test I wrote ended up being almost exactly the same as the one provided by [~svoutil]. I did find another detail in my investigation that seems important - this bug not only causes the leader to not send the correct updates to the follower, but the leader can also incorrectly tell the follower to truncate its log, resulting in the loss of even more transactions on the follower. This requires a slightly different sequence of events (a few more steps). I found it easier to use my original test as a base and make some improvements using the test submitted here, so that's why the test I'm submitting looks so different.
+
+h4. Test
+
+Here's a description of what the test does:
+
+# Enable forceSnapSync
+# Set a very high snapshotSizeFactor to guarantee a DIFF if forceSnapSync is off
+# Start 5 servers
+# Create a baseline znode /w (not necessary, but shows where the data loss starts)
+# Shutdown SID 4
+# Create /x while SID 4 is down
+# Shutdown SID 0
+# Create /y while SIDs 0 and 4 are down
+# Start SID 4 (which receives a SNAP from the current leader because of forceSnapSync=true)
+# Create /z while SID 0 is down
+# Disable forceSnapSync
+# Shutdown current leader - SID 4 becomes leader
+# Start SID 0 (which receives a TRUNC from SID 4 without the fix and a SNAP with the fix)
+# Check for the presence of all znodes on all servers (without the fix, SID 0 is missing /x and /y)
+
+More detail on what goes wrong in step 13:
+
+(Using W = the zxid of the transaction which creates /w, X for /x, etc.)
+
+At this point, SID 4 has W and Z in its log and it has a snapshot containing the updates from W, X, and Y. It tries to sync with SID 0 (whose last zxid is Y), and iterates through its log until it finds a zxid > Y. It then looks back at the previous log entry (W), sees that W < Y, and tells SID 0 to truncate its log to W. After this, it starts sending updates at Z. SID 0 therefore deletes X and misses Y. The only correct thing for SID 4 to do here is to send a snapshot.
+
+h4. Fix
+
+The approach of writing a file with the last SNAP received to the data dir and checking that value when trying to sync with a follower seems best. The patch adds code to ZKDatabase to handle this file (called lastSnapReceived). LearnerHandler checks this lastSnapReceived value, and if it falls in the range of transactions a follower needs in syncFollower, a snapshot is sent.
+
+We desperately need this fix because of the massive issues the bug is causing, so I will be doing as much testing as I can around it before fixing our internal version of ZK. It would be great to also get it polished to a state where it could be included in a future 3.5.x version.
+
+Some big points to discuss:
+* What should ZKDatabase/Learner do if it can't create or write to the file? It currently doesn't handle any exceptions which will result in the Learner stopping. This ensures correctness, but introduces another way for a Learner to fail.
+* What should ZKDatabase/LearnerHandler do if it can't read the file? LearnerHandler currently catches all exceptions and falls back to sending a SNAP. This is always correct, but there will be performance loss in syncing new learners if the file becomes unreadable/corrupted somehow.
+* Is there risk with upgrades or downgrades? It doesn't seem like there should be. Versions without the fix will just ignore the file if it's present in their data dir. Upgrading from a version without the fix to a version with the fix will result in the file being written when initializing the ZKDatabase.
+
+Smaller points I couldn't decide on:
+* Is it acceptable to enforce snapLog being non-null when constructing a ZKDatabase now? I had to modify some unit tests, but I liked that better than a test-only null check in the constructor.
+* Should zookeeper.forceSnapSync and zookeeper.snapshotSizeFactor be settable system properties? The property names were included in the relevant classes but never used, and I wasn't sure if that was intended or not.
+* Is IOUtils a good home for writeLongToFileAtomic since QuorumPeer and ZKDatabase both need that logic now?
+
+Patch generated against master and seems to apply to branch-3.5. Not needed in branch-3.4 since the issue was introduced in 3.5.0
+, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12834543/ZOOKEEPER-2099.patch
+  against trunk revision cef5978969bedfe066f903834a9ea4af6d508844.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 9 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3495//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3495//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3495//console
+
+This message is automatically generated., Looks like the test needs to be hardened a bit. I think I see the issue - QuorumBase.waitForServerUp doesn't guarantee that the client the test is using to create the nodes is also connected. I ran the test a few dozen times on my machine and saw no failures, but that's obviously not good enough.
+
+As for the testLE failure, that seems to be a known flaky test (ZOOKEEPER-1932), I can't find the other failed test - org.apache.zookeeper.server.quorum.QuorumPeerMainTest.testTransactionLogGap in code base... where is this test coming from? , Ah never mind, that is the test added into the patch:), Should we catch the connection loss exception and retry connecting to make sure the ZK handle used in test is in the connected state? I think all ZK handles were initially in connected state (after calling waitForAll), but maybe for some reasons one or more connections were lost because networking or other issues., As a start, I think I should change the test to use waitForOne on the client being used for the operation after shutting down server 4 instead of waitForServerUp. This will at least make sure the test is waiting for the right thing before moving on and creating paths. I do expect the clients to be disconnected when taking down server 4 (since that should be the current leader), and if that's the only source of connection loss, the test might not need to retry.
+
+As far as I can tell, most other tests don't retry on connection loss. Should they?
+
+, Just did a search on my archived build mails - I see a good amount of tests failed from time to time with 'KeeperErrorCode = ConnectionLoss'. I think the test cases should be made more fault tolerant to such false negatives. I agree that we should not blindly do retry and the retry should be done on a case by case basis. Let me dig more into what this new test and those failed existing tests did.., I updated the test so it hopefully won't see connection loss as a result of its own actions. For the two parts of the test where it causes a new leader to be elected, it now looks for the disconnect and reconnect on the correct client to make sure things have recovered completely. Using the existing CountdownWatcher utility class seemed to be the best fit for that, since using QuorumPeerMainTest::waitForOne might miss the disconnection event if the client reconnects while waitForOne is sleeping.
+
+I did add some asynchronous methods to wait for connection or disconnection in CountdownWatcher to be able to start waiting for the disconnection before shutting down the server, avoiding a potential race condition that might cause the disconnection to be missed. They're just simple wrappers that return a Future and kick off waitForDisconnect or waitForConnect in a thread.
+
+I still couldn't get the old version of the test to fail locally, so there might be issues with this one too, but I think it should be an improvement., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12835192/ZOOKEEPER-2099.patch
+  against trunk revision cef5978969bedfe066f903834a9ea4af6d508844.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 12 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3499//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3499//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/3499//console
+
+This message is automatically generated.]

@@ -1,0 +1,108 @@
+[We think that our issue is related to issue AMQ-2590.
+
+In the AMQ-2590 issue, only one phase commit transactions are rolled back in case of failover.
+
+We change the ConnectionStateTracker code (in 5.10.2) to rollback others type of transaction (BEGIN and PREPARE).
+
+
+{code:title=org.apache.activemq.state.ConnectionStateTracker.java|borderStyle=solid}
+    private void restoreTransactions(Transport transport, ConnectionState connectionState) throws IOException {
+        Vector<TransactionInfo> toRollback = new Vector<TransactionInfo>();
+        for (TransactionState transactionState : connectionState.getTransactionStates()) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("tx: " + transactionState.getId());
+            }
+
+            // rollback any completed transactions - no way to know if commit got there
+            // or if reply went missing
+            //
+            if (!transactionState.getCommands().isEmpty()) {
+                Command lastCommand = transactionState.getCommands().get(transactionState.getCommands().size() - 1);
+                if (lastCommand instanceof TransactionInfo) {
+                    TransactionInfo transactionInfo = (TransactionInfo) lastCommand;
+                    if (transactionInfo.getType() == TransactionInfo.COMMIT_ONE_PHASE
+                            // BEGIN MODIFIED CODE					
+                            || transactionInfo.getType() == TransactionInfo.BEGIN
+                            || transactionInfo.getType() == TransactionInfo.PREPARE
+                            // END MODIFIED CODE							
+                            ) {
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug("rolling back potentially completed tx: " + transactionState.getId());
+                        }
+                        toRollback.add(transactionInfo);
+                        continue;
+                    }
+                }
+            }
+{code}
+
+With this change we can not reproduce our duplicated messages issue.
+
+Is there a specific reason why only one phase transactions are rolled back in AMQ-2590 ?
+
+We are working on our side to provide a test case to reproduce the duplicated message issue.
+
+Thanks., Hi Michael!
+
+1st of all thank you for your work you've done so far, it is very helpful.
+
+So basing on your work, I was able to reproduce the problem with Atomikos 3.9.26 (which include important fix for rollback to fail) but also confirmed this problem to occur with Apache Geronimo transaction manger.
+This proves that problem is purely ActiveMQ related.
+I've also tested JBoss A-MQ 6.1 (5.9 based) and 6.2 (5.11 based)- all affected with same problem!
+
+What is important to say here is that this problem will occur significantly more often on slow envs which prone to freeze/restart (virtual machines especially).
+
+Let's see now what will happen and whether someone will grab that task.
+
+Thanks
+, In order to reproduce the AMQ5854 issue, we have created a maven project amq5854 (see the attached amq5854.tar.gz).
+
+The abnormal behavior has been reproduced in 2 versions of AMQ : 5.10.2 and 5.11.1
+
+The goal is to feign an overloaded CPU by modifying the activemq-client-xxx.jar with a sleep of 20 seconds during the consumption of the message.
+
+Prerequisites to be able to reproduce the abnormal behavior :
+-	Consumer : failover, wireFormat.maxInactivityDuration=5000 and RedeliveryPolicy with a maximumRedeliveries of 3 times
+-	Broker : transport.useKeepAlive=false
+-	activemq-client-xxx.jar : add Thread.sleep(20*1000) on the org.apache.activemq.ActiveMQMessageConsumer (see the attached sources) 
+
+
+Use case :
+ 
+A producer send a message to the INPUT_QUEUE queue on an embedded broker.
+Then a consumer implemented by a Spring Listener consume this message from the INPUT_QUEUE, transform it and send it to another queue (OUTPUT_QUEUE).
+The read from INPUT_QUEUE and the write to OUTPUT_QUEUE are included in a same transaction XA.
+
+With the activemq-client modification, the consumption of the message is superior of 20 seconds and the maxInactivatyDuration for the consumer is 5 seconds.
+Hence, we will be always in the case where an InactivityIOException prevent the arrival of the message on the OUTPUT_QUEUE because of the rollback transaction request.
+So the expected result is to have 1 message in DLQ (Dead Letter Queue) and no message in the OUTPUT_QUEUE.
+But due to the abnormal behavior, Activemq do not rollback the write on the OUTPUT_QUEUE. 
+So After 3 retries,  we have 1 message on DLQ and  3 duplicate messages on the OUTPUT_QUEUE.
+
+, maven project amq5854 and the modified activemq-client-xxx.jar , [~michael.s] the intent of the tracker to to maintain the transaction state, and recover it, if it can. If the commit request gets a failure then it is impossible to know if the message got there or if the reply was lost so notifying the client is the only option. Otherwise failover can try and recreate the transaction state and allow it to complete.
+In hindsight, trying to maintain transaction semantics across failover (especially in the context of multiple consumers) seems too complex.
+I want to investigate the fix for this issue and see if it is better to implement the fix or remove this feature altogether and just rollback any indoubt transaction on failover., Commit 8d982479e9a5579fc3f6da04109a1b3ef69431eb in activemq's branch refs/heads/master from [~gtully]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=8d98247 ]
+
+https://issues.apache.org/jira/browse/AMQ-5854 - fix and test. Ensure transaction rollback if there are pending acks during a failover reconnect. Reliably tracking pending acks to eusure possible redelivery is too complex in the context of acks getting dropped by failover or ignored by the subscription, in addition to being sent async. Couple that with multiple consumers on the same connection and the locking of message delivery; only safe course is to ensure rollback outcome.
+, I have implemented a rollback only option on the transaction context that is triggered by a failover, the initial disconnect that will trigger a reconnect.
+If there are pending acks, so messages that need an ack in the transaction, a rollback is forced. This seems the only sensible option.
+There is a new unit test that simulates a delayed or slow ack, consumer side, with an additional transaction synchronization and can reliably reproduce the missed ack., Excellent news!
+Thanks Gary!, Commit 92e1f60d984d0e29eade47dbb6d2d30d838254c2 in activemq's branch refs/heads/master from [~gtully]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=92e1f60 ]
+
+https://issues.apache.org/jira/browse/AMQ-5854 - tidy up test
+, Thanks Gary for fixing this issue !
+
+Looks okay to us., good to know. thank for the verification, Commit fc25535748fb8dbaea588203086c4802d1ccf091 in activemq's branch refs/heads/master from [~gtully]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=fc25535 ]
+
+https://issues.apache.org/jira/browse/AMQ-5854 - fix intermittent test failure
+, Commit de5d0d9430838948196f573c5278c75fbee9f25e in activemq's branch refs/heads/master from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=de5d0d9 ]
+
+https://issues.apache.org/jira/browse/AMQ-5854
+
+Fix intermittent test failure caused by the test reconnecting before
+the failure assertion had a chance to assert the expected failure
+]

@@ -1,0 +1,210 @@
+[Here is the console log
+
+{code}
+sudo su - -c "/usr/bin/hdfs haadmin -getServiceState nn1" hdfs
+active
+exit code = 0
+sudo su - -c "/usr/bin/hdfs haadmin -getServiceState nn2" hdfs
+standby
+exit code = 0
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null hostname "sudo su - -c \"cat /grid/0/var/run/hadoop/hdfs/hadoop-hdfs-namenode.pid | xargs kill -19\" hdfs"
+sudo su - -c "/usr/bin/hdfs haadmin -getServiceState nn1" hdfs
+Operation failed: Call From host1/ip to host1:8020 failed on socket timeout exception: java.net.SocketTimeoutException: 20000 millis timeout while waiting for channel to be ready for read. ch : java.nio.channels.SocketChannel[connected local=host1/ip:35192 remote=host1/ip:8020]; For more details see:  http://wiki.apache.org/hadoop/SocketTimeout
+exit code = 255
+sudo su - -c "/usr/bin/hdfs haadmin -getServiceState nn2" hdfs
+Operation failed: Call From host2/ip to host2:8020 failed on socket timeout exception: java.net.SocketTimeoutException: 20000 millis timeout while waiting for channel to be ready for read. ch : java.nio.channels.SocketChannel[connected local=host2/ip:37640 remote=host2/68.142.247.217:8020]; For more details see:  http://wiki.apache.org/hadoop/SocketTimeout
+exit code = 255
+{code}, Checked the log with Arpit. Looks like the issue is like this:
+1. After NN1 got suspended, NN2 started the transition. It first tried to stop the editlog tailer thread.
+2. The editlog tailer thread happened to trigger NN1 to roll its editlog right before the transition, and this rpc call got stuck since NN1 was suspended.
+3. It took a relatively long time (>1min) for the rollEditlog rpc call to receive the connection reset exception.
+4. During this time, NN2 waited for the tailer thread to die, and the fsnamesystem lock was held by the stopStandbyService call.
+5. haadmin's getServiceState request could not get response (since the lock was held by the transition thread in NN2) and timeout (its default socket timeout is 20s).
+
+In summary, it is possible that the rollEditlog rpc call from the standby NN to the active NN in the editlog tailer thread may delay the NN failover.
+, Since in active NN we already have a NameNodeEditLogRoller thread triggering the editlog roll, I guess the standby NN doesn't need to trigger the active namenode to roll the editlog., Simple patch to remove the editlog roll from SBN., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12634047/HDFS-6089.000.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 5 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestDelegationTokensWithHA
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestEditLogTailer
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/6376//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/6376//console
+
+This message is automatically generated., Fix unit tests., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12634208/HDFS-6089.001.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/6384//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/6384//console
+
+This message is automatically generated., Hey Jing, I took a quick look at the patch, few comments on the approach:
+
+In EditLogTailer#doTailEdits, I believe that rolling the edit log right before is intended to freshen up the edit log for consumption by the SbNN. Without this, we'll lag by up to the autoroll period and have to do more replay on a failover. This may be significant, so I'd like if someone with more HA experience can comment (maybe [~tlipcon] or [~atm]?).
+
+The autoroller on the active NN was also intended to be a backstop, so if we do decide to go with this approach, we'll need to update its check period and thresholds to be more aggressive., Yep, everything Andrew said makes sense to me.
+
+Maybe we should just have a shorter timeout on the rollEditLog call? Or somehow interrupt the RPC more quickly during a transitionToActive call (given in that case we know that the previous active is likely dead)?, Thanks for the comments, Andrew and Todd!
+
+bq. In EditLogTailer#doTailEdits, I believe that rolling the edit log right before is intended to freshen up the edit log for consumption by the SbNN.
+But in the currently code, the auto trigger is still running periodically, which means we cannot guarantee that we roll the editlog before we call doTailEdits. During the failover, we call editLog.recoverUnclosedStreams() and EditLogTailer#catchupDuringFailover in FSNamesystem#startActiveServices to guarantee the SBN can tail all the editlog. But before failover, if we can make the autoroller on the active NN more aggressive (as you suggested), we can still guarantee that the SBN will not do a lot of replay on a failover. What do you think?
+
+bq. we'll need to update its check period and thresholds to be more aggressive.
+Yes, agree. We should assign a smaller value to the sleep interval (maybe 2min just like the SBN).
+
+bq. Maybe we should just have a shorter timeout on the rollEditLog call. Or somehow..
+We can also do this. But to have two auto roller working in two NN at the same time still seems not that necessary to me.., bq.  the auto trigger is still running periodically, which means we cannot guarantee that we roll the editlog before we call doTailEdits
+
+The autoroller was intentionally set up with a high # edits threshold and check interval, so most of the time it doesn't trigger.
+
+bq. ...make the autoroller on the active NN more aggressive...
+
+This seems okay at a high level, but we need to strike some balance with the autoroller thresholds. Right now, the autoroller triggers on a conservative # edits, since we wanted to avoid having a single giant edit log segment. If we add a time threshold (like the tailer), we want to avoid the reverse problem: a lot of small segments accumulating in the absence of a standby. But, we'd also want to keep this threshold low to minimize SbNN staleness.
+
+If it's also easy to twiddle the RPC timeout, maybe we should pursue that route., Thanks for the response, Andrew. 
+
+bq. If we add a time threshold (like the tailer), we want to avoid the reverse problem: a lot of small segments accumulating in the absence of a standby.
+Could you please explain how we avoid this issue with the current strategy?
+For the autoroller in ANN, I guess it should still determine whether to roll based on the # edits, however, we should change its sleeping interval from 5min to a smaller number (e.g., 2min), which means it will come to check the edits # every 2min and roll edits if necessary. Can this address your concern? Or am I missing something here?, Basic question - If standby namenode is rolling every x minutes, why cannot that be the period the active namenode can roll the editlogs? Why can't active use the same criteria for rolling edits?, Hi guys, hope I can clarify what I said:
+
+bq. Could you please explain how we avoid this issue with the current strategy?
+
+Checkpointing combines the edit log with the fsimage, and we purge unnecessary log segments afterwards. It's okay for the standby to roll the edit log on a time basis because it's also doing checkpoints, so it's clearing edit log segments as it's making them.
+
+The same thing is not true on the active NN. In the absence of checkpointing, rolling on a time basis leads to a lot of small edit logs that just accumulate. This is why the active NN autoroller triggers on a big # of edits, not time. It's trying to avoid a single giant edit log segment by making some number of medium-sized ones. Also rolling on a time-basis (which is good for standby tailing) would end up making a lot of small segments.
+
+I guess we can shrug and say this is alright, but if an alternative solution is amenable, maybe we can pursue that instead., Hi Andrew, thanks for the explanation. I guess I understand your concern now: only rolling on ANN based on edits # may cause issue in some scenario. This is because if we don't have further operations it is possible that SBN will wait a long time to tail that part of edits which is in an in-progress segment.
+
+bq. Checkpointing combines the edit log with the fsimage, and we purge unnecessary log segments afterwards.
+But I'm still a little confused about this part. I fail to see the difference of the based-on-time rolling from SBN and ANN. In the current code, SBN triggers rolling still through RPC to ANN. Also this does not affect checkpointing and purging: when SBN does a checkpoint, both SBN and ANN will purge old edits in their own storage (SBN does the purging before uploading the checkpoint, and ANN does it after getting the new fsimage).
+
+So I guess a possible solution may be: just letting ANN does rolling every 2min. I think this can achieve almost the same effect as the current mechanism, without delaying the failover. Or you see some counter examples with this change?
+
+Back to the changing the rpc timeout solution. Looks like we have not set timeout for this NN-->NN rpc right now (correct me if I'm wrong). Setting a timeout (e.g., 20s just like the default timeout from client to NN) of course can improve the failover time in our test case, but I still prefer the above solution because it makes the rolling behavior simpler and more predictable (especially it removes the rpc call from SBN to ANN)., Hmm, let me try to explain one more time. My concern wasn't about staleness here, but spamming the edits dirs with a lot of small files.
+
+I agree that having the ANN roll on a time basis is fine when SbNN and ANN are both up and checkpointing is happening.
+
+An issue arises if checkpoints aren't happening, either because the SbNN is down, or checkpoints are otherwise broken (e.g. the "edit log op too big" bug, transfer timeouts with a large fsimage, or some of the fallout from the PB-fication of the fsimage). In this scenario, the ANN will keep rolling every 2mins, generating a lot of edit log segments that aren't being cleared out. I've seen oblivious customers run for a month while checkpointing was nonfunctional, and 2 min rolling would lead to an awful lot of files. This is one reason why the ANN autoroller rolls on a size basis rather than time. It should generates fewer, larger segments, which is more manageable.
+
+This isn't a super major issue, but I thought I'd bring it up as a reason why we might prefer a different solution., bq. This is because if we don't have further operations it is possible that SBN will wait a long time to tail that part of edits which is in an in-progress segment.
+bq. In this scenario, the ANN will keep rolling every 2mins, generating a lot of edit log segments that aren't being cleared out.
+Hmm, actually my thought yesterday was not correct. Yes, we cannot do auto rolling simply based on time, and the reason is just like [~andrew.wang] pointed out.
+
+Hopefully this is my last question, just want to make sure: the current SBN auto roller can cause the same issue like "a lot of edit log segments aren't being cleared out" in case that checkpoints are broken (but the SBN is not down), right?
+
+Anyway I will post a patch to add rpc timeout later. , bq. the current SBN auto roller can cause the same issue like "a lot of edit log segments aren't being cleared out" in case that checkpoints are broken (but the SBN is not down), right?
+
+Yea, I think so. Checkpointing is pretty stable nowadays though, so I think this is pretty rare :) Thanks Jing., Patch that adds rpc timeout for the rollEditLog call. I set the default timeout to 20s., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12635688/HDFS-6089.002.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestFailureToReadEdits
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/6448//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/6448//console
+
+This message is automatically generated., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12635688/HDFS-6089.002.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/6451//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/6451//console
+
+This message is automatically generated., +1 looks good to me. Will commit shortly, thanks Jing., Committed this back through 2.4, thanks again Jing for the patch and Arpit for the report., SUCCESS: Integrated in Hadoop-trunk-Commit #5365 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/5365/])
+HDFS-6089. Standby NN while transitioning to active throws a connection refused error when the prior active NN process is suspended. Contributed by Jing Zhao. (wang: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1579692)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #516 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/516/])
+HDFS-6089. Standby NN while transitioning to active throws a connection refused error when the prior active NN process is suspended. Contributed by Jing Zhao. (wang: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1579692)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #1708 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1708/])
+HDFS-6089. Standby NN while transitioning to active throws a connection refused error when the prior active NN process is suspended. Contributed by Jing Zhao. (wang: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1579692)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk #1733 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1733/])
+HDFS-6089. Standby NN while transitioning to active throws a connection refused error when the prior active NN process is suspended. Contributed by Jing Zhao. (wang: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1579692)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+]

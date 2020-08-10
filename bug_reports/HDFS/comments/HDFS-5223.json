@@ -1,0 +1,163 @@
+[I was chatting about this informally with [~tlipcon] a day or two ago, and we came up with the following two alternative implementations:
+
+# Introduce a new separate "NN metadata version" number which is decoupled from the existing "layout version". We will allow the NN to start up if its NN metadata version number is higher than what's in the fsimage/edit log headers without requiring the '-upgrade' flag. From now on the addition of new edit log opcodes would increment the NN metadata version, and we would require that changes made to the format of existing fsimage/edit log entries be done in a backward compatible fashion. We would freeze the existing "layout version" number and from now on only increment this in the case of more fundamental NN metadata version changes.
+# Introduce a set of NN metadata format feature flags which can be enabled or disabled by the admin at runtime. These feature flags could be enabled/disabled entirely independently, so we would move away from a strictly-increasing NN metadata version number. The fsimage and edit log header would be changed to enumerate which of these features were enabled. We will allow the NN to start up only if its software supports the full set of features identified in the fsimage/edit log headers.
+
+I'd love to solicit others thoughts/feedback on these proposals, or suggest an alternative if you have one., To expand a little bit on Aaron's summary of our discussion above.
+
+*Proposal 1*:
+- note that we already include a version number in the header of the edit log and image formats. So, within a single image or edits directories, you might now have different edit log segments or images with different version numbers -- the ones written post-upgrade would have a higher version number.
+- note that this allows for in-place software upgrade, but not in-place software downgrade. Once you've written an edit log with the new version, you couldn't downgrade the NN back to the previous version, because it would refuse to read the higher-versioned edit log segment.
+
+bq. and we would require that changes made to the format of existing fsimage/edit log entries be done in a backward compatible fashion
+
+This isn't quite the case -- because the new edit log segments would have a new version number, we have the same ability to evolve opcodes as today. I verified with Aaron that he mis-stated this above.
+
+*Proposal 2*:
+- This is basically the way that file systems such as ext3 handle version compatibility. Every ext3 filesystem's superblock contains a set of flags which determine which features have been enabled for it. Similarly, we'd add something to the edit log and fsimage headers with a set of feature names. Here's the docs from Documentation/filesystems/ext2.txt in the kernel tree:
+
+{code}
+These feature flags have specific meanings for the kernel as follows:
+
+A COMPAT flag indicates that a feature is present in the filesystem,
+but the on-disk format is 100% compatible with older on-disk formats, so
+a kernel which didn't know anything about this feature could read/write
+the filesystem without any chance of corrupting the filesystem (or even
+making it inconsistent).  This is essentially just a flag which says
+"this filesystem has a (hidden) feature" that the kernel or e2fsck may
+want to be aware of (more on e2fsck and feature flags later).  The ext3
+HAS_JOURNAL feature is a COMPAT flag because the ext3 journal is simply
+a regular file with data blocks in it so the kernel does not need to
+take any special notice of it if it doesn't understand ext3 journaling.
+
+An RO_COMPAT flag indicates that the on-disk format is 100% compatible
+with older on-disk formats for reading (i.e. the feature does not change
+the visible on-disk format).  However, an old kernel writing to such a
+filesystem would/could corrupt the filesystem, so this is prevented. The
+most common such feature, SPARSE_SUPER, is an RO_COMPAT feature because
+sparse groups allow file data blocks where superblock/group descriptor
+backups used to live, and ext2_free_blocks() refuses to free these blocks,
+which would leading to inconsistent bitmaps.  An old kernel would also
+get an error if it tried to free a series of blocks which crossed a group
+boundary, but this is a legitimate layout in a SPARSE_SUPER filesystem.
+
+An INCOMPAT flag indicates the on-disk format has changed in some
+way that makes it unreadable by older kernels, or would otherwise
+cause a problem if an old kernel tried to mount it.  FILETYPE is an
+INCOMPAT flag because older kernels would think a filename was longer
+than 256 characters, which would lead to corrupt directory listings.
+The COMPRESSION flag is an obvious INCOMPAT flag - if the kernel
+doesn't understand compression, you would just get garbage back from
+read() instead of it automatically decompressing your data.  The ext3
+RECOVER flag is needed to prevent a kernel which does not understand the
+ext3 journal from mounting the filesystem without replaying the journal.
+{code}
+
+This would allow us to do rolling upgrades, run mixed-version clusters, and still retain the ability to roll back to a prior version until the new feature was used. So, to take the example of a feature like snapshots which required a metadata change, the admin workflow would be:
+
+# Shutdown standby node
+# Upgrade standby software version
+# Start standby node, failover to it
+# Shutdown and upgrade the old active, start it back up.
+# Note: at this point, the format for the edit logs and images is identical to the pre-upgrade format, so the user could still roll back. Trying to create a snapshot at this point would fail with an error like "Snapshots not enabled for this filesystem. Run dfsadmin -enableFeature snapshots to enable"
+# User runs the above command, which forces an edit log roll. The new edit logs contain the flag indicating that snapshots are enabled, and may use the new opcodes (or add new fields to the old opcodes as necessary)
+
+If the "explicit enable" doesn't sit well with people, we could also add a slightly simpler version like "-enableAllNewFeatures" or whatever, which a user can use after an upgrade with the understanding that it will prevent rollback.
+
+
+I personally prefer option 2 -- it helps a lot with the HA upgrade scenario per above, allows rollback, and also has the nice property that it will allow us to selectively backport features between software versions without bizarre non-linear version numbering hacks like we have today., Thanks Aaron and Todd for bringing this up.
+
+I love the flexibility of feature bits however I'm very nervous about the complexity they tend to bring. As long as there is incredibly tight controls it can work but more often than not I've seen this sort of approach lead to some incredibly unmaintainable code. The code can get very complex dealing with multiple combinations and the testing/QA can get also be very difficult to manage. Things can get overwhelmingly complex quite quickly. Having an "-enableAllNewFeatures" helps a bit but I'm not sure it lowers the complexity all that much. 
+
+Of the two options, I'd lean in the direction of #1 at this point. 
+
+iiuc, option 2 basically means that V2 software has to remember how to both read and write in V1 format whereas option 1 only requires that V2 be able to read V1 format (like we do today). I kind of like the fact that new software doesn't ever have to write things according to the older format. 
+
+* When we update the SBN to V2 it would be allowed to come up and it would still be able to process V1 images/edits
+* The first time it tries to write a new image, it would do so in V2 format 
+* When uploading a new V2 image to ANN, the upload would not proceed because of the version mismatch (this way the ANN's local storage stays purely V1)
+* At this point we can still rollback by simply re-bootstrapping the SBN
+* Now we failover to the SBN, the SBN changes the shared edits area to indicate V2 (just an update to VERSION file I think)
+* Upgrade old ANN with V2 software
+* old ANN comes up as Standby, reads the new V2 image and starts processing new V2 edits (somewhere in here also has to change local storage to V2)
+
+What's not great about this approach is that as soon as V2 software becomes active, we're writing in V2 format and at that point can't go back without losing edits. However, that's basically very similar to today's -upgrade. The only difference being that we haven't done anything to protect the blocks on the datanodes (with -upgrade we hardlink everything and therefore guarantee data blocks can't go away). So, maybe we need a mode where HDFS stops deleting blocks both from the NN's perspective (won't issue invalidates any longer), as well as from the DN side where it will ignore block deletion requests. Kind of a semi-safe-mode where the filesystem acts pretty much normally except that it refuses to delete any blocks. If we get ourselves into a true disaster-recovery situation, we can go back to V1 software + last V1 fsimage + all V1 edits that applied to that image + all blocks from the datanodes.
+
+
+, bq. I love the flexibility of feature bits however I'm very nervous about the complexity they tend to bring. As long as there is incredibly tight controls it can work but more often than not I've seen this sort of approach lead to some incredibly unmaintainable code. The code can get very complex dealing with multiple combinations and the testing/QA can get also be very difficult to manage. Things can get overwhelmingly complex quite quickly. 
+
+I agree that it's a bit more complex, but I'm not sure it's quite as bad in our context as it might be in others. Most of our edit log changes to date have been fairly simple. Looking through the Feature enum, they tend to fall into the following categories:
+- Entirely new opcodes (eg CONCAT) - these are easy to do on the writer side by just throwing an exception in logEdit() if the feature isn't supported. Sometimes these also involve a new set of data written to the FSImage (eg in the case of delegation token persistence) but again it should be pretty orthogonal to other features.
+- New "container" format features (eg fsimage compression, or checksums on edit entries). These are new features which are off by default and orthogonal to any other features.
+- Single additional fields in existing opcodes. We'd need to be somewhat careful not to make use of any of these fields if the feature isn't enabled, but I think there's usually pretty clear semantics.
+
+Certainly it's more complex than option 1, but I think the ability to downgrade without data loss is pretty key. A lot of Hadoop operators are already hesitant to upgrade between minor versions already, and losing the ability to roll back would make it a non-starter for a lot of shops. If that's the case, then I think it would be really tough to add new opcodes or other format changes even between minor releases (eg 2.3 to 2.4) and convince an operator to do the upgrade.
+
+Am I being overly conservative in what operators will put up with, instead of overly conservative in the complexity we introduce?
+
+
+(btw, I agree completely about the "no-delete" mode -- I think a "TTL delete mode" is also a nice feature we could build in at the same time, where block deletions are always delayed for a day, to mitigate potential for data loss even with bugs present), Here is a first version implementing the feature flag approach.  It's still a bit rough and needs some unit tests.  The basic idea is to place a LayoutFlags object inside the FSNamesystem, and supply the flags object whenever we need to roll the edit logs, etc.  We also store these flags in the FSImage header and FSEditLog header.  The flags are supplied during edit log opcode serialization and deserialization.
+
+After installing new software, and ensuring that it's stable, the user performs an allowLayoutFlag RPC to finalize the upgrade.  Once the new layout flag has been added to the FSImage and edit log, downgrade is not possible.  We may want to add a downgrade feature flag tool later, possibly as part of NameNode recovery mode.  Since the old version cannot support the new features, by definition this will involve data loss.
+
+I didn't implement this for BKJM, so it's frozen at LayoutFlags.NONE.  We can address this later in a follow-on change., Just skimmed really quick. I noticed that this doesn't separate flags into "compatible" ones and "incompatible ones" per the discussion above. Implementations like ext3 and nilfs2 do this so that it's possible to introduce features and label them as backward-compatible or at least readonly-back-compatible. 
+
+As an example of a readonly-back-compatible flag, consider the case of adding new ops like "Add cache pool" and "remove cache pool". An old NN could easily start up and simply ignore these opcodes that it doesn't understand (once we have protobuf-ified). Another example would be adding a new field to the inode structure such as "preferred storage class". An old NN could simply ignore the new fields in read-only mode, or drop them relatively safely in a downgrade scenario. On the other hand, a feature such as compression, or adding OP_ADD_BLOCK instead of OP_UPDATE_BLOCK would not be ro-compatible since an old NN wouldn't be able to reconstruct the user data.
+
+I think it would be short-sighted of us to not include a similar functionality in our flags, even if this initial patch doesn't handle the two types of flags differently., I think the way to do backwards compatible feature flags would be to have a flag prefix such as "compat_".  This would let older NameNodes know that the (new, unknown to them) flag they were looking at was compatible.  The information needs to be in the flag name, since it can't be in the older software.
+
+However, I don't think we should implement this now.  We don't really have any infrastructure in place today to use "backwards compatible feature flags."  With the simple DataInputStream/DataOutputStream based decoding we have now, any extra field results in a loading failure.
+
+So it's fair to say: we can't create even one "backwards compatible feature flag" without installing new software beyond what this patch provides.  Given that this is true, we should just implement compatible feature flags later when we know we need (or at least can use) them.  I am all for doing it after the protobuf merge.  But there's simply no reason to do it before because I don't believe a backwards compatible change can be made at this point., For the edits one could require that in order to downgrade you must do a "save-image" and then delete the null edits-log. We would then limit our solution to the image. For the image we could do the following:
+
+Add a *second* layout version field (call it "compatible-layout-version") that indicates which version can safely read the image without data-loss. A NN that starts up will compare this field with its current layout version and then proceed as long as the edits is null.
+* The ACL example (see Jira description) will state that the previous version  can safely read the image without data loss. Of course newly created ACLs would be lost.
+* Truncate example is tricky: one can safely downgrade if the truncate operation was not used. We could add code to not allow such new features till finalize is done.  This is somewhat analogous to what ext3 was trying to do with  its superblock feature flags (see Todd's comment above); what I am proposing is slightly different since it limits such features till upgrade is finalized while ext3's approach is more general in that you can downgrade at anytime as long as you have used the feature.  We could also do the following slight variation if "finalize" seems too arbitrary: once you use the new feature (e.g, truncate) simply change the "complatible-layout-version" to be the current one and this will safely prevent older binaries from reading it. 
+Of course alternatively, we could simply not support downgrade for such a feature and simply mark the compatible-layout-version accordingly.
+
+
+
+, The above solution was inspired by Hive's ORC. They have two complementary mechanisms to address dealing with old and new binaries. They specify the oldest version that can safely read the new data (which inspired the solution i gave above) and also new binaries can write in older format. This second mechanim is too burdensome for HDFS. Instead I would prefer to disable the new new features after which one cannot downgrade. , I've been testing a patch based on Sanjay's earlier comments.  It takes the approach of maintaining the prior layout version during the upgrade window and rejecting attempts to use new features until after the upgrade has been finalized.  This guarantees that the prior software version can read the fsimage and edit logs if the administrator decides to downgrade.
+
+Each new feature tracks a "minimum compatible layout version".  This indicates the earliest prior software version that could still load metadata generated by this version.  In general, our typical features that involve just adding new edit log operations will be able to maintain a minimum compatible layout version.  Structural changes, like reworking the metadata directory structure, still could not support downgrade, because there is no way the prior software version could understand that new structure.
+
+I'm attaching a brief design doc that describes the approach in more detail.  I'm also attaching my patch.  The patch is not intended to be committed in its current form.  I wanted to show a practical example of using this scheme, so the patch really shows what we could have done if we already had this in place for 2.7.0.  I took the {{TRUNCATE}}, {{APPEND_NEW_BLOCK}} and {{QUOTA_BY_STORAGE_TYPE}} features added in 2.7.0 and showed how they could be changed to support downgrade.  We can't commit that code though, because we can't retroactively change existing 2.7.0 deployments.
+, Hey Chris, thanks a lot for working on this.
+
+Seems like this approach would certainly help with the downgrade/rollback issue, but wouldn't do much to make the upgrade itself easier. In cases where the only NN metadata change between versions is just the introduction of new edit log op codes, I think it'd be much better if we could just swap the software during a rolling restart without having to use the {{-rollingUpgrade}} functionality at all, and then optionally enable the feature via an administrative command afterward - essentially the "feature flags" proposal earlier discussed. That approach will both make non-destructive downgrades possible from versions which introduce new op codes, and make upgrades substantially easier as well.
+
+What's your reasoning for wanting to stick with a linear layout version number approach when introducing new op codes? In general I think it'd be beneficial for HDFS to move toward a bit-set denoting which features/op codes are enabled/disabled, much like [~tlipcon] described earlier., Hi [~atm].
+
+bq. Seems like this approach would certainly help with the downgrade/rollback issue, but wouldn't do much to make the upgrade itself easier.
+
+That's correct.  The rolling upgrade procedure still would be required.  This document/patch focuses on expanding the uses cases that can support downgrade.
+
+bq. In general I think it'd be beneficial for HDFS to move toward a bit-set denoting which features/op codes are enabled/disabled, much like Todd Lipcon described earlier.
+
+I share some of the concerns mentioned earlier about operational complexity.
+
+https://issues.apache.org/jira/browse/HDFS-5223?focusedCommentId=13779177&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-13779177
+
+Complexity in HDFS often arises from combinations of its features rather than individual features in isolation.  If individual features can be toggled, then no two HDFS instances running the same software version are really guaranteed to be alike.  This becomes another layer of troubleshooting required for a technical support team.  Testing the possible combinations of features on and off becomes a combinatorial explosion that's difficult for a QA team to manage.
+
+Aside from managing metadata upgrades, we've also found rolling upgrade to be valuable because of the OOB ack propagated through write pipelines (HDFS-5583) to tell clients to pause rather than aborting the connection.  Even if it wasn't required from a metadata standpoint, some users might continue to use rolling upgrade to get this benefit, even within a minor release line where the layout version hasn't changed.  Considering that use case, I see value in improving our ability to downgrade within the current rolling upgrade scheme.
+
+If you prefer to keep the discussion here focused on building consensus around feature flags, then I could potentially move this work to a separate jira where it could move ahead independently.  Let me know your thoughts.  Thanks!, bq. Complexity in HDFS often arises from combinations of its features rather than individual features in isolation. If individual features can be toggled, then no two HDFS instances running the same software version are really guaranteed to be alike. This becomes another layer of troubleshooting required for a technical support team. Testing the possible combinations of features on and off becomes a combinatorial explosion that's difficult for a QA team to manage.
+
+This is an issue, to be sure, but is this really different with or without feature flags present? Even today, users can always choose to use or not use all the various features of HDFS in any number of combinations. The fact that presently all features are always enabled means that we should consider ourselves obligated to make sure that all features work well with all other features.
+
+bq. Aside from managing metadata upgrades, we've also found rolling upgrade to be valuable because of the OOB ack propagated through write pipelines (HDFS-5583) to tell clients to pause rather than aborting the connection. Even if it wasn't required from a metadata standpoint, some users might continue to use rolling upgrade to get this benefit, even within a minor release line where the layout version hasn't changed. Considering that use case, I see value in improving our ability to downgrade within the current rolling upgrade scheme.
+
+Fair point, but this suggests to me that the OOB ack feature should perhaps be separated from the rolling upgrade feature, since those seem somewhat orthogonal. One might want to use the OOB ack feature just when doing a rolling restart (no upgrade) to effect a configuration change, without the additional complexity of metadata changes, etc., bq. The fact that presently all features are always enabled means that we should consider ourselves obligated to make sure that all features work well with all other features.
+
+Yes, definitely agreed.
+
+I don't think I communicated this point clearly.  What I meant was that I see additional complexity arising from the new combinations of "feature X on while feature Y off".  These represent new system states not covered by existing tests, and this is where we get a combinatorial explosion in the test matrix.  It's particularly challenging if one feature is coupled to another, either in code or as an implementation pre-requisite.
+
+As an example, an early design proposal for ACLs would have involved implementing xattrs first, followed by implementing ACLs in terms of private xattrs.  (This is a common implementation in other file systems.)  We didn't do it this way, but if we had, then we'd have a situation where the {{EXTENDED_ACL}} feature is dependent upon {{XATTRS}}.  What is the effect of disabling {{XATTRS}} while {{EXTENDED_ACL}} is enabled?  I suppose the correct response is to block disabling {{XATTRS}} if {{EXTENDED_ACL}} is still on.  This becomes extra code to write and test.  It also becomes extra knowledge for operators to be aware that both must be enabled before the feature can be used.
+
+The monotonically increasing (well, technically decreasing!) layout version has the benefit of restricting possible system states, because it guarantees that prior features in the lineage are enabled.  The drawback is that it harms flexibility.  In this particular case, I prefer keeping that invariant and the safety it brings over the increased flexibility.
+
+bq. One might want to use the OOB ack feature just when doing a rolling restart (no upgrade) to effect a configuration change, without the additional complexity of metadata changes, etc.
+
+FWIW, the existing rolling upgrade functionality doesn't really dictate what it is that you're upgrading, and the design targeted a DN-only upgrade as one of its use cases.  It would be completely legitimate to skip the NN portion of the rolling upgrade procedure and do just the DN portion to push a configuration change with no code changes, like increasing the xceiver count., I have deleted the design document and patch and moved it over to HDFS-8432, so that this issue can remain focused on discussion of the proposal for feature flags.]

@@ -1,0 +1,260 @@
+[Could you reproduce this situation? I'm interested on issue but it seems that we doesn't have enough informations.
+
+Btw, you can hook events with implementing ITaskHook, please refer http://storm.apache.org/documentation/Hooks.html.
+Since you're (and I'm) suspecting task id is null, apply-hooks would throw Exception when creating one of EmitInfo, SpoutAckInfo, SpoutFailInfo, BoltExecuteInfo, BoltAckInfo, BoltFailInfo because it receives int, not Integer.
+Or in EmitInfo, there's outTasks field which we can check one or more elements (out task id) is null.
+
+After applying then we could become closer to null task id., It seems that out task id could be null. It's broadcast tuple, and it will be sent to all tasks.
+
+{code}
+(defn mk-task-receiver [executor-data tuple-action-fn]
+  (let [^KryoTupleDeserializer deserializer (:deserializer executor-data)
+        task-ids (:task-ids executor-data)
+        debug? (= true (-> executor-data :storm-conf (get TOPOLOGY-DEBUG)))
+        ]
+    (disruptor/clojure-handler
+      (fn [tuple-batch sequence-id end-of-batch?]
+        (fast-list-iter [[task-id msg] tuple-batch]
+          (let [^TupleImpl tuple (if (instance? Tuple msg) msg (.deserialize deserializer msg))]
+            (when debug? (log-message "Processing received message FOR " task-id " TUPLE: " tuple))
+            (if task-id
+              (tuple-action-fn task-id tuple)
+              ;; null task ids are broadcast tuples
+              (fast-list-iter [task-id task-ids]
+                (tuple-action-fn task-id tuple)
+                ))
+            ))))))
+{code}, Just to make sure I follow, are you saying 'null' is a valid value for a task, or that a task can get a value of 'null' in certain cases, and it's bug?
+
+It took ~2 days for the topology to break last time I ran it. Since I've restarted it, it's been running ok for about 3 days now. 
+So unfortunately, I haven't been able to reproduce it yet. If it's indeed a race condition, it might be tricky to reproduce., I mean 'out-task-id', but never mind. It seems not related to this issue.
+
+If you don't mind, could you provide source code snippet which includes topology configuration (Spout / Bolt declaration) and nimbus / supervisor / worker logs if you have?
+More informations about topology DAG, grouping, fields (if you use field grouping), emit type (direct or not), what component raises NPE (spout or bolt), etc. are very appreciated., https://github.com/apache/storm/commit/861a92eab8740cfc0f83ac4d7ade9a2ab04a8b9b
+
+Maybe it wasn't an issue before this commit (introduced on 0.9.2-incubating) because 
+- transfer-fn could publish pair of null task value and serialized tuples without issue (no conversion is being processed)
+-- Please refer mk-transfer-fn
+- transfer-tuple-handler finds node-port with null task value, maybe fail to find, then silently discard tuple
+-- Please refer mk-transfer-tuples-handler
+
+I still don't get why task becomes null (It may be related to grouping, I found some scenario which tasks-fn may return null or [null]), but if it's possible, and there's no issue to discard tuples with null task value, we can easily apply it by modifying mk-transfer-fn.
+
+Though null task value is not acceptable, we need to check null task value before encountering NPE (maybe we can log it when emitting), and log it with various informations for debug.
+
+[~clockfly]
+Since you're author of commit, I wish to hear your motivation / intention of these changeset.
+
+to. committers 
+Please clarify when null task value occurs and whether null task value is acceptable or not.
+
+Thanks in advance!, The exception reported was observed in one of the bolts, after we had experimented with substantially increasing the traffic being handled by the topology at hand. Its core logic has not been changed in the past few months.
+
+Perhaps it's worth noting that the exception happened all of a sudden, there were no previous warnings or indications of distress in the logs. Once the exception took place, the topology could not recover and went into a restart loop.
+
+Topology details:
+We're using 'fieldsGrouping', running 2 workers per machine, where the topology at hand is assigned 10 workers (i.e., it is running on 5 nodes). Each worker is assigned 24 executors.
+We have a total of 5 components, 4 bolts and 1 kafka spout.
+Direct emit is not employed., I observed the same issue with almost similar environment 
+
+- the bolt reads default streams from 2 other bolts with grouping on 2 fields
+- performs heavy cpu operations and also asyncronous i/o operations (core.async).
+- produces no tuples, but some metrics
+- uses (core.async/go CSP-thread to do fails/acks of tuples, so tuples to fail/ack are communicated using core.async/channel, there is one go-routine that checks the channel and does the ack/fail). // I can smell there may exist some problem here with thread-safety... not sure though. It worked long time without issues.
+- What is very important, at the time of the fail and about 30 minutes before, the topology was running near the capacity limit on that scale (performance tests). So, assume there is always data in those 2 streams. 
+On a 2 times lower rate the issue is not observed.
+
+Also "the exception happened all of a sudden, there were no previous warnings or indications of distress in the logs." The topology recovered in several minutes after the load was decreased back to "normal". No rebalance, re-deploy, or nodes restarts were accomplished.
+
+I have also prepared all the logs, let me know if they also bring someting. 
+Also, the part that is missing in logs above: 
+{code}
+// Assumed the java.lang.RuntimeException: java.lang.NullPointerException happened at 14:32:30.682
+// supervisor.log
+2015-04-15T14:33:02.360 b.s.d.supervisor [INFO] Shutting down and clearing state for id 9acc8f8a-4593-4798-87d2-5dfbffc5ac39. Current supervisor time: 1429101182. State: :timed-out, Heartbeat: #backtype.storm.daemon.common.WorkerHeartbeat{:time-secs 1429101151, :storm-id "changed-topology-name-380-1428677575", :executors #{[30 30] [-1 -1]}, :port 6709}
+2015-04-15T14:33:02.364 b.s.util [INFO] Error when trying to kill 42221. Process is probably already dead.
+{code}
+, Interesting, our topology never recovered on its own and we had to restart it manually.
+We did not reduce the load though, which remained high ever since we cranked it up and saw the exception in the first place., Did nimbus node too busy? 
+Nimbus should detect killed / hanging worker by heartbeat, and ask supervisor to kill it and restart worker., It seems that we can find similar conditions from two situations, high load, field grouping.
+
+Btw, I can't find any thread-unsafe possibilities from field-grouper. Maybe I'll try to dig other things (DisruptorQueue).
+
+{code}
+(defn- mk-fields-grouper [^Fields out-fields ^Fields group-fields ^List target-tasks]
+  (let [num-tasks (count target-tasks)
+        task-getter (fn [i] (.get target-tasks i))]
+    (fn [task-id ^List values]
+      (-> (.select out-fields group-fields values)
+          tuple/list-hash-code
+          (mod num-tasks)
+          task-getter))))
+{code}
+, I did not see any abnormal stats reported by the nimbus, CPU, soft-interrupts, network, nothing seemed out of the ordinary.
+
+I have to admit though, that we rarely see a topology ever recover on its own when a bolt fails. When a bolt goes down, it results in cascading failures in other bolts trying communicate with it, which makes them fail as a result. This usually creates a situation where the various components of the topology would go up and down in waves, without ever reaching a state where all are up successfully. 
+
+However, I don't think it's particularly related to the case at hand, just a background story., Regarding nimbus-node in 2nd case - everything seems to be fine.
+The worker in our case is detected ~32 seconds later after exception happened as {{:timed-out}} and then is tried to be killed by supervisor, but is already dead. See the supervisor log above.
+
+In regards to recovering the topology functioning on it's own, in our case we have observed such behaviour some times ago (on storm 0.9.2-incubating) and made a conclusion that this was STORM-537.
+On storm-0.9.3 this issue reported to be fixed, and I confirm that in our case same topology could return to functioning state on it's own., Before finding root cause of this issue, it would be better to let worker not killed by this issue but just log with WARN or ERROR level.
+
+It really makes sense cause before 0.9.2 Storm silently ignores tuple, and with Guaranteeing Message Processing, after timed-out tuple will be replayed. (It isn't applied to non-ack)
+
+I'll make a new issue addressing it., STORM-790 addresses my comment - log strange behavior instead of killing entire worker., Just happened again, this time after the topology ran for about ~2.5 days.
+From what we're seeing here, it looks like it's pretty safe to say this issue is not a one timer., [~staslev]
+Could you try patch STORM-790 and try again?
+It needs to replace lib/storm-core*.jar from your cluster and restart cluster.
+
+If you're not sure about patching source and build your own, I can provide patched storm-core*.jar, When you run patched version of Storm, please share log messages if any kind of "Can't transfer tuple - task value is null. tuple information ... " messages are available. 
+Please notice it will be WARN level., I had a chance to test 0.9.4 with this patch on it, have not seen neither the exception, nor the WARN level message. It is already second day as it runs.
+I observe some other errors, but I am sure now that they are side-effects of trying 0.9.4 as they happen in other bolts. The bolt that had the NPE is now functioning without errors.
+
+Next step is to revert to pure 0.9.3 with only this patch applied., Thanks for following up!
+We would be better to have newly added logs to continue resolving. You're doing a great job!, So, the 0.9.3 deploy went fine, it is about 3 hours running. I have not seen the exception, but I have seen the 2 WARN messages that we are looking for. We have all logs machine-processed and indexed for search, so I can guarantee, than in the cluster (6 machines) in last 3 hours only 2 of such WARN occurred.
+However, the scenario is different now.
+
+The messages are unfortunately not as helpful as expected, because there is no tuple information printed.
+
+The exception happens on different bolts of different topologies. 
+But both of them do some prepare operations - they prepare sessions and statements for work with Cassandra.
+
+
+{code}
+
+2015-04-22T14:30:44.689+0200 b.s.d.executor [INFO] Prepared bolt db-reader:(4)
+2015-04-22T14:30:44.789+0200 b.s.d.worker [WARN] Can't transfer tuple - task value is null. tuple information: 
+
+// ... after this it works normally.
+
+{code}
+
+on the second bolt it is the same, topology and the name of the bolt is different.
+
+{code}
+
+2015-04-22T14:51:48.847+0200 b.s.d.executor [INFO] Prepared bolt db-writer:(28)
+2015-04-22T14:51:55.525+0200 b.s.d.worker [WARN] Can't transfer tuple - task value is null. tuple information: 
+
+{code}
+
+
+What may be a hint, is that storm is using netty for message transfer, and so does cassandra, which is initialized in prepare-method in these bolts. I doubt that this could somehow interfere, but decided to mention this.
+
+These are cassandra driver and it's dependencies.
+{code}
+[com.datastax.cassandra/cassandra-driver-core "2.1.2"]
+     [com.codahale.metrics/metrics-core "3.0.2"]
+     [io.netty/netty "3.9.0.Final"]
+{code}
+
+Storm 0.9.3 is using same version {{<netty.version>3.9.0.Final</netty.version>}}
+
+I will let the patched 0.9.3 running and will observe if the issue appear further and under which circumstances., Thanks!
+
+Your input makes me feeling...
+
+- The problem occurs more than I thought. IMO, it is a really major issue and it should be addressed.
+- My patch works fine, so it should be introduced to prevent random worker crash.
+- Tuple information doesn't print anything. It is a hint itself.
+-- Normally it should print like {noformat}15937 [Thread-106-disruptor-executor[12 12]-send-queue] WARN  backtype.storm.daemon.worker - transfering tuple - task value is 3 and tuple information: source: __acker:12, stream: __ack_ack, id: {}, [8773541098787514395]{noformat}
+-- Here is TupleImpl's toString()
+{code}
+    @Override
+    public String toString() {
+        return "source: " + getSourceComponent() + ":" + taskId + ", stream: " + streamId + ", id: "+ id.toString() + ", " + values.toString();
+    }
+{code}
+-- TridentTupleView doesn't implement toString(), but it should print object information as same as Object.toString()
+-- It shows that at that time tuple variable was not referencing instance of TupleImpl. Maybe empty Array or empty String?
+
+Could you drag message to determine that tuple's information has spaces or new line? Thanks in advance!, http://www.michael-noll.com/blog/2013/06/21/understanding-storm-internal-message-buffers/
+
+AFAIK it is related to sending, from User Logic to Worker Send Thread in post's illustration.
+But we met strange tuple before transmitting, so I don't think it is related to Netty for now.
+
+It may be related to Disruptor since Disruptor plays as queue, and User Logic could never emit non-tuple., I've modified STORM-790 to leave tuple's type which gives us perfect evidence.
+[~pershyn] If you really don't mind, could you apply updated patch?, Thanks :)
+
+I have extended the patch a bit and applied.
+
+There is a {{backtype.storm.daemon.worker/mk-transfer-local-fn}}, and I observed, that it produces quite frequently the "Received invalid messages for unknown tasks. Dropping...".
+
+I am really curious, so I extended the {{mk-transfer-local-fn}} to print a bit more info about the "unknown" tuple-batch.
+
+{code}
+ ;...
+   (log-warn "Received invalid messages for unknown tasks. Dropping... tuple-batch type: " (type tuple-batch) ", value: " tuple-batch)
+ ;...
+{code}
+
+So, now the storm-0.9.3 with this patch is running. Logs are monitored, so I am looking forward to get more information.
+
+Thanks for your work ;-), Great!
+I'm also looking forward to see it. Thanks for follow up again! :)
+
+Btw, it'll print type / information of both tuple (which was a reason to crash) and whole tuple-batch, right?, So, I have got the first one. Again, it happens after the bolt was initialized after rebalance (not on initial submit).
+
+This is the line that is built into the storm-core (from patch):
+{code}
+(log-warn "Can't transfer tuple - task value is null. tuple type: " (type tuple) " and information: " tuple))
+{code}
+
+This is the result that it produces:
+{code}
+// happens strait after {{prepare}} method of a bolt.
+2015-04-23T14:46:59.517+0200 b.s.d.worker [WARN] Can't transfer tuple - task value is null. tuple type:  and information: 
+{code}
+
+I am confused why we don't see {{nil}} there. Is it possible that {{log-warn}} prints nothing instead? 
+, I am confused, too. I'm beginner to clojure, I don't even think about it could be possible., I just got it. 
+https://groups.google.com/d/msg/clojure/s15BAMnZlCM/8K-Px1CqdeEJ
+
+Maybe tuple is nil as you assumed.
+I'll update my PR to print nil properly., OK, I've updated it., Good finding, I thought the log-warn is having same behaviour as {{print}}, and {{print}} prints {{nil}}.
+
+So, I have patched the 0.9.3 again and let it running couple days.
+Since then I have observed several following messages. They happen mostly after deploying new topology or rebalancing. But as well in the middle of the workflow. Some times there are handled exceptions around. So, in user code there is exception thrown and handled.
+
+{code}
+2015-04-27T16:37:33.011+0200 b.s.d.executor [INFO] Prepared bolt db-writer:(21)
+2015-04-27T16:39:02.503+0200 b.s.d.worker [WARN] Can't transfer tuple - task value is nil. tuple type: nil and information: nil
+{code}, Good.
+Did you extend the patch as you mentioned and see what tuple-batch's type and value are?
+If you did, could you share what it printed out?, I did extended it, but so far there were no such errors (Dropping unknown messages) observed., We observed the same issue with storm 0.9.3.
+We got the NPE after our topology had been up for few minutes.
+
+The exception occurred only with bolts executing tuples in batch (using TickTuple). The bolt does async cassandra statements. Each tuple is ack/fail by a single thread instantiated in the prepare method (ThreadPoolExecutor).
+
+Could the issue be caused by acking tuples from a thread that is not a storm task ?, [~fhussonnois] 
+Thanks for information! I think I'm too late to comment.
+
+Actually there're some issues with documentation.
+
+http://storm.apache.org/documentation/Concepts.html says
+
+{quote}
+Its perfectly fine to launch new threads in bolts that do processing asynchronously. OutputCollector is thread-safe and can be called at any time.
+{quote}
+
+and http://storm.apache.org/documentation/Troubleshooting.html says
+
+{quote}
+This is caused by having multiple threads issue methods on the OutputCollector. All emits, acks, and fails must happen on the same thread. One subtle way this can happen is if you make a IBasicBolt that emits on a separate thread. IBasicBolt's automatically ack after execute is called, so this would cause multiple threads to use the OutputCollector leading to this exception. When using a basic bolt, all emits must happen in the same thread that runs execute.
+{quote}
+
+It is a contradiction, and at least for now OutputCollector is not thread-safe.
+https://www.mail-archive.com/dev@storm.incubator.apache.org/msg00939.html, OK. I got a hint from archive of Storm Dev mailing list.
+https://www.mail-archive.com/dev@storm.incubator.apache.org/msg00939.html
+
+As we know already (or not) OutputCollector is not thread-safe.
+And if you don't respect this, task id and tuple could be null, and it could throw NPE with various causes.
+
+Before 0.9.2, cause of NPE is "KryoTupleSerializer.serialize() tries to serialize null", cause tuple is null.
+At 0.9.2 or upper version, cause of NPE is "clojure.lang.RT.intCast() tries to cast null", cause task id is null.
+
+Please leave replies when you found another cases. Thanks!, Thanks, I am indeed aware of that (we've probably read the same posts :) ).
+I'm synchronizing on the output collector instance before invoking on it, the exception I've reported in this ticket happens with the synchronization in place., Yes. It seems to be one kind of way to reach this issue.
+But I can't find other ways, for example, meet NPE from Bolt which doesn't launch new thread.
+Can I see your Bolt implementation if you don't really mind?, I'll check if that's something that can be arranged.]

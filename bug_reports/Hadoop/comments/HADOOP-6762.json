@@ -1,0 +1,716 @@
+[the general problem is that 'client' threads hold the socket and do writes to it to send RPCs.  If a client thread receives an interrupt, it will leave the socket in an unusable state. 
+
+i have a test for this general case and a patch which moves the actual writing to the socket to a thread owned by the Client object.  This means a client can be interrupted and not ruin the socket for other clients.
+
+note:  other socket errors may occur that make the socket unusable. The patch doesn't handle this (only intended to help with interrupted cases since that is common with filesystem.close).
+
+we might also want to consider finding a way to fail fast when RPC goes bad.  Near as I can tell from watching this happen, until the filesystem is closed, the underlying RPC is in a bad state.  It seems like we could fail on one operation, detect the bad socket and perhaps recreate the socket or the whole RPC object.  not sure where this retry logic goes, test uses MiniDFSCluster and includes a patch to it.  i might need to make a test case that doesn't rely on hdfs testing utils, updated test to not used MiniDFSCluster, 1. previous patch had a bug where a race condition could cause indefinite hang of the client
+2. cleaned up case of close by shutting down executor (speeds up shutdown as thread is interrupted), unit tests would hang since threads in executor were not daemon threads.  change to daemon threads, Hey Sam. Is it not sufficient to simply add a "this.interrupt()" in the catch clause of sendParams?
+
+I was running into an occasional issue with 1 minute pauses during DFSClient pipeline recovery, and I think it's due to this issue. I added this.interrupt() and it seems to pass test case, I'll see if it also fixes my 1 minute pauses., so you mean add Thread.currentThread.interrupt() above markClosed(e) ?  I don't think this fixes the underlying problem.
+
+The problem is if a channel is doing a wait for IO and an interrupt comes in, you get a ClosedByInterrupt exception
+
+http://java.sun.com/javase/6/docs/api/java/nio/channels/ClosedByInterruptException.html
+
+from the doc, this closes the channel and sets the interrupt status (ie interrupt() shouldn't have an effect--means my test doesn't repro the same thing I saw).
+What I then saw was that other RPC instances using the same channel would get ChannelClosedException.  The only way to avoid this in the FileSystem case was to move the thread that uses the channel to its own so the lease checker won't interrupt it.
+
+I'll play with the test case and see why your change makes it pass when it doesn't seem like it can't fix the underlying problem, maybe you can elaborate on where you are adding the interrupt() call as trying what I understand you to have suggested didn't make the test pass.
+
+Is this what you mean for sendParam:
+
+{code}
+    public void sendParam(Call call) {
+      if (shouldCloseConnection.get()) {
+        return;
+      }
+
+      DataOutputBuffer d=null;
+      try {
+        synchronized (this.out) {
+          if (LOG.isDebugEnabled())
+            LOG.debug(getName() + " sending #" + call.id);
+          
+          //for serializing the
+          //data to be written
+          d = new DataOutputBuffer();
+          d.writeInt(call.id);
+          call.param.write(d);
+          byte[] data = d.getData();
+          int dataLength = d.getLength();
+          out.writeInt(dataLength);      //first put the data length
+          out.write(data, 0, dataLength);//write the data
+          out.flush();
+        }
+      } catch(IOException e) {
+        Thread.currentThread().interrupt(); //add this--should have no effect on ClosedByInterrupt as it sets the current thread to be interrupted already
+        markClosed(e);
+      } finally {
+        //the buffer is just an in-memory buffer, but it is still polite to
+        // close early
+        IOUtils.closeStream(d);
+      }
+    }  
+{code}, Hey Sam. Instead of Thread.currentThread().interrupt(), I mean this.interrupt(), in order to interrupt the Connection thread (not the caller thread)., sorry, I'm still confused--once you catch the IOException here, the channel is closed.  How does interrupting the Connection help avoid this?, maybe my test case is not sufficiently deterministic so it works differently for you.  I replaced "Thread.currentThread.interrupt()" with "this.interrupt()" in the code I pasted above.  
+
+The test still fails
+(and regardless, I don't think that can affect the underlying problem that if something interrupts a thread that is doing RPC and that thread is blocked on the channel, it gets closed automatically)
+, improved test case: runs 200 threads doing rpc via the same connection.  shows that interrupting one can cause errors in the others., had unnecessary Runnable cast, todd : you can try this.interrupt() now.  please let me know if it passes the new test case, Hey Sam. Sorry, I misunderstood your point earlier. You're definitely right that interrupting one thread shouldn't take down the RPC connection.
+
+Adding yet another thread to IPC seems a bit complicated, though. What about if we added a flag to Connection saying "no more sends on this connection", so that interrupting the sender did kill the connection but lets currently pending calls complete? Then when the queue has been quiesced the connection shuts down like it does today?
+
+The issue I'm thinking is that we solve the interrupt problem, but don't solve the general case of exceptions during sendparam. The user can still have a Writable which eg throws an NPE, and we're back to the same problem of lack of isolation between writers., Hmm, how would pending calls complete?  They already have a Connection object with a socket channel that is in bad shape.  basically there would have to be a check inside a sync block that the channel is valid before sending.  If it's not, it would have to create a new socket (or whole Connection, again all in sync block).  Does this make sense?  A bunch of threads get the Connection object and pile up on the synchronized(this.out) and if one of them is interrupted, the whole pile will get errors.  I think having the test & fix code is more complicated than using another thread actually, but I may be biased (having already done it the other way)
+
+FWIW, we're already using this on our 0.20 branch in production where we have up to 200+ threads using the same RPC instance.
+
+also, i don't actually think the code is complex--it's using an executor so the thread management is as simple as it can get. 
+We can even get rid of the latch--it's not necessary, but I wanted the change to function exactly as it does now, so I put it in.
+
+
+, Hey Sam, that's a fair argument. Let me look over your patch more closely. Do you have this against 0.20 as well? The test case I have that caused me to notice this is an 0.20 based cluster test., oh, i see now that this essentially applies to 20 without changes. Will try it out and let you know., This patch should largely work against 0.20.  I originally patched our 0.20 and then ported to trunk (which was mostly re-writing the test case)
+
+if this doesn't apply, let me know and i'll back-port this (including test case) to 0.20
+
+also, I do agree on one point about the extra thread:  while I don't see it as inherently complex, I do see it as an additional resource.  if we could solve it w/o the thread and similar in code complexity, that would be the superior solution imo
+, Looking at the code:
+- Instead of using the CountdownLatch, can you change the Runnable to a Callable<Void>() and then get back a Future<Void>? Seems a little cleaner.
+- The behavior is different since we've added a timeout waiting to sendParam. Do you think this change is necessary? (under what case would we block forever waiting to write?)
+- Regarding the issue I raised above with a Writable param that throws NPE, can we move the actual buffer construction back into the calling thread? Then if it throws an RTE, the user will see it (rather than it getting lost somewhere). There's still an issue that this will leave the call on the connection queue, but that's probably worth a separate jira.
+
+Regarding the resource usage issue: can we just use a static  cachedthreadpool that's shared across all of RPC for sending params? In the common case it would only have 0 or 1 threads but it could grow as necessary and then shrink back when idle., thanks for reviewing the patch so quickly.  
+
+1. latch : I agree.  I'll change it to use a future & get (with timeout, see #2).
+
+2. actually the timeout helped me debug a switch issue today.  I would see a flurry of timeouts when I saturated a switch that wasn't performing to spec.  getting the timeouts was far preferable than hanging indefinitely.  i agree it changes the behavior, but it's the same we do pings at I think.  Also, playing a game of adversary, *if* somehow the connection thread in the executor did die, the latch would hang indefinitely.
+
+perhaps the timeout value should be something else? I choose the timeout value that was used to connect the socket (pingInterval) as it seemed appropriate.
+
+3. ah, i misread your comment above--that's a great idea.  Only the actual push out the socket needs to be in critical section (in theory could improve perf a tiny bit).
+
+I'll get to the changes and post another patch., re timeout: I'm a little nervous about such a change in the semantics of IPC at this point. The ping system ensures that the other side isn't completely dead, so some people use IPCs that are *supposed* to take a really long time, and rely on ping to know it's at least still connected. Maybe if you find it useful you could introduce a new parameter for the IPC timeout, and have it default to 0 (no timeout?)
+
+I could also see a situation where we wait for the ping time, and then print a LOG.warn("IPC call Protocol.callName to <IP> still waiting after 60000ms") once every ping interval. This would help debugging without changing behavior. (I too have often wished for such a thing), Hey Sam,
+
+My cluster test case just spat out a nice warning and then deadlocked my DFS client:
+
+10/06/03 18:48:54 WARN hdfs.DFSClient: Error Recovery for block blk_832465809601113490_3336818 in pipeline 192.168.42.40:11072, 192.168.42.41:11072, 192.168.42.43:11072: bad datanode 192.168.42.41:11072
+Exception in thread "DataStreamer for file /user/todd/test-sync block blk_832465809601113490_3336818" java.lang.reflect.UndeclaredThrowableException
+        at $Proxy1.getProtocolVersion(Unknown Source)
+        at org.apache.hadoop.ipc.RPC.getProxy(RPC.java:359)
+        at org.apache.hadoop.ipc.RPC.getProxy(RPC.java:346)
+        at org.apache.hadoop.ipc.RPC.getProxy(RPC.java:383)
+        at org.apache.hadoop.hdfs.DFSClient.createClientDatanodeProtocolProxy(DFSClient.java:146)
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream.processDatanodeError(DFSClient.java:2627)
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream.access$1600(DFSClient.java:2139)
+        at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream$DataStreamer.run(DFSClient.java:2306)
+Caused by: java.lang.InterruptedException
+        at java.util.concurrent.locks.AbstractQueuedSynchronizer.tryAcquireSharedNanos(AbstractQueuedSynchronizer.java:1238)
+        at java.util.concurrent.CountDownLatch.await(CountDownLatch.java:253)
+        at org.apache.hadoop.ipc.Client$Connection.sendParam(Client.java:526)
+        at org.apache.hadoop.ipc.Client.call(Client.java:765)
+        at org.apache.hadoop.ipc.RPC$Invoker.invoke(RPC.java:220)
+        ... 8 more
+
+I think we need to add another catch (InterruptedException) and rethrow as IOException around the sendParam call in Client.call, forgot to comment on static cachedThreadPool:
+
+This concerns me as if we don't bound the size of this, we could get a massive # of threads;  if we do bound it, then it seems to me we might have some form of deadlock possible where one RPC depends on another (indirectly) and due to limited threads, it can't complete.  Basically we would want at least one thread per Connection, but no more (which is what have now)
+
+We have seem one case of distributed deadlock here on the IPC workers in the DN, so this isn't 100% theory
+
+While it is an extra resource, for simplicity and safety, I *do* prefer one thread Connection.  
+
+What do you think?
+
+, yea, we do need to catch the interruptedException--our 0.20 version had that.  i'll also add that one
+
+thx
+, re: timeout, so if a server disappeared, the ping would fail and the RPC would fail that way?  if that's the case, then I think removing the timeout on the Future.get() is fine. , bq. re: timeout, so if a server disappeared, the ping would fail and the RPC would fail that way? if that's the case, then I think removing the timeout on the Future.get() is fine.
+
+Yep, that should be the case. Of course a server can stay up but be unresponsive (eg deadlocked). In those cases, while it's annoying that clients get blocked forever, I don't know that changing the behavior to be timeout based would be a change we could really make at this point without worrying that it would break lots and lots of downstream users :(
+
+bq. We have seem one case of distributed deadlock here on the IPC workers in the DN, so this isn't 100% theory
+
+Yep, I've seen internode deadlocks several times as well. Not pretty! However, I can't think of a situation where this could happen here -- the only thing that can block one of these sendParam calls is TCP backpressure on the socket, and that only happens when the network is stalled. I don't see a case where allowing other threads to start sending would have unstalled a prior sender.
+
+We could actually enforce the max one thread per connection thing by synchronizing on Connection.this.out *outside* the submission of the runnable. That way we know there's only one sending going on at a time, and we're just using the thread exactly for avoiding interruption and nothing else., hmm, actually with a Future, if there is a runtime exception, it'll show up as an ExecutionException on future.get(), so there isn't a need to move the buffer construction outside (requires another try/catch clause due to IOException).   We can use getCause() on the ExecutionException to find the underlying exception and use markClosed() if it's an IOException, and re-throw if it's a runtime exception (same behavior as now)
+
+or we can move it into the caller thread.  Using the future requires handling the ExecutionException anyway, so I sort of lean this way as it kills two birds. i don't know how much more parallelism we gain moving the buffer construction outside the sync block.
+
+what do you think?
+
+
+, Either way seems cool. I've never seen call param serialization be a bottleneck where parallelization would really help. Whichever one makes the code cleaner :), I almost have an updated patch.  I loved the idea of sync on Connection.this.out around submit + wait, but this causes deadlock as the out.write() call inside is a synchronized function.  I instead sync'd on the connection object itself (seems safe and gives the same result.  1 : 1 Connection/socket => bounds the threads by the # of connections
+(really, very clean/clever idea to optimize thread use)
+
+one catch with the static executor instance:  nothing ever shuts it down.  While this isn't an issue for actual execution, it won't cause unit tests to hang, will it?  (I made a thread factory that makes the threads daemons for this purpose)
+
+patch coming after i run a larger set of unit tests, 1. changed to use Future.get() w/o timeout
+2. static executor instance with cached thread instances (with daemon thread factory)
+3. added catch of interruptedException around sendParams call to avoid undeclared throwable exception
+
+note : used a dedicated lock var around the submit + wait for a sendParams call.  I didn't want to worry about reasoning through lock contention/deadlock with synchronized methods (why I didn't synchronize on "this")
+, btw, is it appropriate to delete the very old patches as they aren't really relevant?  or just leave them?, todd : actually i want open the timeout discussion back up.  I think there might be some confusion.  The 20s timeout that was there was *not* on the RPC, but *only* on sending the RPC.  Basically this is the time to write to the socket (which there might a timeout on the actual out.write call already--i need to double-check).
+
+The RPC itself still would have no timeout.
+
+let me know what you think., bq. btw, is it appropriate to delete the very old patches as they aren't really relevant? or just leave them?
+
+Usually just leave them - makes it easier to follow the conversation and see how the patch evolved.
+
+bq. (which there might a timeout on the actual out.write call already--i need to double-check)
+
+Looks like there is one - a timeout is set when NetUtils.getOutputStream is called on the socket in setupIOStreams(). So I don't think we need a separate timeout in awaiting the send param.
+
+
+I think the patch is good. I ran it with my test case since Friday night and didn't see any RPC hangs. The test case eventually failed with "Too many open files" but I think it's some other bug/socket leak in DFS code, not IPC. Mark Patch Available to swing it through Hudson?, +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12446356/hadoop-6762-7.txt
+  against trunk revision 951624.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/567/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/567/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/567/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/567/console
+
+This message is automatically generated., I applied the patch and ran this test continuously.
+Seems still race condition is occuring randomly.
+That means this patch is not working. :-(, can you elaborate on what you ran and what error messages + exceptions you saw in the test logs?  the thread that does the IO cannot receive an interrupt so if you are seeing an error, i don't think it can be the same one.
+, Actually, this might be an artifact of the test.  The threads in the executor's threadpool will be interrupted on shutdown.  the test doesn't wait for all of the threads to terminate gracefully before doing so.  This means there is a race in the test for rpc threads to finish before getting interrupted.  I have an updated test that uses a latch to wait for all threads to terminate before letting the test complete. I haven't been able to repro, but can post the patch this afternoon and let you try.
+
+please do still post what exception and any relevant looking log parts here.  it will help me ascertain if this is the case, turns out this is just a really bad case of logging.  the exception was a BrokenBarrierException and I wasn't logging the real exception.  changed that and fixed the test so this doesn't occur
+, testRPCInterrupted3:--
+i also feel this may be the test problem.
+ in this test, inside run method it is throwing the exception i.e java.util.concurrent.BrokenBarrierException
+This is happening some times.
+I added some wait to complete all the threads before assertion.
+This is happenning randomly...most of the times passing the test.
+Please post the latest test., -8 is the latest.  i ran it 100 times and did not get any failures.  do you still see a failure with rev 8?  if so, I can do some more work with latches to tighten it up (right now I have a simple sleep that should allow the threads to get warmed up, and a latch to let them gracefully exit)
+, -8 is identical to -7, did you mean to upload a different patch?, this is downright odd--if I click and view
+
+https://issues.apache.org/jira/secure/attachment/12446356/hadoop-6762-7.txt
+https://issues.apache.org/jira/secure/attachment/12446530/hadoop-6762-8.txt
+
+they differ (the latter has a Thread.sleep() in the unit test)
+
+but grabbing with wget 
+
+wget https://issues.apache.org/jira/secure/attachment/12446530/hadoop-6762-7.txt --no-check-certificate
+wget https://issues.apache.org/jira/secure/attachment/12446530/hadoop-6762-8.txt --no-check-certificate
+
+they both have the Thread.sleep()
+
+is something up with JIRA?  or what did I do?, Note that one of the path segments differs between the two URLs. I think it just pulls an attachment ID from that path segment and downloads that, regardless of the name at the end of the path (your two wget urls have the same path segment, I guess you manually edited the last bit?), yes, I did :)
+
+so the two patches do differ, probably in one line, Thread.sleep(1000);
+
+As I said, I ran ant test-core in a loop 100x and did not see the failure.  If someone does, though, I can do something more sophisticated in the test (like using another latch to make sure the leader has started before interrupting it and causing the BrokenBarrierException)
+
+let me know
+
+, Hey Sam, one small thing in the newest patch: there are some unspecified generics - eg should be new AtomicReference<Throwable>, not just new AtomicReference. Otherwise we get some warnings compiling the tests., AtomicReference typed now, This looks ready for commit. Please resubmit to hadoopQA so that the final round of tests pass., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12447484/hadoop-6762-9.txt
+  against trunk revision 957074.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    -1 javadoc.  The javadoc tool appears to have generated 1 warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/597/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/597/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/597/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/597/console
+
+This message is automatically generated., the javadoc warnings do not appear to be from my patch
+(and I see 6, not 1)
+
+     [exec]   [javadoc] Constructing Javadoc information...
+     [exec]   [javadoc] /grid/0/hudson/hudson-slave/workspace/Hadoop-Patch-h4.grid.sp2.yahoo.net/trunk/src/java/org/apache/hadoop/security/KerberosName.java:31: warning: sun.securi
+ty.krb5.Config is Sun proprietary API and may be removed in a future release
+     [exec]   [javadoc] import sun.security.krb5.Config;
+     [exec]   [javadoc]                         ^
+     [exec]   [javadoc] /grid/0/hudson/hudson-slave/workspace/Hadoop-Patch-h4.grid.sp2.yahoo.net/trunk/src/java/org/apache/hadoop/security/KerberosName.java:32: warning: sun.securi
+ty.krb5.KrbException is Sun proprietary API and may be removed in a future release
+     [exec]   [javadoc] import sun.security.krb5.KrbException;
+     [exec]   [javadoc]                         ^
+     [exec]   [javadoc] /grid/0/hudson/hudson-slave/workspace/Hadoop-Patch-h4.grid.sp2.yahoo.net/trunk/src/java/org/apache/hadoop/security/KerberosName.java:81: warning: sun.securi
+ty.krb5.Config is Sun proprietary API and may be removed in a future release
+     [exec]   [javadoc]   private static Config kerbConf;
+     [exec]   [javadoc]                  ^
+     [exec]   [javadoc] /grid/0/hudson/hudson-slave/workspace/Hadoop-Patch-h4.grid.sp2.yahoo.net/trunk/src/java/org/apache/hadoop/security/SecurityUtil.java:33: warning: sun.securi
+ty.jgss.krb5.Krb5Util is Sun proprietary API and may be removed in a future release
+     [exec]   [javadoc] import sun.security.jgss.krb5.Krb5Util;
+     [exec]   [javadoc]                              ^
+     [exec]   [javadoc] /grid/0/hudson/hudson-slave/workspace/Hadoop-Patch-h4.grid.sp2.yahoo.net/trunk/src/java/org/apache/hadoop/security/SecurityUtil.java:34: warning: sun.securi
+ty.krb5.Credentials is Sun proprietary API and may be removed in a future release
+     [exec]   [javadoc] import sun.security.krb5.Credentials;
+     [exec]   [javadoc]                         ^
+     [exec]   [javadoc] /grid/0/hudson/hudson-slave/workspace/Hadoop-Patch-h4.grid.sp2.yahoo.net/trunk/src/java/org/apache/hadoop/security/SecurityUtil.java:35: warning: sun.securi
+ty.krb5.PrincipalName is Sun proprietary API and may be removed in a future release
+     [exec]   [javadoc] import sun.security.krb5.PrincipalName;
+     [exec]   [javadoc]                         ^
+     [exec]   [javadoc] ExcludePrivateAnnotationsStandardDoclet
+     [exec]   [javadoc] Standard Doclet version 1.6.0_11
+     [exec]   [javadoc] Building tree for all the packages and classes...
+     [exec]   [javadoc] Building index for all the packages and classes...
+     [exec]   [javadoc] Building index for all classes...
+     [exec]   [javadoc] Generating /grid/0/hudson/hudson-slave/workspace/Hadoop-Patch-h4.grid.sp2.yahoo.net/trunk/build/docs/api/stylesheet.css...
+     [exec]   [javadoc] 6 warnings
+     [exec] 
+, Hi Sam,
+
+With this patch, I see occasinal failures of TestGridmixSubmission when the JobMonitor gets interrupted:
+
+{noformat}
+10/08/25 11:05:20 WARN ipc.Client: interrupted waiting to send params to server
+java.lang.InterruptedException
+        at java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireSharedInterruptibly(AbstractQueuedSynchronizer.java:1215)
+        at java.util.concurrent.FutureTask$Sync.innerGet(FutureTask.java:218)
+        at java.util.concurrent.FutureTask.get(FutureTask.java:83)
+        at org.apache.hadoop.ipc.Client$Connection.sendParam(Client.java:754)
+        at org.apache.hadoop.ipc.Client.call(Client.java:1001)
+        at org.apache.hadoop.ipc.RPC$Invoker.invoke(RPC.java:224)
+        at org.apache.hadoop.mapred.$Proxy10.getJobStatus(Unknown Source)
+        at org.apache.hadoop.mapred.JobClient$NetworkedJob.updateStatus(JobClient.java:250)
+        at org.apache.hadoop.mapred.JobClient$NetworkedJob.isSuccessful(JobClient.java:339)
+        at org.apache.hadoop.mapreduce.Job.isSuccessful(Job.java:332)
+        at org.apache.hadoop.mapred.gridmix.JobMonitor$MonitorThread.process(JobMonitor.java:134)
+        at org.apache.hadoop.mapred.gridmix.JobMonitor$MonitorThread.run(JobMonitor.java:175)
+10/08/25 11:05:20 WARN gridmix.JobMonitor: Lost job GRIDMIX00000
+java.io.IOException: java.lang.InterruptedException
+        at org.apache.hadoop.ipc.Client.call(Client.java:1007)
+        at org.apache.hadoop.ipc.RPC$Invoker.invoke(RPC.java:224)
+        at org.apache.hadoop.mapred.$Proxy10.getJobStatus(Unknown Source)
+        at org.apache.hadoop.mapred.JobClient$NetworkedJob.updateStatus(JobClient.java:250)
+        at org.apache.hadoop.mapred.JobClient$NetworkedJob.isSuccessful(JobClient.java:339)
+        at org.apache.hadoop.mapreduce.Job.isSuccessful(Job.java:332)
+        at org.apache.hadoop.mapred.gridmix.JobMonitor$MonitorThread.process(JobMonitor.java:134)
+        at org.apache.hadoop.mapred.gridmix.JobMonitor$MonitorThread.run(JobMonitor.java:175)
+Caused by: java.lang.InterruptedException
+        at java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireSharedInterruptibly(AbstractQueuedSynchronizer.java:1215)
+        at java.util.concurrent.FutureTask$Sync.innerGet(FutureTask.java:218)
+        at java.util.concurrent.FutureTask.get(FutureTask.java:83)
+        at org.apache.hadoop.ipc.Client$Connection.sendParam(Client.java:754)
+        at org.apache.hadoop.ipc.Client.call(Client.java:1001)
+        ... 7 more
+{noformat}
+
+I think the patch is doing the right thing here for the most part, but it should throw InterruptedIOException instead of just a normal IOException. Then the caller can at least catch it distinctly from a normal IOException., actually, I might take it back - it looks like you can't pass cause information into an InterruptedIOException, so it's better to have callers check e.getCause() instanceof InterruptedException instead? What do you think? The gridmix case above already checks for ClosedByInterruptException, so it can easy check for InterruptedException too., I think IOException makes sense for 2 reasons
+
+1. the reason you stated--we can pass the actual cause
+2. my read is that only if you are the thread doing the IO should you throw InterruptedIOException.  In this case, the thread truly was interrupted--the IO happens in the other thread.  
+http://download-llnw.oracle.com/javase/6/docs/api/java/io/InterruptedIOException.html
+it also has a field for the partial bytes transfered.  In fact, this patch is supposed to keep the IO from actually being interrupted :)
+
+how can we make it so the test will pass?  does the test have a faulty assumption that I should fix?, I think we just need this fix to the gridmix test:
+{quote}
+--- a/src/contrib/gridmix/src/java/org/apache/hadoop/mapred/gridmix/JobMonitor.java
++++ b/src/contrib/gridmix/src/java/org/apache/hadoop/mapred/gridmix/JobMonitor.java
+@@ -177,7 +177,8 @@ class JobMonitor implements Gridmix.Component<Job> {
+                 continue;
+               }
+             } catch (IOException e) {
+-              if (e.getCause() instanceof ClosedByInterruptException) {
++              if (e.getCause() instanceof ClosedByInterruptException ||
++                  e.getCause() instanceof InterruptedException) {
+                 // Job doesn't throw InterruptedException, but RPC socket layer
+                 // is blocking and may throw a wrapped Exception if this thread
+                 // is interrupted. Since the lower level cleared the flag,
+{quote}, just getting around to this--this requires a patch to the mapred project rt?  so do i file a separate jira for that?
+, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12447484/hadoop-6762-9.txt
+  against trunk revision 1031422.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://hudson.apache.org/hudson/job/PreCommit-HADOOP-Build/35//console
+
+This message is automatically generated., i'll update the patch.  I think it just needs to be rebased
+, also this was run against trunk?, rebase off latest trunk, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12459934/hadoop-6762-10.txt
+  against trunk revision 1036130.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    -1 javadoc.  The javadoc tool appears to have generated 1 warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+    +1 system test framework.  The patch passed system test framework compile.
+
+Test results: https://hudson.apache.org/hudson/job/PreCommit-HADOOP-Build/110//testReport/
+Findbugs warnings: https://hudson.apache.org/hudson/job/PreCommit-HADOOP-Build/110//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://hudson.apache.org/hudson/job/PreCommit-HADOOP-Build/110//console
+
+This message is automatically generated., the javadoc warnings are not in any files I touched.  The warnings in tr
+
+-----------
+
+  [javadoc] Loading source files for package org.apache.hadoop.contrib.failmon...  [javadoc] Constructing Javadoc information...  [javadoc] /data/users/srash/apache/hadoop-common/src/java/org/apache/hadoop/security/SecurityUtil.java:39: warning: sun.security.jgss.krb5.Krb5Util is Sun proprietary API and may
+ be removed in a future release
+  [javadoc] import sun.security.jgss.krb5.Krb5Util;  [javadoc]                              ^  [javadoc] /data/users/srash/apache/hadoop-common/src/java/org/apache/hadoop/security/SecurityUtil.java:40: warning: sun.security.krb5.Credentials is Sun proprietary API and may b
+e removed in a future release
+  [javadoc] import sun.security.krb5.Credentials;  [javadoc]                         ^
+  [javadoc] /data/users/srash/apache/hadoop-common/src/java/org/apache/hadoop/security/SecurityUtil.java:41: warning: sun.security.krb5.PrincipalName is Sun proprietary API and may be removed in a future release
+  [javadoc] import sun.security.krb5.PrincipalName;  [javadoc]                         ^
+  [javadoc] /data/users/srash/apache/hadoop-common/src/java/org/apache/hadoop/security/KerberosName.java:31: warning: sun.security.krb5.Config is Sun proprietary API and may be rem
+oved in a future release
+  [javadoc] import sun.security.krb5.Config;  [javadoc]                         ^
+  [javadoc] /data/users/srash/apache/hadoop-common/src/java/org/apache/hadoop/security/KerberosName.java:32: warning: sun.security.krb5.KrbException is Sun proprietary API and may 
+be removed in a future release
+  [javadoc] import sun.security.krb5.KrbException;  [javadoc]                         ^
+  [javadoc] /data/users/srash/apache/hadoop-common/src/java/org/apache/hadoop/security/KerberosName.java:81: warning: sun.security.krb5.Config is Sun proprietary API and may be rem
+oved in a future release
+  [javadoc]   private static Config kerbConf;  [javadoc]                  ^
+  [javadoc] ExcludePrivateAnnotationsStandardDoclet
+  [javadoc] Standard Doclet version 1.6.0_21
+  [javadoc] Building tree for all the packages and classes...  [javadoc] Building index for all the packages and classes...
+  [javadoc] Building index for all classes...
+  [javadoc] Generating /data/users/srash/apache/hadoop-common/build/docs/api/stylesheet.css...
+  [javadoc] 6 warnings
+, todd: where are we on this?  you said some gridmx test in the mapred project needs updated based on this? shall we commit this and file a mapreduce jira?
+
+, Sorry, Sam, this one dropped off my radar. I'd like to get it in for 0.22, let me swing around and see what work's remaining., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12459934/hadoop-6762-10.txt
+  against trunk revision 1071364.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://hudson.apache.org/hudson/job/PreCommit-HADOOP-Build/272//console
+
+This message is automatically generated., Hi Sam,
+
+We saw the following deadlock which I think is related to this patch:
+
+{noformat}
+Thread 50994 (IPC Client (47) connection to XXXXXXXXX:8020 from hdfs):
+State: BLOCKED
+Blocked count: 7168
+Waited count: 7122
+Blocked on java.io.DataOutputStream@2e932fec
+Blocked by 50828 (sendParams-14)
+Stack:
+org.apache.hadoop.ipc.Client$Connection.sendPing(Client.java:676)
+org.apache.hadoop.ipc.Client$Connection.access$400(Client.java:210)
+org.apache.hadoop.ipc.Client$Connection$PingInputStream.handleTimeout(Client.java:340)
+org.apache.hadoop.ipc.Client$Connection$PingInputStream.read(Client.java:370)
+java.io.BufferedInputStream.fill(BufferedInputStream.java:218)
+java.io.BufferedInputStream.read(BufferedInputStream.java:237)
+java.io.DataInputStream.readInt(DataInputStream.java:370)
+org.apache.hadoop.ipc.Client$Connection.receiveResponse(Client.java:781)
+org.apache.hadoop.ipc.Client$Connection.run(Client.java:689)
+
+
+Thread 50828 (sendParams-14):
+State: BLOCKED
+Blocked count: 54
+Waited count: 8313
+Blocked on org.apache.hadoop.ipc.Client$Connection@54aeb3dd
+Blocked by 50994 (IPC Client (47) connection to XXXXXX:8020 from hdfs)
+Stack:
+org.apache.hadoop.ipc.Client$Connection.markClosed(Client.java:809)
+org.apache.hadoop.ipc.Client$Connection.access$1200(Client.java:210)
+org.apache.hadoop.ipc.Client$Connection$3.run(Client.java:745)
+java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:441)
+java.util.concurrent.FutureTask$Sync.innerRun(FutureTask.java:303)
+java.util.concurrent.FutureTask.run(FutureTask.java:138)
+java.util.concurrent.ThreadPoolExecutor$Worker.runTask(ThreadPoolExecutor.java:886)
+java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:908)
+java.lang.Thread.run(Thread.java:619)
+{noformat}
+
+The issue is that in the patch, we have the following inverted lock orders:
+sendParam's senderFuture: Connection.out -> Connection (in markClosed)
+sendPing: Connection -> Connection.out (explicit sync)
+
+Have you guys seen this issue?, I haven't noticed this.  In the rev we're running,  inside sendParams(), markClosed() is called outside the synchronized(Connection.this.out), so that lock isn't held...?
+
+(I'm using the original patch I uploaded before we changed it to a Future--it uses a latch)
+
+
+
+, I'd really like to get this in for 0.23. I'm going to steal the patch and rebase Sam's work to trunk., Rebased on trunk. A few changes since the earlier revs:
+- added a new "simple" test case with a single thread
+- moved the serialization of the call response into the calling thread, outside of the lock acquisition, to get better CPU parallelism
+- used guava's ThreadFactoryBuilder to make the thread factory
+- Cleaned up some of the warning messages to include thread name, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12491826/hadoop-6762.txt
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    -1 findbugs.  The patch appears to introduce 4 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+
+                  org.apache.hadoop.ipc.TestRPC
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/89//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HADOOP-Build/89//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-annotations.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HADOOP-Build/89//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HADOOP-Build/89//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-auth.html
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/89//console
+
+This message is automatically generated., Test failed since one of the new tests was leaving the main thread in an interrupted state, so a Thread.sleep crashed in the next test case. I added a "Thread.interrupted()" in the tests to clear state between test cases.
+
+The -1 findbugs issue is due to HADOOP-7587 (not this patch), -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12491826/hadoop-6762.txt
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    -1 findbugs.  The patch appears to introduce 4 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+
+                  org.apache.hadoop.ipc.TestRPC
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/92//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HADOOP-Build/92//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-auth.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HADOOP-Build/92//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HADOOP-Build/92//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-annotations.html
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/92//console
+
+This message is automatically generated., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12491851/hadoop-6762.txt
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    -1 findbugs.  The patch appears to introduce 4 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in hadoop-common-project.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/93//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HADOOP-Build/93//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-annotations.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HADOOP-Build/93//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HADOOP-Build/93//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-auth.html
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/93//console
+
+This message is automatically generated., Todd,
+Looks like the patch is out of date, mind updating it?, Unsure if this is still needed but here's a "rebase". Had to add in some hunks manually, as certain parts seem to have been highly updated since back then., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12546168/HADOOP-6762.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 2 new or modified test files.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests in hadoop-common-project/hadoop-common:
+
+                  org.apache.hadoop.ipc.TestSaslRPC
+                  org.apache.hadoop.ipc.TestMultipleProtocolServer
+                  org.apache.hadoop.ipc.TestProtoBufRpc
+                  org.apache.hadoop.ipc.TestRPCCallBenchmark
+                  org.apache.hadoop.ha.TestZKFailoverController
+                  org.apache.hadoop.ipc.TestRPC
+                  org.apache.hadoop.ipc.TestIPC
+                  org.apache.hadoop.ipc.TestRPCCompatibility
+                  org.apache.hadoop.ipc.TestIPCServerResponder
+                  org.apache.hadoop.security.TestDoAsEffectiveUser
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/1499//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/1499//console
+
+This message is automatically generated., Cancelling patch as it fails several relevant tests. Needs to be re-investigated.
+
+Todd - Would you have a chance to look into this soon? Is this still required?, Thanks for updating the patch, Harsh. I'm looking into this again now. I'll try to post another patch later today., Here's an updated patch against trunk.
+
+I ran all of the unit tests in the ipc package locally and they passed. I also tried the new unit tests _without_ the patch, and they failed as expected.
+
+Given that there was a deadlock found in an early rev of this patch, I also ran all of the IPC unit tests under jcarder to look for lock inversions and it found none.
+
+I ran the RPCCallBenchmark for 30 seconds with and without the patch, with the following results:
+
+With patch:
+====== Results ======
+Options:
+rpcEngine=class org.apache.hadoop.ipc.ProtobufRpcEngine
+serverThreads=30
+serverReaderThreads=4
+clientThreads=30
+host=0.0.0.0
+port=12345
+secondsToRun=30
+msgSize=1024
+Total calls per second: 24668.0
+CPU time per call on client: 58639 ns
+CPU time per call on server: 64893 ns
+
+
+Without patch:
+====== Results ======
+Options:
+rpcEngine=class org.apache.hadoop.ipc.ProtobufRpcEngine
+serverThreads=30
+serverReaderThreads=4
+clientThreads=30
+host=0.0.0.0
+port=12345
+secondsToRun=30
+msgSize=1024
+Total calls per second: 27881.0
+CPU time per call on client: 68079 ns
+CPU time per call on server: 62582 ns
+
+As expected, the CPU time on the client was increased and the throughput went down by about 13%, since the RPC calls are now being shuttled between threads on the client side. That's unfortunate, but given that this fixes an important bug, and given that _client_ side RPC throughput is rarely a bottleneck in common usage scenarios, I think it is acceptable.
+
+This patch is also nearly identical to a patch that we've shipped in CDH since June 2010, so I'm fairly confident that the approach is correct., Also figured I'd write up a short summary of this, since the above discussion is long and somewhat hard to follow after 2.5 years and ~15 attachments :)
+
+The issue at hand is what happens when an IPC caller thread (i.e the user thread who is making an IPC call, for example to the NN) is interrupted while in the process of writing the call to the wire. Java NIO's semantics are that a ClosedByInterruptException is thrown on the blocked thread, _and also that the underlying channel is closed_. In the context of IPC, this meant that the caller thread would receive a ClosedByInterruptException, and that any other threads which were sharing the same IPC socket would then receive ClosedChannelExceptions, even though those other threads were never meant to be interrupted.
+
+The solution is to change the call-sending code such that the actual write() call happens on a new thread, created by the {{SEND_PARAMS_EXECUTOR}} in the patch. Since the user code has no reference to this thread, it won't ever get interrupted, even if someone interrupts the user thread making the call. So, the user thread will receive an InterruptedException, but any other threads using the same socket continue to run unaffected., The latest patch looks good to me. +1 pending Jenkins.
+
+Jenkins appears to be down right now, and I think Jenkins flakiness caused test-patch not to notice this one. May need to manually kick it once Jenkins comes back up., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12555841/hadoop-6762.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/1843//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/1843//console
+
+This message is automatically generated., Committed to trunk and branch-2. Thanks, Sam., Integrated in Hadoop-trunk-Commit #3106 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/3106/])
+    HADOOP-6762. Exception while doing RPC I/O closes channel. Contributed by Sam Rash and Todd Lipcon. (Revision 1419782)
+
+     Result = SUCCESS
+todd : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1419782
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestIPC.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
+, Integrated in Hadoop-Yarn-trunk #62 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/62/])
+    HADOOP-6762. Exception while doing RPC I/O closes channel. Contributed by Sam Rash and Todd Lipcon. (Revision 1419782)
+
+     Result = FAILURE
+todd : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1419782
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestIPC.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
+, Integrated in Hadoop-Hdfs-trunk #1251 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1251/])
+    HADOOP-6762. Exception while doing RPC I/O closes channel. Contributed by Sam Rash and Todd Lipcon. (Revision 1419782)
+
+     Result = FAILURE
+todd : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1419782
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestIPC.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
+, Integrated in Hadoop-Mapreduce-trunk #1282 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1282/])
+    HADOOP-6762. Exception while doing RPC I/O closes channel. Contributed by Sam Rash and Todd Lipcon. (Revision 1419782)
+
+     Result = SUCCESS
+todd : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1419782
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestIPC.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestRPC.java
+]

@@ -1,0 +1,196 @@
+[Is this somehow related to HDFS-9781 ?, [~shahrs87], I do see HDFS-9781 (NPE during Full Block Report and especially after a volume removal) quite frequently in my test (TestDataNodeHotSwapVolumes) runs. But for these tests Incremental Block Reports from DataNodes are sufficient and they do work as expected. Block Report generations are happening within a try catch block and they are ignoring any encountered exceptions. Thanks for pointing me to the other jira, will follow up on that as well.
+, *Summary:* 
+-- I can see an issue in the current code where by the NameNode can miss out permantnetly to replicate a block to a DataNode. 
+-- If the write pipeline doesn’t have enough DataNodes to match the expected replication factor, then NameNode schedules replication of the block moments after the block has been COMMITTED or COMPLETED.  But, if the block COMMIT at NameNode arrives/happens after all BlockManager::addStoredBlock() (happens when processing block reports from DataNodes in the current write pipeline) then NameNode totally misses out to replicate the block because of the way it manages the {{LowRedundancyBlocks}} and {{PendingReconstructionBlocks}}.
+
+*Details:*
+Here are the events and their rough timeline order I noticed in one of the failures.
+1. Say the setup has 3 DataNodes ( DN(1..3) ) and the replication factor configured to be 3
+2. Client is writing a block (BLK_xyz_GS1) with the constructed pipeline DN1 —> DN2 —> DN3
+3. Say DN1 encounters an issue (like downstream communication, or interrupts or storage volume issue etc.,) before the block is FINALIZED
+4. Client detects the pipeline issue and gets a new write pipeline DN2 —> DN3 
+5. Generation stamp for the current block is bumped up (BLK_xyz_GS2)
+6. Client write (BLK_xyz_GS2) to DN2 and DN3
+7. NameNode (NN) is getting Incremental Block Reports (IBR) from DN1, DN2 and  DN3
+8. NN sees a mix of (BLK_xyz_GS1) and (BLK_xyz_GS2) in IBRs from DN1, DN2 and DN3
+9. NN marks (BLK_xyz_GS1) as corrupted and puts these DNs in invalidation list to remove that particular block
+
+10. After seeing the first BLK_xyz_GS2 from one the DNs (say DN2)
+— — NN adds  BLK_xyz_GS2 to the respective {{DatanodeStorageInfo}} (Refer: {{BlockManager::addStoredBlock}} )
+— — Since  BLK_xyz_GS2 is not COMMITTED from the Client yet, NN cannot move BLK_xyz_GS2 to COMPLETE state
+— — NN does not update the {{LowRedundancyBlocks}} neededReconstruction as it is done only after BLK_xyz_GS2 is COMMITTED by the Client 
+11. NN sees BLK_xyz_GS2 from the other DN (DN3)
+— — NN adds BLK_xyz_GS2
+— — At NN, BLK_xyz_GS2 is still in UNDER_CONSTRUCTION state as the Client has not COMMITTED yet. So, neededReconstruction is still not updated.
+
+
+12. At this point, for BLK_xyz_GS2 the live replica count is 2 and the expected replica count is 3.
+— — For the {{ReplicationMonitor}} to pick up a replica work, the intention must be available in {{LowRedundancyBlocks}} neededReconstruction
+— — Since no event triggered the addition of intention yet, no block replication work scheduled yet to the missing DN1
+
+13. Client closes the file
+— — NN moves the block to COMMITTED state
+— — Since there are already 2 love copies of the block, NN moves the block to COMPLETED state
+— — But, before moving the block to COMPLETED state, NN does something like below 
+
+{{BlockManager.java}}
+{noformat}
+public boolean commitOrCompleteLastBlock(BlockCollection bc,     Block commitBlock) throws IOException { 
+  ...
+  final boolean committed = commitBlock(lastBlock, commitBlock);   
+  if (committed && lastBlock.isStriped()) {   
+  ...
+  if (hasMinStorage(lastBlock)) {     
+        if (committed) {       
+          //XXX: Is adding to {{PendingReconstructionBlocks}} list without adding to
+          // 	 {{LowRedundancyBlocks}} list right ?
+          //     This fakes block replication task in progress without even
+          //     any {{BlockReconstructionWork}} scheduled. 
+
+          addExpectedReplicasToPending(lastBlock);     
+         }
+         completeBlock(lastBlock, false); 
+         }   
+    ... 
+ }
+{noformat}
+
+— — Since the block is added the {{pendingReconstruction}} list without any actual reconstruction work, the follow on {{checkRedundancy}} mistakenly believes that there is sufficient redundancy for the block and does not trigger any further block reconstruction works.
+
+{noformat}
+839 2016-08-23 10:57:21,450 [IPC Server handler 4 on 57980] INFO  blockmanagement.BlockManager (BlockManager.java:checkRedundancy(4046)) - CheckRedun Block: blk_1073741825_1002, exp: 3, replica: *LIVE=2*, READONLY=0, DECOMMISSIONING=0, DECOMMISSIONED=0, CORRUPT=0, EXCESS=0, STALESTORAGE=     0, REDUNDANT=0, *pending: 1*	
+840 2016-08-23 10:57:21,451 [IPC Server handler 4 on 57980] INFO  blockmanagement.BlockManager (BlockManager.java:hasEnoughEffectiveReplicas(1685)) - Blk: blk_1073741825_1002, numEffectiveReplicas: 3, required: 3, pendingReplicaNum: 1, placementPolicy: true
+{noformat}
+
+— — {{ReplicationMonitor}} which runs once in every 3 seconds, is also unable to help here as {{LowRedundancyBlocks}} list {{neededReplication}} is empty. 
+
+— — So the test fails with following signature 
+
+{noformat}
+Running org.apache.hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes
+Tests run: 1, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: 44.057 sec <<< FAILURE! - in org.apache.hadoop.hdfs.serv
+testRemoveVolumeBeingWritten(org.apache.hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes)  Time elapsed: 43.927 se
+java.util.concurrent.TimeoutException: Timed out waiting for /test to reach 3 replicas
+Results :
+Tests in error: 
+  TestDataNodeHotSwapVolumes.testRemoveVolumeBeingWritten:637->testRemoveVolumeBeingWrittenForDatanode:714 » Timeout
+Tests run: 1, Failures: 0, Errors: 1, Skipped: 0
+[INFO] Apache Hadoop HDFS Client .......................... SUCCESS [  2.345 s]
+[INFO] Apache Hadoop HDFS ................................. FAILURE [ 45.878 s]
+[INFO] BUILD FAILURE
+[INFO] Total time: 48.995 s
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:2.17:test (default-test) on project hadoop
+{noformat}
+
+, The core issue here is in the handling *write pipeline errors* and the follow on *race condition* between the following events
+-- Client sending Block COMMIT to the NN
+-- DN sending IBR with stale Block (the one with old generation stamp) info and 
+-- DN sending IBR with right Block (the one with expected generation stamp) info
+
+I have been seeing TestDataNodeHotSwapVolumes#testRemoveVolumeBeingWrittenForDatanode failing very frequently on the latest trunk. Though they all fail with same signature "Timed out waiting for /test to reach 3 replicas", there could be more than one issue here as I can see different code paths being taken in the failed logs. One common thing among the failures is they are all happening under pipeline error recovery case.
+
+*Problem 1:*
+-- BlockManager failing to trigger block replication in time to the missed out DN (the DN which is not in the write pipeline after pipeline error recovery)
+-- BlockManager mistakenly believes that there is already a block reconstruction to the last DN in progress and starts monitoring it using pendingReconstruction list
+-- Previous comment explains why BlockManager trapped into such belief. 
+
+*Problem 2:*
+-- This is totally different from the previous case
+-- A DN reported (in the IBR) the receipt of Block with the right generation stamp. But, BlockManager failed to add this StoredBlock for the reporting DN
+-- Later BlockManager detects (erroneously) the replication factor not caught up and tries to replicate the block the missing DN. Except, the {{BlockPlacementPolicy}} engine fails to find a target node as it sees all the given nodes already have the given Block. This detection and failed replication continues on and on. 
+
+I have theories for both of the above problems. Will try to elaborate more on further comments and will love to have your feedback on my understandings.
+
+
+, More details on the Issue 1:
+
+*Problem:*
+— After pipeline recovery (from data streaming failures), block replication to stale replicas are not happening
+— TestDataNodeHotSwapVolumes fails with “TimeoutException: Timed out waiting for /test to reach 3 replicas” signature
+
+*Analysis:*
+— Assume write pipeline DN1 —> DN2 —> DN3
+— For the {{UNDER_CONSTRUCTION}} Block, NameNode sets the *expected replicas* as DN1, DN2, DN3
+— DN1 encounters a write issue (here the volume is removed while write is in-progress)
+— Client detects pipeline issue, triggers pipeline recovery and gets the new write pipeline as DN2 —> DN3
+
+— On a successful {{FSNameSystem::updatePipeline}} request from Client, NameNode bumps up the Generation Stamp (from 001 to 002) of the UnderConstruction (that is, the last) block of the file.
+— All the current *expected replicas* are stale as they have lesser Generation Stamp compared to the new one after the pipeline update.
+— NameNode resets *expected replicas* with the new set of storage ids from the update pipeline, which is {DN2, DN3}
+
+— DNs send their Incremental Block Reports to NameNode. IBRs can have Blocks with old or new Generation Stamp. And these replica blocks can be in any states — FINALIZED, RBW, RBR, etc.,
+— Assume, the stale replica DN1 sending IBR with the following
+— — Replica Block State: RBW
+— — Replica Block GS: 001 (stale)
+— Assume, the good replica DN2, DN3 sending IBR with the following
+— — Replica Block State: FINALIZED
+— — Replica Block GS: 002 (good)
+
+
+— {{BlockManager::processAndHandleReportedBlock}} when processing Incremental Block Reports, for Replica blocks in RBW/RBR states, NameNode does not check block Generation Stamps until the stored block is COMPLETE. Since the Block state at NN is still in UNDER_CONSTRUCTION, the *Stale RBW block from DN1 gets accepted*
+
+— {{BlockManager::addStoredBlockUnderConstruction}} assumes the replica block from corrupt DN1 to be a good one and adds DN1’s StorageInfo to the expected replica locations. Refer: {{BlockUnderConstructionFeature::addReplicaIfNotPresent}}. Thus *expected replicas* again become (DN1, DN2, DN3).
+
+— Later when the Client closes the file, {{FSNameSystem}} moves all the *expected replicas* to pendingReconstrcution. Refer: {{FSNameSystem::addComittedBlocksToPending}}
+
+— {{BlockManager::checkRedundancy}} mistakenly believes pendingReconstruction count 1 (for DN1) is currently in-porgress and adding this to live replicas count 2 (for DN2, DN3), it decides no more reconstruction needed as it matches the configured replication factor of 3.
+
+— Since there wasn’t any block reconstruction triggered for DN1, test times out waiting for the replication factor of 3. 
+
+
+*Fix:*
+
+— I believe the core issue here is in the processing of IBRs from stale replicas. Either 
+— — (A) {{BlockManager::checkReplicaCorrupt}} has to tag the block as corrupt, when the replica state is RBW and when the block is not complete  OR
+— — (B) {{BlockManager::addStoredBlockUnderConstruction}} should not ADD the corrupt replica in the *expected replicas* for the under construction block
+
+Attached patch has the fix (B). Also, wrote a unit test to explicitly check for expected replica count under above line of events. 
+
+[~eddyxu], [~andrew.wang], [~yzhangal] can you please take a look at the patch ?, Filed HDFS-10819 to track the Problem 2., | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 14s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 17s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 47s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 62m  1s{color} | {color:green} hadoop-hdfs in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 21s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 81m 45s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HDFS-10780 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12826293/HDFS-10780.001.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 6c1deef2b562 3.13.0-92-generic #139-Ubuntu SMP Tue Jun 28 20:42:26 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / d6d9cff |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16584/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16584/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+]

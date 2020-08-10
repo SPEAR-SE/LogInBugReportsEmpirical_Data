@@ -1,0 +1,286 @@
+[Hi Chengxiang, could you please provide your test code, and attach the profiler result? , i write a simple test case, run it on a (4 node, each 32 core) cluster, which reproduce this issue., Reading so many HDFS files in parallel in one process is not a normal case, maybe we can:
+1. try some optimization tricks mentioned in HADOOP-5318
+2. statistics is mainly used in MapReduce job report, if spark(or other framework) don't need it, we can make this feature configurable, and disable it in many thread case., Here is a patch try to make read/write bytes stat configurable, by default it still stat, change "fs.read.write.bytes.stat" to false to disable it.
+, Why not keep thread-local read statistics and sum them up periodically?  That seems better than disabling this entirely. , +1 for Colin's suggestion, that was my first thought too. Increment thread-locals, sum them up on read., bq. Increment thread-locals, sum them up on read.
+How do you know all the threads that are maintaining thread local variables?, bq. about 70% cpu time is spent on FileSystem.Statistics.incrementBytesRead().
+BTW I am really surprised by the 70% number. Given that the client is reading the data, doing CRC validation, this number seems too high., bq. How do you know all the threads that are maintaining thread local variables?
+
+The first time a thread tries to access a thread-local-variable, it will get null.  At that point, the thread creates the thread-local counters object, takes a mutex, and adds a reference to it to the list inside FileSystem.  Periodically, we go over the list of thread-locals and sum them up into a total.  (We also do that summation when reading statistics).  At that point, we remove any thread-locals which belong to threads which no longer exist.
+
+Check out the "flat combining" paper, which is a more abstract description of this idea: http://www.cs.bgu.ac.il/~hendlerd/papers/flat-combining.pdf, bq. At that point, we remove any thread-locals which belong to threads which no longer exist.
+The counts from the threads, even though they are not running any more, should be included in stats count. Currently statistics object is passed from the client to the file system. This implementation may need incompatible changes., [~chengxiang li], can you post the detailed configuration of the test, for example, what kinds of cpu are you using to run the test?
+
+And can you test the differences of end-to-end latency before and after the patch?
+
+Although this JIRA do bring up a good point, it seems that many of us are still yet to be convinced that this is a real problem in production settings.
+Since there're many research proposals available since 80's, I believe that it will be straightforward to apply one of them once the community is convinced that it affects the performance significantly, by a detailed analysis of the behavior of real-world Hadoop workload., And I'm still trying to understand the rational of addressing architectural problems in DFSClient.
+
+Controlling issues such as cache alignments, synchronization from JVM are also essential to avoid contentions. Since the information is simply unavailable to Java programs, in my personal opinions the problem might be better addressed in the JVM, or even lower abstraction levels., bq. The counts from the threads, even though they are not running any more, should be included in stats count. Currently statistics object is passed from the client to the file system. This implementation may need incompatible changes.
+
+There's nothing incompatible about it.  The objects used for thread-local storage are not the same object as the client is passing around.  My point is that, if you keep adding objects whenever a thread is created, you also have to get rid of them when the thread is destroyed.  Otherwise, you have a memory leak.
+
+It would be really simple to come up with a patch that does thread-local counters.  I don't have time today, but maybe later this week.
+
+bq. Controlling issues such as cache alignments, synchronization from JVM are also essential to avoid contentions. Since the information is simply unavailable to Java programs, in my personal opinions the problem might be better addressed in the JVM, or even lower abstraction levels.
+
+The JVM has some problems, but this isn't one of them.  Accessing the same memory from many different threads at once is inherently slow on modern multicore CPUs because of cache coherency issues.  It's up to software designers to avoid this if they want the best performance., bq. Why not keep thread-local read statistics and sum them up periodically? That seems better than disabling this entirely.
+ThreadLocal variables also has performance penalties in java, although I have not test it, see http://stackoverflow.com/questions/609826/performance-of-threadlocal-variable. Use them frequently in inner loop may also cause performance penalty
+Since atomic variable or ThreadLocal both have performance impact(big or small), and most applications use hdfs client donot use statistics at all, I think at least we can give them a option to disable it. We can also do optimizations, they are not conflict.
+
+ Hadoop fs client is too heavyweight now, with to much threads and states. Imagine a NM/TaskTracker with 40+ of tasks, each with several hdfs clients which has multiple threads, we may get thousand threads just for hdfs read/write, it will cause a lot of context switch expenses. 
+, [~chengxiang li], could you provide your test environment? CPU and java version? Looks like AtomicLong has scalability issues under specific CPUs and java versions, it may cause this serious 70% CPU usage, in normal cases, there may be some cache coherency effect, but not so much.
+http://java.dzone.com/articles/adventures-atomiclong, A quick hack implementing ThreadLocal version of AtomicLong, you can see from the code that using thread local has two impact:
+1. incrementBytesRead/Written using threadlocal can avoid contention, but introduce null check and hashmap lookup.
+2. getBytesRead/Written now need to loop over all threads, which takes more time than before(just a heap lookup), Resubmit fix a bug.., here is my test environment:
+[root@node13-1 ~]# cat /proc/cpuinfo | grep name | cut -f2 -d: | uniq -c
+     32  Intel(R) Xeon(R) CPU E5-2690 0 @ 2.90GHz
+[root@node13-1 ~]# java -version
+java version "1.6.0_31"
+Java(TM) SE Runtime Environment (build 1.6.0_31-b04)
+Java HotSpot(TM) 64-Bit Server VM (build 20.6-b01, mixed mode), The article I refered before [http://java.dzone.com/articles/adventures-atomiclong] says sandy-bridge processors has this problem, looks like CPU E5-2690 is sandy-bridge?
+Another article [http://java.dzone.com/articles/wanna-get-faster-wait-bit] about why AtomicInteger in java has performance issues under high contention:
+"In many cases, low cost CAS gives an effective alternative for locking primitives but there is an exponentially growing cost of using CAS in contented scenarios."
+In your test case, 30+ threads probably fit this profile.  
+
+The case is in most scenarios(individual hdfs client, MR task) , the contention is far less, and AtomicLong is the best choice, if we change to use thread local, it may downgrade performance., Here's a patch which implements thread-local counters in {{FileSystem#Statistics}}.  When incrementing, no locks need to be taken-- each thread simply increments its thread local value.  The read operations sum up the thread-local data.
+
+Note that it is not necessary to use {{AtomicLong}}.  We only need {{volatile}}.  This is because we only ever have one thread updating the thread-local statistics.  So there is no "lost updates" problem and no need for {{CAS}} or {{LOCK}], etc.  We only need a read barrier, which is provided by {{volatile}}.
+
+Give this a try and see if it addresses the performance problem.  I think this should perform well in non-massively-multithreaded settings as well., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12607862/HDFS-5276.001.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 1 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5165//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5165//console
+
+This message is automatically generated., Fix javadoc warning, {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12607889/HDFS-5276.002.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5166//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5166//console
+
+This message is automatically generated., SUCCESS: Integrated in Hadoop-trunk-Commit #4585 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/4585/])
+Move HDFS-5276 to 2.3.0 in CHANGES.txt (llu: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1531228)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+HDFS-5276. Remove volatile from LightWeightHashSet. (Junping Du via llu) (llu: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1531225)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/LightWeightHashSet.java
+, SUCCESS: Integrated in Hadoop-Yarn-trunk #359 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/359/])
+Move HDFS-5276 to 2.3.0 in CHANGES.txt (llu: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1531228)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+HDFS-5276. Remove volatile from LightWeightHashSet. (Junping Du via llu) (llu: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1531225)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/LightWeightHashSet.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #1549 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1549/])
+Move HDFS-5276 to 2.3.0 in CHANGES.txt (llu: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1531228)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+HDFS-5276. Remove volatile from LightWeightHashSet. (Junping Du via llu) (llu: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1531225)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/LightWeightHashSet.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1575 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1575/])
+Move HDFS-5276 to 2.3.0 in CHANGES.txt (llu: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1531228)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+HDFS-5276. Remove volatile from LightWeightHashSet. (Junping Du via llu) (llu: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1531225)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/util/LightWeightHashSet.java
+, It looks like someone confused confused this for HDFS-5267 when doing a subversion commit of the latter.  That is what is causing all the messages from Jenkins.  Do not be confused, this has NOT been commited yet., SUCCESS: Integrated in Hadoop-trunk-Commit #4591 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/4591/])
+Fix typo (HDFS-5276 -> HDFS-5267) in CHANGES.txt (llu: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1531500)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, [~chengxiang li], is it possible to rerun the test with this patch to see to what extent the patch can reduce the contentions?, Did a micro-benchmark only on FileSystem.Statistics, results seams great, looks like thread local have very little performance penalty. 
+
+Without patch: 
+Thread  1, Time:       1107
+Thread  2, Time:      11391
+Thread  3, Time:      23813
+Thread  4, Time:      37780
+
+With patch:
+Thread  1, Time:        901
+Thread  2, Time:       1056
+Thread  3, Time:       2473
+Thread  4, Time:       2525
+Thread  5, Time:       2689
+Thread  6, Time:       2634
+Thread  7, Time:       2938
+Thread  8, Time:       3499
+Thread  9, Time:       3551
+
+My test env (i7 4core 8 thread hyperthreading) should have linear scalability under 4 threads, don't know why we still see 2x slow down on 3 and 4 threads.  Don't have more cores test env, maybe [~chengxiang li] can provide more results?
+
+Attach test code.
+, test code:
+hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/TestFileSystemStatistics.java, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12608143/TestFileSystemStatistics.java
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5178//console
+
+This message is automatically generated., SUCCESS: Integrated in Hadoop-Yarn-trunk #360 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/360/])
+Fix typo (HDFS-5276 -> HDFS-5267) in CHANGES.txt (llu: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1531500)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #1550 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1550/])
+Fix typo (HDFS-5276 -> HDFS-5267) in CHANGES.txt (llu: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1531500)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1576 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1576/])
+Fix typo (HDFS-5276 -> HDFS-5267) in CHANGES.txt (llu: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1531500)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, [~decster], that's quite impressive. It might be worthwhile to generalize the approach.
+
+But before that, I'm wondering what would the performance look like if you simply mark the variable as volatile? The performance might not be as good the thread-local approach since the JVM specification enforces memory fences at access of volatile variables, but it is the simplest approach and it can be easily generalizable through the code base.
+
+I appreciate if you can test the volatile approach on the same set up and report the result. By then we'll have a much better understanding on which approach we should use to write the statistics code.
+
+Thanks!, Hi [~wheat9], volatile cannot be used as atomic variables, its += operation ( incrementAndGet ) is not thread safe, unless you add lock synchronization., My test env (Macbook Pro i7 4core 8 thread hyperthreading)
+
+Original AtomicLong:        
+Thread  1, Time:       1107
+Thread  2, Time:      11391
+Thread  3, Time:      23813
+Thread  4, Time:      37780
+
+Disable statistics:
+Thread  1, Time:         62
+Thread  2, Time:         67
+Thread  3, Time:        231
+Thread  4, Time:        248
+Thread  5, Time:        264
+Thread  6, Time:        271
+Thread  7, Time:        279
+Thread  8, Time:        297
+Thread  9, Time:        329
+
+With ThreadLocal patch:
+Thread 1, Time: 901
+Thread 2, Time: 1056
+Thread 3, Time: 2473
+Thread 4, Time: 2525
+Thread 5, Time: 2689
+Thread 6, Time: 2634
+Thread 7, Time: 2938
+Thread 8, Time: 3499
+Thread 9, Time: 3551
+
+With sychornized method
+Thread  1, Time:       2837
+Thread  2, Time:       8630
+Thread  3, Time:      11961
+Thread  4, Time:      16026
+Thread  5, Time:      19917
+Thread  6, Time:      24423
+Thread  7, Time:      28467
+, We can see in no contention case(1 thread):
+100M increment ops has cost: 
+Disalbe(63ms) < ThreadLocal(901ms) < AtomicLong(1107ms) < Synchornized Lock(2827ms)
+
+Even under no contention case, suppose a hdfs client read at 500MB/s, each read read(10byts), it will issue 50M increment op/s, almost cost 0.5 CPU time.
+, As Binglin pointed out, you cannot use volatile here because of the "lost updates" problem.  There is no way to atomically add one to a volatile variable-- someone else may have updated it in between the time you read the value, and the time you wrote back the value plus one.
+
+I also suspect that just using volatile would still be slower than the thread-local approach.  The fundamental problem here is inter-CPU communication is slow, and just substituting volatile for atomic doesn't solve that.
+
+Thanks for the benchmarks, Binglin., I really like how this has shaped up. The microbenchmark numbers here very impressive (and probably even better on more cores); thanks for doing this Binglin. It'd still be good to see this with the actual Spark workload if possible.
+
+Colin, overall patch looks good, only some minor comments:
+
+* It'd be nice to include "aggregation" somehow in the name of {{StatisticsVIsitor}} and/or {{#visitAll}}, e.g. {{StatisticsAggregationVisitor}} and/or {{#aggregate}}, since {{total}} is part of the interface.
+* {{FileSystem#reset}} is now resetting all the statistics, not just bytes written and read. This makes sense to me. It looks like the current behavior is just an oversight from when the additional statistics were added in HADOOP-6859; maybe [~sureshms] as the original author can comment.
+* Resetting by taking the current total, {{#negate}}-ing, then adding is not immediately obvious to the reader. Is there a reason we don't just have a {{#reset}} method and reset each {{StatisticData}} in turn?
+* I'd also prefer just to not reuse the visitor / {{visitAll}} here too, since it's kind of weird semantically: {{#total()}} mutates the {{total}} {{StatisticsData}} member, and it depends on {{#total()}} being called exactly once at the end., thanks for the review, Andrew.
+
+bq. FileSystem#reset is now resetting all the statistics, not just bytes written and read. This makes sense to me. It looks like the current behavior is just an oversight from when the additional statistics were added in HADOOP-6859; maybe Suresh Srinivas as the original author can comment.
+
+Yeah, that's what I think too.  Agree that it would be nice to get some comments on that.
+
+bq. Resetting by taking the current total, #negate-ing, then adding is not immediately obvious to the reader. Is there a reason we don't just have a #reset method and reset each StatisticData in turn?
+
+There is a reason.  We can't modify the thread-local data... only the threads themselves can do that, or else there's a race condition.  I added a comment explaining this better.
+
+bq. I'd also prefer just to not reuse the visitor / visitAll [in reset] too, since it's kind of weird semantically: #total() mutates the total StatisticsData member, and it depends on #total() being called exactly once at the end.
+
+I actually thought it was a nice example of code reuse.  Iterating over all the {{StatisticsData}} objects is complex and I would not want to duplicate that code.  I added a comment to {{visitAll}} that describes the fact that {{aggregate}} (previously called {{total}}) is called exactly once at the end-- hopefully that makes it more obvious., Cool, that all works for me. +1 on the new patch; maybe wait a bit in case anyone else wants to ring in, but I think it's fine to commit now if you want., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12608402/HDFS-5276.003.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:red}-1 eclipse:eclipse{color}.  The patch failed to build with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+        {color:red}-1 release audit{color}.  The applied patch generated 1 release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5188//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5188//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5188//console
+
+This message is automatically generated., I ran mvn eclipse:eclipse locally and it succeeded.  The jenkins eclipse:eclipse failure and release audit thing seems to be an environment issue.  (looks like a lingering pid file from a previous test run?)
+
+Thanks for the +1.  Will commit shortly if there are no more comments., SUCCESS: Integrated in Hadoop-trunk-Commit #4632 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/4632/])
+HDFS-5276. FileSystem.Statistics should use thread-local counters to avoid multi-threaded performance issues on read/write.  (Colin Patrick McCabe) (cmccabe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1533668)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FCStatisticsBaseTest.java
+, SUCCESS: Integrated in Hadoop-Yarn-trunk #367 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/367/])
+HDFS-5276. FileSystem.Statistics should use thread-local counters to avoid multi-threaded performance issues on read/write.  (Colin Patrick McCabe) (cmccabe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1533668)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FCStatisticsBaseTest.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #1557 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1557/])
+HDFS-5276. FileSystem.Statistics should use thread-local counters to avoid multi-threaded performance issues on read/write.  (Colin Patrick McCabe) (cmccabe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1533668)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FCStatisticsBaseTest.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1583 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1583/])
+HDFS-5276. FileSystem.Statistics should use thread-local counters to avoid multi-threaded performance issues on read/write.  (Colin Patrick McCabe) (cmccabe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1533668)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/fs/FCStatisticsBaseTest.java
+]

@@ -1,0 +1,79 @@
+[[~slukog] Can you give more information to verify why there was immediate glitch
+# Any NM got restarted? If so how many and how many containers were running in each NM.?
+# Was there RM heavily loaded or any deadlock in scheduler where most of the node heart beat was not processed by scheduler?
+# Do you have Jstack report for RM  while memory is increasing?
+
+These container status are cleared from nodeUpdateQueue when node heartbeat is processed by scheduler. If there is any issue/slow from scheduler, node status events would pile up. This would increase nodeUpdateQueue size and might cause OOM., Hi [~rohithsharma],
+
+* During the sudden heap size increase we didn't notice any NM going down/restarted. But once the heap reached it's max we noticed a couple of NMs going down. This might be due to RM being in OOM state.
+{quote}Any NM got restarted? If so how many and how many containers were running in each NM.?{quote}
+
+* Not sure if CapacityScheduler was in deadlock but can see from thread dump that three IPC Handler threads were waiting on *CapacityScheduler.getQueueInfo* and the *Resource Manager Event Processor* Thread was printing the log line "Null Container Completed". There are millions of such log lines are seen in ResourceManager during the time of issue occurrence.
+{quote}Was there RM heavily loaded or any deadlock in scheduler where most of the node heart beat was not processed by scheduler?{quote}
+
+* Will attach the thread dump in a while
+{quote}Do you have Jstack report for RM while memory is increasing?{quote}, The cause for the OOM looks like huge number of sudden logs of "Null container completed". Do we know in what scenarios we will get this?, [~slukog], could you post an excerpt from the log so we can see the exact log messages?, Sure. Here are the log messages that are seen in RM logs before it goes OOM. There are millions of such entries.
+
+2016-03-22 20:04:40,443 INFO  capacity.CapacityScheduler (CapacityScheduler.java:completedContainer(1190)) - Null container completed...
+2016-03-22 20:04:40,443 INFO  capacity.CapacityScheduler (CapacityScheduler.java:completedContainer(1190)) - Null container completed...
+2016-03-22 20:04:40,443 INFO  capacity.CapacityScheduler (CapacityScheduler.java:completedContainer(1190)) - Null container completed...
+2016-03-22 20:04:40,443 INFO  capacity.CapacityScheduler (CapacityScheduler.java:completedContainer(1190)) - Null container completed..., Thread dump attached , Suspect you may run into YARN-3487, in which case CS lock is hold and the UpdatedContainerInfo gets piled up.
+[~slukog], how often do you see this ?  would you like to patch YARN-3487 and give it a try ?, Hi [~jianhe],
+
+The previous thread dump may be looking like we've hit [YARN-3487|https://issues.apache.org/jira/browse/YARN-3487], but that was extracted from the heap dump. I'm now attaching the thread dump taken when the second time the issue had occurred(removing the old one I attached before which is not complete). There the CS thread(Resource Manager Event Processor) which is supposed to consume from UpdatedContainerInfo is not in blocked state. Still the queue filled up and the issue recurred. Any pointers here? One common observation is there were huge number of log lines I mentioned above both times when the issue occurred., Looking at your attached threadump, I feel root cause for your issue is YARN-3487. May be you can try if it is recurring regularly.
+
+From the thread dump,
+I see that there are 8 threads are waiting for CS lock out of 7 are {{CapacityScheduler.getQueueInf}} which are called from validating resource request either during application submission for AM resource request OR for AM heartbeat request. 
+At this time, nodeUpdate is holding the CS lock. This would take few mills to process containers status if more are there.
+{code}
+	at org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler.completedContainer(CapacityScheduler.java:1190)
+	- locked <0x00000005d4cfe5c8> (a org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler)
+	at org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler.nodeUpdate(CapacityScheduler.java:951)
+	- locked <0x00000005d4cfe5c8> (a org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler)
+{code}
+
+
+In larger cluster what can happen is if more ApplicationsMaster are running concurrently and application submission rate is very high, then significantly nodeUpdate will be blocked for obtaining CS lock. The reason for blocking is YARN-3487. So if more NodeManagers are there then time consumed to process each node update increase which internally pill up the container status and might be causing oom.
+
+Just for an info,  How many NodeManagers are there in cluster? How many AM are running concurrently and How many tasks per job? what is the job submission rate? 
+, Agreed 7 threads are waiting to lock CapacityScheduler.getQueueInfo. What is the impact if these many threads are waiting on this lock in application submission phase? Will it be the cause for RMNodeImpl.nodeUpdateQueue piling up? If yes then YARN-3487 will fix the issue. Else there should be some other reason - like the consumer thread of the queue(RMNodeImpl.nodeUpdateQueue) which is ResourceManager Event processor stuck at something that it is not draining the queue.
+
+Also the thread which is doing nodeUpdate(ResourceManager Event processor) is not in blocked state. It is still runnable. 
+
+There are around 1200 NMs in the cluster. 93 apps were running when issue occurred. The number of containers allocated were 17803 and pending were 63422. Job submission rate was roughly 6 per minute., To be more clear, 
+*Flow-1* : Each AM heart beat or application submission try to acquire CS lock. In your cluster, 93 apps running concurrently would send resource request in  AM heartbeat to RM. These many AM's heartbeat are race to obtain CS lock. 
+
+*Flow-2* And other hand, scheduler event process thread dispatches events one by one. So at any point of time, only one nodeUpdate event is processed.This nodeUpdate event try to acquire a CS lock which is also in race ( From your thread dump, nodeUpdate has acquired the CS lock as I mentioned previous comment).
+
+Consider worst case where always AM heart beat is getting chance to acquire CS lock, then nodeUpdate call would be delayed. As I said scheduler event processor process an event one by one, other node update events will be piled up. Note that scheduler node status event is triggered from RMNodeIMpl. Delay in scheduler event processing does not block NodeManagers heartbeat. So NodeManager keep sending node heart beat and updating the RMNodeImpl#nodeUpdateQueue., I was justifying how without YARN-3487 might cause oom. There could be other reason causing for nodeUpdate queue pill up which need to be analysed. For leaving out a suspect of YARN-3487, apply the patch in the cluster. If issue occur again it is easy to focus on particular area., Thanks [~rohithsharma], this gives some perspective about the starvation of Scheduler Event Processor Thread. May be YARN-3487 would bring down the probability of this issue. 
+
+It took more than 30 minutes for the heap to double and go OOM. So Scheduler Event Processor would have got to process at least some nodeUpdate events. But heap was on growing state continuously and never came down. That's why I am not fully convinced that YARN-3487 would solve the issue. By the way what is the hearbeat interval from AM to RM in which it will acquire the CS lock., bq. By the way what is the hearbeat interval from AM to RM in which it will acquire the CS lock.
+MRAppMaster heartbeat is 1sec default. And CS lock is aquired only if there are ask resource request in heartbeat., [~rohithsharma] the slowness in schedulers still does not explain the built up of UpdatedContainerInfo to be 0.5 million objects in a short span. UpdatedContainerInfo should only be created in case of newly launched/completed containers. 
+Looking at the code at RMNodeImpl.StatusUpdateWhenHealthyTransition  (branch 2.6.0)
+{code}
+ // Process running containers
+        if (remoteContainer.getState() == ContainerState.RUNNING) {
+          if (!rmNode.launchedContainers.contains(containerId)) {
+            // Just launched container. RM knows about it the first time.
+            rmNode.launchedContainers.add(containerId);
+            newlyLaunchedContainers.add(remoteContainer);
+          }
+        } else {
+          // A finished container
+          rmNode.launchedContainers.remove(containerId);
+          completedContainers.add(remoteContainer);
+        }
+      }
+      if(newlyLaunchedContainers.size() != 0 
+          || completedContainers.size() != 0) {
+        rmNode.nodeUpdateQueue.add(new UpdatedContainerInfo
+            (newlyLaunchedContainers, completedContainers));
+      }
+{code}
+
+Above UpdatedContainerInfo is seemed to be getting created each time there is a completed containers in the container status (it is not checking if from previous update this has already been created). Wouldn't this lead to lot of duplicates UpdatedContainerInfo objects and further putting stress on the scheduler unnecessarily.
+, Further analysis shows that we are seeing exceptionally high log lines of "Null container completed...", somewhere in between 100k to 200k every minute. This could be related to lot of duplicate UpdatedContainerInfo objects for completed containers., Thanks for bringing out duplicated container status stored in UpdatedContainerInfo. This makes to think of ticket YARN-2997 which is already solved.
+
+Scenario is NM keeps the containers in NMContext as long as RM sends notification to NM in response to remove from NM. Every heart beat these(pendingCompletedContainers) container status is sent to RM which could be duplicated!!  But from RM , while creating UpdatedContainerInfo validation is not done for duplicated entries. This is keep accumulating when there is slow in scheduler event processing., Adding to above point, since NM->RM is push design, already sent containers are not supposed to send again unless there is RESYNC command from RM. So it should be a bug from NodeManager, Thanks Rohith. Should we consider adding duplicate check in the RM side as well for completed containers as we are doing for launched ones. This will make it more full proof and eliminate scenarious like resync etc where NM might still send duplicates.
+ we can open a new ticket for the same., I will raise a new ticket for this. Thanks:-), Raised a JIRA YARN-4862 for handling duplicated container status check., [~sharadag] [~slukog] As per analysis in earlier discussions, YARN-4862 was identified as reason for OOM. 
+Should this JIRA can be resolved since YARN-4862 patch got committed? Does YARN-4862 need to backported to Hadoop-2.6?]

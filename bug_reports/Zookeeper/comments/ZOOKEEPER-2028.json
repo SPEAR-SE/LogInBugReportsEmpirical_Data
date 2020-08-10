@@ -1,0 +1,156 @@
+[analysis:
+
+{quote}
+[exec] terminate called after throwing an instance of 'CppUnit::Exception'
+[exec] what(): equality assertion failed
+[exec] - Expected: 0
+[exec] - Actual : -116
+[exec]
+[exec] make: *** [run-check] Aborted (core dumped)
+[exec] Zookeeper_simpleSystem::testAuth
+{quote}
+
+above error is caused by below test unit:
+src/c/tests/TestClient.cc:
+    void testAuth() {
+
+        // auth as pat, create /tauth1, close session
+        rc = zoo_add_auth(zk, "digest", "pat:passwd", 10, voidCompletion,
+                          (void*)ZOK);  
+
+    static void voidCompletion(int rc, const void *data) {
+        int tmp = (int) (long) data;
+        CPPUNIT_ASSERT_EQUAL(tmp, rc);   // <----this line
+        count++;
+    }
+
+but it is not expected behavior - there is no source code line provided and the program aborted.
+
+with more debug, we hit below code path(frame #1 is my debug code):
+
+{quote}
+#0  0x000000398b8acb8d in nanosleep () from /lib64/libc.so.6
+#1  0x000000398b8aca00 in sleep () from /lib64/libc.so.6   
+#2  0x000000000042fd1b in Zookeeper_simpleSystem::voidCompletion (rc=-116, data=<value optimized out>)
+    at /home/tianq/zookeeper/src/c/tests/TestClient.cc:440
+#3  0x00000000004566f1 in free_completions (zh=0x22582c0, callCompletion=1, reason=-116)
+    at /home/tianq/zookeeper/src/c/src/zookeeper.c:1200
+#4  0x000000000045aa4c in zookeeper_close (zh=0x22582c0)
+    at /home/tianq/zookeeper/src/c/src/zookeeper.c:2496
+#5  0x000000000040d7ef in watchCtx::~watchCtx (this=0x7fff9b93cc90, __in_chrg=<value optimized out>)
+    at /home/tianq/zookeeper/src/c/tests/TestClientRetry.cc:115
+#6  0x000000000043916a in Zookeeper_simpleSystem::testAuth (this=<value optimized out>)
+    at /home/tianq/zookeeper/src/c/tests/TestClient.cc:649
+#7  0x000000334ee24d3a in CppUnit::TestCaseMethodFunctor::operator()() const ()
+   from /usr/lib64/libcppunit-1.12.so.1
+#8  0x000000334ee1a064 in CppUnit::DefaultProtector::protect(CppUnit::Functor const&, CppUnit::ProtectorContext const&) () from /usr/lib64/libcppunit-1.12.so.1
+#9  0x000000334ee21647 in CppUnit::ProtectorChain::protect(CppUnit::Functor const&, CppUnit::ProtectorContext const&) () from /usr/lib64/libcppunit-1.12.so.1
+#10 0x000000334ee2a854 in CppUnit::TestResult::protect(CppUnit::Functor const&, CppUnit::Test*, std::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) ()
+   from /usr/lib64/libcppunit-1.12.so.1
+#11 0x000000334ee24a18 in CppUnit::TestCase::run(CppUnit::TestResult*) ()
+   from /usr/lib64/libcppunit-1.12.so.1:
+{quote}
+
+Regarding callback voidCompletion, there are 2 possible code paths:
+a)zookeeper_process. this is the expected call in this test. "Processing AUTH_XID" will be logged after the processing, if debug is on.
+b)zookeeper_close->process_completions. when we close connection.
+
+
+in this case we hit the 2nd code path, when we leave testAuth and destruct watchCtx object.
+however, that is not the first failure.  the real problem is actually this line:
+
+{code}
+        // auth as pat, create /tauth1, close session
+        rc = zoo_add_auth(zk, "digest", "pat:passwd", 10, voidCompletion,
+                          (void*)ZOK);
+        CPPUNIT_ASSERT_EQUAL((int) ZOK, rc); 
+        waitForVoidCompletion(3); //wait for 3 seconds, then decrement count anyway.
+        CPPUNIT_ASSERT(count == 0);  //<--- the count is -1, the assert fails and throw exception, cppunit try/catch triggered object destructor, which triggers zookeeper_close code path and the callback.
+{code}
+
+the related code of cppunit:
+
+{code}
+ #define CPPUNIT_ASSERT(condition)                                                 \
+  ( CPPUNIT_NS::Asserter::failIf( !(condition),                                   \
+                                 CPPUNIT_NS::Message( "assertion failed",         \
+                                                      "Expression: " #condition), \
+                                 CPPUNIT_SOURCELINE() ) )
+
+void
+Asserter::failIf( bool shouldFail,
+                  const Message &message,
+                  const SourceLine &sourceLine )
+{
+  if ( shouldFail )
+    fail( message, sourceLine );
+}
+
+void
+Asserter::fail( const Message &message,
+                const SourceLine &sourceLine )
+{
+  throw Exception( message, sourceLine );
+}                                 
+
+//exception should be caught here
+
+bool
+DefaultProtector::protect( const Functor &functor,
+                           const ProtectorContext &context )
+{
+  try
+  {
+    return functor(); //call the Testcase function
+  }
+  catch ( Exception &failure )
+  {
+    reportFailure( context, failure );
+  }
+  catch ( std::exception &e )
+  {
+    std::string shortDescription( "uncaught exception of type " );
+#if CPPUNIT_USE_TYPEINFO_NAME
+    shortDescription += TypeInfoHelper::getClassName( typeid(e) );
+#else
+    shortDescription += "std::exception (or derived).";
+#endif
+    Message message( shortDescription, e.what() );
+    reportError( context, message );
+  }
+  catch ( ... )
+  {
+    reportError( context,
+                 Message( "uncaught exception of unknown type") );
+  }
+
+  return false;
+}
+
+{code}
+
+
+in short it is a typical problem of rule 8, "Effective C++"
+
+
+
+
+
+
+
+, the proposed fix:
+1)do not call cppunit assert in callback function, to avoid raising exception in destructor
+2)using volatile for synchronization is not correct. see http://en.wikipedia.org/wiki/Volatile_variable. using built-in AtomicInt instead.
+3)increase the timeout a bit.
+
+with the new code, if timeout is not long enough, it will report line 547 correctly as below:
+{code}
+     [exec] /home/tianq/zookeeper/src/c/tests/TestClient.cc:547: Assertion: assertion failed [Expression: count.get() == 0]
+     [exec] Failures !!!
+     [exec] Run: 59   Failure total: 1   Failures: 1   Errors: 0
+     [exec] make: *** [run-check] Error 1
+
+{code}
+, I also hit this issue, Qiang's patch works for me.
+
+[~phunt_impala_99b5]  Could you or someone else review this patch?]

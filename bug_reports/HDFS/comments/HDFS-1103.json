@@ -1,0 +1,53 @@
+[Here's a test case that I forward-ported from HDFS-142 that shows this issue., Haven't thought it through entirely, but I think this could be fixed something like this:
+
+- add a field lastChecksumChunkCorrupt to ReplicaWaitingToBeRecovered, ReplicaUnderRecovery, and ReplicaRecoveryInfo
+- rather than using validateIntegrity to set a shortened block length in ReplicaWaitingToBeRecovered, set the lastChecksumChunkCorrupt flag
+- in DataNode.recoverBlock, use the following logic:
+-- If all of the recovery candidates have corrupt last chunks, truncate all of them like we're doing now
+-- If only some of the recovery candidates have corrupt last chunks, don't allow them to participate in recovery, This issue is somewhat similar to HDFS-1057. The underlying problem for both issues is that the last checksum chunk of a file does not atomically move from valid state to valid state, but becomes momentarily invalid during any partial chunk sync., I think this may be a blocker if proper sync is a blocking feature. The testAppendSyncChecksum tests in HDFS-1139 also display a very similar problem where synced data gets truncated, not entirely certain if it's exactly the same issue., This is definitely the same issue -- I remember now that I opened this issue before when I had started forward-porting those same tests :)
+
+I'm not 100% sure what the right recourse is - should we in fact always recover the longest valid replica for RWR/RUR cases, even if it means a lower replication count?, I worked on this a bit, and think we have a few options:
+
+1) Assume that corruption of the last checksum chunk always represents an invalid checksum and possibly-truncated data, but the bytes themselves are OK in the data file.
+
+In this case, we can use the following algorithm:
+- For each replica, run validateIntegrity to determine the length of bytes that fit the checksum
+- Determine the maximum valid length across all replicas
+- For any replica that has at least that number of bytes on disk (regardless of validity), include it in the synchronization
+
+2) Assume that chunks that aren't validated are corrupt in either the checksum or the data
+
+In this case, we take the max of the valid lengths, and only include blocks in synchronization when they have at least this many valid bytes. Thus, in the case where we have two replicas, one of which is potentially corrupt at the end, we'd end up only keeping the valid one.
+
+We can still lose flushed data in the case of multiple datanode failure, if both of the DNs end up with corrupt last chunks (unlikely but possible)
+
+3) Ignore checksums completely for the last chunk
+
+We can entirely throw away the checksums on the last chunk, and augment ReplicaRecoveryInfo to actually include a BytesWritable of the last data chunk (only 512 bytes by default).
+
+During the recovery operation, we can simply find the common prefix of data across all of the replicas, and synchronize to that length (recomputing checksum on each node).
+
+Since we're only talking about one checksum chunk, and these are known to be small, I don't think it's problematic to shove the bytes in an RPC.
+
+
+Thoughts?, Example scenario that would cause this issue:
+
+1. Client A writing to DN A -> DN B -> DN C (the client and the first DN are on the same machine)
+2. Machine A crashes (so both DN and client die at the same time)
+[last chunk of the replica on A is left corrupt because it died mid-write, or journal got lost, whatever]
+3. Machine A reboots, DN comes back up
+4. validateIntegrity truncates the block to the previous checksum chunk boundary
+5. NN lease expires, and NN triggers recovery
+6. len(DN A) < len(others) but with same generation stamp, so synced data is lost during recovery
+
+Even without the inconsistent checksum at the end of the file, we're likely to lose data in this case since we don't actually ever call fsync(). So the replica on DN A is likely to be significantly truncated compared to the replicas on B and C., I do not think that this is the case in 0.21 & the trunk. In our lease recovery algorithm in 0.21, If there are 2 RBWs and 1 RWR, 1 RWR is excluded from the lease recovery. In the scenario that you described, RBW B and RBW C's GS is bumped and the length of recovered two replicas is truncated to MIN( len(B), len(C))., Ah, good point Hairong. I think, though, we should still consider taking MAX(validated lengths of RWR replicas) to avoid the problem demonstrated by the attached test case. What do you think? Is the test case too unrealistic?, in the case when genstamps are the same, we can consider taking MAX(len(B), len(C)), that should solve the problem, isn't it?, In the 0.21 append design, if every BlockReceiver could make sure that its buffered packet gets flushed to the disk before it exits on error, then I do not think the problem you described will happen. Probably the code does not enforce it now. I do not think that we should use the max of RBWs. In 0.21, there is no concept of validate length for RBWs. , We should also exclude those RBWs that were failed on disk errors from lease recovery if there are good ones available., "I do not think that this is the case in 0.21 & the trunk. In our lease recovery algorithm in 0.21, If there are 2 RBWs and 1 RWR, 1 RWR is excluded from the lease recovery. In the scenario that you described, RBW B and RBW C's GS is bumped and the length of recovered two replicas is truncated to MIN( len(B), len(C)). "
+
+Hairong, can you explain to me that why RBW B and RBW C's GS are bumped up.
+Is that because of the lease recovery protocol?
+But from my understanding, from Todd description, NN lease recovery is trigger
+after Machine A report..., RBW B and RBW C's GS gets bumped up by pipeline recovery since the client detects that A in pipeline is down.
+Even if the client fails before pipeline recovery starts, the lease recovery does not takes RWR into consideration when there is RBW or finalized replica available.
+, Thanks for explaining, Hairong.
+One more clarification,
+If there are only RWR, then those RWR replica should 
+take part in lease recovery, right?, As explained by Hairong, this is invalid.  Please feel free to reopen if you think it is not.  Resolving.]

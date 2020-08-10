@@ -1,0 +1,204 @@
+[Another problem we have seen is that container-executor still has code that cherry-picks the PID of the launch shell from the docker container and writes that into the {{/sys/fs/cgroup/cpu/hadoop-yarn/container_id/tasks}} file, effectively moving it from {{/sys/fs/cgroup/cpu/hadoop-yarn/container_id/docker_container_id}} to {{/sys/fs/cgroup/cpu/hadoop-yarn/container_id}}.   So you end up with one process out of the container in the {{container_id}} cgroup, and the rest in the {{container_id/docker_container_id}} cgroup.
+
+Since we are passing the {{--cgroup-parent}} to docker, there is no need to manually write the pid - we can just remove the code that does this.  , One proposal to fix the leaking cgroups is to have docker put its containers directly under the {{yarn.nodemanager.linux-container-executor.cgroups.hierarchy}} directory. For example, instead of using {{cgroup-parent=/hadoop-yarn/container_id-}}, we use {{cgroup-parent=/hadoop-yarn}}. This does cause docker to create a {{hadoop-yarn}} cgroup under each resource type, and it does not clean those up, but that is just one unused cgroup per resource type vs hundreds of thousands.
+
+This can be done by just passing an empty string to DockerLinuxContainerRuntime.addCGroupParentIfRequired(), or otherwise changing it to ignore the containerIdStr. Doing this and removing the code that cherry-picks the PID in container-executor does work, but the NM still creates the per-container cgroups as well - they're just not used. The other issue with this approach is that the cpu.shares is still updated (to reflect the requested vcores allotment) in the per-container cgroup, so it is ignored. In our code, we addressed this by passing the cpu.shares value in the docker run --cpu-shares command line argument.
+
+I'm still thinking about the best way to address this. Currently most of the resourceHandler processing happens at the linuxContainerExecutor level. But there is clearly a difference in how cgroups need to be handled for docker vs linux cases. In the docker case, we should arguably use docker command line arguments instead of directly setting up cgroups.
+
+One option would be to provide a runtime interface useResourceHandlers() which for Docker would return false. We could then disable all of the resource handling processing that happens in the container executor, and add the necessary interfaces to handle cgroup parameters to the docker runtime.
+
+Another option would be to move the resource handler processing down into the runtime. This is a bigger change, but may be cleaner. The docker runtime may still just ignore those handlers, but that detail would be hidden at the container executor level.
+
+cc:, [~ebadger] [~jlowe] [~eyang] [~shanekumpf@gmail.com] [~billie.rinaldi]
+
+ , +1 for the proposal to fix the cgroup leak by having docker place its cgroup at the same level YARN is creating its containers.  That preserves the semantic hierarchy of the hadoop-yarn cgroup in case administrators are explicitly setting controls on the entire YARN container hierarchy so it plays nice with other systems on the node.  It also preserves the cgroup sharing semantics between nodes performing a mix of container launches where some are docker and others are native.
+
+Now the hard part is figuring out the cleanest way to have the NM create cgroups in the native case and avoid creating the cgroup in the docker case.  This implies the container runtime needs some say in how cgroups are handled if it isn't delegated to the container runtime completely.  One potential issue with a useResourceHandlers() approach is if the NM wants to manipulate cgroup settings on a live container.  Having a runtime that says it doesn't use resource handlers implies that can't be done by that runtime, but it can be supported by the docker runtime.
+
+We should consider breaking this up into two JIRAs if it proves difficult to hash through the design.  It's a relatively small change to move the docker containers under the top-level YARN cgroup hierarchy to fixes the cgroup leaks, with the side-effect that the NM continues to create and cleanup unused cgroups per docker container launched.  We could follow up that change with another JIRA to resolve the new design for the cgroup / container runtime interaction so those empty cgroups are avoided in the docker case.  If we can hash it out quickly in one JIRA that's great, but I want to make sure the leak problem doesn't linger while we work through the architecture of cgroups and container runtimes., [~jlowe] thanks for the comment.
+{quote}We should consider breaking this up into two JIRAs if it proves difficult to hash through the design. It's a relatively small change to move the docker containers under the top-level YARN cgroup hierarchy to fixes the cgroup leaks, with the side-effect that the NM continues to create and cleanup unused cgroups per docker container launched. We could follow up that change with another JIRA to resolve the new design for the cgroup / container runtime interaction so those empty cgroups are avoided in the docker case. If we can hash it out quickly in one JIRA that's great, but I want to make sure the leak problem doesn't linger while we work through the architecture of cgroups and container runtimes.
+ {quote}
+
+The main issue with doing this quick fix for the cgroups leak is that any cgroup parameters written by the various resource handlers will be ignored in the docker case because they will be written to the unused container cgroup.  Internally, we added a cpu-shares option to docker to handle the cpu resource because that is the only one we're using, but for community I think we need to address them all.
+Is it worth breaking cgroups parameters temporarily for docker to fix the leak?
+, bq. Is it worth breaking cgroups parameters temporarily for docker to fix the leak?
+
+No, I was under the impression we would modify the docker runtime to port the settings over for the container launch as we did internally for CPU shares.  However you're correct that anything calling ResourceHandler#updateContainer won't have an effect until this is rightfully fixed, so we should probably address this all at once to avoid regressions elsewhere when fixing the leak., I am wondering if this approach would break the docker launching docker use case. Currently if you're launching a new docker container from an existing docker container, you can have the new container use the same cgroup as the first container (e.g. /hadoop-yarn/${CONTAINER_ID}), but if there weren't a unique cgroup parent for the container you wouldn't be able to do that. Unless there's a way to find out the docker container id from inside the container?, {quote}I am wondering if this approach would break the docker launching docker use case. Currently if you're launching a new docker container from an existing docker container, you can have the new container use the same cgroup as the first container (e.g. /hadoop-yarn/${CONTAINER_ID}), but if there weren't a unique cgroup parent for the container you wouldn't be able to do that. Unless there's a way to find out the docker container id from inside the container?
+{quote}
+ 
+
+Thanks [~billie.rinaldi]. Yes I think this use-case would break as you suggest.
+{quote}One potential issue with a useResourceHandlers() approach is if the NM wants to manipulate cgroup settings on a live container. Having a runtime that says it doesn't use resource handlers implies that can't be done by that runtime, but it can be supported by the docker runtime
+{quote}
+Agreed [~jlowe].  I no longer think useResourceHandlers() is a good approach
+
+I don't have a full solution in mind yet, but one question is whether we should continue using the per-container cgroup as the cgroup parent for docker.  The main advantage to maintaining it is that there is a lot of code that already depends on it.  All existing resource handlers just work with this setup.  The disadvantage is that it makes fixing the leak harder because docker is creating hierarchies under the unused resource types (cpuset, hugetlb, etc...) and it creates them as root making it harder for the NM to remove them.
+
+If we use the top-level (hadoop-yarn) as the cgroup parent, then docker cleans everything up pretty nicely (although it still leaks the top-level hadoop-yarn cgroup for the unused-by-NM resources.  But it breaks the case [~billie.rinaldi] mentioned above, and requires that we convert all existing resource handlers to use docker command options in the docker case.
+
+One thought I had is adding a dockerCleaupResourceHandler that we tack on to the end of the resourceHandlerChain - it's only job would be to clean up the extra container cgroups that docker creates., I have been experimenting with the following incomplete approach:
+ * CGroupsHandler
+ ** Add missing controllers to the list of supported controllers
+ ** Add initializeAllCGroupControllers()
+ *** Initializes all of the cgroups controllers that were not already initialized by a ResourceHandler - this is mainly creating the hierarchy (hadoop-yarn) cgroup or verifying that it is there and writable.
+ ** Add CreateCGroupAllControllers(containerId)
+ *** Creates the containerId cgroup under all cgroup controllers
+ ** Add DeleteCGroupAllControllers(containerId)
+ *** Deletes the containerId cgroup under all cgroup controllers
+ *  ResourceHandlerModule
+ ** Add wrappers to call the above methods.
+ * LinuxContainerExecutor
+ ** Add calls to above methods if the runtime is Docker (would probably be better to move these to the runtime)
+
+So far I have been testing with pre-mounted cgroup hierarchies.  That is, I manually created the hadoop-yarn cgroup under each controller.
+
+I've run into several problems experimenting with this approach on RHEL 7:
+ * The hadoop-yarn cgroup under the following controllers is being deleted by the system (when I let it sit idle for a while): blkio, devices, memory, pids
+
+ ** I got around this for now by just not adding pids to the list and skipping the others in the new methods.  We are not leaking cgroups for these controllers.
+ * I am still leaking cgroups under /sys/fs/cgroup/systemd
+ ** Even if I add "systemd" as one of the supported controllers, our mount-tab parsing code does not find it because it's not really a controller.
+ * This feels pretty hacky - it might be better to just add a new dockerCGroupResourceHandler (as I mentioned above) to do effectively the same thing - we'd have to supply the list of controllers in a config property and deal with systemd.   The way things are right now we would still have to add these to the list of supported controllers, because most of the interfaces are based on a controller enum.  But even moving it to a separateResourceHandler still seems hacky.
+ * I haven't tested the mount-cgroup path yet, but I believe we would need to configure all of the controllers that we need to mount in container-executor.cfg.
+
+The main advantage to something along these lines is that it preserves the existing cgroups hiearchy, and no additional code is needed to deal with cgroup parameters.   The other advantage is that we are pre-creating the hadoop-yarn cgroups with the correct owner/permissions - docker creates them as root.
+
+At this point, I'm not sure if I should proceed with this approach and I'm looking for opinions.
+
+The options I am considering are:
+ # The approach I've been experimenting with, cleaned up
+ # The minimal, just-fix-the-leak approach, which would be to add a cleanupCGroups() method to the runtime.
+ ** We call it after calling the ResourceHandlers.postComplete() in LCE.
+ ** Docker would be the only runtime that implements it.
+ ** We'd need to add a container-executor function to handle it.
+ ** It could search for the containerId cgroup under all mounted cgroups and delete any that it finds
+
+ *** Would not delete any that still have processes
+ *** Security concerns?
+ # The let-docker-be-docker approach
+ ** This is the change-the-cgroup-parent approach.  Instead of passing /hadoop-yarn/containerId, we would just use /hadoop-yarn and let docker create its dockerContainerId cgroups under there.
+ ** Solves the leak by just letting docker handle it - no intermediate containerId cgroups are created, so they don't need to be deleted by NM.
+ ** To do this, I think we'd need to change every Cgroups ResourceHandler to do something different for Docker.  The main ones are for blkio and cpu.
+ *** Don't create the containerId cgroups
+ *** Don't modify cgroup params directly.
+ *** Return the /hadoop-yarn/tasks path for the ADD_PID_TO_CGROUP operation so we set the cgroup parent correctly.
+ *** Would likely need to add new PriviledgedOps for each cgroup parameter to pass them through (these are returned by ResourceHandler.preStart()).
+ *** Add code to add each new cgroup parameter to docker run.
+ *** Would need to support updating params via docker update command to support the ResourceHandler.updateContainer() method.
+ *** [~billie.rinaldi], I've thought a bit more about the docker in docker case, which we thought would be a problem with this approach.   I think it is solvable though - you can obtain the name of the docker cgroup from /proc/self/cgroup.  I don't know if this is workable for your use-case though?
+
+Comments?  Concerns?  Alternatives?
+
+cc:[~jlowe], [~ebadger], [~shanekumpf@gmail.com], [~billie.rinaldi], [~eyang], I am in favor of minimal fix at this time.  Let docker be docker seems to have possibility to introduce risk where container-executor usage is either unaccounted, or Kernel underflow occurs.  When cgroup is managed separately, there is a chance that YARN and Docker don't agree on actual usage.  (i.e. 2GB allocated to container, but container-executor used 5mb, and docker used 2GB.)  Miscalculated number can cause Kernel underflow.  If YARN uses a flat namespace like docker does, then it will be safe to let docker be docker.  In today's reality, there are people out there that don't have cgroup v2 in their kernel.  This means it is less likely to be a feasible option to do major change to yarn cgroup, although it would be a great option to have two years down the road to support cgroup v2., Thanks [~eyang]!  My main concern about the minimal fix is the security aspect, since we will need to add an option to container-executor to tell it to delete all cgroups with a particular name as root (since docker will create them as root).
+
+I think this is mitigated if we use the "cgroup" section of the container-exectutor.cfg to constrain it.  This is currently used to enable updating params, but I think it could be used for this as well.    It already defines the CGROUPS_ROOT (e.g., /sys/fs/cgroup), and the YARN_HIERARCHY (e.g, hadoop-yarn).  We could either add another config parameter to define the list of hierarchies to clean up (e.g, cpuset, freezer, hugetlb, etc...), or we can parse /proc/mounts to determine the full list.  I think it's safer to add the config parameter.
+
+I will start working on this version unless there are objections?, [~Jim_Brennan] {quote}
+I think this is mitigated if we use the "cgroup" section of the container-exectutor.cfg to constrain it.  This is currently used to enable updating params, but I think it could be used for this as well.    It already defines the CGROUPS_ROOT (e.g., /sys/fs/cgroup), and the YARN_HIERARCHY (e.g, hadoop-yarn).  We could either add another config parameter to define the list of hierarchies to clean up (e.g, cpuset, freezer, hugetlb, etc...), or we can parse /proc/mounts to determine the full list.  I think it's safer to add the config parameter.
+{quote}
+
+The proposal looks good.  As long as the default list can match docker's cgroup usage when docker is enabled instead of being empty list.  I think this solution can work., IMO I like the idea of actually dealing with this problem via proposal 1, but it seems like a much bigger effort that has many corner cases and realistically is going to require a whole new resource module controller. Therefore, I think we shouldn't let perfect get in the way of good and move forward with the more simple approach of removing the cgroups via the container-executor. I don't _like_ this solution, but I think it is a stopgap until we are able to really fix the underlying issues. , Putting up a patch for this.   Made this a docker-only change by adding a clean-docker-cgroups command to container-executor that is only valid when docker is enabled.  It is called from DockerLinuxContainerRuntime.handleContainerRemove(), which seems like the appropriate place.
+
+ , | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 24s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 18m  8s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  2s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 38s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 20s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m  4s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 24s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 20s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager: The patch generated 1 new + 10 unchanged - 0 fixed = 11 total (was 10) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 21s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 22s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 11s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  1m  8s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 68m 59s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:ba1ab08 |
+| JIRA Issue | YARN-8648 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12937524/YARN-8648.001.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux add37685e48d 4.4.0-133-generic #159-Ubuntu SMP Fri Aug 10 07:31:43 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 3e18b95 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/21706/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/21706/testReport/ |
+| Max. process+thread count | 399 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/21706/console |
+| Powered by | Apache Yetus 0.9.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Looks like this is ready for review.
+
+ , Thanks for the patch!
+
+Why was the postComplete call moved in reapContainer to before the container is removed via docker?  Shouldn't docker first remove its cgroups for the container before we remove ours?
+
+Is there a reason to separate removing docker cgroups from removing the docker container?  This seems like a natural extension to cleaning up after a container run by docker, and that's already covered by the reap command.  The patch would remain a docker-only change but without needing to modify the container-executor interface.
+
+Nit: PROC_MOUNT_PATH should be a macro (i.e.: #define) or lower-cased.  Similar for CGROUP_MOUNT.
+
+The snprintf result should be checked for truncation in addition to output errors (i.e.: result >= PATH_MAX means it was truncated) otherwise we formulate an incomplete path targeted for deletion if that somehow occurs.  Alternatively the code could use make_string or asprintf to allocate an appropriately sized buffer for each entry rather than trying to reuse a manually sized buffer.
+
+Is there any point in logging to the error file that a path we want to delete has already been deleted?  This seems like it will just be noise, especially if systemd or something else is periodically cleaning some of these empty cgroups.
+
+Related to the previous comment, the rmdir result should be checked for ENOENT and treat that as success.
+
+Nit: I think lineptr should be freed in the cleanup label in case someone later adds a fatal error that jumps to cleanup., [~jlowe] thanks for the review!
+{quote}Why was the postComplete call moved in reapContainer to before the container is removed via docker? Shouldn't docker first remove its cgroups for the container before we remove ours?
+{quote}
+I was trying to preserve the order of operations. Normally postComplete is called immediately after the launchContainer() returns, and then reapContainer() is called as part of cleanupContainer() processing.
+ So the resource handlers usually get a chance to clean up cgroups before we cleanup the container. If we do the docker cleanup first, it will delete the cgroups before the resource handler postComplete processing - it doesn't know which ones are handled by resource handlers, so it just deletes them all. Since they both are really just deleting the cgroups, I don't think the order matters that much, so I will move it back if you think that is better.
+{quote}Is there a reason to separate removing docker cgroups from removing the docker container? This seems like a natural extension to cleaning up after a container run by docker, and that's already covered by the reap command. The patch would remain a docker-only change but without needing to modify the container-executor interface.
+{quote}
+It is currently being done as part of the reap processing, but as a separate privileged operation. We definitely could just add this processing to the remove-docker-container processing in container-executor, but it would require adding the yarn-hierarchy as an additional argument for the DockerRmCommand. This would also require changing the DockerContainerDeletionTask() to store the yarn-hierarchy String along with the ContainerId. Despite the additional container-executor interface, I think the current approach is less code/simpler, but I'm definitely willing to rework it if you think it is a better solution.
+{quote}Nit: PROC_MOUNT_PATH should be a macro (i.e.: #define) or lower-cased. Similar for CGROUP_MOUNT.
+{quote}
+I will fix these.
+{quote}The snprintf result should be checked for truncation in addition to output errors (i.e.: result >= PATH_MAX means it was truncated) otherwise we formulate an incomplete path targeted for deletion if that somehow occurs. Alternatively the code could use make_string or asprintf to allocate an appropriately sized buffer for each entry rather than trying to reuse a manually sized buffer.
+{quote}
+I will fix this. I forgot about make_string().
+{quote}Is there any point in logging to the error file that a path we want to delete has already been deleted? This seems like it will just be noise, especially if systemd or something else is periodically cleaning some of these empty cgroups.
+{quote}
+I'll remove it - was nice while debugging, but not needed.
+{quote}Related to the previous comment, the rmdir result should be checked for ENOENT and treat that as success.
+{quote}
+I explicitly check that the directory exists before calling rmdir, so I'm not sure this is necessary, but I can add it anyway.
+{quote}Nit: I think lineptr should be freed in the cleanup label in case someone later adds a fatal error that jumps to cleanup.
+{quote}
+Will do.
+
+Thanks again for the review!, {quote}
+I explicitly check that the directory exists before calling rmdir, so I'm not sure this is necessary, but I can add it anyway.
+{quote}
+
+There is a small window where it could be removed between the exist check and the rmdir, so it is necessary.   I'm tempted to just remove the dir_exists() check.
+
+]

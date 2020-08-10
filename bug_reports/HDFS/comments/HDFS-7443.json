@@ -1,0 +1,212 @@
+[This is the first error seen.
+
+{noformat}
+ERROR datanode.DataNode: Initialization failed for Block pool <registering> (Datanode Uuid unassigned)
+ service to some.host:8020 EEXIST: File exists
+{noformat}
+
+This was after successful upgrade of several volumes. Since the hard link summary was not printed and it was multiple seconds after starting upgrade of this volume (did not fail right away), the error must have come from {{DataStorage.linkBlocks()}} when it was checking the result with {{Futures.get()}}.
+
+Then it was retried and failed the same way.
+
+{noformat}
+INFO common.Storage: Analyzing storage directories for bpid BP-xxxx
+INFO common.Storage: Recovering storage directory /a/b/hadoop/var/hdfs/data/current/BP-xxxx
+ from previous upgrade
+INFO common.Storage: Upgrading block pool storage directory /a/b/hadoop/var/hdfs/data/current/BP-xxxx
+   old LV = -55; old CTime = 12345678.
+   new LV = -56; new CTime = 45678989
+ERROR datanode.DataNode: Initialization failed for Block pool <registering> (Datanode Uuid unassigned)
+ service to some.host:8020 EEXIST: File exists
+{noformat}
+
+This indicates {{Storage.analyzeStorage()}} correctly returning {{RECOVER_UPGRADE}} and the partial upgrade is undone before retrying. This repeated hundreds of times before termination of datanode, which logged the stack trace.
+
+{noformat}
+FATAL datanode.DataNode: Initialization failed for Block pool <registering> (Datanode Uuid unassigned)
+ service to some.host:8020. Exiting. 
+java.io.IOException: EEXIST: File exists
+        at sun.reflect.GeneratedConstructorAccessor18.newInstance(Unknown Source)
+        at sun.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+        at java.lang.reflect.Constructor.newInstance(Constructor.java:525)
+        at com.google.common.util.concurrent.Futures.newFromConstructor(Futures.java:1258)
+        at com.google.common.util.concurrent.Futures.newWithCause(Futures.java:1218)
+        at com.google.common.util.concurrent.Futures.wrapAndThrowExceptionOrError(Futures.java:1131)
+        at com.google.common.util.concurrent.Futures.get(Futures.java:1048)
+        at org.apache.hadoop.hdfs.server.datanode.DataStorage.linkBlocks(DataStorage.java:999)
+        at org.apache.hadoop.hdfs.server.datanode.BlockPoolSliceStorage.linkAllBlocks(BlockPoolSliceStorage.java:594)
+        at org.apache.hadoop.hdfs.server.datanode.BlockPoolSliceStorage.doUpgrade(BlockPoolSliceStorage.java:403)
+        at org.apache.hadoop.hdfs.server.datanode.BlockPoolSliceStorage.doTransition(BlockPoolSliceStorage.java:337)
+        at org.apache.hadoop.hdfs.server.datanode.BlockPoolSliceStorage.recoverTransitionRead(BlockPoolSliceStorage.java:197)
+        at org.apache.hadoop.hdfs.server.datanode.DataStorage.recoverTransitionRead(DataStorage.java:438)
+        at org.apache.hadoop.hdfs.server.datanode.DataNode.initStorage(DataNode.java:1312)
+        at org.apache.hadoop.hdfs.server.datanode.DataNode.initBlockPool(DataNode.java:1277)
+        at org.apache.hadoop.hdfs.server.datanode.BPOfferService.verifyAndSetNamespaceInfo(BPOfferService.java:314)
+        at org.apache.hadoop.hdfs.server.datanode.BPServiceActor.connectToNNAndHandshake(BPServiceActor.java:221)
+        at org.apache.hadoop.hdfs.server.datanode.BPServiceActor.run(BPServiceActor.java:829)
+        at java.lang.Thread.run(Thread.java:722)
+Caused by: EEXIST: File exists
+        at org.apache.hadoop.io.nativeio.NativeIO.link0(Native Method)
+        at org.apache.hadoop.io.nativeio.NativeIO.link(NativeIO.java:836)
+        at org.apache.hadoop.hdfs.server.datanode.DataStorage$2.call(DataStorage.java:991)
+        at org.apache.hadoop.hdfs.server.datanode.DataStorage$2.call(DataStorage.java:984)
+        at java.util.concurrent.FutureTask$Sync.innerRun(FutureTask.java:334)
+        at java.util.concurrent.FutureTask.run(FutureTask.java:166)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1145)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:615)
+        ... 1 more
+{noformat}
+
+At this point, {{previous.tmp}} contained the new directory structure with blocks and meta files placed in the ID-based directory. Some orphaned meta and block files were observed.  Restarting datanode does not reproduce the issue, but I suspect data loss based on the missing files and the number of missing blocks., The {{EEXIST}} error and the modified {{previous.tmp}} seem related.  If we somehow tried to upgrade a directory that was already half-upgraded, {{EEXIST}} is exactly what we'd expect to see., It appears that the old software could sometimes create a duplicate copy of the same block in two different {{subdir}} folders on the same volume.  In all the cases in which we've seen this, the block files were identical.  Two files, both for the same block id, in separate directories.  This appears to be a bug, since obviously we don't want to store the same block twice on the same volume.  This causes the {{EEXIST}} problem on upgrade, since the new block layout only has one place where each block ID can go.  Unfortunately, the hardlink code doesn't print the name of the file which caused the problem, making diagnosis more difficult than it should be.
+
+One easy way around this is to check for duplicate block IDs on each volume before upgrading, and manually remove the duplicates.
+
+We should also consider logging an error message and continuing the upgrade process when we encounter this.
+
+[~kihwal], I'm not sure why, in your case, the DataNode retried the hard link process multiple times.  I'm also not sure why you ended up with a jumbled {{previous.tmp}} directory.  When we reproduced this on CDH5.2, we did not have that problem, for whatever reason., This patch changes the upgrade path from non-blockid-based-layout to blockid-based layout so that it uses the jdk7 {{Files#createLink}} function, instead of our hand-rolled hardlink code.
+
+This avoids the dilemma of detecting EEXIST on all the various platforms that we hacked in support for in {{HardLink.java}}, such as Linux shell-based (no libhadoop.so case), cygwin, Windows native, and Linux JNI-based.  It might be possible to distinguish regular errors from EEXIST on all those platforms, but writing all that code would be a very big job.
+
+I did not remove or alter any other code in {{HardLink.java}} in this patch.  I think clearly we should think about refactoring that code to use jdk7 later, but that is a bigger change that is not as critical as this fix.  We also can't get rid of {{HardLink.java}} completely because we are unfortunately depending on reading the hard link count of files in a few places-- something jdk7 does not support.
+
+Another weird thing about the {{HardLink}} class is that all it actually contains is statistics information-- every important method is {{static}}.  So that's why we continue to use a {{HardLink}} instance in the upgrade code.   I think in the future, we should simply use the {{HardLink#Statistics}} class  directly, since the outer class provides no value (it has only static methods)., Oh yeah, and this patch changes {{hadoop-24-datanode-dir.tgz}} to have a duplicate block (present in multiple subdirectories in a volume), so that we are exercising the collision-handling pathway in {{TestDatanodeLayoutUpgrade}}., +1 pending Jenkins. Thanks for ensuring it's covered in testing., Actually I just had a thought. I assumed that the excess copies would be hard links to the same physical file, perhaps due to a bug in the earlier LDir code. If these are distinct physical files, then should we retain the one with the largest on-disk size?, When we observed this, they were not hard links, but separate copies.  They were identical (we ran a command-line checksum on them).  If possible, I would rather not start trying to pick the "best" one because I feel like 3x replication should ensure that we have redundancy in the system, and because the code would get a lot more complex.  Because we do the hardlinks in parallel, we would have to somehow accumulate the duplicates and deal with them at the end, once all worker threads had been joined., bq. because the code would get a lot more complex. Because we do the hardlinks in parallel, we would have to somehow accumulate the duplicates and deal with them at the end, once all worker threads had been joined.
+We wouldn't need all that. A length check on src and dst when we hit an exception should suffice right, depending on the result either discard src or overwrite dst? Anyway I think your patch is fine to go as it is., bq. We wouldn't need all that. A length check on src and dst when we hit an exception should suffice right, depending on the result either discard src or overwrite dst? Anyway I think your patch is fine to go as it is.
+
+The problem is, what happens if another thread comes along and starts modifying the replica while we're measuring the length.  I can come up with an interleaving like:
+
+thread #1 receives EEXIST from link()
+thread #2 receives EEXIST from link()
+thread #2 does stat() on block file
+thread #1 does stat() on block file
+thread #1 replaces block file because old copy was too short
+thread #2 replaces block file because old copy was too short
+
+Now, if thread #1's copy was actually longer than thread #2's, we aren't getting the longest replica after all.
+
+Hence my suggestion to move the questionable replicas to a special folder and process them after joining all threads.  Still doesn't solve the issue of replicas with different genstamps, either..., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12688142/HDFS-7443.001.patch
+  against trunk revision c4d9713.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestBootstrapStandbyWithQJM
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+                  org.apache.hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureToleration
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestRetryCacheWithHA
+                  org.apache.hadoop.fs.TestSymlinkHdfsFileContext
+
+                                      The following test timeouts occurred in hadoop-hdfs-project/hadoop-hdfs:
+
+org.apache.hadoop.hdfs.server.blockmanagement.TestDatanodeManager
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/9079//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/9079//artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9079//console
+
+This message is automatically generated., I added a test case where one duplicate block was shorter than the other, and one duplicate block had an older genstamp than the other.
+{code}
+cmccabe@keter:~> find | egrep 'blk_[0-9]*$' | awk -F '/' '{print $NF}' | sort | uniq -c | grep -v '      1'
+      2 blk_1073742010
+      2 blk_1073742407
+cmccabe@keter:~> find -name 'blk_1073742010*' -o -name 'blk_1073742407' | xargs -l ls -l
+-rw-r--r-- 1 cmccabe users 11 Dec 18 19:30 ./dfs/data/current/BP-1455098086-127.0.1.1-1404855087848/current/finalized/subdir6/blk_1073742010_1185.meta
+-rw-r--r-- 2 cmccabe users 512 Jul  8 14:34 ./dfs/data/current/BP-1455098086-127.0.1.1-1404855087848/current/finalized/subdir6/blk_1073742010
+-rw-r--r-- 1 cmccabe users 510 Dec 18 19:37 ./dfs/data/current/BP-1455098086-127.0.1.1-1404855087848/current/finalized/subdir60/blk_1073742407
+-rw-r--r-- 1 cmccabe users 512 Dec 18 19:36 ./dfs/data/current/BP-1455098086-127.0.1.1-1404855087848/current/finalized/subdir3/blk_1073742407
+-rw-r--r-- 2 cmccabe users 512 Jul  8 14:34 ./dfs/data/current/BP-1455098086-127.0.1.1-1404855087848/current/finalized/subdir53/blk_1073742010
+-rw-r--r-- 1 cmccabe users 11 Jul  8 14:34 ./dfs/data/current/BP-1455098086-127.0.1.1-1404855087848/current/finalized/subdir53/blk_1073742010_1186.meta
+{code}, this version is better because it doesn't rely on JDK7 (which means we can easily backport it to older releases), and handles short blocks and blocks with lower genstamps correctly, HDFS-6931 introduced a resolveDuplicateReplicas to handle the duplicated blk from diff volume, this jira is to handle the dup in the same volume, am i right?, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12688243/HDFS-7443.002.patch
+  against trunk revision 6635ccd.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureToleration
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestRetryCacheWithHA
+                  org.apache.hadoop.fs.TestSymlinkHdfsFileContext
+                  org.apache.hadoop.hdfs.server.namenode.TestCacheDirectives
+
+                                      The following test timeouts occurred in hadoop-hdfs-project/hadoop-hdfs:
+
+org.apache.hadoop.hdfs.server.blockmanagement.TestDatanodeManager
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/9091//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/9091//artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9091//console
+
+This message is automatically generated., bq. HDFS-6931 introduced a resolveDuplicateReplicas to handle the duplicated blk from diff volume, this jira is to handle the dup in the same volume, am i right?
+
+Right.  {{resolveDuplicateReplicas}} deals with multiple replicas on the same DataNode in different volumes.  The HDFS-7443 code is for the intra-datanode case.  Additionally, {{resolveDuplicateReplicas}} requires a {{VolumeMap}}, {{ReplicaMap}}, and other internal data structures.  We don't have any of those here, just a list of files to be symlinked.  The rules of resolution are the same, though.
+
+bq. Findbugs said: Exceptional return value of java.io.File.delete() ignored in org.apache.hadoop.hdfs.server.namenode.TransferFsImage.deleteTmpFiles(List)
+
+This findbugs warning is unrelated, as are the unit test failures, +1 for the v2 patch. Thanks for adding duplicate resolution., Thanks for the reviews.  I ran TestDatanodeManager, TestDataNodeVolumeFailureToleration, TestDatanodeLayoutUpgrade locally and they all passed.  The findbugs warning is about {{org.apache.hadoop.hdfs.server.namenode.TransferFsImage.deleteTmpFiles}}, which wasn't changed in this patch.  Committing.
+
+I will file a follow-up for converting the {{HardLink.java}} methods to jdk7 in Hadoop 2.7+, FAILURE: Integrated in Hadoop-trunk-Commit #6760 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/6760/])
+HDFS-7443. Datanode upgrade to BLOCKID_BASED_LAYOUT fails if duplicate block files are present in the same volume (cmccabe) (cmccabe: rev 8fa265a290792ff42635ff9b42416c634f88bdf3)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-24-datanode-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #47 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/47/])
+HDFS-7443. Datanode upgrade to BLOCKID_BASED_LAYOUT fails if duplicate block files are present in the same volume (cmccabe) (cmccabe: rev 8fa265a290792ff42635ff9b42416c634f88bdf3)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-24-datanode-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
+, SUCCESS: Integrated in Hadoop-Yarn-trunk #781 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/781/])
+HDFS-7443. Datanode upgrade to BLOCKID_BASED_LAYOUT fails if duplicate block files are present in the same volume (cmccabe) (cmccabe: rev 8fa265a290792ff42635ff9b42416c634f88bdf3)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-24-datanode-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #1979 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1979/])
+HDFS-7443. Datanode upgrade to BLOCKID_BASED_LAYOUT fails if duplicate block files are present in the same volume (cmccabe) (cmccabe: rev 8fa265a290792ff42635ff9b42416c634f88bdf3)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-24-datanode-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #44 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/44/])
+HDFS-7443. Datanode upgrade to BLOCKID_BASED_LAYOUT fails if duplicate block files are present in the same volume (cmccabe) (cmccabe: rev 8fa265a290792ff42635ff9b42416c634f88bdf3)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-24-datanode-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #48 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/48/])
+HDFS-7443. Datanode upgrade to BLOCKID_BASED_LAYOUT fails if duplicate block files are present in the same volume (cmccabe) (cmccabe: rev 8fa265a290792ff42635ff9b42416c634f88bdf3)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-24-datanode-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk #1998 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1998/])
+HDFS-7443. Datanode upgrade to BLOCKID_BASED_LAYOUT fails if duplicate block files are present in the same volume (cmccabe) (cmccabe: rev 8fa265a290792ff42635ff9b42416c634f88bdf3)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataStorage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-24-datanode-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+]

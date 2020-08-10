@@ -1,0 +1,463 @@
+[Here is the stack trace:
+{code}
+ Got exception: java.io.EOFException
+        at java.io.DataInputStream.readFully(DataInputStream.java:197)
+        at java.io.DataInputStream.readFully(DataInputStream.java:169)
+        at org.apache.hadoop.security.Credentials.readTokenStorageStream(Credentials.java:189)
+        at org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncher.setupTokens(AMLauncher.java:225)
+        at org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncher.createAMContainerLaunchContext(AMLauncher.java:196)
+        at org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncher.launch(AMLauncher.java:107)
+        at org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncher.run(AMLauncher.java:250)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1145)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:615)
+        at java.lang.Thread.run(Thread.java:745)
+{code}
+
+Since the launch context is corrupt all subsequent max app attempts fail as well . This is a non-deterministic Heisenbug that does not reproduce on job re-submission., googling turn out another report [1|http://mail-archives.apache.org/mod_mbox/hadoop-common-user/201410.mbox/%3CCAF=VmjG8W6hNi8C6B0UZfke7_9o8UBsMgfXAy_uNPMndpY=8yw@mail.gmail.com%3E], [2|http://www.brainleg.com/external/286352/java-io-eofexception-at-java-io-datainputstream-readfully-datainputstream-java-197-at-java-io-datainputstream-readfully-datainputstream-java-169-at-org-apache-hadoop-security-credentials-readtokenstoragestream-credentials-java-189-at-org-apache-hadoop]. , I am also encountering this same error.  The failures are pretty sporadic and I've never been able to reproduce it.  Resubmitting the failed job always works, however., I've also noticed that if multiple jobs are submitted at the same time and this error occurs, all the jobs will fail., Hi [~ajsquared], what type of jobs are you seeing this with? I think almost all failures for us are Scalding/Cascading jobs, which made me think that it has to do with their multithreaded job submission code., [~jira.shegalov] This is always with Scalding jobs., Is there a significant fraction of other type of jobs on your clusters ?, No, it's at least 95% Scalding jobs., Is this in a secure cluster or a non-secure one? Trying to see if we can corner the type of tokens involved.
+
+Also, is it possible to patch your clusters locally to have some debug logs in the ResourceManager?, I'm seeing this error on a non-secure cluster. , That is very interesting. In non-secure mode, strictly in YARN's purview, no tokens really flow from the client to the RM. May be we should look at Scalding/Cascading 's submission code to see if it injects some tokens in non-secure mode too?, Yeah, that definitely seems like its worth a look.  Is there anything specific I should look out for?, I feel I know what cause this issue.
+This issue most likely in the following code:
+{code}
+   Credentials credentials = new Credentials();
+    DataInputByteBuffer dibb = new DataInputByteBuffer();
+    if (container.getTokens() != null) {
+      // TODO: Don't do this kind of checks everywhere.
+      dibb.reset(container.getTokens());
+      credentials.readTokenStorageStream(dibb);
+    }
+{code}
+we didn't rewind the token after credentials.readTokenStorageStream(dibb),
+I checked the code in DataInputByteBuffer. It will move the position of ByteBuffer (container.getTokens) in DataInputByteBuffer.read.
+(HeapByteBuffer is used for container.getTokens).
+{code}
+    public int read(byte[] b, int off, int len) {
+      if (bidx >= buffers.length) {
+        return -1;
+      }
+      int cur = 0;
+      do {
+        int rem = Math.min(len, buffers[bidx].remaining());
+        buffers[bidx].get(b, off, rem);
+        cur += rem;
+        off += rem;
+        len -= rem;
+      } while (len > 0 && ++bidx < buffers.length);
+      pos += cur;
+      return cur;
+    }
+{code}
+So If exception happen in AMLauncher.setupTokens before the ByteBuffer changed in container.setTokens.
+Then the position of ByteBuffer of Tokens will be at the end and we will see this issue next time when we retry.
+So it think it will be good to add  container.getTokens().rewind() after credentials.readTokenStorageStream(dibb);.
+I will create a patch for this.
+, I find there is another possibility which can also cause this exception for none-secure one: the JobClient corrupted the tokens buffer.
+The RM code only check the tokens buffer in RMAppManager#submitApplication for secure one.
+{code}
+    if (UserGroupInformation.isSecurityEnabled()) {
+      try {
+        this.rmContext.getDelegationTokenRenewer().addApplicationAsync(appId,
+            parseCredentials(submissionContext),
+            submissionContext.getCancelTokensWhenComplete(),
+            application.getUser());
+      } catch (Exception e) {
+        LOG.warn("Unable to parse credentials.", e);
+        // Sending APP_REJECTED is fine, since we assume that the
+        // RMApp is in NEW state and thus we haven't yet informed the
+        // scheduler about the existence of the application
+        assert application.getState() == RMAppState.NEW;
+        this.rmContext.getDispatcher().getEventHandler()
+          .handle(new RMAppRejectedEvent(applicationId, e.getMessage()));
+        throw RPCUtil.getRemoteException(e);
+      }
+
+  protected Credentials parseCredentials(
+      ApplicationSubmissionContext application) throws IOException {
+    Credentials credentials = new Credentials();
+    DataInputByteBuffer dibb = new DataInputByteBuffer();
+    ByteBuffer tokens = application.getAMContainerSpec().getTokens();
+    if (tokens != null) {
+      dibb.reset(tokens);
+      credentials.readTokenStorageStream(dibb);
+      tokens.rewind();
+    }
+    return credentials;
+  }
+{code}
+I think we should do the same for none-secure one, so we can fail the application earlier to avoid confusion.
+
+Also I find out a cascading patch to fix the credentials corruption at the jobClient.
+https://github.com/Cascading/cascading/commit/45b33bb864172486ac43782a4d13329312d01c0e
+
+I will update the patch to check the  tokens buffer for for none-secure one in RMAppManager#submitApplication., Hi [~zxu], it's great that you make progress on this JIRA. Any chance you can capture the failure scenarios in some unit test so we can relate it better to the real failures we are seeing., Hi [~jira.shegalov],
+That is a very good suggestion. Yes, I will think about to write a test case for this failure.
+thanks zhihai, Great progress, [~zxu]! Your explanation sounds like this error should always happen. Do you know why we are only seeing it sporadically? Are there special conditions when this happens?, Hi [~vinodkv],
+Sporadic job failures are due to the cascading sharing the credentials between Jobs. Because the Credentials class is not thread-safe, if multiple jobs try to access the shared credentials, we will have the race condition, which will cause Sporadic job failures.
+The shared credentials is introduced in JobConf constructor: If we create a new job using JobConf from the old job, these two jobs will share the same credentials.
+{code}
+public JobConf(Configuration conf) { 
+super(conf); 
+if (conf instanceof JobConf) { 
+JobConf that = (JobConf)conf; 
+credentials = that.credentials; 
+} 
+checkAndWarnDeprecation(); 
+} 
+{code}
+
+The credential from JobConf will be passed to YARNRunner#submitJob which will call createApplicationSubmissionContext to configure Tokens in ContainerLaunchContext
+{code}
+    DataOutputBuffer dob = new DataOutputBuffer();
+    ts.writeTokenStorageToStream(dob);
+    ByteBuffer securityTokens  = ByteBuffer.wrap(dob.getData(), 0, dob.getLength());
+    ContainerLaunchContext amContainer =
+        ContainerLaunchContext.newInstance(localResources, environment,
+          vargsFinal, null, securityTokens, acls);
+{code}
+It looks like we have two other potential issues in JobConf and Credentials.
+I created MAPREDUCE-6269 and HADOOP-11667 for separate discussion., bq. Also I find out a cascading patch to fix the credentials corruption at the jobClient. https://github.com/Cascading/cascading/commit/45b33bb864172486ac43782a4d13329312d01c0e
+I scanned all reports collected over last months, and the current cluster logs. I can confirm all affected jobs were the ones that still had Cascading 2.5.4-based dependency. Thanks a lot for pointing it out [~zxu]!, Hi [~jira.shegalov], I am sorry I was busy last week. I just uploaded a new patch YARN-2893.001.patch, which has two test cases: one for app submission with valid token and the other one for app submission with invalid token. The patch will reject the app with invalid tokens. Could you review it?
+thanks
+, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12704616/YARN-2893.001.patch
+  against trunk revision bd0a9ba.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 5 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6962//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/6962//artifact/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6962//console
+
+This message is automatically generated., The find bugs warnings are not related to my change, they will be fixed at YARN-3341 and YARN-3355., Hi [~jianhe], Do you have time to review the patch YARN-2893.001.patch? since you are familiar with RMApp and DelegationToken stuff. thanks, The AMLauncher changes look like a possible fix though it does not have a matching unit test that demonstrates the root cause for this bug.
+
+The changes for RMAppManager#submitApplication seems to no longer return RMAppRejectedEvent for any exception in   getDelegationTokenRenewer().addApplicationAsync. Is that deliberate?, [~adhoot], thanks for the review. I added a test case for the  AMLauncher changes in the new patch YARN-2893.002.patch.
+The root cause for this bug is at job Client which submitted a bad token in ApplicationSubmissionContext.
+The changes for RMAppManager#submitApplication is to prevent this error earlier. So the user who submit the application knows the real cause of the issue.
+
+bq. The changes for RMAppManager#submitApplication seems to no longer return RMAppRejectedEvent for any exception in getDelegationTokenRenewer().addApplicationAsync. Is that deliberate?
+I checked the code for DelegationTokenRenewer#addApplicationAsync, I didn't find any exception which will be generated from addApplicationAsync.
+addApplicationAsync will launch a thread to run handleDTRenewerAppSubmitEvent, any exception from handleDTRenewerAppSubmitEvent will return RMAppRejectedEvent.
+{code}
+    private void handleDTRenewerAppSubmitEvent(
+        DelegationTokenRenewerAppSubmitEvent event) {
+      try {
+        // Setup tokens for renewal
+        DelegationTokenRenewer.this.handleAppSubmitEvent(event);
+        rmContext.getDispatcher().getEventHandler()
+            .handle(new RMAppEvent(event.getApplicationId(), RMAppEventType.START));
+      } catch (Throwable t) {
+        LOG.warn(
+            "Unable to add the application to the delegation token renewer.",
+            t);
+        // Sending APP_REJECTED is fine, since we assume that the
+        // RMApp is in NEW state and thus we havne't yet informed the
+        // Scheduler about the existence of the application
+        rmContext.getDispatcher().getEventHandler().handle(
+            new RMAppRejectedEvent(event.getApplicationId(), t.getMessage()));
+      }
+  }
+{code}
+This is why I only check the exception for parseCredentials.
+Also the original code only expected the exception from parseCredentials based on the exception message.
+{code}
+LOG.warn("Unable to parse credentials.", e);
+{code}, By the way, the new added test case in TestApplicationMasterLauncher will fail without the AMLauncher changes
+The following is sample failure message without the AMLauncher changes.
+{code}
+------------------------------------------------------
+ T E S T S
+-------------------------------------------------------
+Running org.apache.hadoop.yarn.server.resourcemanager.TestApplicationMasterLauncher
+Tests run: 3, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 12.838 sec <<< FAILURE! - in org.apache.hadoop.yarn.server.resourcemanager.TestApplicationMasterLauncher
+testSetupTokens(org.apache.hadoop.yarn.server.resourcemanager.TestApplicationMasterLauncher)  Time elapsed: 2.101 sec  <<< FAILURE!
+java.lang.AssertionError: EOFException should not happen.
+	at org.junit.Assert.fail(Assert.java:88)
+	at org.apache.hadoop.yarn.server.resourcemanager.TestApplicationMasterLauncher.testSetupTokens(TestApplicationMasterLauncher.java:278)
+{code}, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12707662/YARN-2893.002.patch
+  against trunk revision 47782cb.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager:
+
+                  org.apache.hadoop.yarn.server.resourcemanager.TestRMHA
+                  org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.TestFairScheduler
+                  org.apache.hadoop.yarn.server.resourcemanager.TestMoveApplication
+                  org.apache.hadoop.yarn.server.resourcemanager.webapp.TestRMWebappAuthentication
+                  org.apache.hadoop.yarn.server.resourcemanager.recovery.TestZKRMStateStore
+                  org.apache.hadoop.yarn.server.resourcemanager.TestRMRestart
+                  org.apache.hadoop.yarn.server.resourcemanager.TestRMAdminService
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/7118//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/7118//console
+
+This message is automatically generated., Thanks [~zxu] for the patch, and apologies for the delay. I skimmed over the patch, and it looks good overall.
+
+Can you keep your logic in {{RMAppManager#submitApplicationmove}} with parseCredentials but put it back under {{if (UserGroupInformation.isSecurityEnabled()) {}}, [~jira.shegalov], thanks for the review.
+I can put back catching the exception for {{if (UserGroupInformation.isSecurityEnabled()) {}}. I will keep the change to parseCredentials for Security not Enabled case, So we can reject an application with corrupted credentials for none-secure one. 
+Are you ok with it?, Hi [~jira.shegalov], I can catch the exception for all the code. 
+try {
+  Credentials credentials = parseCredentials(submissionContext);
+  if (UserGroupInformation.isSecurityEnabled()) {
+    this.rmContext.getDelegationTokenRenewer().addApplicationAsync(appId,
+            credentials,
+            submissionContext.getCancelTokensWhenComplete(),
+            application.getUser())
+  } else {
+    this.rmContext.getDispatcher().getEventHandler()
+        .handle(new RMAppEvent(applicationId, RMAppEventType.START));
+  }
+} catch (Exception e) {
+        LOG.warn("Unable to parse credentials.", e);
+        // Sending APP_REJECTED is fine, since we assume that the
+        // RMApp is in NEW state and thus we haven't yet informed the
+        // scheduler about the existence of the application
+        assert application.getState() == RMAppState.NEW;
+        this.rmContext.getDispatcher().getEventHandler()
+          .handle(new RMAppRejectedEvent(applicationId, e.getMessage()));
+        throw RPCUtil.getRemoteException(e);
+}
+{code}
+Are you ok with above change?
+I think it will be better to parseCredentials and catch the exception for Security not Enabled case, So we can find corrupted credentials from Client earlier., Hi [~jira.shegalov], It looks like the Credentials from client is not used by YARN in non-secure mode. Can we set the Tokens to null in non-secure mode? if we don't want to parseCredentials(reject an application with corrupted credentials) in non-secure mode.
+{code}
+submissionContext.getAMContainerSpec().setTokens(null);
+{code}
+
+For me, it is reasonable to check Credentials parameter in non-secure mode, because any parameter from Client should be valid and it is the Client's responsibility to maintain these parameters and Client can set the Tokens to null if Client doesn't want to pass any tokens to RM., Hi [~jianhe], Do you think any of my earlier suggestions are reasonable?, Hi [~zxu], for me personally it's easier to review if you simply make the change, and upload a new patch. The additional benefit is that we'll see hopefully if our assumptions are validated by unit tests., thanks [~jira.shegalov], yes, I uploaded a new patch YARN-2893.003.patch for review., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 38s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | javac |   7m 35s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 38s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   7m 40s | The applied patch generated  1  additional checkstyle issues. |
+| {color:green}+1{color} | install |   1m 41s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 16s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:green}+1{color} | yarn tests |  52m  1s | Tests passed in hadoop-yarn-server-resourcemanager. |
+| | |  95m 26s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12728096/YARN-2893.003.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / dcc5455 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/7497/artifact/patchprocess/checkstyle-result-diff.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/7497/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/7497/testReport/ |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7497/console |
+
+
+This message was automatically generated., Thanks for the 003 patch, [~zxu]! I agree that validating credentials in either case is a good idea. LGTM. Nits: can you take care of the 80-column violations in your test methods., [~jira.shegalov], thanks for the review. I uploaded a new patch YARN-2893.004.patch, which fixed all the 80-column violations in my test methods except import statements. I think it is ok for import statements to be more than 80-column. Please correct me if i am wrong., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  15m  6s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | javac |   7m 46s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 46s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 21s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   4m  4s | The applied patch generated  1  additional checkstyle issues. |
+| {color:green}+1{color} | install |   1m 32s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 13s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:red}-1{color} | yarn tests |  52m 36s | Tests failed in hadoop-yarn-server-resourcemanager. |
+| | |  93m  0s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRestart |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12728977/YARN-2893.004.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / c79e7f7 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/7530/artifact/patchprocess/checkstyle-result-diff.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/7530/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/7530/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf903.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7530/console |
+
+
+This message was automatically generated., (!) The patch artifact directory on has been removed! 
+This is a fatal error for test-patch.sh.  Aborting. 
+Jenkins (node H3) information at https://builds.apache.org/job/PreCommit-YARN-Build/7535/ may provide some hints., The TestAMRestart failure is not related to my change. YARN-2483 is for this test failure., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  17m 37s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | javac |   9m  6s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  11m 36s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 24s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   5m  9s | The applied patch generated  1  additional checkstyle issues. |
+| {color:green}+1{color} | install |   2m  0s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 40s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 34s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:red}-1{color} | yarn tests |  51m 53s | Tests failed in hadoop-yarn-server-resourcemanager. |
+| | | 100m  3s | |
+\\
+\\
+|| Reason || Tests ||
+| Timed out tests | org.apache.hadoop.yarn.server.resourcemanager.security.TestAMRMTokens |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12729253/YARN-2893.004.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 3dd6395 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/7544/artifact/patchprocess/checkstyle-result-diff.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/7544/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/7544/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf903.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7544/console |
+
+
+This message was automatically generated., Hi [~zxu], thanks for updating the patch. I believe the remaining checkstyle violation comes from double indentation in the catch block:
+{code}
++    } catch (Exception e) {
+         LOG.warn("Unable to parse credentials.", e);
+         // Sending APP_REJECTED is fine, since we assume that the
+         // RMApp is in NEW state and thus we haven't yet informed the
+         // scheduler about the existence of the application
+         assert application.getState() == RMAppState.NEW;
+{code}
+It will go away once you make it 2-space instead of 4-space indentation that arose because you moved code around.
+, thanks [~jira.shegalov], that is a good catch. I uploaded a new patch YARN-2893.005.patch, which fixed the double indentation checkstyle violation., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 45s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | javac |   7m 33s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 43s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   5m 32s | The applied patch generated  1  additional checkstyle issues. |
+| {color:green}+1{color} | install |   1m 34s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 16s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:red}-1{color} | yarn tests |  52m 35s | Tests failed in hadoop-yarn-server-resourcemanager. |
+| | |  93m 57s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestContainerAllocation |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12729414/YARN-2893.005.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / aa22450 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/7551/artifact/patchprocess/checkstyle-result-diff.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/7551/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/7551/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf904.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7551/console |
+
+
+This message was automatically generated., TestContainerAllocation failure is not related to my change, it is just fixed at YARN-3564.
+Also this checkstyle issue may be caused by the import statement:
+{code}
+import org.apache.hadoop.classification.InterfaceAudience.Private;
+{code}
+but this import statement doesn't look like an issue for me.
+I found similar checkstyle issue at MAPREDUCE-6339, which was caused by the import statement.
+Hi [~jira.shegalov], Do you want me to do the same experiment as MAPREDUCE-6339 to prove the import statement cause this checkstyle issue?, Thanks for updating the patch [~zxu]. I verified with HADOOP-11889 that ignores imports, that the long import line  is the only non-issue. +1 for 005, SUCCESS: Integrated in Hadoop-trunk-Commit #7716 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/7716/])
+YARN-2893. AMLaucher: sporadic job failures due to EOFException in readTokenStorageStream. (Zhihai Xu via gera) (gera: rev f8204e241d9271497defd4d42646fb89c61cefe3)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestApplicationMasterLauncher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestAppManager.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/amlauncher/AMLauncher.java
+, Thanks [~zxu] for contribution! Committed to trunk and branch-2., thanks [~adhoot] for the review and thanks [~jira.shegalov] for the review and committing the patch ! Greatly appreciated., FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #181 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/181/])
+YARN-2893. AMLaucher: sporadic job failures due to EOFException in readTokenStorageStream. (Zhihai Xu via gera) (gera: rev f8204e241d9271497defd4d42646fb89c61cefe3)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/amlauncher/AMLauncher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestApplicationMasterLauncher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestAppManager.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #915 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/915/])
+YARN-2893. AMLaucher: sporadic job failures due to EOFException in readTokenStorageStream. (Zhihai Xu via gera) (gera: rev f8204e241d9271497defd4d42646fb89c61cefe3)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestAppManager.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestApplicationMasterLauncher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/amlauncher/AMLauncher.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #172 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/172/])
+YARN-2893. AMLaucher: sporadic job failures due to EOFException in readTokenStorageStream. (Zhihai Xu via gera) (gera: rev f8204e241d9271497defd4d42646fb89c61cefe3)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestAppManager.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/amlauncher/AMLauncher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestApplicationMasterLauncher.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #2113 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2113/])
+YARN-2893. AMLaucher: sporadic job failures due to EOFException in readTokenStorageStream. (Zhihai Xu via gera) (gera: rev f8204e241d9271497defd4d42646fb89c61cefe3)
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestAppManager.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestApplicationMasterLauncher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/amlauncher/AMLauncher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #182 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/182/])
+YARN-2893. AMLaucher: sporadic job failures due to EOFException in readTokenStorageStream. (Zhihai Xu via gera) (gera: rev f8204e241d9271497defd4d42646fb89c61cefe3)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestApplicationMasterLauncher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/amlauncher/AMLauncher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestAppManager.java
+* hadoop-yarn-project/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk #2131 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2131/])
+YARN-2893. AMLaucher: sporadic job failures due to EOFException in readTokenStorageStream. (Zhihai Xu via gera) (gera: rev f8204e241d9271497defd4d42646fb89c61cefe3)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMAppManager.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestApplicationMasterLauncher.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/amlauncher/AMLauncher.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestAppManager.java
+]

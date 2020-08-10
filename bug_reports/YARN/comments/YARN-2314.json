@@ -1,0 +1,202 @@
+[The problem is that the cache doesn't try very hard to remove proxies when the cache is at or beyond the maximum configured size.  When adding a new proxy to the cache and it should remove an entry, it simply grabs the least-recently-used proxy and tries to close it.  If the entry is currently in use then an entry isn't immediately removed and that means we're running with a cache larger than configured.
+
+This can get far worse on a big cluster.  For example, if the least-recently-used proxy is currently performing a call that is stuck on socket connection retries, the LRU entry could take quite a while before it closes.  During that time each new proxy created will make the same attempt to close that proxy and fail to do so.  That means that the cache size is now N-1 larger than it should be when it finally does close where N is the number of proxies created while the LRU entry was busy.
+
+On a large cluster with thousands of nodes a proxy hanging on one node could allow the cache to have thousands of more proxies in it than configured.  Since each proxy is a thread, that's thousands of threads, and all those thread stacks can blow container limits on the AM (or address limits if it's a 32-bit AM)., While there is cache mismanagement going on as described above, a bigger issue is how this cache interacts with the ClientCache in the RPC layer and how Connection instances behave.  Despite this cache's intent to try to limit the number of connected NMs, calling stopProxy does *not* mean the connection and corresponding IPC client thread is removed.  Closing a proxy will only shutdown threads if there are *no* other instances of that protocol proxy currently open.  See ClientCache.stopClient for details.  Given that the whole point of the ContainerManagementProtocolProxy cache is to preserve at least one reference to the Client, the IPC Client stop method will never be called in practice and IPC client threads will never be explicitly torn down as a result of calling stopProxy.
+
+As for Connection instances within the IPC Client, outside of erroneous operation they will only shutdown if either they reach their idle timeout or are explicitly told to stop via Client.stop, and the latter will never be called in practice per above.  That means the number of IPC client threads lingering around is solely dictated by how fast we're connecting to new nodes and how long the IPC idle timeout is.  By default this timeout is 10 seconds, and an AM running a wide-spread large job on a large, idle cluster can easily allocate containers for and connect to all of the nodes in less than 10 seconds.  That means we cam still have thousands of IPC client threads despite ContainerManagementProtocolProxy's efforts to limit the number of connections.
+
+In simplest terms this is a regression of MAPREDUCE-3333.  That patch explicitly tuned the IPC timeout of ContainerManagement proxies to zero so they would be torn down as soon as we finished the first call.  I've verified that setting the IPC timeout to zero prevents the explosion of IPC client threads.  That's sort of a ham-fisted fix since it brings the whole point of the NM proxy cache into question.  We would be keeping the proxy objects around, but the connection to the NM would need to be re-established each time we reused it.  Not sure the cache would be worth much at that point.  If we want to explicitly manage the number of outstanding NM connections without forcing the connections to shutdown on each IPC call then I think we need help from the IPC layer itself.  As I mentioned above, I don't think there's an exposed mechanism to close an individual connection of an IPC Client.
+
+So to sum up, we can fix the cache management bugs described in the first comment, but that alone will not prevent thousands of IPC client threads from co-existing.  We either need to set the IPC timeout to 0 (which brings the utility of the NM proxy cache into question) or change the IPC layer to allow us to close individual Client connections., Hi @, Hi [~jlowe], I'm interested in looking into the cache overflow side of this issue (Sorry about the last comment that I mistyped my keyboard and sent it out...). After checking your comments and the code, I think a quick fix would be, when adding a new proxy into the cache and the cache is full, instead of only relying on (and trying to delete) the least recently used item, the cache should keep checking through the whole list to find one item that is not being used by a RPC, and replace it at that place. There is one scenario that this may not actually help, and that would be the whole list of cached items are used by RPCs. I would like to check with you to see if this is a frequent case in your cluster, and if not, if this quick fix would work for the cache overflow problem. Thanks! , I was thinking along similar lines, but I am worried about the corner case where all RPCs are in use.  I think we need to handle this case even if it's rare.  An AM running on a node where it can see the RM but has a network cut to the rest of the cluster could go really bad really quick otherwise.  If we don't handle the corner case then we'll continue to grow the proxy cache beyond its boundaries as we do today, and that AM will explode with thousands of threads for what may be a temporary network outage.
+
+While debugging this I wrote up a quick prototype patch to try to fix the cache so that it keeps the cache under the configured limit.  Attaching the patch for reference.  However as I mentioned above, simply keeping the NM proxy cache under its configured limit means nothing if we don't address the problems with connections remaining open in the IPC Client layer., Thanks [~jlowe]! About the corner case, I'm wondering whether a bounded time waiting would be slightly better than waiting? In that way if a certain timeout is triggered then it means all RPCs are occupied for a really long time, and the system could report this abnormal situation. , I suppose we could use a wait timeout.  I was just matching the behavior when it tries to refresh the NM token on an in-use proxy which also waits indefinitely.  What's the proposed behavior when the timeout expires?  Log a message and then...?  Arguably the timeouts should be on the RPC calls rather than the proxy cache, since I'm assuming if we're not willing to wait forever for a proxy to be freed up we're also not willing to wait forever for a remote call to complete., Yes, that makes sense. And I do agree that a quick fix to the problem. , We hit same problem on one of our large cluster with more than 2.5K nodes. As a work around we ended up increasing container size to 6G for AM (and with pmem-vmem ratio of 2:1) we give away 12G of VM for AM container. From initial looks of this, there is no way to turn this behavior off via config, other than patching code, right?, Yeah, I don't think there's a good way to fix this short of running a bigger container than necessary or patching the code.
+
+Attaching a patch we've been running with recently that disables the CM proxy cache completely and reinstates the fix from MAPREDUCE-3333.  It's not an ideal fix but it effectively restores the behavior to what Hadoop 0.23 did which worked OK for us., Thanks [~jlowe], Hi [~jlowe],
+Looking at this issue recently. I think it will be not easy to change the under layer of RPC.
+
+One question, according to the patch you mentioned in https://issues.apache.org/jira/browse/YARN-2314?focusedCommentId=14131901&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14131901, do you have any data about is there any performance downgrade of this patch in your environment? I'm wondering if we can just disable the cache and make the timeout to 0 as the standard behavior.
+
+Thanks,
+Wangda, We have been running with the proposed patch (disabling the cache and making the timeout to 0) with a good result., [~sjlee0],
+Thanks for your reply, it's very helpful to have such experimental result :)
+
+Wangda, The patch effectively restores 0.23 behavior in this area, as 0.23 also had the client close the connection after each RPC call and did not attempt to cache proxies.  We were happy with the performance from 0.23, and we did not measure any significant slowdown in this area for 2.x once this patch was applied., Thanks [~jlowe]!, Discussed with [~vinodkv] offline, summary of what we have discussed/confirmed,
+
+1) There's no problem when multiple proxy to a same NM in an AM existed (Tokens will be simply added to Set<Token> of subject of UserGroupInformation)
+2) There's no thread-leaking in MR-AM side (MRAppMaster has a {{yarn.app.mapreduce.am.containerlauncher.thread-count-limit}}) to limit maximum number of threads in ContainerLauncher
+3) Basically the cache doesn't have more functionalities other than just cache the connection.
+
+So it should be safe to remove the cache, but it's better to add an option for user to enable/disable the cache. [~jlowe], could you please add an option to disable/enable cache in your existing patch or you can assign it to me if you don't have bandwidth to do that. 
+
+Thanks,
+Wangda, bq. Basically the cache doesn't have more functionalities other than just cache the connection.
+
+It doesn't even do that, because if we cache the connection to the NM then we leak threads.  When a cache entry is purged the RPC Client thread (tied to the NM socket connection) can linger because the RPC layer doesn't provide a way to force a connection to be closed due to protocol refcounting.  We need to set the RPC idle timeout to 0 as a workaround to force the connections to close so we don't leak threads.  Therefore all the cache is doing is caching the proxy objects with no connection behind them.  Those objects will reconnect to the NM each time we make a call.
+
+Not sure saving the proxy objects themselves is worth it -- would be interesting to prove this cache helps in a meaningful way before we assume we need it.  But I can update the patch to provide a config property to keep it anyway, hope to have that up later today., Hi [~jlowe],
+Thanks for your comment, I also agree just caching the proxy object itself may not be necessary. The behavior in my mind should be, admin can setup if the container management proxy is disabled. 
+- If it is disabled, IPC_CLIENT_CONNECTION_MAXIDLETIME_KEY will be set to 0 and all the cache logic will be disabled as what you have done in your patch. 
+- If it is enabled, we should keep the existing behavior (or improve the LRU cache as other patch in this JIRA), but basically, it's better to keep it. I'm a little doubt about if there is any other potential bug if we completely remove it. 
+
+Thanks,
+, Hi [~wangda], maybe we want to leave a note in the config, saying that enabling the RPC cache may cause problems for large cluster (so that people would know the possible side-effect of enabling this)? , [~gtCarrera9], 
+Agree, and the disabled should be default behavior. , Attaching a patch that allows the existing yarn.client.max-nodemanagers-proxies to be zero to indicate the proxy cache is disabled.  Also per Wangda's comment the default is 0 (i.e.: cache is disabled).  If disabled it sets the idle timeout to zero, otherwise it leaves it untouched and caches the proxy objects.  The comment for the property was updated to also mention the issue with lingering connection threads and the potential for the cache to cause problems on large clusters.  This patch also includes my earlier prototype fix to keep the cache from accidentally increasing in size if connections are busy.
+
+bq. I'm a little doubt about if there is any other potential bug if we completely remove it.
+
+I'm on the other side of that fence, since we ran for a long time on Hadoop 0.23 without this cache and did not see issues.  We've already found two issues with the cache (grows above the specified size and accumulates lingering connection threads), and I have yet to see evidence it is needed.  If anything there's some evidence to the contrary from us and Sangjin.
+
+But in case someone running on a smaller cluster really is depending upon this cache for some use case, the patch tries to let large clusters work yet small cluster users can turn on this cache., Folks, this is something that would be of interest in Tez since it uses the ContainerManagementProtocolProxy. My summary understanding is that the default is to turn this proxy off and this improves things for large scale clusters. So when Tez moves to 2.6 then it will automatically pick the defaults (which turn caching off) and benefit for large clusters. Is that correct?, Yes, the patch sets the default to off since that allows all cluster sizes to work.  If it's crucial to default to enabled for small clusters then those with large clusters will have to manually configure the cache off.  Again I have yet to see evidence this cache is necessary, so defaulting to something that doesn't fail for all cluster sizes seemed like a better choice than one which would work for some but not others.  If you have evidence where Tez absolutely has to have this cache enabled that would be good to share., To be clear, my question was only to clarify if Tez would get the benefits without doing anything because the defaults are correct. Looks like that is the case. Thanks!, So Tez will automatically benefit on large clusters because the default is to not use the cache.  However if we've found empirically that Tez needs the proxy cache to perform well then this patch would be a performance hit for Tez by default on clusters where the cache issues weren't a problem.  I wasn't sure which default benefit you were referring to above (running faster because cache is enabled or working on a large cluster because cache is disabled).
+
+If Tez shows significant improvements with this cache turned on then I could see an argument to have the cache on by default since small clusters are common and large clusters are rare. , My understanding from the comments was that in most cases this cache was adding overhead without benefit since the RPC layer was not controlled by the cache.
+
+We have no empirical evidence either ways about the performance. If you know of cases where this change of default might cause issues, then it would be helpful if they were enumerated in a comment. Then Tez/other users could test for those cases when they upgrade to 2.6 and make their own choices., The only issue I can think of is the idle timeout change that goes along with the cache being disabled.  Since we disable the cache by default we also, by default, set the cm proxy connection idle timeouts to zero. That means for each cm proxy RPC call we will create a new connection to the NM.  That sounds expensive, and probably was the motivation for the creation of the cache, but in practice it doesn't seem to matter (at least for the loads we tested which didn't include Tez).  For our case we were comparing 2.x against 0.23, and 0.23 was slightly faster in the AM scalability test than 2.x despite 2.x having this cache and 0.23 lacking it., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12674827/YARN-2314.patch
+  against trunk revision cdce883.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common:
+
+                  org.apache.hadoop.yarn.client.TestApplicationClientProtocolOnHA
+
+                                      The following test timeouts occurred in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common:
+
+org.apache.hadoop.yarn.client.TestRMFailover
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/5389//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/5389//console
+
+This message is automatically generated., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12674827/YARN-2314.patch
+  against trunk revision 128ace1.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/5408//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/5408//console
+
+This message is automatically generated., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12674827/YARN-2314.patch
+  against trunk revision 128ace1.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/5407//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/5407//console
+
+This message is automatically generated., [~jlowe],
+Thanks for updating the patch, generally it looks very good to me. A minor suggestion is, I'd suggest to change yarn.client.max-nodemanagers-proxies to yarn.client.max-cached-nodemanagers-proxies. Because when the user set the MAX_NM_PROXIES to 0, he/she can still connect to more than 0 NMs, even if the java docs is very clear, but the name is still a little confusing.
+
+Wangda, Updated the patch to deprecate yarn.client.max-nodemanagers-proxies in favor of yarn.client.max-cached-nodemanagers-proxies., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12675108/YARN-2314v2.patch
+  against trunk revision f19771a.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/5414//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/5414//console
+
+This message is automatically generated., Attaching the results of getProxy() call for tez with 20 nodes with this patch for different cache sizes and for different data sizes (tested a job @200GB and 10 TB scale).  Overall, there is slight degradation in performance (in milliseconds) by setting cache size to 0, but not significant to make an impact in overall job runtime in tez., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12675252/tez-yarn-2314.xlsx
+  against trunk revision 2894433.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/5418//console
+
+This message is automatically generated., [~jlowe], thanks for update, patch looks good to me, +1!
+[~rajesh.balamohan], thanks for your performance report based on this. 20-30ms is still a latency for interactive tasks cannot be totally ignored. At least, we have way to cache connections via configuration option in this patch.
+
+Wangda, Thanks Jason, I looked at the patch, looks good overall. just one thing:
+- IIUC, {{mayBeCloseProxy}} can be invoked by MR/NMClient, but {{proxy.scheduledForClose}} is always false.  So it won’t call the following stopProxy. If cache is disabled, this doesn’t matter too much as the idleTimeout is set to 0. But if the cache is enabled, MR/NMClient, won’t be able to explicitly close the proxy ?
+
+Also, Can you help me understand one point:
+bq. See ClientCache.stopClient for details. Given that the whole point of the ContainerManagementProtocolProxy cache is to preserve at least one reference to the Client, the IPC Client stop method will never be called in practice and IPC client threads will never be explicitly torn down as a result of calling stopProxy.
+once {{ContainerManagementProtocolProxy#tryCloseProxy}} is called, internally it’ll call {{rpc.stopProxy}}, will it eventually call {{ClientCache#stopClient}} ?
+, bq. IIUC, mayBeCloseProxy can be invoked by MR/NMClient, but proxy.scheduledForClose is always false. So it won’t call the following stopProxy.
+
+proxy.scheduledForClose is not always false, as it can be set to true by removeProxy.  removeProxy is called by the cache when an entry needs to be evicted from the cache.  If the cache never fills then we never will call removeProxy by the very design of the cache.  This patch doesn't change the behavior in that sense.  I suppose we could change the patch so that it only caches the proxy objects but not their underlying connections.  However I have my doubts that's where the real expense is in creating the proxy -- it's much more likely to be establishing the RPC connection to the NM.
+
+bq. once ContainerManagementProtocolProxy#tryCloseProxy is called, internally it’ll call rpc.stopProxy, will it eventually call ClientCache#stopClient
+
+ClientCache#stopClient will not necessarily shut down the connection.  It will only shutdown the connection if there are no references to the protocol by any other objects, but the very nature of the ContainerManagementProtocolProxy cache is to keep around references.  Therefore stopClient will never actually do anything in practice as long as we are caching proxy objects.  That's why I mentioned earlier that the RPC layer itself needs to change to add the ability to shutdown connections or change the way the ClientCache behaves to really fix this if we want to continue to cache proxy objects at a higher layer., Jason,  thanks for your explanation.
+bq. If the cache never fills then we never will call removeProxy by the very design of the cache.
+I was thinking the client could  have a way to explicitly stopProxy and remove the entry from the cache, rather than remove the entry only if it hits the cache limit.  But looks like this is by design. And yes, this is the existing behavior., committing this. , Committed to trunk, branch-2, branch-2.6.  thanks [~jlowe] !, thanks [~rajesh.balamohan] for the performance testing , thanks [~gtCarrera9] and [~leftnoteasy] for reviewing the patch !, FAILURE: Integrated in Hadoop-trunk-Commit #6343 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/6343/])
+YARN-2314. Disable ContainerManagementProtocolProxy cache by default to prevent creating thousands of threads in a large cluster. Contributed by Jason Lowe (jianhe: rev f44cf99599119b5e989be724eeab447b2dc4fe53)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/ContainerManagementProtocolProxy.java
+* hadoop-yarn-project/CHANGES.txt
+]

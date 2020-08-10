@@ -1,0 +1,229 @@
+[
+TreeSet() there does not seem to be any method to get reference of an object that exists in the set.
+, TreeSet wraps a TreeMap, so you might as well just use a TreeMap whose keys and values are identical, or somesuch., Now datanode's blocks is defined as TreeMap. 
+
+I am attaching the proposed patch for review. I have done brief testing and will test with manually deleting some blocks from the datanode to trigger new code.
+, 
+block-prefs-2.patch. This removes another copy of block for files that are created in current instance of running Namenode. Also removes iterations when a file is added.
+
+Extra copy still exists for files that are created at the beginning while reading fsimage.
+, 
+2) Another candidate : 
+There are two global Maps for blocks 
+   a) blockMap : block --> nodes that have this block.
+   b) activeBlock : block --> file Inode
+
+We can have only one map : 
+    
+    blockMap : block --> BlockInfo { Block, nodes, Inode, ... }
+
+Of course this is a bigger code change. 
+
+Is TreeSet much bigger in size than a LinkedList? We have one TreeSet of nodes for each block.
+, I do not see how replacing TreeSet=TreeMap<Block, static final Object> by TreeMap<Block, Block> in DatanodeDescriptor 
+would reduce memory consumption.
+
+Block getBlock( Block b)
+looks very strange. So you need a block in order to get it ..........
+, > I do not see how replacing TreeSet=TreeMap<Block, static final Object> by TreeMap<Block, Block> in DatanodeDescriptor
+> would reduce memory consumption.
+
+This does not reduce memory .This will let us get hold of original object that was inserted in to the map. That fact that all nodes that have a particular block and blockMap reference the same object reduces memory. Now we have 1 Block object instead of 4 (in the case of 3 replicas). This references argument might be flawed since I am kind of new to Java.
+
+> Block getBlock( Block b)
+> looks very strange. So you need a block in order to get it .......... 
+
+:). We could call it getStoredBloc() or getBlock(BlockId). We want a function that gives the Block object what was stored in the map.
+, block-refs-3.patch:
+
+1) changed to getBlock(Block) to getBlock( long blockid ). Note that this version includes a 'new'.
+2) Konstantin found a bug because of change in semantics of removeStoredBlock() and addStoredBlock().
+     previously they did not modify node's map. restored.
+
+this also slightly modifies Block.compareTo().
+
+Why not have TreeMap<BlockId, Block> instead of TreeMap<Block, Block>?
+   BlockId is long and it needs to be Long for this generic class. That implies another allocation of Long for each element in the map.
+, If the new report contains different block length do you update it in the stored block?
+, 
+This patch does not. I was wondering about this. No where in the code do we check or enforce that lengths reported by datanodes are same. For e.g. when a file is closed all the blocks for the file use the length reported by first data node in that has that block. This patch does not change that behavior. Block length is rarely considered.
+, Different replicas having different lengths should be detected by check sums.
+Your patch should update length imo, since before it was updated with every block report.
+If an append occurs the file length should change., 
+Ok, so the length reported in the latest block report is the correct length. I will attach a new patch with this change.
+, 
+block-refs-4.patch : adds Konstantin's suggestion above.  Diff between 3 and 4 :
+
+-            block = containingNodes.first().getBlock(block.getBlockId());
++            Block storedBlock = 
++                containingNodes.first().getBlock(block.getBlockId());
++            // update stored block's length.
++            if ( block != storedBlock && block.getNumBytes() > 0 ) {
++                storedBlock.setNumBytes( block.getNumBytes() );
++            }
+
+We now update the block length with the length reported by latest datanode. 
+
+As before this does not affect block lengths of blocks that belong to files that created during previous runs of the namenode.
+, 
+please disregard 4. diff between patch 5 and 3:
+
+- block = containingNodes.first().getBlock(block.getBlockId());
++ Block storedBlock =
++ containingNodes.first().getBlock(block.getBlockId());
++ // update stored block's length.
++ if ( block.getNumBytes() > 0 ) {
++ storedBlock.setNumBytes( block.getNumBytes() );
++ block = storedBlock;
++ }
+, Currently blockMap maps a block to a TreeSet of DatanodeDescriptors. I would suggest that we use ArrayList in order to reduce the use of memory. Most of the time the set size is 3 because the default replication factor of a file is 3. So in term of speed, there is no benifit using TreeSet. However in term of memory TreeSet is way more expensive than ArrayList. An entry in TreeSet is at least 6 times as expensive as an entry in ArrayList and approximately we have 3*total#_of_blocks of such entries in FSNamesystem., +1
+I was thinking of the same. 
+How much do think the memory difference between a LinkedList entry and ArrayList entry?
+, A LinkedList entry contains a pointer to the previous entry and a pointer to the next entry. So it is more expensive entry-wise. One problem with ArrayList is that it creates an array of size 10 by default. But because most of time the set size is 3, we could set the intial array size to be 3., 
+The attached patch seems to save in the order of 1MB with around 3000 blocks (9000 total blocks/3). Without the patch Jconsole show  around 5.3-5.57 MB of heap in use just after GC.  With the patch it is around 4.4-4.8 MB. Calculation would be more accurate on a larger cluster. I will try.
+, 
+Modified containingNodes to be ArrayList instead of sortedSet. On a lightly loaded 500 node cluster (each node has 500-600 blocks), with the patch memory (in MB) was low to mid 40s after GC and with out the patch memory was in mid 50s. I will submit a new patch.
+
+, 
+The latest patch changes Datanode container associated with each block to ArrayList instead of a SortedSet. ArrayList's initial size is set to number of replications for the file.
+, +1, because http://issues.apache.org/jira/secure/attachment/12348783/HADOOP-803.patch applied and successfully tested against trunk revision r495045., I just committed this.  Thanks, Raghu!, This was causing problems and has been reverted in HADOOP-898., 
+This is pretty weird. Both NPE and SmallBlock test failures in HADOOP-898 are caused by the same problem : node.getBlock(blockId) returns null sometimes. But I verified that node.blocks contains this block earlier and right after this failure. Any ideas?
+
+blocks map in DatanodeDescrptor is changed like this : 
+-  private volatile Collection<Block> blocks = new TreeSet<Block>();
++  private volatile SortedMap<Block, Block> blocks = new TreeMap<Block, Block>();
+
+and getBlock(long blockid) is defined as : 
+{  return blocks.get( new Block(blockId, 0) );  } 
+
+, The bug is in the following patch. Very costly oversight: The does not affect equals() but affects Block.comparedTo().
+
+     public int compareTo(Object o) {
+-        Block b = (Block) o;
+-        if (getBlockId() < b.getBlockId()) {
+-            return -1;
+-        } else if (getBlockId() == b.getBlockId()) {
+-            return 0;
+-        } else {
+-            return 1;
+-        }
++        long diff = getBlockId() - ((Block)o).getBlockId();
++        return ( diff < 0 ) ? -1 : ( ( diff > 0 ) ? 1 : 0 );
+     }
+
+e.g: 'diff' wont be < 0 when blocks ids are LONG_MAX and -10.
+
+changing this to following fixes it. 
+
++        Block b = (Block)o;
++        return ( blkid < b.blkid ) ? -1 :
++               ( ( blkid > b.blkid ) ? 1 : 0 );
+
+Now TestSmallBlocks patch does not fail.
+, > e.g: 'diff' wont be < 0 when blocks ids are LONG_MAX and -10.
+I meant 'wont be > 0'.
+, 
+On a small cluster with 3035 blocks verified blocks references work as expected using netbeans profiler:
+
+Number of Block objects  : 
+before the patch : 5*3035  ( 3 replicas, 1 in blockMap, 1 in Inode/File )
+after the patch   :  2 * 3035 ( in blockMap and  inode/File).
+
+If the blocks were created after Namenode is started, one in inode will share the object with blockMap. When name nodes starts up, it initially creates all the blocks in Indode while reading the image file.. does not seem easy to share that reference.
+
+TreeMap.Entry objects also reduced from 20k to around 11.5 k. Due to changing containingNodes to ArrayList instead of TreeMap. 
+
+TreeMap.Entry and Block used to take max memory after byte[] and char[] from the profiler.  Now Blocks has gone down in the list.
+
+I will submit the patch today. We could wait till current trunk is more stable to check it in.
+
+, Attaching patch for review. changes between 803.patch and 803-2.patch are minor.
+, Attaching the same patch. did not grant ASF license by mistake last time., Another relatively simpler change : 
+
+each Inode allocates a TreeMap for chidren. Each TreeMap takes around 40 bytes (from profiler, not sure if it includes gc overhead). Since most nodes in FS don't have any children, we can postpone allocating TreeMap until it is needed. --- (a)
+
+INode.children does not strictly need to be a TreeMap. Each TreeMap entry seems to be around 30 bytes. I am not planning to include this change in this bug, but that would be another 30 bytes per node.
+
+, Few more thoughts: (these are not intended to be included in patch for this issue)
+
+A big per file consumer of memory is INode.name. It stores full path. We can save hundred or more bytes per file if we store only the file name. Full path name can always be constructed from parent. --- (b) . 
+
+Each directory has 'activeBlocks' which is a HashMap for block to INode. We already have a global blockMap (block to containingNodes). This also implies that every call to getBlock(File) results in recursing from root to the node, each of which involves a TreeMap  look up in children map. I think we should have just Map : block to { INode, self-ref, containingNodes ... } . This will save  HashMap entry (30+ bytes) and block object  (20-30 bytes) for each block. It also improves getFile() by many times. This will also let us use ArrayList instead of TreeMap for INode.children  (30-40 bytes per file) --- (c)
+
+
+
+
+
+
+
+, 803_3.patch add the following : remove allocation of a TreeMap in INode by default.
+
+, > A big per file consumer of memory is INode.name. It stores full path. 
+> We can save hundred or more bytes per file if we store only the file name. 
+> Full path name can always be constructed from parent. --- (b) .
+
+Konstantin pointed out INode.name is in fact just the file name. Since it is declared as String it still seems to be taking around 128 bytes. I will check if the size comes down if it is declared as char[]. Not sure if it can be declared byte[].
+, 
+The patch is estimated to give around 25% on a large NameNode on 32bit JVM.
+
+, see attached NameNodeMemoryHogs.txt for better formated list. Following is cut-n-paste of the attachment.
+
+Main FS wide datastructures : 
+----------------------------- 
+    
+    blockMap        : block --> containing nodes : HashMap  
+    activeBLocks    : block --> INode : HashMap 
+    INode.children  : FileName --> INode : TreeMap (in dir INode). 
+    DN.blocks       : block --> self : TreeMap ( in each DataNodeDescriptor ) 
+    datanodeMap     : String --> DatanodeDescriptor ( linear cost with 
+                                                      number of dataNodes ) 
+Memory cost per Block : 
+---------------------- 
+  Before this patch : 
+     Block Objects : 3 ( one per replica in DN.blocks) 
+                     1 ( in blockMap ) 
+                     1 ( in INode ); 
+     TreeMap       : 1 ( containingNode TreeSet )  
+     TreeMap$Entry : 3 ( conatiningNodes TreeSet in blockMap ) 
+                     3 ( in DN.blocks in each of the nodes ) 
+     HashMap$Entry : 1 ( blockMap ) 
+                     1 ( activeBlocks ) 
+ 
+  After this patch : 
+     Block Objects : 1 ( in blockMap ) 
+                     1 ( in INode that existed before NameNode restarted ) 
+     ArrayList     : 1 ( containingNodes Arraylist )  
+     TreeMap$Entry : 3 ( in DN.blocks in each of the nodes ) 
+     HashMap$Entry : 1 ( blockMap ) 
+                     1 ( activeBlocks ) 
+ 
+Memory cost per INode : 
+---------------------- 
+     TreeMap       : 1 ( children. removed in this issue for regular files ) 
+     TreeMap$Entry : 1 ( in parent.children ) 
+     INode object  : 1 
+     char[128]     : 1 (char[] used in String) 
+     String        : 1 ( name ) 
+, Patch doesn't apply to latest trunk., Updated patch., Patch now applies to current trunk, assuming I resolved the conflict correctly..., Thanks Doug. The new patch looks fine.
+For now I am removing the 'patch available' state until this patch gets reviewed.
+, > If the blocks were created after Namenode is started, one in inode will share the object with blockMap. When name nodes starts up, it initially creates all the blocks in Indode while reading the image file.. does not seem easy to share that reference. 
+
+Even after a name node starts up, a block in inode does not share the object with blockMap. So a name node contains two Block instantiations per block.
+
+To reduce the number of block instantiations to 1, I think we can create a TreeSet of blocks which maps a block id to its block object. When a block is intially created, simply add the block to this block set. When later a reference to the block is needed, we can get it from the block set.
+
+We can furthur remove the blockMap and activeBlock list by adding two non-persistent fields to the Block data structures. One is a reference to all its containing data nodes and one to the inode representing the file that the block belongs to., 
+> Even after a name node starts up, a block in inode does not share the object with blockMap.
+> So a name node contains two Block instantiations per block.
+
+In the patch, when a file is closed, we do use the reference in blockMap (because, datanode that has block would have informed namenode already).
+
+Yes, we can get rid of one of blockMap and activeBlocks maps (not both). This also removes extra block object we have for files that exist before namenode restarts. The changes for this are a bit more intrusive, I am wondering if I should do it as part of this patch..
+
+
+, In the patch the type of the field "blocks" in DatanodeDescriptor is changed from TreeSet<Block> to TreeMap<Block, Block>. I think type TreeSet<Block> is the same as TreeMap<Block, Block>, but with a cleaner interface. Is there any reason that we need the change?, TreeMap<Block, Block> allows us to get the object that was inserted into the map. With TreeSet we can not get the object that was inserted. This is the base for removing extra block objects in this patch.
+
+, +1 code reviewed. Raghu, you might need to regenerate the patch.,  attached 5.patch: Updated patch for current trunk.
+
+Thanks for reviewing Hairong.
+, +1, because http://issues.apache.org/jira/secure/attachment/12351093/HADOOP-803_5.patch applied and successfully tested against trunk revision r507276., I just committed this.  Thanks, Raghu!]

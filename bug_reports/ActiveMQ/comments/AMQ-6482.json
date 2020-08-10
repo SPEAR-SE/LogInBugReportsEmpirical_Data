@@ -1,0 +1,81 @@
+[Full thread dump, This keeps increasing , ~ 400 thread every 4/5 hours. Right now, on the same instance :
+
+   1873  (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)
+   1613  (a java.util.concurrent.locks.ReentrantLock$NonfairSync)
+, Are new websocket connections being created/destroyed often or do the connections come online and pretty much stay there?  I'm trying to get a better idea if this is something related to a websocket connection not being shutdown cleanly or maybe a deadlock with long running connections, etc., New websocket connections are definitively created quiet often. They are created every time a user log in to the website (or throug mobile app) or switch to a new page while being logged in. 
+
+Something (maybe) interesting is that we had a bug in our code which was creating too many topics (~ 100k in a few seconds) by sending messages to lot of these new topics. 95% of them were never read. We fixed it and reduced to ~ 8000 topics (no GC of old destination right now), but the thread leak is still present and seems to grow at same speed than before (from ~ 300 right after start to ~ 1000 in 3 hours), so looks like this is not related to topics/messages. So the only remaining possibility is client side.  Moreover, looking at the graph, it seems that the number of thread increases by "step". For ex between 7.50 and 8.10 pm (utc+2) it only increase of 100threads,  then in 15 minutes I have a 500 thread bump, then almost stable for 10 minutes, then +400 threads in 5 minutes etc ... It seems that the number of threads increases faster when I have a lot of "outgoing messages", and slowly when I don't have much, maybe a hint.
+
+Though this is a production service, we can accept small downtime (like for a restart, if config update is needed) and I'm available as Sp4rKy on freenode if you want some live debug (baiscally between 9 and 19 utc+2)., From what I can tell, the issue seems to be that the Websocket connections are hanging waiting for a response from the client when doing the inactivity check. There are tons of the below blocked threads:
+
+{noformat}
+"ActiveMQ InactivityMonitor Worker" #40006 daemon prio=5 os_prio=0 tid=0x00007fc60cfd4800 nid=0x4c92 waiting on condition [0x00007fc4148c7000]
+   java.lang.Thread.State: WAITING (parking)
+	at sun.misc.Unsafe.park(Native Method)
+	- parking to wait for  <0x000000055a702d70> (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)
+	at java.util.concurrent.locks.LockSupport.park(LockSupport.java:175)
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await(AbstractQueuedSynchronizer.java:2039)
+	at org.eclipse.jetty.util.SharedBlockingCallback$Blocker.block(SharedBlockingCallback.java:219)
+	at org.eclipse.jetty.websocket.common.BlockingWriteCallback$WriteBlocker.block(BlockingWriteCallback.java:83)
+	at org.eclipse.jetty.websocket.common.WebSocketRemoteEndpoint.blockingWrite(WebSocketRemoteEndpoint.java:107)
+	at org.eclipse.jetty.websocket.common.WebSocketRemoteEndpoint.sendString(WebSocketRemoteEndpoint.java:387)
+	at org.apache.activemq.transport.ws.jetty9.StompSocket.sendToStomp(StompSocket.java:47)
+	at org.apache.activemq.transport.stomp.ProtocolConverter.onActiveMQCommand(ProtocolConverter.java:888)
+	at org.apache.activemq.transport.ws.AbstractStompSocket.oneway(AbstractStompSocket.java:63)
+	at org.apache.activemq.transport.AbstractInactivityMonitor.doOnewaySend(AbstractInactivityMonitor.java:334)
+	at org.apache.activemq.transport.AbstractInactivityMonitor.access$800(AbstractInactivityMonitor.java:41)
+	at org.apache.activemq.transport.AbstractInactivityMonitor$4.run(AbstractInactivityMonitor.java:200)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+	at java.lang.Thread.run(Thread.java:745)
+{noformat}
+
+There seems to me to be 2 issues here:
+
+1) Jetty seems to have an issue where it gets stuck and never returns or times out the blocking send.  I found this issue here: https://github.com/eclipse/jetty.project/issues/272
+2) The inactivity monitor is supposed to be doing a one way send anyways but the send is actually a blocking send so it can get stuck waiting for a response. 
+
+I think under the old Jetty 8 websocket stuff we were doing async sends but under Jetty 9 that got switched to sync and it waits for the bytes to transfer.  I think, at least for the inactivity monitor and maybe all calls, we should be doing async sends and not blocking so that the lock can be released.  Or at least have some way to timeout.
+
+[~tabish121], what do you think about something like this? https://github.com/cshannon/activemq/commit/915cc828b928268e18bb50b99247e78e77aa0d51, Seems reasonable that these calls shouldn't block but we need to at least try and throw an error if the send can't complete to break the connection, so maybe something like:
+
+{code}
+    @Override
+    public void sendToStomp(StompFrame command) throws IOException {
+        try {
+            session.getRemote().sendStringByFuture(command.format()).get(30, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            throw IOExceptionSupport.create(e);
+        }
+    }
+{code}, Commit 450cabe4ead1fb78eec2e94013d2868a5bf864da in activemq's branch refs/heads/master from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=450cabe ]
+
+https://issues.apache.org/jira/browse/AMQ-6482
+
+Adding a timeout for websocket sends to prevent the transport thread
+from getting stuck and blocking.  The default is 30 seconds.
+, Commit fdf1537eb8c3bf08668d452f2c816cb28acd8f00 in activemq's branch refs/heads/activemq-5.14.x from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=fdf1537 ]
+
+https://issues.apache.org/jira/browse/AMQ-6482
+
+Adding a timeout for websocket sends to prevent the transport thread
+from getting stuck and blocking.  The default is 30 seconds.
+
+(cherry picked from commit 450cabe4ead1fb78eec2e94013d2868a5bf864da)
+, Commit 937b2acd4628fdbfe8165db5f97225dddab515e7 in activemq's branch refs/heads/master from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=937b2ac ]
+
+https://issues.apache.org/jira/browse/AMQ-6482
+
+Adding websocket send timeout to AMQP over websockets
+, Commit e9489a45b382b292ed975331a0dd5233d250ac3f in activemq's branch refs/heads/activemq-5.14.x from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=e9489a4 ]
+
+https://issues.apache.org/jira/browse/AMQ-6482
+
+Adding websocket send timeout to AMQP over websockets
+
+(cherry picked from commit 937b2acd4628fdbfe8165db5f97225dddab515e7)
+]

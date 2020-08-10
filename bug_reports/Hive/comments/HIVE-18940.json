@@ -1,0 +1,70 @@
+[[~LinaAtAustin] [~kkalyan] [~spena] FYI., For replication purposes, and perhaps for sentry delta updates capture as well, the EVENT_ID has to be in the order of commit.
+For example, if the EVENT_ID 5 has been written and then consumed by replication program, it would then only look for rows where EVENT_ID > 5. So if there are two concurrent transactions writing new rows and one of them with EVENT_ID 5 commits before EVENT_ID 4, then EVENT_ID 4 would get missed.
+Holes would be OK, what is not OK is that for another application to see row with EVENT_ID 5 getting visible before one with EVENT_ID 4.
+
+DB generated timestamp has same issue, unless it can represent the commit sequence.
+
+I believe the use of database autoincrement field was considered in HIVE-16886 and it wasn't meeting this criteria. 
+
+cc [~anishek], [~thejas] Yes, you are correct, this is a nice assumption to work from, the only problem is that there is no way we can guarantee it *and* avoid global synchronization of all write HMS events. This means that we need to think about alternative solutions that can relax the accepted behavior of notification stream. We might provide both 'strict' and 'relaxed' modes, which is Ok, but complicates HMS even more because we may need different tables and HM methods to implement the two., I think part of the issue is that the event id generation mechanism is done using a different table which always has 1 row {{NOTIFICATION_SEQUENCE}} Why can't we use auto-increment directly on the {{NOTIFICATION_LOG}} table for event id? I know derby doesn't support auto-increment but I think most production clusters will be not using derby. Designing a feature just to make it work for derby does not seem to be a good idea. If derby doesn't support auto-increments we should treat it as an exception and handle that in the code separately. We should also separate event ID and commit id for an event. Currently, the event id is strictly tied with the actual commit time which is why we have to hold the lock at the generation time until the transaction commits which in theory could take a long time. Also, the timing of generating the event id and actual commit is non-obvious in the code. So it is easy to miss that while writing the code.
+
+I think it would be great to use something like auto-increment to just uniquely identify a notification log message. The actual commit id should be generated from a global monotonically increasing number at the actual commit time. This number should apply to all the events pertaining to that transaction. A transaction which alters 1000 partitions should not have 1000 different ids because they were not committed one by one in 1000 transactions. They were all committed as one transaction and hence ideally should only generate one commit id. This would greatly help with the lock durations for long transactions because now commit lock is held for a constant time irrespective of how long that transaction ran., having a separate global commit id might not solve the problem since association between the events ( if we use auto increment ) and the global commit has to be done in the same txn. Also since we cant have ordering of the commit ids different to the point of commits, lock on this table will have to be taken to make sure one txn commits before the other one can commit.  if there was some way to do fine grained control such that txn's with commit ids fire the db (COMMIT sql statement) in order of their id's. We can trim down the time the lock is taken by doing some directsql and putting in commit-id based ordering, which again across multiple metastores would add latency to the whole process. 
+
+, [~vihangk1] The major problem with all auto-increment approaches is that clients have to deal with holes in the stream of IDs and the hole can be temporary (there is transaction in flight) or permanent (transaction failed). I am not convinced that we must produce events in the commit order but it is important to not loose events (and guarantee that within a session the order is preserved).
+
+Sessions usually have a nice property that they send some operations to HMS, wait for completion and only then send another one. Interleaving ordering between different sessions should be fine. Unfortunately, HMS APIs do not include any session ID (otherwise we could use it to partition locks).
+
+, I think may be I didn't make my suggestion very clear. I did not suggest using auto-increment for commit id. auto-increment is just use to uniquely identify an event. This useful because now we are adding tons of information in one event. So instead of creating one giant event we can create several small events. The relationship between a commit id and event id is one to many. There could be many event ids associated with one commit id. The commit id itself is a monotonically increasing global number generated just before a transaction does an actual commit. Here is the pseudo code of my suggestion above:
+
+Modify NOTIFICATION_LOG to add a new field CommitID
+
+Modify NOTIFICATION_LOG table such that EVENT_ID is an auto-increment
+
+Remove the use of NOTIFICATION_SEQUENCE (or perhaps we can reuse it to generate commit id)
+
+Now here is how the methods generating events might look like
+{code:java}
+public someMethodWhichGeneratesEvents() {
+List<Event> allEventsInThisTransaction;
+openTransaction(allEventsInThisTransaction);
+//do some work which adds events to allEventsInThisTransaction
+//openTransaction again; pass the allEventsInThisTransaction
+openTransaction(allEventsInThisTransaction);
+//dummy commit
+commit(allEventsInThisTransaction);
+//actual commit
+commit(allEventsInThisTransaction);
+}
+{code}
+ The commits would look like this
+  
+{code:java}
+public boolean commit(List<Event> eventsInThisTransaction) {
+counter--;
+//if this is an actual commit
+if (counter == 0) {
+//generate one monotonically increasing number from database
+//same logic as used for generating event id currently from NOTIFICATION_SEQUENCE table
+//lock is held for a constant time irrespective of how many events this transaction generates
+commitId = getCommitID();
+//add events
+for (Event event : eventsInThisTransaction) {
+  event.setCommitId(commitID);
+  addNotificationEvent(event);
+}
+return pm.commit();
+}
+{code}
+ 
+
+So if the commit fails, no events are generated. If the commit succeeds all the events are generated with unique event ids and the same commit id. If there are holes in commit id, it means that the transaction has failed and is guaranteed never to be filled., The restriction that  the EVENT_ID has to be in the order of commit is presumably having a major impact on concurrency in the HMS DBMS. It effectively serializes avery transaction. Has there been any thought to relaxing this restriction? , [~vihangk1]'s approach of accumulating the events and only getting the lock towards end seems like a reasonable way to reduce the duration lock is held to a very small time, for metastore calls that lead to several events. Other parts of the transactions can go ahead in parallel.
+It doesn't have to use same commitID for all events, getting new values should be OK, as long as the lock on NOTIFICATION_SEQUENCE is obtained at the end.
+
+, Another improvement based on [~akolb]'s suggestion above is to break the lock for each unique {{dbname.tblname}} pair and generate the commit ids specific to that individual entity. So instead of having one row blocking the whole world in NOTIFICATION_SEQUENCE table, it would now have multiple rows one for each table. This would obviously mean that clients will have to smarter and will need to store the last commit id on an individual table basis. Since this will be a change of behavior, this will have to be done using a configurable option so that existing clients can still use the current way and move to the later when they are ready by switching the config. The biggest advantage of this approach is that practically no transaction will ever block since conflicting transactions are not allowed in the first place using ZK locks at the query compilation time. The disadvantage here is added complexity on both server and client side. Server needs to handle corner cases well (create/drop database events). Clients will need added logic to store the commit id on an individual table level., One immediate improvement that we can make that will help somewhat.
+
+# Collect all notifications in the ObjectStore instance
+# When commitTransaction() really does a commit push all notifications in one shot using bulk update.
+
+This should reduce the amount of time the lock is held., As [~vihangk1] noticed the problem is even worse since DbNotifictionListener also does file system calls as part of creating notifications and these can significantly increase the hold time for the lock.
+
+Also note that any consumer (e.g. replication) who tries to get last notification ID will be blocked as well., [~akolb] the pseudo code in my comment above collects the events until the actual commit time. Is that not what you suggested? I can take a stab at this based on the suggestions above., [~vihangk1] Pretty much what you suggested - I am just thinking that we can make just this change until we figure out some bigger change that may require client changes., Another interesting question - is it possible to do expensive work (like listing file systems, etc) outside of the transaction altogether?]

@@ -1,0 +1,95 @@
+[I haven't had time to look into this fully, but I suspect that it's some kind of race condition in the BlockPoolSliceScanner.  Whatever it is, it certainly did lead to a lot of logs getting generated (there were gigabytes of that "is no longer in the dataset" message).  The datanode stayed in this state until restarted., Which should we dealing with this problem by, log4j setting or source code level fix? We can add a configuration to limit msg of "is no longer in the dataset" if we fix it at source code level., The problem here is really not log overflow. That can be dealt with (as I mentioned). The problem here is that the observed behavior seems to indicated a deeper (potentially significant) problem along the lines of what [~cmccabe] has mentioned., It's not a log4j problem.  The problem is that the DataNode is logging millions of identical lines about the same block.  The scanner has gotten stuck in a loop, basically, Hi Colin and Roman, I think the following code won't delete block from blockInfoSet if block is already removed from blockMap:
+{code}
+  /** Deletes the block from internal structures */
+  synchronized void deleteBlock(Block block) {
+    BlockScanInfo info = blockMap.get(block);
+    if ( info != null ) {
+      delBlockInfo(info);
+    }
+  }
+{code}
+Then, if the block is happened to be the first block on blockInfoSet, then log will loop forever.
+The reason of inconsistent between blockMap and blockInfoSet may because blockInfoSet is an unsynchronized TreeSet so is not thread-safe. May be we should replace it with ConcurrentSkipListMap (which keep order and concurrency). Thoughts?, Colin and Roman,
+
+thank you for sharing! I understood the problem correctly.
+
+Junping, 
+
+Both blockMap and blockInfoSet must be synchronized by BlockPoolSliceScanner's instance in this case. verifyFirstBlock method refers blockInfoSet, but it's not synchronized. IMHO, if we can make verifyFirstBlock method synchronized, this problem may be solved. What do you think?, >> verifyFirstBlock method refers blockInfoSet, but it's not synchronized. IMHO, if we can make verifyFirstBlock method synchronized, this problem may be solved. What do you think?
+
+Sorry, I meant not verifyFirstBlock method, but scan method., Maybe this is a critical section to be fixed., Hi Tsuyoshi, I think this fix may also work as this is the only unsynchronized block that accessing blockInfoSet. However, why don't you merge the synchronized block with above code block which is synchronized also. It would be nice if you can have a unit test to reproduce the bug and verify the patch can fix it., A patch for reproducing this problem.
+
+The analysis of the code is as follows:
+
+1. DataBlockScanner#run() tries to scan blocks via BlockPoolSliceScanner#scanBlockPoolSlice in the main loop.
+2. At the same time, the other theads(BlockReceiver's constructor) issue blockScanner.deleteBlock.
+3. BlockPoolSliceScanner#deleteBlock() tries to remove BlockScanInfo from blockInfoSet. However, this is not visible from BlockPoolSliceScanner#scanBlockPoolSlice's thread, because there is no memory barrier. This may be the critical section we've faced.
+4. Other threads issue FsDatasetImpl#unfinalizeBlock, FsDataImpl, checkAndUpdate, and updates BlockPoolSliceScanner#dataset, and remove the block entry from dataset. This is because the log 'is no longer in the dataset' is dumped repeatedly.
+
+Note taht this may be not complete: I've faced the log 'is no longer in the dataset' dumped repeatedly, but sometimes with my code., {quote}
+Note that this may be not complete: I've faced the log 'is no longer in the dataset' dumped repeatedly, but sometimes with my code.
+{quote}
+
+I mean the log messages itself are dumped every time, but the "logging the same 'is no longer in the dataset' message over and over again" can happen sometimes., Add test for synchronization of BlockPoolSliceScanner#blockInfoSet., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12605069/HDFS-5225.2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.datanode.TestMultipleNNDataBlockScanner
+                  org.apache.hadoop.hdfs.web.TestWebHDFS
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5036//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5036//console
+
+This message is automatically generated., Some TestMultipleNNDataBlockScanner-related cases fails with my patch. I'll recheck why these fail., Hi [~ozawa], thanks for the patch! Besides fixing test failures, it would be nice if you can attach log of your reproduce bug (only related part) so that Roman can judge if it is the same bug.  , I am seeing cases of repeated logging of "Verification succeeded for xxx" for the same block. Since it loops, the disk fills up very quickly. 
+
+These nodes were told to write a replica then minutes later it was deleted. Minutes went by and the same block with the identical gen stamp was transferred to the node. All these were successful. In the next block scanner scan period, however, the thread gets into seemingly infinite loop of verifying this block replica, after verifying some number of blocks.
+
+, I took a heap dump of a data node with this problem. Its blockInfoSet contains two entries for the block that it was spinning on. The left-mode entry, the oldest, was one and the right-most, the newest was the other. The oldest one was not in the block map, but the last one was.
+
+At one point in the past, there must be duplicate insertion. As soon as the older one becomes the oldest one in the tree after scanning some blocks, reinsertion of this block info with updated scan stat would only replace the newer one. This results in the oldest entry remaining the same, causing repeated scan verification of the same block.
+
+I will review the patch to see whether it will address this problem as well., The scan spins because getEarliestScanTime() will return the last scan time of the oldest block. Since it never gets removed, the scanner keeps calling verifyFirstBlock().
+
+Also, jdk doc on TreeSet states, "Note that the ordering maintained by a set (whether or not an explicit comparator is provided) must be consistent with equals if it is to correctly implement the Set interface."  This is the case in branch-0.23, but broken in branch-2.
+
+, Thank you for your investigating, Kihwal! Now I'm creating the test which can reproduce the bug you mentioned., [~djp], OK. But the current patch for reproducing can produce the bug rarely as I mentioned. I'll renew the patch for reproducing based on [~kihwal]'s comment., Due to HDFS-4797, two BlockScanInfo for different blocks could collide with each other in blockInfoSet if the last scan time is the same. This can easily create inconsistencies between blockMap and blockInfoSet. This problem has been fixed recently by HDFS-5031. Other than this, I cannot find any other reason for the two data structures going out of sync. 
+
+[~ozawa], can you reproduce the problem with HDFS-5031? Your reproducer patch artificially introduces duplicate entries. That should not happen with proper synchronization. Other flaws in algorithm may cause wrong records to get removed or added, but the two data structures should stay in sync after HDFS-5031.  
+
+If we want to make sure this is the case now and also in the future-proof, we could add sanity checks to addBlockInfo() and delBlockInfo(). For addBlockInfo(), addition to any data structure should not see a duplicate entry. For delBlockInfo(), both data structures should contain an entry to be deleted. , In HDFS-5031, Vinay explained,
+
+bq. BlockScanInfo.equals() is strictly checking for the instance of BlockScanInfo, but in almost all retrievals from blockMap are done using instance of Block, so always will get null value and hence scan will happen again.
+
+Since the check returns null, addBlockInfo() can be called without removing the entry first. This will replace the existing entry in blockMap since its using Block's hash code. However, blockInfoSet can end up adding a duplicate entry for the block, since it is keyed on the last scan time. If the older entry becomes the first in the ordered set, "is no longer in the dataset" will show up repeatedly if the block was deleted. If not deleted, "Verification succeeded for..." will appear.
+
+I will pull HDFS-5031 in to branch-2.1-beta.
+, I am resolving this as dupe of HDFS-5031 after merging the patch to branch-2.1-beta., [~kihwal], thanks for the explanation. The point I mentioned was:
+
+{code}
+        if (((now - getEarliestScanTime()) >= scanPeriod)
+            || ((!blockInfoSet.isEmpty()) && !(this.isFirstBlockProcessed()))) {
+          verifyFirstBlock();
+        } 
+{code}
+
+but this is not problem, because isFirstBlockProcessed() checks whether blockInfoSet is empty or not with synchronization correctly. LGTM. [~rvs], what do you think?, Once this shows up in the branch for beta 2.1.2 I can re-run my tests in Bigtop and let you guys know., We're being hit by this issue at the moment. I didn't follow all the explanations so I'm unsure what to do now.
+
+Is changing log settings for that class the correct "workaround" or is there anything else we can do to break the loop?, [~lars_francke], what is the version of Hadoop you are using?, We're running CDH 4.5.0 which is using Hadoop 2.0. I see that a fix for this issue is in CDH 4.6 but that's not released yet.]

@@ -1,0 +1,189 @@
+[Suspecting maybe the [asynchronous write|https://github.com/apache/storm/blob/3b1b3bfa595851afd468594079caa7c772dafd48/storm-core/src/jvm/backtype/storm/messaging/netty/Client.java#L323] in Client#flushMesages might be the issue.  We create a future here to write the data asynchronously, but the new thread does not have to be scheduled to run before subsequent batches are written, and so batches can be sent in the wrong order.
+
+EDIT: spelling, [~dagit] How are you reproducing this? I just ran this test in a loop for 50 times and it passed all the time for me. I am on following java version
+
+➜  incubator-storm git:(ha-merge) ✗ java -version
+java version "1.8.0_31"
+Java(TM) SE Runtime Environment (build 1.8.0_31-b13)
+Java HotSpot(TM) 64-Bit Server VM (build 25.31-b07, mixed mode)
+
+
+, I'm not sure it was same issue cause error messages were not properly logged, but sometimes Travis CI also fails because of netty unit test. Please see here.
+https://travis-ci.org/apache/storm/jobs/76404540
+
+If it succeeds, test result is below,
+{quote}
+Running backtype.storm.messaging.netty-unit-test
+Tests run: 3, Passed: 100003, Failures: 0, Errors: 0
+{quote}
+
+But in this situation, test result shows difference,
+{quote}
+Running backtype.storm.messaging.netty-unit-test
+16417 [main] INFO  b.s.m.n.Client - closing Netty Client Netty-Client-localhost/127.0.0.1:6700
+16417 [main] INFO  b.s.m.n.Client - waiting up to 600000 ms to send 0 pending messages to Netty-Client-localhost/127.0.0.1:6700
+Tests run: 3, Passed: 100001, Failures: 2, Errors: 0
+{quote}
+
+Strange thing comes here - INFO lines exposed to output which didn't.
+
+Actually I've met failure of test-batch on my Mac recently, but it is not reproducible., > How are you reproducing this?
+
+We have seen intermittent test failures on OSX and Linux.  It varies, but I see it happen at least once in 10 tries when doing `mvn test -Dtest=...`.  When I tested via the REPL with `run-tests`, it seemed not to happen.  I have not tried on a single-core environment, but I imagine it could be more likely on multi-core machines.
+
+I have this on OSX:
+
+{code}
+∴ java -version
+java version "1.8.0_45"
+Java(TM) SE Runtime Environment (build 1.8.0_45-b14)
+Java HotSpot(TM) 64-Bit Server VM (build 25.45-b02, mixed mode)
+{code}
+
+> Strange thing comes here - INFO lines exposed to output which didn't.
+
+Yeah, I noticed the output in the XML file under test-reports.
+, After discussion with [~revans2] and [~knusbaum], I am looking at correcting out-of-order messages on the receiving side by adding sequence numbers to each batch.
+
+Meanwhile, on [~kishorvpatil]'s suggestion, I looked at using the [OrderedDownstreamThreadPoolExecutor|http://netty.io/3.9/api/org/jboss/netty/handler/execution/OrderedDownstreamThreadPoolExecutor.html] where we initialize the Netty [Context|https://github.com/apache/storm/blob/07e0ff2e206a0e0ca96da9137ebbd3fc7a5e9c8b/storm-core/src/jvm/backtype/storm/messaging/netty/Context.java#L58-L64].  This approach could have some impact to performance, as it guarantees that downstream events, per-channel, are ordered when sending.  I tried it out and found that the batch test still fails with individual messages appearing out of order.  The reproducability is similar to testing without changes.  
+
+{code}
+            <failure>expected: (= req_msg resp_msg)
+  actual: (not (= &quot;64648&quot; &quot;64649&quot;))
+      at: test_runner.clj:105</failure>
+            <failure>expected: (= req_msg resp_msg)
+  actual: (not (= &quot;64649&quot; &quot;64648&quot;))
+      at: test_runner.clj:105</failure>
+            <failure>expected: (= req_msg resp_msg)
+  actual: (not (= &quot;68841&quot; &quot;68842&quot;))
+      at: test_runner.clj:105</failure>
+            <failure>expected: (= req_msg resp_msg)
+  actual: (not (= &quot;68842&quot; &quot;68841&quot;))
+      at: test_runner.clj:105</failure>
+{code}, Following up briefly: I wanted to see if the nature of the failures when using the OrderedDownstreamThreadPoolExecutor was different from before, but with another test run just now it appears the same.
+
+In the quoted example, it shows individual messages—but not batches—being delivered out of order from the perspective of the test.  I ran it again just now, and the test failed with long sequences of messages being delivered out-of-order as in the description.  I will attach a file with just the test failure output as an example., assertions failed from test-report output for netty-unit-test/test-batch with OrderedDownstreamThreadPoolExecutor used in backtype.storm.messaging.netty.Context, If I enable the debugging statement that logs how many messages are sent when sending a batch, I can no longer reproduce the error.  As soon as I disable this statement, the error reappears.
+
+So I thought I would quickly check the actual network traffic.  I confirmed by inspecting packets sent during the netty-unit-test/test-batch that the task messages were actually sent out-of-order, and it is not a matter of the test code incorrectly handling what had been received in-order.
+
+Patch:
+
+{code}
+diff --git a/storm-core/src/jvm/backtype/storm/messaging/netty/Context.java b/storm-core/src/jvm/backtype/storm/messaging/netty/Context.java
+index 5d27a16..0b59ec6 100644
+--- a/storm-core/src/jvm/backtype/storm/messaging/netty/Context.java
++++ b/storm-core/src/jvm/backtype/storm/messaging/netty/Context.java
+@@ -18,6 +18,7 @@
+ package backtype.storm.messaging.netty;
+ 
+ import org.jboss.netty.channel.socket.nio.NioClientSocketChannelFactory;
++import org.jboss.netty.handler.execution.OrderedDownstreamThreadPoolExecutor;
+ import org.jboss.netty.util.HashedWheelTimer;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -56,11 +57,10 @@ public class Context implements IContext {
+ 		ThreadFactory bossFactory = new NettyRenameThreadFactory("client" + "-boss");
+         ThreadFactory workerFactory = new NettyRenameThreadFactory("client" + "-worker");
+         if (maxWorkers > 0) {
+-            clientChannelFactory = new NioClientSocketChannelFactory(Executors.newCachedThreadPool(bossFactory),
+-                    Executors.newCachedThreadPool(workerFactory), maxWorkers);
++            clientChannelFactory = new NioClientSocketChannelFactory(new OrderedDownstreamThreadPoolExecutor(4, 30, TimeUnit.SECONDS, bossFactory),
++                    new OrderedDownstreamThreadPoolExecutor(4, 30, TimeUnit.SECONDS, workerFactory), maxWorkers);
+         } else {
+-            clientChannelFactory = new NioClientSocketChannelFactory(Executors.newCachedThreadPool(bossFactory),
+-                    Executors.newCachedThreadPool(workerFactory));
++            throw new RuntimeException(Config.STORM_MESSAGING_NETTY_CLIENT_WORKER_THREADS + " should be greater than 0");
+         }
+         
+         clientScheduleService = new HashedWheelTimer(new NettyRenameThreadFactory("client-schedule-service"));
+{code}
+
+
+Here are three messages received in sequence showing out-of-order sending from the network perspective:
+
+{code}
+ASCII-encoded hex values of task message 
+                               |
+   payload length (long)       |
+                |              |
+taskId (short)  |              |
+    |           |              |
+<...> <.........> <............>
+00:01:00:00:00:05:36:32:32:32:34:ff:37
+00:01:00:00:00:05:36:32:32:32:36:ff:37
+00:01:00:00:00:05:36:32:32:32:35:ff:37
+{code}
+
+Messages decode to "62224", "62226", "62225", and this corresponds with the test output:
+
+
+{code}
+  expected: (= req_msg resp_msg)
+  actual: (not (= "62225" "62226"))
+      at: test_runner.clj:105
+  expected: (= req_msg resp_msg)
+  actual: (not (= "62226" "62225"))
+      at: test_runner.clj:105
+{code}
+
+It does not happen every time, and the specific failures vary, but at least this confirms that it is not an issue with the test code, and that the client actually sent things out-of-order even when Netty's executor ensures ordering of downstream events., GitHub user knusbaum opened a pull request:
+
+    https://github.com/apache/storm/pull/711
+
+    STORM-996: netty-unit-tests/test-batch demonstrates out-of-order delivery
+
+    Netty calls notifyInterestChanged which causes a race condition in flushMessages.
+
+You can merge this pull request into a Git repository by running:
+
+    $ git pull https://github.com/knusbaum/incubator-storm STORM-996
+
+Alternatively you can review and apply these changes as the patch at:
+
+    https://github.com/apache/storm/pull/711.patch
+
+To close this pull request, make a commit to your master/trunk branch
+with (at least) the following in the commit message:
+
+    This closes #711
+    
+----
+commit 11886c0c4c3aa2547b1ef571712bed83229dc4e4
+Author: Kyle Nusbaum <kylejnusbaum@gmail.com>
+Date:   2015-09-01T17:13:05Z
+
+    Netty Fix.
+
+commit 3783f4e6669d185d5a0fd42468347238350c2774
+Author: Kyle Nusbaum <kylejnusbaum@gmail.com>
+Date:   2015-09-01T17:37:01Z
+
+    Whitespace
+
+----
+, Github user d2r commented on the pull request:
+
+    https://github.com/apache/storm/pull/711#issuecomment-136813085
+  
+    +1 This seems to fix the issue. I ran test-batch ~50 times without a failure.
+, Github user kishorvpatil commented on the pull request:
+
+    https://github.com/apache/storm/pull/711#issuecomment-136840377
+  
+    LGTM. +1
+, Github user HeartSaVioR commented on the pull request:
+
+    https://github.com/apache/storm/pull/711#issuecomment-136859814
+  
+    +1
+    Great! Missed StormClientHandler so there's only one thread which accesses to Client at any time.
+, Github user ptgoetz commented on the pull request:
+
+    https://github.com/apache/storm/pull/711#issuecomment-136884363
+  
+    +1 Nice work.
+, Github user asfgit closed the pull request at:
+
+    https://github.com/apache/storm/pull/711
+, Nice work, [~knusbaum]
+I merged into master and 0.10.x-branch., Also backported to 0.9.x-branch.]

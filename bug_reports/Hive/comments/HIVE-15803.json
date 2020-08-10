@@ -1,0 +1,141 @@
+[Stack:
+
+{noformat}
+"main" #1 prio=5 os_prio=0 tid=0x00007f853401a000 nid=0x3e3e waiting on condition [0x00007f853b0b6000]
+   java.lang.Thread.State: WAITING (parking)
+        at sun.misc.Unsafe.park(Native Method)
+        - parking to wait for  <0x00000000fdfaba30> (a java.util.concurrent.FutureTask)
+        at java.util.concurrent.locks.LockSupport.park(LockSupport.java:175)
+        at java.util.concurrent.FutureTask.awaitDone(FutureTask.java:429)
+        at java.util.concurrent.FutureTask.get(FutureTask.java:191)
+        at org.apache.hadoop.hive.ql.metadata.HiveMetaStoreChecker.checkPartitionDirs(HiveMetaStoreChecker.java:523)
+        at org.apache.hadoop.hive.ql.metadata.HiveMetaStoreChecker.checkPartitionDirs(HiveMetaStoreChecker.java:424)
+        at org.apache.hadoop.hive.ql.metadata.HiveMetaStoreChecker.findUnknownPartitions(HiveMetaStoreChecker.java:315)
+        at org.apache.hadoop.hive.ql.metadata.HiveMetaStoreChecker.checkTable(HiveMetaStoreChecker.java:291)
+        at org.apache.hadoop.hive.ql.metadata.HiveMetaStoreChecker.checkTable(HiveMetaStoreChecker.java:236)
+        at org.apache.hadoop.hive.ql.metadata.HiveMetaStoreChecker.checkMetastore(HiveMetaStoreChecker.java:113)
+        at org.apache.hadoop.hive.ql.exec.DDLTask.msck(DDLTask.java:1759)
+        at org.apache.hadoop.hive.ql.exec.DDLTask.execute(DDLTask.java:378)
+        at org.apache.hadoop.hive.ql.exec.Task.executeTask(Task.java:160)
+        at org.apache.hadoop.hive.ql.exec.TaskRunner.runSequential(TaskRunner.java:89)
+        at org.apache.hadoop.hive.ql.Driver.launchTask(Driver.java:1745)
+        at org.apache.hadoop.hive.ql.Driver.execute(Driver.java:1491)
+        at org.apache.hadoop.hive.ql.Driver.runInternal(Driver.java:1289)
+{noformat}, If I remembered correctly, I did not share the thread pool when I do a BFS in my first patch. Then reviewers suggested reuse the thread pool. I changed my patch to reuse them. If we are using the patch here, then it means we are only using thread-pool for the first level of directory. I think this is a setting problem. I would suggest that the user should set hive.mv.files.thread=0 or hive.mv.files.thread=a number that is large enough. Or i would change hive.mv.files.thread to a boolean. If it is true, then we are going to automatically set it to the maximum number, else we set it to 0. How about this? ccing [~ashutoshc] and [~hagleitn], [~rajesh.balamohan] are you saying "very slow" or dead lock? I'm assuming it's the latter.
+
+I don't think manually changing the setting is a solution. It would mean that users can run into hang/deadlock scenarios and then have to find the correct setting to move on. Why do we run into the hang in the first place? It seems we should be able to have a fixed size pool and predictable completion at the same time., I agree with [~hagleitn]. The issue cannot be solved just by changing it to "right" number of threads. It will always happen when number of partition keys (depth of the recursion tree) is greater than the number of the threads. For instance I could reproduce the problem by setting number of threads to 3 and creating 4 partition keys.
+
+{noformat}
+0 jdbc:hive2://localhost:10000/> set hive.mv.files.thread=3;
+0: jdbc:hive2://localhost:10000/> create table repairtable3(col string) partitioned by (p1 string, p2 string, p3 string, p4 string);
+0: jdbc:hive2://localhost:10000/> dfs -mkdir -p /user/hive/warehouse/repairtable3/p1=a/p2=b/p3=c/p4=d;
+0: jdbc:hive2://localhost:10000/> dfs -touchz /user/hive/warehouse/repairtable3/p1=a/p2=b/p3=c/p4=d/datafile;
+0: jdbc:hive2://localhost:10000/> msck repair table repairtable3;
+{noformat}
+
+The issue happens because each thread which processes a path X waits until some other thread from the pool processes the children paths of X. If the recursion level is deep enough eventually the pool runs out of threads to process the children paths., [~hagleitn] - It is not slow, it gets stuck.  
+
+Another option is to use CachedThreadPool (which would spin up additional threads on need basis) instead of FixedThreadPool in executor service.  But again, if there are 50000 partitions with nesting, it would end up throwing "unable to create native thread".  Passing "null" (instead of pool) https://github.com/apache/hive/blob/master/ql/src/java/org/apache/hadoop/hive/ql/metadata/HiveMetaStoreChecker.java#L499 would ensure that only certain amount of threads are there doing the processing and any further nesting has to be handled in the same thread context. That would still improve the perf compared to no-thread pool scenario as 15 threads would be processing instead of 1., I agree with [~rajesh.balamohan] suggestion to pass on null for thread pool in recursive call. It will mean parallelism will be limited to number of distinct dirs in first level, but that will be better than single threaded execution as well as hangs.
+[~pxiong] What do you think?, [~ashutoshc], i think we can revert our patch to disable reusing the pool when we do the BFS., [~rajesh.balamohan] and [~ashutoshc], instead of simply passing null to recursive call, can we maintain an atomic counter and pass null as soon we see number of threads in the pool are over. That way we can best utilize the threads., We can split the {{hive.mv.files.thread}} count and create different pool for each level (depth)
+{code}
+private List<ExecutorService> getExecutorServiceList(int numberOfExecutorService, int totalThreads) {
+  int average = totalThreads / numberOfExecutorService;
+  int remainingThreads = totalThreads;
+  List<ExecutorService> serviceList = new ArrayList<ExecutorService>(numberOfExecutorService);
+  while(numberOfExecutorService == 0) {
+    --numberOfExecutorService;
+    int numberOfThreads = numberOfExecutorService != 0 ? average : remainingThreads;
+    serviceList.add(Executors.newFixedThreadPool(numberOfThreads, new ThreadFactoryBuilder().setDaemon(true).setNameFormat("MSCK-GetPaths-%d").build()));
+    remainingThreads = remainingThreads - numberOfThreads;
+  }
+  return serviceList;
+}
+{code}
+
+Now instead of passing  {{pool}} to {{private void checkPartitionDirs(final ExecutorService pool, final ConcurrentLinkedQueue<Path> basePaths, final Set<Path> allDirs, final FileSystem fs, final int depth, final int maxDepth)}}, we can pass {{List<ExecutorService> poolList}} and for accessing the pool we can use  {{poolList\[depth\]#submit}}, [~nandakumar131]  Trouble with list of pool is, its unbounded, in pathological case of large number of levels, we will have large number of pools each having its own set of threads.  I like [~pattipaka] suggestion better of using counter that we get sharing as much as possible with predefined number of threads. Would you like to create a patch with that approach?, LGTM +1., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12851512/HIVE-15803.patch
+
+{color:green}SUCCESS:{color} +1 due to 1 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 4 failed/errored test(s), 10241 tests executed
+*Failed tests:*
+{noformat}
+TestDerbyConnector - did not produce a TEST-*.xml file (likely timed out) (batchId=235)
+org.apache.hadoop.hive.cli.TestEncryptedHDFSCliDriver.testCliDriver[encryption_join_with_different_encryption_keys] (batchId=159)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query14] (batchId=223)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query23] (batchId=223)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/3425/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/3425/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-3425/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 4 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12851512 - PreCommit-HIVE-Build, Thank you for sharing the patch. Deadlock would happen when multiple paths are there. For instance, following would deadlock with the patch.
+
+{noformat}
+DROP table repairtable;
+CREATE TABLE repairtable(col STRING) PARTITIONED BY (p1 STRING, p2 STRING);
+dfs -mkdir -p /apps/hive/warehouse/test.db/repairtable/p1=c/p2=a/p3=b;
+dfs -mkdir -p /apps/hive/warehouse/test.db/repairtable/p1=c/p2=a/p3=b/;
+dfs -mkdir -p /apps/hive/warehouse/test.db/repairtable/p1=cc/p2=aa/p3=bb/;
+dfs -mkdir -p /apps/hive/warehouse/test.db/repairtable/p1=ccc/p2=aaa/p3=bbb/;
+dfs -mkdir -p /apps/hive/warehouse/test.db/repairtable/p1=cccc/p2=aaaa/p3=bbbb/;
+dfs -mkdir -p /apps/hive/warehouse/test.db/repairtable/p1=ccccc/p2=aaaaa/p3=bbbbb/;
+dfs -mkdir -p /apps/hive/warehouse/test.db/repairtable/p1=cccccc/p2=aaaaaa/p3=bbbbbb/;
+dfs -mkdir -p /apps/hive/warehouse/test.db/repairtable/p1=ccccccc/p2=aaaaaaaa/p3=bbbbbbbb/;
+
+dfs -touchz /apps/hive/warehouse/test.db/repairtable/p1=c/p2=a/p3=b/datafile;
+dfs -touchz /apps/hive/warehouse/test.db/repairtable/p1=cc/p2=aa/p3=bb/datafile;
+dfs -touchz /apps/hive/warehouse/test.db/repairtable/p1=ccc/p2=aaa/p3=bbb/datafile;
+dfs -touchz /apps/hive/warehouse/test.db/repairtable/p1=cccc/p2=aaaa/p3=bbbb/datafile;
+dfs -touchz /apps/hive/warehouse/test.db/repairtable/p1=ccccc/p2=aaaaa/p3=bbbbb/datafile;
+dfs -touchz /apps/hive/warehouse/test.db/repairtable/p1=cccccc/p2=aaaaaa/p3=bbbbbb/datafile;
+dfs -touchz /apps/hive/warehouse/test.db/repairtable/p1=ccccccc/p2=aaaaaaaa/p3=bbbbbbbb/datafile;
+set hive.mv.files.thread=1;
+MSCK TABLE repairtable;
+{noformat}, Modified patch, which checks for thread pool's usage. Similar to the suggestion by [~pattipaka], modified debug logs in .2 version., 
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12851547/HIVE-15803.2.patch
+
+{color:green}SUCCESS:{color} +1 due to 1 test(s) being added or modified.
+
+{color:red}ERROR:{color} -1 due to 5 failed/errored test(s), 10241 tests executed
+*Failed tests:*
+{noformat}
+TestDerbyConnector - did not produce a TEST-*.xml file (likely timed out) (batchId=235)
+org.apache.hadoop.hive.cli.TestEncryptedHDFSCliDriver.testCliDriver[encryption_join_with_different_encryption_keys] (batchId=159)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query14] (batchId=223)
+org.apache.hadoop.hive.cli.TestPerfCliDriver.testCliDriver[query23] (batchId=223)
+org.apache.hadoop.hive.ql.security.TestStorageBasedMetastoreAuthorizationDrops.testDropTable (batchId=210)
+{noformat}
+
+Test results: https://builds.apache.org/job/PreCommit-HIVE-Build/3432/testReport
+Console output: https://builds.apache.org/job/PreCommit-HIVE-Build/3432/console
+Test logs: http://104.198.109.242/logs/PreCommit-HIVE-Build-3432/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.TestCheckPhase
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 5 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12851547 - PreCommit-HIVE-Build, +1, Pushed to master. Thanks, Rajesh!]

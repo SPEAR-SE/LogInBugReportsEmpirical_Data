@@ -1,0 +1,231 @@
+[Caching for UGI instances., Looks good. But depending on toString() of UGI might cause problems if it changes.
+
+<code>
+private static String getKey(String user, UserGroupInformation realUgi) {
+         return user + " via " + realUgi.toString();
+       }
+</code>
+
+ Can we construct it instead of calling toString(). Also the authentication method returned in the toString() is not required. Removing that will ensure we cache only one ugi for Kerberos(GSS-API) and delegation token(DIGEST-MD5) auth schemes cutting down on the number of FileSystem objects by half., Must incorporate Rohini's review comments., Removed dependency on UGI::toString(). Using a custom implementation in UGICache., @Rohini: Point taken. Here's an update., +1. Looks good., @Mithun: Please post a review request on reviewboard or phabricator. Thanks., Sure thing, Carl. Here it is:
+https://reviews.facebook.net/D3543, Hello, folks. Does the patch look good?, @Mithun,
+is this similar to HIVE-3155 and HDFS-3545 ? , Hey, Ashutosh.
+
+I'm not sure about HIVE-3155 (since it talks of the LeaseRenewer), but HDFS-3545 is definitely related. The leak mentioned in this JIRA is seen in FileSystem.CACHE.
+
+Mithun, @Ashutosh: Thanks for the heads-up. I've linked this to HDFS-3545.
+
+As per Daryn's last comment, it's likely not solvable in HDFS, since a check for UGI/Subject-equivalence will not suffice, since they are mutable. That explains why Subjects are compared for equality/identity., This patch will fix HIVE-3155 too., Rohini,
+
+HIVE-3155 is talking about leak in HiveServer (not HiveMetaStore). Further, they haven't specified if they are running in secure mode (I will ask on that ticket now)., @Mithun,
+According to analysis done by Daryn https://issues.apache.org/jira/browse/HDFS-3545?focusedCommentId=13398502&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-13398502 proper fix for application(Hive) is to call FileSystem.closeForAll(ugi) once ugi is no longer in use. , @Ashutosh,
+   We would not hit the wrong token issue mentioned by Daryn, because hive metastore proxies as the user requesting the operation. The actual ugi with which the operation would be done is "user via metastoreuser". The metastoreuser UGI is the RealUser and the kerberos TGT of it is used so there is never a issue of expired or wrong tokens. We have had the same fix in hdfsproxy and Oozie for 2 years now in production and we have not had issues with it. Hdfsproxy/Oozie UGI cache is slightly more advanced and they close unused filesystem objects from the cache after 30 mins or some configured time. Closing the FileSystem object immediately and not taking advantage of the cache is a bad thing as the fs init operation is costly. Not closing the filesystem and retaining it in the cache with this fix is not going to cause memory leak unless you have 10000s of users accessing the hivemetastore. Oozie was doing it for sometime before the cache expiry logic was added., If I understand correctly, you essentially intend to only use the cached UGI in a {{doAs}} to get a {{FileSystem}}?  That should generally work so long as tokens are never allowed to be added to the cached UGIs.
+
+Even after the caching is fixed, you will have to age out and close fs instances.  Some like hftp and webhdfs will implicitly acquire tokens.  When those tokens eventually expire, the fs instance becomes useless and must be re-created., @Daryn
+{code}
+ public static UserGroupInformation createProxyUser(String user,
+      UserGroupInformation realUser) {
+    Set<Principal> principals = subject.getPrincipals();
+    principals.add(new User(user));
+    principals.add(new RealUser(realUser));
+    UserGroupInformation result =new UserGroupInformation(subject);
+{code}
+
+  Since the new UGI refers to the realUser (which is UserGroupInformation.getLoginUser()), the tokens used for authentication would be that of the logged in user. Since TGT will be part of the logged in users tokens, it will always be used to do SASL authentication. Currently the filesystem fetched inside doAs in hive metastore is only hdfs:// and so only SASL will be done. 
+
+The problem you mentioned with hftp:// and webhdfs:// is there. UGI does not get modified with addition of tokens, but the FileSystem class itself becomes unusable because they fetch the delegation tokens  in their constructors and store in private variables of the class. DelegationTokenRenewer in those classes take care of renewing the token. But after the renewal limit is over(7 days default), the local variable is not updated and so the FileSystem class becomes unusable. One way to get it working would be to fix the DelegationTokenRenewer to get a new token and update the local variable after token expiry.
+
+@Ashutosh,
+   We need to add closing of the filesystem along with the cache if we are going to access hftp:// or webhdfs:// in hive metastore. hftp:// I am not sure as it readonly, but users might start specify partition location using webhdfs:// soon.
+
+, @Rohini,
+
+Another possibility is to disable fs cache altogether via {{fs.hdfs.impl.disable.cache}} config parameter. I get that it will add to latency, but once we switch to {{FileContext}} api in 2.0 line, this problem itself will no longer be there (since FileContext has no cache). So, instead of adding code to workaround underlying fs problem, we can live with the latency till we make that move. Does that sound reasonable?, As I remember it, testing with fs.cache disabled didn't help, for some odd reason. It's worth testing again., I believe neither disabling the fs cache nor switching to {{FileContext}} will help since Rohini stated earlier the desire to take advantage of the cache for performance, albeit w/o leaking.
+
+{{FileContext}} isn't going to be a panacea for this issue.  I think it only implements hdfs, view, and ftp (not hftp).  It provides no {{close()}} method, so there's no way to cleanup or shutdown clients until jvm shutdown, ie. aborting streams, deleting tmp files, closing the dfs client, etc.  The latter will lead to leaks such as the dfs socket cache leaks, dfs lease renewer threads, etc.
+
+Even with the fs cache disabled, leaks such as the aforementioned dfs leaks will still occur unless _all_ fs instances are explicitly closed.
+
+I'd suggest either {{closeAllForUGI}} which provides a cache boost for each request, but degrades performance across multiple requests.  Or do the oozie style UGI caching with a periodic cache purging., Or FIX Hadoop FileSystem caching, this issue is gremlin-ing all over as we have long running/multiuser systems that use Hadoop FileSystem., I think we are mixing two things here: Performance Vs Memory Leak.
+
+Patch is originally intended to plug memory leak, not the performance. It fixes the original leak, but will introduce a new one. It fixes the case when a limited number of users are contacting metastore(which was the original Mithun's test where same 60 clients keep hitting the metastore). But, if different users hit the metastore, leak is still there, rather more acute with a patch, since there are now two caches (ugi and fs) which both will grow, instead of just one (fs). 
+
+Problem stems from the fact that there is no expiration policy either in fs or ugi cache. We need to design for UGI cache eviction policy. There, when we are expiring stale ugi's from ugi-cache we can do {{closeAllForUGI}} for evicting ugi to evict cached FS objects from fs-cache.
+
+      , bq. Or FIX Hadoop FileSystem caching
+
+I wanted to "fix" the cache for the NM, but after digging around, I think the cache is working as designed.  UGIs are mutable, so if two different requests share the same cached UGI, then tokens from one request will be shared with another request.  This contamination may lead to security issues and will cause bugs., But we have a bug, that not only affects clients creating UGIs on the fly for the same user and if caching is not off will choke the NN with open sockets. And the more clients doing that the more likely for the NM to choke. Could we make UGIs immutable (which they should have been in the first place)?, Unfortunately, no.  If you make a {{UGI}} immutable, it really means marking the {{Subject}} immutable.  Everything token-based breaks because they can't be added to the {{Subject}}, you can't login from a keytab or relogin because you can't update the TGT in the {{Subject}}, proxy users (any maybe spnego?) won't work because service tickets can't be added to the {{Subject}}.
+
+A {{Subject}}/{{UGI}} is an execution context with specific privileges.  Those contexts cannot be cached and shared w/o risking escalated privileges. Think of it this way:  If I entrust you with the keys to my home to pickup a delivery, I don't want you to make a copy of the keys and have the ability to enter anytime you want w/o my explicit permission.
+
+Without knowing the intricacies, I recommend: leaving the fs cache on, create a new ugi for connections, and {{closeAllForUGI}} when the request is complete. , bq. Problem stems from the fact that there is no expiration policy either in fs or ugi cache. We need to design for UGI cache eviction policy. There, when we are expiring stale ugi's from ugi-cache we can do closeAllForUGI for evicting ugi to evict cached FS objects from fs-cache.
+
++1. It may be more tractable to have a cache expiration policy in ugi-cache based on the semantics of this particular use case. In FS-cache it gets trickier because of the general purpose nature of the file system., @Daryn,
+
+Your solution of closeAllForUGI means you have to keep the original UGI, if you keep recreating them you are back to square one.
+
+Thanks for the UGI mutability explanation. Still, I'd argue that we could achieve UGI immutability if we create a new UGI everytime you add credentials to it by composing the old UGI and the new credentials. But this still would not solve the caching problem if we want to do it by user ID.
+
+Leaving UGI alone, it seem that one thing it would help is hadoop-common providing an (<KEY>, FileSystem) ExpirationCache implementation for others to use. This cache should return a FileSystemProxy wrapping the original filesystem instance which in turn wraps the IO stream returned by open()/create() to be able to detect streams in use to not start the eviction timer.
+
+thx, Alejandro,
+  Daryn is absolutely right that we can't make the Subjects immutable. We need to be able to update a Subject with update Kerberos tickets and Tokens and changing that would break a lot of other code.
+
+It would probably make sense to make a UGI.doAsAndCleanup that does a doAs and then removes all filesystems based on the ugi, since clearly most of the Hadoop ecosystem servers have related problems., Hi Owen, yeah, I do understand we are already hosed on how UGI works and we cannot change things. Not sure how you suggestion of doAsAndCleanup() would work as the usecase is a server based system that does not keep state for a user, not even the UGI but wants to benefit from an ExpirationCache of FS instances for performance. If the system creates a new UGI for the same user every time it needs to do something, then there will be a new FS instance every time and the doAsAndCleanup() will miss all the FS instances created before. In the case Oozie and HttpFS we need a cache based on the username, we don't playaround adding/removing credentials to the Subject., You can't reasonably expect or know that any code called, now or in the future, by the request isn't going to implicitly alter the {{Subject}} with the addition of tokens/TGT/service tickets/etc.
+
+bq. Your solution of closeAllForUGI means you have to keep the original UGI, if you keep recreating them you are back to square one.
+
+The UGI is basically a wrapper around the javax security context's {{Subject}} which is created by the authentication process.  By design, the UGI/Subject is a context for a specific request/connection -- not for an indeterminate number of future requests.  A UGI should be created when a request comes in and used throughout the request rather than a new UGI created multiple times during the request.  If the request operates in a {{doAs}} block, you don't have to explicitly remember the UGI.  You can simply do a {{FileSystem.closeAllForUGI(UserGroupInformation.currentUser()}} when the request is done.
+
+bq. I'd argue that we could achieve UGI immutability if we create a new UGI everytime you add credentials to it by composing the old UGI and the new credentials.
+
+I admire the thought, but it won't work.  If you mean creating a new UGI:
+* Login/relogin is completely broken.  It's not possible to propagate the new UGI to everything holding the old UGI reference in every thread.
+* Code operating in a {{doAs}} block would have to add another nested {{doAs}} to use the tokens/tickets it just acquired.
+* Similarly, code currently expects to create a UGI, perform a {{doAs}} which may update the {{Subject}} with tickets or tokens, exit the {{doAs}} block, then call {{doAs}} on the same UGI and expect the tokens to be in the UGI.
+
+If you mean swapping out the UGI's subject, it won't work either.  The hash code is based on the {{Subject}}'s identity hash.  Swapping out the {{Subject}} when tokens are added fouls collections using the UGI.
+
+There might be some interesting things that could be done by moving the fs cache into the {{Subject}}'s credentials.  A finalizer could ensure that all {{Closable}} objects (such as fs instances) in the {{Subject}}'s credentials are closed.  That still requires a UGI to be scoped to a request but could better ensure that everything is cleaned up for the security context., [~rohini] / [~mithun] : After reading through all the comments, my recommendation is to instead of adding more code (and complexity) in Hive to workaround underlying Filesystem issue, lets just disable the fs.cache via config parameter because:
+
+* By disabling cache we are not making anything worse then its today, since we are already unable to reuse FS objects without this patch. 
+* Disabling cache will plug the memory leak by not filling FS cache.
+* Once FSContext apis are declared stable for other projects to consume, we can switch over to those where the promise is that underlying problem is fixed., Possibly a reasonable approach.  Just make sure you aren't doing a lot of {{FileSystem.get}} or {{path.getFileSystem}} calls to avoid creating a bunch of fs & client objects.  I think {{DFSClient}} and its renewal thread might have a cyclic dependency.  If so, all dfs instances will need to be explicitly closed to avoid another leak.
+
+According to another jira, {{FileContext}} isn't going to offer a {{close}} method so it may still leak {{DFSClient}} instances., Or, as mentioned earlier, if you are entirely operating within a {{doAs}} (I don't know if you are), just add a single line of {{FileSystem.closeAllForUGI(UserGroupInformation.currentUser()}} before you exit the {{doAs}}., Then I guess that for a system like HttpFS which is all about proxying to a FS, the solution is to disable the Hadoop FS caching and do its own app level caching as proposed in HDFS-3513., @Ashutosh
+bq. to workaround underlying Filesystem issue, lets just disable the fs.cache via config parameter. Disabling cache will plug the memory leak by not filling FS cache.
+  Disabling fs.cache is not going to matter. We are already getting a new FileSystem object for every request and the fs.cache is not used at all. The newly created FileSystem objects are still going to be in memory until garbage collected. And they don't get garbage collected for some reason (We have not analyzed what else is holding reference to them) as the experiments Mithun ran with fs.cache disabled did not make any difference. 
+
+bq. Once FSContext apis are declared stable for other projects to consume, we can switch over to those where the promise is that underlying problem is fixed.
+   As Daryn had mentioned in previous comments, this is not going to solve the problem at all.
+
+We need to fix this. It is not good to have to restart the metastore server every week or two. I see two possible interim fixes until it is solved in core hadoop itself for all applications.
+ 1) Disable fs.cache and do fs.close() after every filesystem call in the code.  If there is a place to put the fs.close() after every request is executed it is easy. Or you might have to put fs.close() in too many places. Anyways it is not going to be good for performance.
+  2) Add the fs.close() logic after a timeout to the current patch. Mithun was already working on this. I can't understand why you think it adds too much complexity. Other applications are already doing this. It will be difficult to answer to the Ops guys why we have a software that needs to be restarted often., I should have the aging-cache +  FS.closeAllForUGI() code in a patch shortly. The approach is to have a clean-up thread toss out UGIs from the UGICache that are "too old", after calling FS.closeAllForUGI(). The assumption is that a FileSystem instance is likely to be done with if it's been idle for 5 minutes. (The FS operations would have completed well before, given that they're largely directory-creation/listing operations.)
+
+It is probably worth a shot testing again with the FS.CACHE disabled, but as Rohini mentions, the last time I tried this, the problem persisted., @Mithun, if you are reading/writing a large file, you are still using the FS instance through the corresponding IN/OUT stream, you'll have to wrap those as well to check for FS activity. Futhermore, you should not close a FS is a stream is not closed.
+
+, [~tucu00] : This is a metastore. So, in this context we only perform metadata operations, like create/rm dir/file. We never open/read/write files in this use-case.
+Similarly, Daryn's point about cyclic dependency between dfsclient and renewal thread is moot here, since there are no write calls that we do., that makes sense, again this reinforces the point that apps have to do their own caching of FS as the one provided by Hadoop FS is not really useful :(, You are right. Since there is no way to track if a filesystem is actually still in use within hadoop (unless they start implementing reference counters for open IO and making a lot of things synchronized) and the knowledge lies with the application, the FSCache is not fully beneficial though its still very useful for client applications. Only server applications have this problem. Not having to track requests (unlike oozie and hdfsproxy) makes it a little more easy for metastore. , bq. This is a metastore. So, in this context we only perform metadata operations, like create/rm dir/file. We never open/read/write files in this use-case.  Similarly, Daryn's point about cyclic dependency between dfsclient and renewal thread is moot here, since there are no write calls that we do.
+
+I don't think you can create a file in dfs w/o creating a stream which starts the lease renewer.  I believe creation of an empty file involves an open/close.
+
+bq. the FSCache is not fully beneficial though its still very useful for client applications. Only server applications have this problem
+The cache is actually useful for both clients and servers if used as designed.  In fact, {{closeAllForUGI}} is specifically for servers.  Servers like the JT use it to avoid leaking filesystems like a sieve.  The general idea is to service a request something like this:
+{code}
+UserGroupInformation remoteUser = <get from somewhere or create it>;
+remoteUser.doAs(...);
+{code}
+followed by, or included at the end of the {{doAs}}:
+{code}FileSystem.closeAllForUGI(remoteUser);{code}
+
+This pattern allows arbitrary code to freely obtain cached fs instances w/o requiring an explicit close.  When the request is finished, you know it's safe to close all the request's cached fs instances.  There's no need to track activity, etc.
+
+I'm not going to tell anyone what to do.  I just think trying to roll a custom ugi/fs shared cache will add a lot of complexity and subtle edge-cases., @Daryn
+   The metastore only created directories. Does not create files. It only deletes them. So that should be ok. 
+
+   When you have multiple parallel requests from same user, you cannot easily do a FileSystem.closeAllForUGI(remoteUser); The same FileSystem instance will be fetched by other threads from the cache and could still be in use. Only when you are certain that no other threads have reference to the FileSystem object, you can go ahead and close the filesystems., bq.  When you have multiple parallel requests from same user, you cannot easily do a FileSystem.closeAllForUGI(remoteUser); The same FileSystem instance will be fetched by other threads from the cache and could still be in use
+
+Correct, but it's only an issue when attempting to cache the ugi.  If you allow each request to continue to have its own ugi, then its completely safe to call {{FileSystem.closeAllForUGI}} when the request is finished.  That one-liner should solve the leak., > .. FileContext isn't going to offer a close method so it may still leak DFSClient instances.
+We eliminated the cache completely in FileContext because the cache is a mess to deal with - however FileContext is not in active use and hence it still remains to be seen if it all works out in practice., It's not the lack of a cache in {{FileContext}} that causes the problem, but rather that it holds a reference to a fs, and possibly creates new fs instances on the fly, and there is no means to close them.  In the case of {{DFSClient}} there are cyclic hard references that prevent the client from being gc-ed unless explicitly closed.  Even if those hard references are broken, the fs doesn't get a chance to abort streams and delete tmp files., Here's an extension of the old patch, complete with FileSystem.closeAllForUGI() and cache-aging. This should address concerns about cache-cleanup and further memory-leaks., (Re-upload, fixing the ASF license.), [~mithun] Thanks mithun for addressing the concerns. I will take a look shortly. Will it be easy for you to also update the phabricator link ?, Few comments: 
+
+1) Better to have AGE_THRESHOLD configurable instead of a constant.
+
+2) LOG.debug("Cleaning up file-system handles for: " + ugi); - Can be info
+
+3) if (ugi == null) ugi = newUgi; is redundant. There is no way ugi can be null after putIfAbsent call.
+{code}
+ugi = ugiCache.putIfAbsent(key, newUgi);
++           if (ugi == null) // New entry.
++             ugi = newUgi;
+{code}
+
+4) Would be good to move UGICache to a separate class., Sorry. Ignore 3). That is valid. , It's probably safer to use the iterator's remove instead of a direct remove from the map.  Ie. change {{trashedUGIs.add(ugiCache.remove(entry.getKey())}} to {{entry.remove(); trashedUGIs.add(entry.getKey)}}.
+
+How does this protect against requests using trashed UGIs having their filesystems closed before the request is complete?  Is it assuming all requests will complete within the time interval between which the ugi is trashed and then purged?  If true, it seems fragile esp. when considering rpc retries, HA failover delays, etc.
+
+Has anyone benchmarked cached ugis to ensure this isn't a premature optimization?, Hey, All. First off, I'm considering a rewrite, essentially identical but implemented via Guava caching. This will save on lines-of-code.
+
+@Ashutosh: Sure. I'll put a new patch on Phabricator, as soon as I've incorporated Rohini's comments. The code could stand to be refactored.
+
+@Daryn: Thank you for reviewing.
+1. If the concern is over ConcurrentModificationExceptions, that's not a problem since ugiCache is a ConcurrentHashMap. :]
+2. Yes, that was the assumption, but you have a point. Perhaps a better way to deal with this is through WeakReferences (or some such).
+3. I'm not sure I follow your concern about premature-optimization. We're caching to avoid the creation of multiple FS instances. We've seen from tests that this solves that problem. Would you please elaborate?, I think the large discussion has obscured the fact that there's nothing wrong with the fs api.  The leak is a result of hive misusing the fs api.  Simply calling {{FileSystem.closeAllForUGI(remoteUser)}} at the end of a request will stop hive from leaking.  My guess, and I could be wrong, is that trying to cache UGIs will provide a negligible performance increase.  Hence why I question if this is premature optimization., [~mithun] Few comments on current patch.
+* As Rohini suggested its a good idea to extract UGI in its own class, since HadoopThrift20SAuthBridge is already getting too big.
+* +1 on using Guava for this. {{CacheBuilder}} class provides appropriate functionality for it.
+* I think configuring the size of cache with CacheBuilder::maximumSize(long size) might be better idea then time-based expiration. This way we can limit the cache size by memory rather time-based. What do you think?
+* Also, update HadoopShimsSecure::createRemoteUser() to do UGICache.getRemoteUser() from current UGI.createRemoteUser() so that it also benefits from ugi-cache. , @Daryn: I was about to reply that calling FS.closeAllForUGI(remoteUser) would be dangerous if the UGI is shared across multiple requests, but that clearly can't be the case. :] Your suggestion warrants trying out. I'll post results as soon as I'm done.
+
+@Ashutosh:
+1. Yep. UGICache ballooned up more than expected. :]
+2. Guava should be interesting.
+3. You're right. We were considering the same, if only to do away with the cleanup thread.
+4. I'll keep HadoopShimsSecure in mind. There's also HdfsAuthorizationProvider to be considered, in HCatalog code.
+
+I'll carry on with implementation iff Daryn's suggestion doesn't work out., Good news.
+
+After applying the following change (i.e. to use FS.closeAllForUGI(), as was intended), I see that the memory footprint doesn't grow as before. The cleanup of FS handles is better. 
+
+I left my stress-test running overnight. I see that the memory-footprint does grow when compared to running with the UGICache, (22MB vs 75MB). But it doesn't grow to the ludicrous proportions of the past (2GB). I'm going to put the increase down to heap-fragmentation because of new object-creation (avoidable with the cache).
+
+Review, please?, +1 Looks great!  I see that 20S is in the class name.  The same behavior is needed for all releases so I'm not sure if you need to add it to other files as well?, Thanks for reviewing, Daryn. Unless I'm terribly mistaken, this is the only class that needs changing. 
+
+Ashutosh, if this solution is acceptable, could this please be checked in?, Daryn,
+   bq. trying to cache UGIs will provide a negligible performance increase. Hence why I question if this is premature optimization.
+   Ran a small test. For a 10 node cluster with kerberos: 
+     - First FileSystem.get() took 350-700ms. On one node it was ~350ms and other ~700ms. Did not spend time trying to analyze the reason behind the difference. Some of the time I assume is spent on fetching service ticket to NN, opening socket, etc. 
+     - Further FileSystem.get() for the same namenode took ~75ms (With fs.cache disabled or different UGIs with cache enabled).
+     - If FileSystem is fetched from cache because of same UGI, it is 0-1 ms.   
+
+  Time might be slightly higher for a bigger cluster with namenode under heavy usage.
+
+  ~75ms is negligible at the moment. But as we move towards using hive for more realtime queries and we look at reducing the response times of the hive metastore operations, we can consider the UGI-FSCache patch as 75ms is ~25-40% of the response time for some hive metastore operations.
+
+  Hope this data is useful for HADOOP-7973 too.   
+, Mithun:
+
+Sorry for being late in getting back on this one. Patch looks good. There is a similar leak (and thus same fix) for unsecure case as well. It will be good to get that in too., Posting updated patch for unsecure-Hadoop., Updated patch that fixes the leak in TUGIBasedProcessor (alongside the fix in HadoopThriftAuthBridge20S.), Thanks, Ashutosh and Alan. The new patch looks good., +1 will commit if tests pass., Committed to trunk. Thanks, Mithun & Rohini for your persistence on this one!, Integrated in Hive-trunk-h0.21 #1654 (See [https://builds.apache.org/job/Hive-trunk-h0.21/1654/])
+    HIVE-3098 : Memory leak from large number of FileSystem instances in FileSystem.CACHE (Mithun R via Ashutosh Chauhan) (Revision 1382040)
+
+     Result = FAILURE
+hashutosh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1382040
+Files : 
+* /hive/trunk/metastore/src/java/org/apache/hadoop/hive/metastore/TUGIBasedProcessor.java
+* /hive/trunk/shims/src/0.20/java/org/apache/hadoop/hive/shims/Hadoop20Shims.java
+* /hive/trunk/shims/src/common-secure/java/org/apache/hadoop/hive/shims/HadoopShimsSecure.java
+* /hive/trunk/shims/src/common-secure/java/org/apache/hadoop/hive/thrift/HadoopThriftAuthBridge20S.java
+* /hive/trunk/shims/src/common/java/org/apache/hadoop/hive/shims/HadoopShims.java
+, Gentlemen, would it be agreeable to get this fix into branch-0.9/? That would really help us., Committed to 0.9 branch., Integrated in Hive-0.9.1-SNAPSHOT-h0.21-keepgoing=false #137 (See [https://builds.apache.org/job/Hive-0.9.1-SNAPSHOT-h0.21-keepgoing=false/137/])
+    HIVE-3098 : Memory leak from large number of FileSystem instances in FileSystem.CACHE (Mithun Radhakrishnan via Ashutosh Chauhan) (Revision 1384541)
+
+     Result = FAILURE
+hashutosh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1384541
+Files : 
+* /hive/branches/branch-0.9/metastore/src/java/org/apache/hadoop/hive/metastore/TUGIBasedProcessor.java
+* /hive/branches/branch-0.9/shims/src/0.20/java/org/apache/hadoop/hive/shims/Hadoop20Shims.java
+* /hive/branches/branch-0.9/shims/src/common-secure/java/org/apache/hadoop/hive/shims/HadoopShimsSecure.java
+* /hive/branches/branch-0.9/shims/src/common-secure/java/org/apache/hadoop/hive/thrift/HadoopThriftAuthBridge20S.java
+* /hive/branches/branch-0.9/shims/src/common/java/org/apache/hadoop/hive/shims/HadoopShims.java
+, Integrated in Hive-0.9.1-SNAPSHOT-h0.21 #137 (See [https://builds.apache.org/job/Hive-0.9.1-SNAPSHOT-h0.21/137/])
+    HIVE-3098 : Memory leak from large number of FileSystem instances in FileSystem.CACHE (Mithun Radhakrishnan via Ashutosh Chauhan) (Revision 1384541)
+
+     Result = SUCCESS
+hashutosh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1384541
+Files : 
+* /hive/branches/branch-0.9/metastore/src/java/org/apache/hadoop/hive/metastore/TUGIBasedProcessor.java
+* /hive/branches/branch-0.9/shims/src/0.20/java/org/apache/hadoop/hive/shims/Hadoop20Shims.java
+* /hive/branches/branch-0.9/shims/src/common-secure/java/org/apache/hadoop/hive/shims/HadoopShimsSecure.java
+* /hive/branches/branch-0.9/shims/src/common-secure/java/org/apache/hadoop/hive/thrift/HadoopThriftAuthBridge20S.java
+* /hive/branches/branch-0.9/shims/src/common/java/org/apache/hadoop/hive/shims/HadoopShims.java
+, Integrated in Hive-trunk-hadoop2 #54 (See [https://builds.apache.org/job/Hive-trunk-hadoop2/54/])
+    HIVE-3098 : Memory leak from large number of FileSystem instances in FileSystem.CACHE (Mithun R via Ashutosh Chauhan) (Revision 1382040)
+
+     Result = ABORTED
+hashutosh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1382040
+Files : 
+* /hive/trunk/metastore/src/java/org/apache/hadoop/hive/metastore/TUGIBasedProcessor.java
+* /hive/trunk/shims/src/0.20/java/org/apache/hadoop/hive/shims/Hadoop20Shims.java
+* /hive/trunk/shims/src/common-secure/java/org/apache/hadoop/hive/shims/HadoopShimsSecure.java
+* /hive/trunk/shims/src/common-secure/java/org/apache/hadoop/hive/thrift/HadoopThriftAuthBridge20S.java
+* /hive/trunk/shims/src/common/java/org/apache/hadoop/hive/shims/HadoopShims.java
+, This issue is fixed and released as part of 0.10.0 release. If you find an issue which seems to be related to this one, please create a new jira and link this one with new jira.]

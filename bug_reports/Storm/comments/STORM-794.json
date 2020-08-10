@@ -1,0 +1,221 @@
+[Out of curiosity, waiting 1 sec to prepare shutdown seems to be too short.
+
+It seems that worker couldn't execute whole shutdown function before worker has been killed by supervisor.
+(Please correct me if I'm wrong! :) )
+
+Last log which is in shutdown function is "Shutting down receive thread".
+
+{code}
+        shutdown* (fn []
+                    (log-message "Shutting down worker " storm-id " " assignment-id " " port)
+                    (doseq [[_ socket] @(:cached-node+port->socket worker)]
+                      ;; this will do best effort flushing since the linger period
+                      ;; was set on creation
+                      (.close socket))
+                    (log-message "Shutting down receive thread")
+                    (receive-thread-shutdown)
+                    (log-message "Shut down receive thread")
+                    (log-message "Terminating messaging context")
+                    (log-message "Shutting down executors")
+                    (doseq [executor @executors] (.shutdown executor))
+                    (log-message "Shut down executors")
+                                        
+                    ;;this is fine because the only time this is shared is when it's a local context,
+                    ;;in which case it's a noop
+                    (.term ^IContext (:mq-context worker))
+                    (log-message "Shutting down transfer thread")
+                    (disruptor/halt-with-interrupt! (:transfer-queue worker))
+
+                    (.interrupt transfer-thread)
+                    (.join transfer-thread)
+                    (log-message "Shut down transfer thread")
+                    (cancel-timer (:heartbeat-timer worker))
+                    (cancel-timer (:refresh-connections-timer worker))
+                    (cancel-timer (:refresh-active-timer worker))
+                    (cancel-timer (:executor-heartbeat-timer worker))
+                    (cancel-timer (:user-timer worker))
+                    
+                    (close-resources worker)
+                    
+                    ;; TODO: here need to invoke the "shutdown" method of WorkerHook
+                    
+                    (.remove-worker-heartbeat! (:storm-cluster-state worker) storm-id assignment-id port)
+                    (log-message "Disconnecting from storm cluster state context")
+                    (.disconnect (:storm-cluster-state worker))
+                    (.close (:cluster-state worker))
+                    (log-message "Shut down worker " storm-id " " assignment-id " " port))
+{code}, I've tested "deactivate" to storm-starter's TridentWordCount and it works.
+Maybe some situations prevent checking state., Sorry for last comment, completely misleading.
+Storm-starter's DRPC Stream was registered to Spout, and FixedBatchSpout is also registered to Bolt.
+
+My only odd thing is why $mastercoord-bg0 didn't be deactivated.
+I have similar 6 topologies and all topologies ran into same situation., I found the issue.
+
+I modified executor.clj to add logs representing size of overflow-buffer, pending, max-spout-pending, and active flag.
+
+{code}
+(let [active? @(:storm-active-atom executor-data)
+                curr-count (.get emitted-count)]
+            (do
+              (log-message "overflow-buffer's size " (.size overflow-buffer) " and pending size " (.size pending)
+                " and max-spout-pending " max-spout-pending " and active " active?)
+
+              (if (and (.isEmpty overflow-buffer)
+                   (or (not max-spout-pending)
+                       (< (.size pending) max-spout-pending)))
+              (if active?
+                (do
+                  (when-not @last-active
+                    (reset! last-active true)
+                    (log-message "Activating spout " component-id ":" (keys task-datas))
+                    (fast-list-iter [^ISpout spout spouts] (.activate spout)))
+
+                  (fast-list-iter [^ISpout spout spouts]
+                    (do
+                      (log-message "pending size " (.size pending) " and max-spout-pending " max-spout-pending
+                        " and active " active?)
+                      (.nextTuple spout))))
+                (do
+                  (when @last-active
+                    (reset! last-active false)
+                    (log-message "Deactivating spout " component-id ":" (keys task-datas))
+                    (fast-list-iter [^ISpout spout spouts] (.deactivate spout)))
+                  ;; TODO: log that it's getting throttled
+                  (Time/sleep 100))))
+              )
+            (if (and (= curr-count (.get emitted-count)) active?)
+              (do (.increment empty-emit-streak)
+                  (.emptyEmit spout-wait-strategy (.get empty-emit-streak)))
+              (.set empty-emit-streak 0)
+              )) 
+{code}
+
+And below is logs. Please take a look at tx 41696:0.
+
+{noformat}
+2015-05-04 14:02:37.198 INFO  [Thread-16-$mastercoord-bg0][executor] Acking message 41696:0
+2015-05-04 14:02:37.198 INFO  [Thread-16-$mastercoord-bg0][task] Emitting: $mastercoord-bg0 $commit [41696:0]
+2015-05-04 14:02:37.198 INFO  [Thread-16-$mastercoord-bg0][task] Emitting: $mastercoord-bg0 __ack_init [-6284616655193060224 0 1]
+2015-05-04 14:02:37.199 INFO  [Thread-16-$mastercoord-bg0][executor] overflow-buffer's size 0 and pending size 10 and max-spout-pending 10 and active true
+2015-05-04 14:02:37.199 INFO  [Thread-4-__acker][executor] Processing received message source: $mastercoord-bg0:1, stream: __ack_init, id: {}, [-6284616655193060224 0 1]
+2015-05-04 14:02:37.199 INFO  [Thread-4-__acker][task] Emitting direct: 1; __acker __ack_ack [-6284616655193060224]
+2015-05-04 14:02:37.200 INFO  [Thread-16-$mastercoord-bg0][executor] Processing received message source: __acker:3, stream: __ack_ack, id: {}, [-6284616655193060224]
+2015-05-04 14:02:37.200 INFO  [Thread-16-$mastercoord-bg0][executor] Acking message 41696:0
+2015-05-04 14:02:37.200 INFO  [Thread-16-$mastercoord-bg0][task] Emitting: $mastercoord-bg0 $success [41696:0]
+2015-05-04 14:02:37.200 INFO  [Thread-2-$spoutcoord-spout0][executor] Processing received message source: $mastercoord-bg0:1, stream: $success, id: {}, [41696:0]
+2015-05-04 14:02:37.203 INFO  [Thread-16-$mastercoord-bg0][task] Emitting: $mastercoord-bg0 $batch [41706:0]
+2015-05-04 14:02:37.204 INFO  [Thread-16-$mastercoord-bg0][task] Emitting: $mastercoord-bg0 __ack_init [8327784611027372914 600406483975750023 1]
+2015-05-04 14:02:37.204 INFO  [Thread-2-$spoutcoord-spout0][executor] Processing received message source: $mastercoord-bg0:1, stream: $batch, id: {8327784611027372914=600406483975750023}, [41706:0]
+2015-05-04 14:02:37.204 INFO  [Thread-4-__acker][executor] Processing received message source: $mastercoord-bg0:1, stream: __ack_init, id: {}, [8327784611027372914 600406483975750023 1]
+2015-05-04 14:02:37.204 INFO  [Thread-16-$mastercoord-bg0][executor] overflow-buffer's size 0 and pending size 10 and max-spout-pending 10 and active true
+{noformat}
+
+When MasterBatchCoordinator.ack() has called and its attempt state is COMMITTING, MasterBatchCoordinator treats current tx to be completed, AND it starts new transaction immediately by increasing current tx id and calling sync() directly.
+You can find that mastercoord-bg0 emits 41696:0 to $success and starts 41706 (note that max spout pending is 10). Async loop comes too late.
+
+So, though executor can know that active is false, above if-statement could be always false so executor is never deactivated.
+
+ps. My spout can sleep more than 1 sec before emitting from emitBatch(), but I don't think it should be issue. 
+Btw, complete latency of batch is about 20 secs. At this time Spout doesn't emit anything from emitBatch(). 
+{noformat}
+2015-05-04 14:02:17.173 INFO  [Thread-16-$mastercoord-bg0][task] Emitting: $mastercoord-bg0 $batch [41696:0]
+2015-05-04 14:02:37.198 INFO  [Thread-16-$mastercoord-bg0][task] Emitting: $mastercoord-bg0 $commit [41696:0]
+2015-05-04 14:02:37.200 INFO  [Thread-16-$mastercoord-bg0][task] Emitting: $mastercoord-bg0 $success [41696:0]
+{noformat}, IMO, predicate for nextTuple and deactivate should be different.
+Current predicate is for nextTuple, not deactivate.
+What's the reason that Spout waits pending tuples count to be lower then max spout pending?
+Deactivate should be performed ASAP to prevent Spout emitting new tuples and let bolts have time to process pending tuples., GitHub user HeartSaVioR opened a pull request:
+
+    https://github.com/apache/storm/pull/542
+
+    STORM-794 Modify Spout async loop to treat activate/deactivate ASAP
+
+    Currently when overflow buffer is not empty or pending is equal or greater than max spout pending, Spout doesn't handle activate / deactivate.
+    
+    I've met this scenario with Trident topology, max spout pending is 10, $batch's complete latency is about to 20 sec.
+    Please refer https://issues.apache.org/jira/browse/STORM-794 for more description.
+    
+    After applying this patch to 0.9.3, issue is resolved, though it still handles already emitted batches. 
+    
+    >> deactivate
+    ```
+    2015-05-04 16:35:52.127 INFO  [Thread-12-spout0][RecollectSpout] batchId <46253> start
+    2015-05-04 16:35:53.538 INFO  [Thread-16-$mastercoord-bg0][executor] Deactivating spout $mastercoord-bg0:(1)
+    2015-05-04 16:35:54.130 INFO  [Thread-12-spout0][RecollectSpout] batchId <46244> end
+    2015-05-04 16:35:54.130 INFO  [Thread-12-spout0][RecollectSpout] batchId <46254> start
+    ...
+    2015-05-04 16:36:10.153 INFO  [Thread-12-spout0][RecollectSpout] batchId <46262> start
+    ...
+    2015-05-04 16:36:12.297 INFO  [Thread-12-spout0][RecollectSpout] batchId <46262> end
+    ... no more batch emitted (46253 + 10 = 46263, no txid 46263 found)
+    ```
+    
+    >> activate
+    ```
+    2015-05-04 16:42:23.715 INFO  [Thread-16-$mastercoord-bg0][executor] Activating spout $mastercoord-bg0:(1)
+    ...
+    2015-05-04 16:42:23.721 INFO  [Thread-12-spout0][RecollectSpout] batchId <46263> start
+    2015-05-04 16:42:25.159 INFO  [Thread-12-spout0][RecollectSpout] batchId <46264> start
+    2015-05-04 16:42:27.162 INFO  [Thread-12-spout0][RecollectSpout] batchId <46265> start
+    ```
+
+You can merge this pull request into a Git repository by running:
+
+    $ git pull https://github.com/HeartSaVioR/storm STORM-794
+
+Alternatively you can review and apply these changes as the patch at:
+
+    https://github.com/apache/storm/pull/542.patch
+
+To close this pull request, make a commit to your master/trunk branch
+with (at least) the following in the commit message:
+
+    This closes #542
+    
+----
+commit 39aaa4c29242d42cd30097176d08d66bad99661d
+Author: Jungtaek Lim <kabhwan@gmail.com>
+Date:   2015-05-04T07:25:54Z
+
+    Modify Spout async loop to treat deactivate ASAP
+
+----
+, Github user HeartSaVioR commented on the pull request:
+
+    https://github.com/apache/storm/pull/542#issuecomment-98628505
+  
+    Kafka test failures again. Other things are OK.
+, Github user HeartSaVioR commented on the pull request:
+
+    https://github.com/apache/storm/pull/542#issuecomment-108116505
+  
+    @ptgoetz @revans2 
+    I'd like you to take a look. Thanks!
+, Github user revans2 commented on the pull request:
+
+    https://github.com/apache/storm/pull/542#issuecomment-155917369
+  
+    @HeartSaVioR is this something you still want?  I like the idea of the change, and the code looks good, but we would need to upmerge.
+, Github user HeartSaVioR commented on the pull request:
+
+    https://github.com/apache/storm/pull/542#issuecomment-155928236
+  
+    @revans2 
+    Yes, as I described to [JIRA issue](https://issues.apache.org/jira/browse/STORM-794?focusedCommentId=14526316&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14526316), MasterBatchCoordinator doesn't play well with async loop, since it  handles emitting batch independently. MasterBatchCoordinator could make pending tuple count always same to max spout pending in point of async loop's view, which makes async loop to never trigger deactivate.
+    I'll do upmerge and let you know. Thanks!
+, Github user HeartSaVioR commented on the pull request:
+
+    https://github.com/apache/storm/pull/542#issuecomment-155947307
+  
+    @revans2 Upmerged.
+, Github user revans2 commented on the pull request:
+
+    https://github.com/apache/storm/pull/542#issuecomment-156138322
+  
+    The changes look good to me and all of the tests pass so I am +1 for this.
+, Github user asfgit closed the pull request at:
+
+    https://github.com/apache/storm/pull/542
+, Thanks [~kabhwan],
+
+I just merged this into master.  Thanks for the fix.]

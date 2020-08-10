@@ -1,0 +1,120 @@
+[The childQueues of a ParentQueue are stored in a TreeSet where UsedCapacity defines the sort order. I believe for the scheduler to work correctly, we must maintain this order explicitly. 
+When a new container is assigned to an application, the correposnding queue is removed and readded, maintain the order. When a container completes however the UsedCapacity of the queue is
+changed, but we don't resort the childQueues. This means the TreeSet assumptions are not maintained, and we might miss to assign containers to this queue. 
+
+Example:
+Parent queue (root) has four child queues with capacities (A:25%, B:25%, C:25%, D:25%). The cluster has 10GB of resources with a minimum allocation of 1GB.
+1-      Through some history we got to assign 1,2,3,4 containers respectively to the queues (note: container = 1GB): status child-queues: root.a(0.4), root.b(0.8), root.c(1.2), root.d(1.6)
+2-      3 containers from D complete, status child-queues: root.a(0.4), root.b(0.8), root.c(1.2), root.d(0.4)
+3-      Now if A and B keep receiving and releasing containers without ever passing the 1.2 mark of C we might have D being stuck behind C and never receive containers. 
+
+In practice this might not show up often because of reservations (that bypass this ordering). If D has reservations pending it might get at least one container, and this will trigger the resorting, thus un-stucking it. 
+Nonetheless this should be addressed. I discussed this briefly with few folks at Hadoop Summit and we seemed to confirm the problem, but we should double check further. 
+
+[~dedcode] will post a small test that triggers the issue, and an idea of patch soon... comments welcome.
+
+, Simple JUnit Test that triggers the bug., We spotted this bug while experimenting on dynamic queues updates. The TreeSet methods .contains() and .remove() failed on retrieving a queue that we knew was there, and that gave us a hint that the tree was unsorted properly.
+The attached test is a [simple junit test | https://issues.apache.org/jira/secure/attachment/12590676/TestBugParentQueue.java] inspired by the already available capacity scheduler tests. It does simulate the scenario that [~curino] describes above and displays the order in which the childQueues is left after a couple of container assignments and completions.
+I will post a first version of a patch that re-inserts the recently completed container's queue (and all its parents) into their respective parents' childQueues. , [~dedcode] / [~curino] you want to work on the patch or can I take over? seems like an important bug which needs to be fixed. I looked at the code and on container completion it is not resorting the TreeSet which will result into unfairness.., I agree this need fixing soon. We have a first draft of the patch, we were planning to test it out carefully before posting it, but if you have cycles we can socialize it right-away and we can work on it together.  
+[~dedcode] please post the patch in its current state. [~ojoshi] you can check it out and we can test/verify in the meantime. , Attached is a first patch attempt to address the bug:
+Upon container completion, which triggers completedContainer(), remove and reinsert the queue into its parent's childQueues. This operation is done recursively starting from the leafQueue where the container got released. 
+Thus, by handling both cases where usedCapacity is ever changed (assignement and completion) the TreeSet remains properly sorted., [~dedcode] Thanks for posting the patch... looked at the code.. 
+
+bq.     // Can't use childQueues.remove() since the TreeSet might be out of order.
+any reason for this even after this patch? if we don't see any other issues then why not just use childQueues.remove instead of iterating?
+
+* reinsertQueue could be marked synchronized? thoughts? But yeah.. without that too it is thread safe as we are locking it at CapacitySchedulder.nodeUpdate(). but still it is better to mark it.
+
+*         LOG.info("Re-sorting queues since queue got completed: " + childQueue.getQueuePath() + 
+nit. line > 80
+
+* at present we send the container completed event to leaf queue and then keep propagating it till root. why not sent the event to root grab the locks from root->leaf and update it? any thoughts?, Omkar, thanks for the quick feedback... 
+
+bq. any reason for this even after this patch? if we don't see any other issues then why not just use childQueues.remove instead of iterating?
+I initially thought the same, but I worried that since the underlying capacity attribute has been changed, the TreeSet is already non-consistent? [~dedcode] can you check whether this is true or not? Also can we use some careful operation ordering, and get away with Omkar suggestion?
+
+bq. reinsertQueue could be marked synchronized? thoughts? But yeah.. without that too it is thread safe as we are locking it at CapacitySchedulder.nodeUpdate(). but still it is better to mark it.
+
+We should probably follow your suggestion (especially if this method will be reused elsewhere), or at least use the lock annotations properly. (again this patch wasn't quite ready)
+
+bq. nit. line > 80
+
+will do
+
+bq. at present we send the container completed event to leaf queue and then keep propagating it till root. why not sent the event to root grab the locks from root->leaf and update it? any thoughts?
+Lock ordering is somewhat delicate (and I worry not very consistent). In general, the idea to lock bottom up should allow for part of the operations (updating of two leaf queues) to be concurrent until the recursion meet at some common ancestor, at which point we serialize. However, at least for some of the operations this is inside a global scheduler lock, so we loose that benefit in the first-place. It might be interesting to review the locks carefully and see whether we can rationalize them further. Although this is delicate, and unless we are lock-bound on the scheduler in practice would not buy us much.  
+
+We didn't have time to test this through to a level I would be confident PAing this. Omkar do you have any cycle to test this? [~acmurthy],[~tgraves] do you guys have a moment to review this? 
+
+BTW we are working on a discrete event simulator, which should allow us to lock-step/debug the entire RM codebase... that would make for easy testing of some of this stuff (more as soon as we get it ready to show it around)., Omkar, thanks for the feedback
+{quote}any reason for this even after this patch? if we don't see any other issues then why not just use childQueues.remove instead of iterating?{quote}
+The tree is already out of order because of the new usedCapacity, the remove() won't work. We have to iterate and add() to fix the order.
+{quote}reinsertQueue could be marked synchronized? thoughts? But yeah.. without that too it is thread safe as we are locking it at CapacitySchedulder.nodeUpdate(). but still it is better to mark it.{quote}
+ok, sounds reasonable to put a synchronize there.
+{quote}LOG.info("Re-sorting queues since queue got completed: " + childQueue.getQueuePath() +
+nit. line > 80{quote}
+sure
+{quote}at present we send the container completed event to leaf queue and then keep propagating it till root. why not sent the event to root grab the locks from root->leaf and update it? any thoughts?{quote}
+Because the released container is linked to a leaf queue and we have to walk bottom up to figure out to which parent propagate. The assignment phase, however, works the way you described., bq. BTW we are working on a discrete event simulator, which should allow us to lock-step/debug the entire RM codebase... that would make for easy testing of some of this stuff (more as soon as we get it ready to show it around).
+interesting... 
+
+Yes I am checking it but it seems to have solved the original problem....checked the test code too seems ok.
+
+bq. The tree is already out of order because of the new usedCapacity, the remove() won't work. We have to iterate and add() to fix the order.
+Yeah you are right... releaseResource has already updated it.
+probably the sequence could have been removeFromParentIfPresent, releaseResource , addToParentIfPresent....however let other folks reply 
+, Patch reflecting Omkar's comments. 1) add synchronized to reinsertQueue 2) reduce line length, [~dedcode] please do keep older patches... it helps reviewing by sometimes diffing against older patches and verifying older comments... Thanks, Patch looks good. Can you please provide a patch which includes the test as well (rather than 2 files). Tx!, On second thoughts - we should get ParentQueue.completedContainer to resort, rather than relying on LeafQueue to make an explicit 'resort' call... , That is what I tried before, but because the parentQueue doesn't know which queue made the call, we don't know what to reinsert. Basically all we can do is to go down to tree to figure this out. Alternatively, we can modify the signature of completedContainer to include the Queue...
+That's why we figured that it's more efficient to have the leaf queue explicitly trigger the call., [~acmurthy] what's your preference? Keep what we proposed or modify the completedContainer signature?, Good point, I think it's appropriate to modify completedContainer to include the queue name. Thanks., A new version of the patch with completedContainer taking the CSQueue to reinsert as suggested by [~acmurthy].
+Also the patch now contains the unit test for testing proper childQueues sort order., [YARN-897-3.patch|https://issues.apache.org/jira/secure/attachment/12591926/YARN-897-3.patch], {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12593228/YARN-897-3.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/1534//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/1534//console
+
+This message is automatically generated., [~dedcode] One nit - the call to ParentQueue.reinsertQueue should be within the sync block in ParentQueue.completeContainer. There-by, in ParentQueue.reinsertQueue, a simple childQueues.remove(completedChildQueue) followed by childQueues.add(completedChildQueue) should suffice (rather than the iteration) ?, [~acmurthy] Unfortunately, as I pointed above with Omkar, we have to iterate because at that point in time the chilQueues are already out of order and we can't use TreeSet methods. For the same reason assignContainersToChildQueues iterate then add/remove too.
+This patch moves the code of reinsertQueue inline with completedContainer. , {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12593319/YARN-897-4.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/1541//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/1541//console
+
+This message is automatically generated., I just committed this. Thanks [~dedcode] and [~curino]!, Thanks [~acmurthy] for the prompt review!
+, Posted patch for branch-0.23]

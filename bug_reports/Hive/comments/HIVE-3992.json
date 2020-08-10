@@ -1,0 +1,117 @@
+[Profile view of RCFile::sync(long), This is one of the big things that is solved by the ORC file (HIVE-3874). Not saying that it shouldn't be fixed in RCFile, but we will need to modify RCFile to similarly include some kind of file header/footer to index into the row-groups., We can't fix it when the map-splits are properly distributed onto different map-tasks. 
+
+But as the profile shows, we have a CombineHiveRecordReader which is reading multiple splits in the same process using different RCFileRecordReaders.
+
+I put in some prints to check for sync behaviour of readers.
+
+{code}
+ip-10-195-75-130: split = 0-67108864
+ip-10-195-75-130: sync = 57
+ip-10-195-75-130: Last seen sync = 70351814 (in 57-67108864)
+ip-10-195-75-130: split = 67108864-134217728
+ip-10-195-75-130: sync = 70351814
+ip-10-195-75-130: Last seen sync = 136274939 (in 70351814-134217728)
+ip-10-195-75-130: split = 134217728-157715536
+ip-10-195-75-130: sync = 136274939
+{code}
+
+so every preceding RCFileRecordReader knows what was the last sync point, except the next one fails to use that information & does a fresh sync().
+
+We need a sync cache within the same process for the same file-split. 
+
+I.e find me the last sync where sync.end > split.start && sync.start < split.start for the same path.
+
+Holding that info in-memory should avoid sync passes after the first 57 byte sync-check., Cuts down on Sync calls in 2 ways.
+
+1) Does not do sync if ExecMapper.getDone() == true
+2) Caches sync points encountered during previous iterations of the same file (previous split), Testing dummy query (to simulate a "col in (select ...)" style query) at SCALE=10
+
+select /*+MAPJOIN(time_dim)*/ store_sales_rc.ss_item_sk from store_sales_rc join time_dim on (store_sales_rc.ss_sold_time_sk = time_dim.t_time_sk) limit 100;
+
+Before
+{code}
+2013-02-07 06:32:02,164 Stage-1 map = 0%,  reduce = 0%
+2013-02-07 06:32:20,082 Stage-1 map = 50%,  reduce = 0%, Cumulative CPU 53.9 sec
+2013-02-07 06:32:21,127 Stage-1 map = 100%,  reduce = 0%, Cumulative CPU 61.59 sec
+Job 0: Map: 8   Cumulative CPU: 61.59 sec   HDFS Read: 104763092 HDFS Write: 4749 SUCCESS
+Total MapReduce CPU Time Spent: 1 minutes 1 seconds 590 msec
+Time taken: 34.572 seconds, Fetched: 100 row(s)
+{code}
+
+After
+{code}
+2013-02-07 06:35:29,413 Stage-1 map = 0%,  reduce = 0%
+2013-02-07 06:35:43,200 Stage-1 map = 25%,  reduce = 0%, Cumulative CPU 9.31 sec
+2013-02-07 06:35:44,247 Stage-1 map = 100%,  reduce = 0%, Cumulative CPU 39.45 sec
+MapReduce Total cumulative CPU time: 39 seconds 450 msec
+Ended Job = job_1359695160319_0164
+MapReduce Jobs Launched: 
+Job 0: Map: 8   Cumulative CPU: 39.45 sec   HDFS Read: 25416952 HDFS Write: 4749 SUCCESS
+Total MapReduce CPU Time Spent: 39 seconds 450 msec
+Time taken: 31.351 seconds, Fetched: 100 row(s)
+{code}
+
+Now the interesting bit is that even though we cut down the CPU cost by almost 50%, the over-all latency drops only by 2 secs., Patch optimizes for rcfile splits when they are being merged in a CombineFileSplit instance., From the best of my understanding, this is affecting performance in the short-circuited read because the "in" stream is not buffered & fires 1 byte read() syscalls., I have a question related to 1) Does not do sync if ExecMapper.getDone() == true
+Outside of Hive (meaning using RCFile independent of Hive), getDone() will always be false, so this if block will always be skipped and part of this optimization will not fire. That is alright, but want to make sure this will not result in wrong results for that scenario. [~gopalv] Is that correct?
+, That part of the patch can be dropped if hive created record readers only when the mapper is processing, but it does create & sync record readers irrespective of whether the reader is needed or not.
+
+Making hive less eager about that would remove the need for that line, but this patch gave performance improvements with the least code change instead of a patch higher above that affects all record reader inits., Following tests failed on trunk:
+* Test org.apache.hadoop.hive.ql.io.TestRCFile FAILED
+
+*     [junit] Begin query: mapjoin_test_outer.q
+    [junit] Deleted file:/home/ashutosh/hive/build/ql/test/data/warehouse/dest_1
+    [junit] Running: diff -a /home/ashutosh/hive/build/ql/test/logs/clientpositive/mapjoin_test_outer.q.out /home/ashutosh/hive/ql/src/test/results/clientpositive/mapjoin_test_outer.q.out
+    [junit] 414d413
+    [junit] <
+    [junit] 569a569
+    [junit] >
+    [junit] 1320d1319
+    [junit] <
+    [junit] 1475a1475
+    [junit] >
+    [junit] Exception: Client execution results failed with error code = 1
+    [junit] See build/ql/tmp/hive.log, or try "ant test ... -Dtest.silent=false" to get more logs.
+    [junit] Failed query: mapjoin_test_outer.q, That seems odd, I haven't run tests on this since early Feb. Let me rebase this patch and update it., Update patch to trunk.
+
+Fix the test failure where overlapping splits of varying sizes over the same file are read.
+
+Fix thread-safety issues & GC overhead errors (for HBase use-case), with a Synchronized WeakHashMap., I didnt intend to say that ExecMapper.getDone() should be removed. I was trying to understand if that if check is always false (which will be if RCFile is used outside of Hive) correctness is not compromised. For Hive, it will still provide speedup. If thats true (which your previous comment seem to indicate) I think we can keep that.
+Secondly, putting an entry into map after doing null-check looks bit suspicious to me. Better is to use Guava's MapMaker classes for this. You can do {{ConcurrentMap map = new MapMaker().weakkeys().weakvalues.makeMap();}} and than {{map.putIfAbsent()}} We already have dependency on guava, so using guava should not be a problem. 
+Also, I will suggest to create a ReviewBoard or Phabricator entry for this, as we iterate on the patch., I also didn't get your point about GC overhead errors (for HBase use-case). How could that have been a problem?, I think the ExecMapper.getDone() is breaking layering & control. Once I thought about it more, I couldn't retain it as there is no way to really turn it off once a mapper runs (say, you want to read an RCFile in the cleanup code for the mapper).
+
+The GC overhead errors were due to the fact that the cache grows without bounds for a long running process. The weak hashmap works as a solution for that & will invalidate the cache as the weak-refs are collected by the gc., A couple of comments on your patch:
+* You don't use and don't need the start of the previous split.
+* The fields in the cache entry should be package private instead of public.
+* I'm concerned in corner cases you'll use a lot of RAM for the cache. Maybe we should put a limit of 100 files in the cache., Combined with Ashutosh's comment on using Guava, it makes sense to use Guava's cache impls instead of implementing my own from scratch.
+
+Will update the patch today., [~gopalv] Actually I take that Guava's suggestion back. I just realized that it will introduce runtime dependency of RCFile on guava. Currently we don't send guava to task nodes and I dont see a strong reason here to make that change. So, lets keep using your old version of synchronized weak hash map.
+
+[~owen.omalley] Implementing such limits in cache (which means implementing some variant of LRU cache) often brings new bugs and causes problems than what it solves. See, HIVE-3098 for one such discussion. In my opinion, corner case will be too rare occurence in practice, my suggestion will be to not implement such limits. What do you think?, Update patch to use a flat hash, with a hive conf option to turn it off and a synchronized weak hashmap, I find that this does improve performance a fair bit 
+
+A count(1) over a store_sales_rc_10 went from 122.988 seconds to 112.805 secs on a single node cluster.
+
+After digging down deeper, I found that the real culprit is the CombineInputFormat. A single split generalted look like this
+
+/user/hive/warehouse/tpcds_bin_flat_rc_10.db/store_sales/000002_0:0+67108864,
+/user/hive/warehouse/tpcds_bin_flat_rc_10.db/store_sales/000002_0:67108864+67108864,
+/user/hive/warehouse/tpcds_bin_flat_rc_10.db/store_sales/000002_0:134217728+24563332
+
+all wrapped up into a single InputSplitShim - which syncs twice, which is where I'm saving the CPU here with the cache.
+
+If we could combine splits for real in the combine input format phase, then this band-aid cache will become redundant., +1, Committed to trunk. Thanks, Gopal!, Integrated in Hive-trunk-hadoop2 #145 (See [https://builds.apache.org/job/Hive-trunk-hadoop2/145/])
+    HIVE-3992 : Hive RCFile::sync(long) does a sub-sequence linear search for sync blocks (Gopal V via Ashutosh Chauhan) (Revision 1465536)
+
+     Result = FAILURE
+hashutosh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1465536
+Files : 
+* /hive/trunk/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/io/RCFileRecordReader.java
+, Integrated in Hive-trunk-h0.21 #2051 (See [https://builds.apache.org/job/Hive-trunk-h0.21/2051/])
+    HIVE-3992 : Hive RCFile::sync(long) does a sub-sequence linear search for sync blocks (Gopal V via Ashutosh Chauhan) (Revision 1465536)
+
+     Result = FAILURE
+hashutosh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1465536
+Files : 
+* /hive/trunk/common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+* /hive/trunk/ql/src/java/org/apache/hadoop/hive/ql/io/RCFileRecordReader.java
+]

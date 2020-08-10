@@ -1,0 +1,92 @@
+[We cannot simply add a synchronized modifier to internal fields used to get user-limit and headroom, it will lead to deadlock:
+Assume:
+- Thread 1 is CS's message handler, it process a node's heartbeat and trying to allocate some containers. It will acquires LeafQueue's synchronized lock first, then acquires corresponding FiCaScheduler's synchronized lock
+- Thread 2 is ApplicationMasterService.allocate, it will all CS.allocate, first will acquires FiCaScheduler's synchronized lock, then it will acquires LeafQueue's synchronized
+Thread 1/2 will be deadlock after then.
+
+Basically, we have two choices to solve this problem and avoid deadlock mentioned above,
+- Adding synchronized modifier to CapacityScheduler.allocate, that writing operations to LeafQueue will be protected by CapacityScheduler lock. But according to read world use case, CapacityScheduler.allocate will be called by all application between a short period, lock whole CS seems too inefficiency here.
+- Adding a fine-grained lock in LeafQueue, only protect resource/capacity related fields. With this, fields could be protected and CS lock will be avoided altogether, so I prefer to do the 2nd way. , HI [~wangda]
+
+Do you mean completely remove CS specific lock here, and protect only the data structures with lock from LeafQueue?
+, Hi [~sunilg],
+No, I didn't intent to remove the CS lock, actually when trying to getHeadroom from FiCaSchedulerApp side, there was no CS lock, what we should do is protect internal fields for resources in LeafQueue, which described above:
+bq. Adding a fine-grained lock in LeafQueue, only protect resource/capacity related fields. With this, fields could be protected and CS lock will be avoided altogether, Hey Wangda, couple questions:
+
+Have you actually seen a case of corruption/misbehavior which you think is happening, or is it something you are anticipating based on a review of the code?
+Which fields in the LeafQueue are problematic for this scenario?, Hi Craig,
+It is what I anticipated when reviewing of the code.
+When LeafQueue compute user-limit, it uses fields like usedResource. The resource update may use Resources.addTo(..), it is not a atomic operation, so the field being used by LeafQueue might be corrupted since it is possible writing by another thread., Attached a fix of the method described above, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12685465/YARN-2925.1.patch
+  against trunk revision 475c6b4.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6016//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/6016//artifact/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6016//console
+
+This message is automatically generated., So, a few things things:
+
+I can see how we could get stale values for usedResources during the getHeadroom call - the usedResources component of headroom calculation was added after the initial change to do final computation on demand and the potential impact of that not thought through all the way, clearly.  A comment there to the effect that there is an additional entry point thread wise to consider would have helped (& I think we should add it with this change for the future...).  
+
+There is synchronization on each active application during computeUserLimit*, and updates to usedResources occur there, and the getHeadroom call is also synchronized on the application, so there is a high degree of likelihood of reasonable consistency in practice, but no guarantee as far as I can see.  Fortunately, the low level value fields of Resource are "ints", so the worst that can happen is that we are working with stale values (not "values which were never set/random int values"...), but we don't want to be working with stale values as that will mean we could get incorrect results on occasion.
+
+At the moment the consistent lock point between the allocate() where headroom is retrieved and the compute... in the queue is only the application, which is not sufficient to cover those some items which are further shared - usedResource (which you were looking at), the user's resource (consumedResource on the User object associated with the application) and clusterResource (which need to be dealt with too as far as I can see - though it is probably rarely an issue in practice, should fix it now too).
+
+All that said, some thoughts on the particulars of your patch:
+
+1.  I think we should combine the QueueHeadroomInfo and the QueueResourceInfo types - I didn't get to it before you posted your patch, but the purpose of QueueHeadroomInfo was already to provide a finer grained lock point for the very reasons outlined here, and it is doing so for certain items, but it doesn't catch them all or do it in a way which is 100% safe as you've noted.  I don't think it matters which one we end up  but we don't need both and they are both trying to accomplish the same thing, so we should combine them.
+
+2.  I don't think the patch as it stands will resolve the issue as it is just asserting consistency for access to the resource members of QueueResourceInfo - the problem is the calculation of headroom which makes use of their values which could occur concurrently with the addTo or subtractFrom operations after the references have been pulled from the accessor.   The lock consistency will need to also encompass the calculation which occurs in getHeadroom(User user, Resource queueMaxCap,
+      Resource clusterResource, Resource userLimit) in LeafQueue to be successful
+
+Also, "usedResources" does not appear to be used in either AbstractCSQueue or ParentQueue for anything except debug logging - and as applications can only run in leaf queues, I believe it should be relocated back to be a member of LeafQueue.  Given that, I think that the QueueHeadroomXYZ class should live in the LeafQueue for simplicity/encapsulation.  Finally, the clusterResource also needs to be handled here, as well as the user's consumed resource (user.getTotalConsumedResources())
+
+I also don't think that the read/write lock complexity is called for here, I don't think it's helping anything and will make the code/understanding the code more complex, we should just synchronize on the QueueXYZInfo instance which survives the combination of QHeadroomInfo and QResourceInfo
+
+Given all that, I think the full fix would be:
+
+Combine QHeadroom* and QueueResource* into one class who's per-queue- instance lives in LeafQueue
+relocate UsedResources toLeafQueue (in the QHead/Resource* instance)
+move the final getHeadroom calculation into that same class, synchronize it.
+move the add/subtract to/from for usedResources into a synchronized method of that class (much as you have), and do the same for the user consumed resource values (and in a sense cluster, see below)
+
+clusterResource - 
+
+I think this one also needs to be handled - the instance of this which is used should be copied when it is set inside a synchronized method of the QHeadroom|Resource* class which we end up with - setting of the clusterResource appears to happen consistently when it changes (via updateClusterResource so it should be kept sufficiently up to date with the cluster resource and by copying it and then we don't have to try to lock the scheduler which is where it is be modified and which would be too intrusive.
+
+[~leftnoteasy] does this make sense?, Hmm, there might be an even simpler approach - if we placed lock(s) (just a single lock, or potentially read/write) in the LeafQueue and then just held them around the final headroom calculation and the two locations where other changes occur (user comsumed +- and queue usedResources +-), all of which I believe occur in leaf queue, and then setup the lastClusterResource to be copied (inside the (write)lock), I think this would be resolved, and it would not be much of a change / much code.  In fact, we would not need the queueresourceinfo at all, and could potentially drop the headroominfo as well.  [~leftnoteasy] I think this might actually bethe simplest approach, Thoughts?, [~cwelch],
+Thanks for your comments, your suggestion makes sense to me, I will:
+- Drop the existing QueueResourceInfo implementation, and will do refactoring in future patch
+- Add a fine grain lock only for headroom computing to resolve both consistent and stale issue, will include user consumed resource and used resource. I suggest to use read/write to achieve better performance. 
+
+Any thoughts? Will work on a patch later.
+
+Thanks,, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12685465/YARN-2925.1.patch
+  against trunk revision af9d4fe.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/7282//console
+
+This message is automatically generated., Problem should be already fixed after YARN-3099, closing this as duplicated.]

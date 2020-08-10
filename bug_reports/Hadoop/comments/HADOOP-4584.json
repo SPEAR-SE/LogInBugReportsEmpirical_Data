@@ -1,0 +1,389 @@
+[I can add that we are starting to run into this problem as we convert over our pre-existing servers to HDFS!
+
+The largest has the capacity to store 650k, 64-MB blocks.  At some point, it's going to "kill itself" just waiting for the block report -- even under light load!, +1. This has been long standing problem with DataNodes and has been mentioned multiple times in user mailing lists and other jiras., Current loop in {{Datanode.OfferService()}} performs multiple steps as follows:
+1. If in the next heartbeat interval {{sendHeartbeat}}. Process the {{DatanodeCommand}} from the namenode
+2. If there is a block received send {{blockReceived}} request to the namenode
+3. If in the next blockreport interval build and send {{blockReport}}. Process the {{DatanodeCommand}} from the namenode.
+4. Wait till the next heartbeat interval or until another block is received
+5. go back to 1.
+
+With the changes we have two threads.
+Heartbeat Thread:
+1. New thread sends heartbeat and receives {{DatanodeCommand}} in response. Queues the command to an arraylist.
+
+Main thread does the following without the previous heartbeat functionality:
+1. If there are commands in the queue, process all of them.
+2. If there is a block received send {{blockReceived}} request to the namenode
+3. If in the next blockreport interval build and send {{blockReport}}. Process the {{DatanodeCommand}} from the namenode.
+4. If there are no blocks recieved or commands to process wait for 1 second or until another block is received
+5. go back to 1.
+
+
+Questions:
+1. In step 4. should we wait for receiving a command or for receiving another block?
+2. In OfferService we process all the commands that are in the queue at once.  Do you see any issues with it?
+, I think this approach might work ok for now. It makes sure the data node is not marked dead. But this should  be considered mostly a work around. We should note the fundamental problem still remains (a little less lethal). e.g. a) new blocks are not reported, b) no new blocks can be written during this time c) (not sure) not blocks can be read? etc. 
+
+If all the nodes are taking very long to process the block report, many operations on HDFS will fail. An admin can increase the block report period to reduce the effect of this problem. The current fix works fine for occasional delays.
+
+> In step 4. should we wait for receiving a command or for receiving another block?
+
+both would be better.
+
+>  In OfferService we process all the commands that are in the queue at once. Do you see any issues with it?
+Not fundamentally different. One main issue would be that there might be thousands of blocks to delete sometimes.. But that is same problem as long block report.
+
+Regd more complete fix, I could file another jira to propose a fix that I discussed with Sameer and Hairong, that satisfies all the requirements on current block report.
+
+, +1. 
+
+> In step 4. should we wait for receiving a command or for receiving another block?
+
+we should wait for either one of them to occur
+
+> In OfferService we process all the commands that are in the queue at once.
+
+This might introduce delays in sending blockReceived/blockReports (especially while processing block deletions). , Updated patch, @Raghu, should we just go for a permanent solution instead of this workaround? If so, lets talk about how it should be done.
+
+In step 4, we cannot wait for both. We are dong {{wait(1000}} against the {{receivedBlockList}}. I am not sure how we can at the same time wait against {{commandQueue}}. We have to chose one of them. Which object might get {{notify()}} of the two? BTW this wait is currently 1 second. So we keep looking for work to do every second.
+
+@dhruba
+Is is it better to process one command at a time instead of all the queued ones at once?, > should we just go for a permanent solution instead of this workaround? If so, lets talk about how it should be done. 
+
+I am fine either way. I don't know the time table for a fix. 
+
+> Which object might get notify() of the two?
+you can use a different object to wait or HeartBeat thread can notify {{receivedBlockList}};
+
+> Is is it better to process one command at a time instead of all the queued ones at once?
+
+The loop should process all the commands before next block report. These commands are more time sensitive than blockReport. For 'blocks received', you could check the blockReceivedList, between the commands., > For 'blocks received', you could check the blockReceivedList, between the commands.
+
++1. This should work best.
+
+Also, is it convenient for CommandQueue to implement the java.util.Queue interface? Or even use something like java.util.LinkedBlockingQueue., I have made the changes to report received block after processing every command from the queue.
+
+@Dhruba
+I have retained {{CommandQueue}} based on LinkedList. The reasons - 1. The required interface is simple 2.{{CommandQueue}} notifies based on a common object {{dataAvailable}} along with receivedBlockList.
+
+Currently the following unit tests are failing (know failures):
+- TestMapReduceLocal
+- TestKillCompletedJob
+, Sounds good to me. thanks., 
+Synchronization is not correct. 
+
+E.g. : The condition should be checked inside the lock that you wait on. It is not fatal in this case only because it waits only for 1 sec, but still it is better not to write that way. The block report thread should ideally do "{{wait(time till next report)}}", then the bug shows up more.  A correct synchronization should work irrespective of wait time.
+
+Similarly commandQueue and receviedBlockList sizes are checked outside the locks. We don't need to synchronize on these two any more (since the patch uses common "dataAvailable" for synchronization).
+
+I don't think new class for CommandQueue is required. Also no need for conversion between list and arrays etc. I would synchronize the following way :
+
+{code}
+// Block receiver thread :
+
+   while (1) {
+        cmd = null;
+        synchronized (dataAvaliable) {
+             cmd = commandQ.dequeue();
+             if (cmd == null) {
+                break;
+         }
+         processCmd(cmd);
+         // similarly receivedBlockList. RPC should called outside lock.
+    }
+
+   // ...
+   synchronized (dataAvailable) {
+        if (cmdQ.size() == 0 || receivedBlockList.size() == 0) {
+           dataAvailable.wait (time till next report);
+       }
+   }
+                     
+// heartBeat thread : 
+   synchronize (dataAvailable) {
+         cmdQ.addAll(cmds);
+         dataAvailable.notify();
+    }
+
+// writers :
+   synchronized (dataAvailable) {
+        receivedBlockArray.add(block);
+        dataAvailable.notify();
+   }
+
+// etc.. may be locking around delHints can also be removed.. though not related here.
+    
+{code}
+
+, 1. {{dataAvailable.wait (time till next report);}}
+
+because currently the loop exit happens when {{shouldRun}} is to {{false}} or {{shutdown()}} is called. Assuming that "time till next report" is time till next block report, the {{offerService()}} does not end for a long time. This delays shutdown in some of the cases and results in few unit testcase failures that assumes datanode shuts down quickly. Alternatively we could notify {{dataAvailable}} when {{shouldRun}} is set to false. But I think that makes the code quite ugly. Hence the 1 second {{wait}} time.
+
+2. Using dataAvailable for synchronizing commandQ and receivedBlockList
+I think currently dataAvailable is used to wake up a thread that is waiting for either a command or a received block. Data can be added to commandQ or receivedBlock independent of each other. Doing this assumes that a command cannot added while received block is being added to receivedBlockList.
+
+, Based on discussion with Raghu, updating the patch incorporating changes suggested by his previous comment, Thanks Suresh.
+
+couple of things  :
+
+  - 'blocksReceived()' RPC is called with 'dataAvailable' lock held.
+  - The test uses "NNBench" log.
+  - (minor): The test set log level to "ALL" for many classes. Not sure if that is required or useful. It usually tends to write too much output and might even mask future bugs in the tests. , Raghu, thanks for the review. Here is the latest patch..., Regd more complete solution, a much simpler fix could be :
+ 
+  * BlockReport does not list the directories at all, but just sends the in-memory list of blocks
+  * Any mysteriously missing blocks would be caught by DataBlockScanner (default period 3 weeks)
+
+Pros :
+   * The simplest fix with maximum benefit
+   * Good precursor to eventually removing or drastically less frequent block reports
+
+Cons :
+    * DataBlockScanner is rather slow (though the period could configured)
+         ** But we have rarely seen blocks disappear. more likely there are truncated or corrupt.
+
+This is preferred fix for this jira.
+
+Separating heartbeat from block reports and deletions that this attached patch does could still be useful. I am +1 having that too.. but not a requirement.
+, New patch with following additional changes:
+- Use in-memory data for building block report instead of building it by listing files and its size on the disk
+- Has a new test case that compares and makes sure that the block report from in-memory data matches the block report generated from the disk, I do not understand this patch very clearly, can you pl explain.
+
+Block reports are meant to find inconsistencies between what is on disk versus what is in the namenode metadata. A typical scenario can be that an administrator mistakenly ran a "rm  -rf <datadir>" on a datanode. The next block report would make the namenode detect this situation. 
+
+Does this patch suggest that a block report is created by the datanode without scanning the data directory on disk? more info HADOOP-1079., Ideally there is no requirement for block reports. It is essentially to used as 'catch all' for various bugs and errors. (of course, it is now overloaded with job of informing about deletions to NameNode and should be separated).
+
+Yes, it specifically removes disk scan without fundamentally changing meaning of block reports. Now DN informs NameNode about the the block that it thinks it has. because :
+
+ * 'rm -r' by admin is just one form of many many things that can go wrong with blocks on datanode. There is no perticular reason we should have this very costly disk scan (with a global lock held) just for this. 
+    ** In fact 'rm -r' is probably the least probable error (haven't seen even once in practice). 
+
+ * We have periodic block verification that does handle various things that can go wrong with a block (it can improve further). 
+      ** So 'rm -r' will be handled, just at the rate of rest of the block problems.
+ 
+ * on the other hand many users have complained about datanode scans taking 10s of minutes and making datanodes lose heartbeats. 
+     ** This makes the system pretty unusable and a major obstruction for graceful degradation under load and for scalability.
+    ** One can argue that those users should not have so many blocks. But I think DN should still handle it to the best of it abilities and not die on them.
+    ** Disks might be slow for many other reasons (other tasks on the machine, etc).
+
+  * I think this is orthogonal to HADOOP-1079 since it addresses RPC and NameNode overhead of block reports. This jira is only about DataNode side.
+
+Yes, this is a bigger change in semantics than what we proposed earlier : to scan the directories slowly, without holding the global lock... but offline scan looks like a workaround for a problem that does not need to be solved. Not scanning is much simpler than handling offline scan.
+
+Eventually we need to reduce the frequency of block reports.. this can be done as soon as we add acks for block deletions. This JIRA is major step in that direction.
+
+ 
+, Hey Raghu,
+
+- Regarding your above point about periodic block verification handling the various things that can go wrong with a block:  Currently, it's woefully insufficient, especially on large data noes, to replace the directory scan.  If we wait 3 weeks (or several months for some of our large nodes) before we find a block is missing, we're going to see lots and lots of issues crop up!
+
+- I have seen the 'rm -r' in practice, by the way :).
+
+- With a reasonably sized block, we've had 48TB servers be able to only take a few minutes for a scan: no heartbeats lost.  That said, I do like your argument that the DN should handle things to the best of its abilities and not die. 
+
+I like the idea of the patch, but only if it's combined with an occasional offline scan (even once a day!).  Creeping inconsistency bugs in the NN seem to make very accurate block reports a precious commodity, one that I'd gladly pay an expensive scan for (though I agree that once an hour is probably excessive)., I think it is imperative that missing blocks be detected by the system more aggresively that what is proposed by this JIRA. This JIRA assumes that if a block file disappears from the disk, then it will be handled by the periodic block scanner, but it might be a couple of weeks before the detection occurs. This could reduce reliability of HDFS, isn't it? Bit rot does not happen that often, but an rougue program deleting lots of block files can occur, especially when arbitrary user-written map-reduce code can execute on cluster nodes.
+
+One option would be to do a a brute-force-block-report (that scans the entire disk) once every day or so. The hourly block reports may skip scanning the disk. This might alleviate the problem to some extent, while at the same time detecting missing blocks much much earlier than what is proposed by the JIRA.
+
+In many cases, a datanode has three or four disk devices where it stores data blocks. What happens if one out of the four configured data directories go bad? if the block scanner never gets to processing a block from that data directory, then all the blocks in that data directory might be inaccesible for  a long time without being detected, isn't it?
+
+, > I have seen the 'rm -r' in practice, by the way .
+A human error like this has a quick work around : to restart the datanode.
+
+Improvements to block verification are required (mainly to catch more errors) and should be part of of block verifier, block report does not need to compensate for that.
+
+The scan of directories once a day is fine might be more assuring to people. But it is very important not to hold the lock (as DN does now) even if the scan is less frequent. i.e., whether we scan once a day or once every block report, the implementation of the scan looks the same. So it still needs to be implemented ...
+, > Creeping inconsistency bugs in the NN seem to make very accurate block reports a precious commodity, one that I'd gladly pay an expensive scan for (though I agree that once an hour is probably excessive).
+
+FYI : none of the NN inconsistencies in recent times we caught or fixed by disk scans in block reports., is it difficult to not hold the global lock while generating block reports? I guess it would require the namenode to handle more subtle race conditions. Is it possible to break up the datanode lock into read/write lock? A block report generation and a block read request can keep the read lock while block creation may acquire the write lock. This might alleviate the problem to some extent. Combined with the fact that a full scan occurs less frequently (maybe once a day), it might be an workable solution.,  I don't think read/write helps much (since we can't make writes wait for that long) or necessary for this.
+
+ It is not very complicated to scan without locking.. DN just needs to keep track of changes (additions and deletions) that happen from the time scan starts to the time it ends and appy those changes at the end. That way scan can proceed without locking the storage. 
+
+Another way to achieve the same to keep a modification timestamp with each block and at the end of the scan, if a in memory block has a timestamp older than start of the scan but not found in scan, then it should be deleted.. etc.
+
+None the less it not as easy as not scanning :).
+
+I think Suresh had more elaborate description of the above with examples. , So what is wrong with just going with the original proposal in this jira that is: prepare block reports in a separate thread without delaying heartbeats and other commands, and sending them as soon as they are ready by {{offerService()}}. This seem to be the mission declared by the issue, and changing block reports to be memory based is an add-on, which is not required to solve the problem stated.
+I understand Dhruba's concerns about reliability. I can add to this that memory based reports can also slow down cleaning up disks from unnecessary blocks, which may be critical if the data-node is close to running out of disk space.
+My approach would be to drop the in-memory block report part and commit the rest. The in-memory reports can be discussed in a subsequent issue.
+I think that would be enough of a change by itself, because there may be a dangerous race condition between {{blockReceived()}} and {{blockReport()}} if it is not done right, as we had seen before., 
+Just moving heartbeat to a different thread is useful by itself. My quote from 4th comment above :
+
+bq. "I think this approach might work ok for now. It makes sure the data node is not marked dead. But this should be considered mostly a work around. We should note the fundamental problem still remains (a little less lethal). e.g. a) new blocks are not reported, b) no new blocks can be written during this time c) (not sure) not blocks can be read? etc. "
+
+If that is what everyone wants then it is ok. But we will continue to see problems with datanodes with lot of blocks. My impression is that it is about time we fix the fundamental problem with the scan in block reports., Currently one of the version of the patches (Feb 10) introduces separate heartbeat thread without the other changes.
+
+I would like to get consensus on if we need to detect missing files faster than what block verification can do. Once we agree to that, we can go for long term solution, which should include:
+
+Block deleted report:
+Sending block deleted (much like block received) from datanode to namenode. Currently block report is the way namenode learns about the deleted blocks. With this change, we can send block reports less frequently.
+
+Faster block scanning functionality for missing/lingering files:
+- We could have a thread that lists the files (without holding a global lock) and reconciles the blocks on the disk with blocks maintained in the FSDataset. This could be done by deleting the blocks from FSDataset map under the following conditions:
+  - block file or a block meta data file is missing on the disk but exists in FSDataset map
+  - block meta data does not match block information (block size and generation stamp) in FSDataset map
+  - block file or block meta data file exists on the disk and does not exist in FSDataset map
+
+I was thinking of doing this in a separate jira for long term., Can you guys vote on your preferred fix:
+# Heartbeat in a separate thread with block report as it is *(patch is ready)*
+# Heartbeat in a separate thread with block report generated from in-memory data *(patch is ready)*
+# Heartbeat in a separate thread with block report generated in a separate thread by listing block files from the disk *(will be addressed in another jira)*, Option 1: +1. This sounds like the approach that will alleviate this problem to a certain extent.
+Option 2: -1
+Option 3: +1, but we can do this as a separate JIRA, As I said I propose to isolate in-memory block reports into a separate issue. Does anybody disagree with that?
+
+As for the heartbeat thread, I would like to propose an alternative to the approach and discuss pros and cons of the two.
+
+# Now we have a single thread (call it offerServer thread) which does all three operations: heartbeat with processing command returned from the name-node, blockReceived and blockReport. 
+# Current Suresh's proposal is to separate heartbeats into a new thread (heartbeat thread), which also means creating a queue of commands returned from name-node for processing by the offerServer thread later on.
+# My proposal is to separate block report preparation into a new thread (blockReport thread), which wakes up once an hour and prepares a block report. Once the report is ready the offerService thread sends it to the name-node.
+
+I think the last proposal (3) may have an advantage over (2) because in (2) we still delay blockReceived and the processing of commands from the name-node until the block report is getting composed., I don't see any advantage to (3), based on more details, it might not even be correct. The requirement is that BlockReport should have "exact snapshot" of blocks... i.e. no changes changes can happen to FSDataset from the time block report starts until it ends. Which thread does it does not matter. Processing commands and block report in one thread makes sense since those need to happen serially.
+
+May be (3) still has some advantage : could you give a specific example that shows the advantage? 
+
+Fixing the block reports properly (with a directory scan once a day or so), i.e. "Option 3" in a seperate jira is ok. But I would like to see that marked as blocker at least for 0.20 or 0.21. I for one am pretty tired of replying "oh, that is a known issue and we need fix" every time users complain about it. Some users even had a separate process to constant scan the directory tree to to keep the inode info in kernel memory.
+, > Option 1: +1. This sounds like the approach that will alleviate this problem to a certain extent.
+
+Not in the current form. HeartBeat still needs to be fixed not to acquire global volumes lock. Currently it  locks to get disk stats. So blockreport still blocks heart beat. I think should be fixed in this jira., > May be (3) still has some advantage : could you give a specific example that shows the advantage?
+
+The example is as I mentioned before: In (2) when blockReport is scanning directories, which may take minutes according to Suresh, blockRecieved can not be processed, and the commands returned from the name-node
+in reply to heartbeats like replicate and delete blocks will just accumulate on the command queue and wait until block report is done. True, the data-node will not die, but it will still be frozen in offerService thread.
+
+I am just proposing to do with block reports the same we did with received blocks: when they arrive we place them into {{receivedBlockList}}, and offerService sends blockRecieved when the list is not empty. Block reports are prepared by a separate thread and placed into {{readyBlockReport}} member. offerService sends it whenever the member is not null., Konstantin, 
+
+does it satisfy the requirement for block reports I mentioned : 
+
+bq. The requirement is that BlockReport should have "exact snapshot" of blocks... i.e. no changes changes can happen to FSDataset from the time block report starts until it ends.
+
+If yes, how? If not, why isn't it required? 
+
+Anyway, next version of the patch can can include the improvement you are proposing, and we can easily check if there is a  clear advantage.
+
+
+, Also, "Option 3" that Suresh proposed above  does scan in a different thread and it does it correctly.. Thus avoids freezing offerService thread. Did you mean to implement "Option 3" in this patch? I am all for it... that is the proper fix I have been lobbying for for long :)
+
+
+, Updated patch for separating heartbeat thread. Methods {{FSDataset.getCapacity(), FSDataset.getDfsUsed(), FSDataset.getRemaining()}} use commands such as {{df}} and {{du}} on data directories and does not need to be synchronized with FSVolumeSet.
+
+Changes are:
+* Removed synchronizing {{FSVolumeSet.getCapacity()}} on {{FSVolumeSet}}
+* Removed synchronizing {{FSVolumeSet.getRemaining()}} on {{FSVolumeSet}}
+* Access to {{FSDataset.getCapacity(), FSDataset.getRemaining(), FSDataset.getDfsUsed()}} are synchronized
+
+Note if {{df}} operation blocks, the heartbeat thread will be blocked. However assuming it will be much shorter than 10 minutes and the datanodes will not be marked dead by namenodes.
+, Separating out heartbeat thread is a step in the direction of more permanent fix. Latest patch separates out the heartbeat thread. It removes the change of generating block report from in-memory data and reverts back to generating it from the disk. Should we commit this change?, Separating a HB thread from the main offerService thread has the following disadvantages:
+# This does not remove contention on processing blocks reports.
+That is, the data-node is still blocked preparing block report and cannot do anything useful like send blockReceived or process commands from the name-node. The only good thing is that it does not die.
+# We loose automatic data-node activity throttling with this. 
+Meaning that while the data-node is busy it still sends heartbeats and name-node replies with commands, which are piled up in the queue because the DN cannot process them.
+This can probably be solved with a smart command queue maintenance or by adjusting of heartbeat frequency with respect to the length of the queue, but will require more work and very thorough tuning.
+# Related to previous. Administrators will no longer be able to judge that a data-node is in trouble by just looking at its heartbeat interval.
+
+So I would argue to keep HB processing in the main offerService loop, but rather separate the block report processing into a separate thread.
+In general we should keep all heavy-weight operation like delete-blocks away from the offer service loop. They can be done in separate threads.
+Does that make me a supporter of "Option 3"?, > Does that make me a supporter of "Option 3"?
+It looks like. 
+
+It is a good point about loosing "throttling" and "indiating to admin about slow datanodes". But fundamentally that is not job of a heartbeat. Those are couple of useful things piggy backed on current heartbeats. Strictly, it is better to make HB report some number indicating backlog at the DataNode rather than delaying HB. HB should only only mean "can this datanode be used or not". 
+
+That said, I am fine with not having a seperate HB threads, as long as we are going to move hardware dependent expensive operations like deleting blocks out of offerservice/HB thread (here or in a new jira).
+ , Based on the discussions so far, here is a proposal:
+# DataBlockScanner will be enhanced to periodically check to see if the blocks on the disk matches blocks in memory.
+# Block list is compiled from disk and in-memory map. The two lists are compared to find the following inconsistencies:
+## Block is in memory and not on the disk
+## Block is on the disk and not in memory
+## Block on the disk does not match the block in memory
+# Reconciling differences is done one difference at a time. FSDataset lock is held to prevent further block changes and a check is done to ensure inconsistency found still exists (to account for changes that might have happened while checking the disk for block files):
+## If a block file is missing on the disk, block is deleted in memory
+## If a block metadata file is missing on the disk, block in memory is updated with generation stamp as zero (as done in block reports currently)
+## If a block is missing in memory, then it is added to FSDataset
+## If blocks do not match, the in-memory block is updated to reflect the block on the disk
+## A block metafile that does not have corresponding block file will be deleted from the disk
+# Block report will be generated from the in-memory data, Couple of changes that requires careful review:
+# Currently metadata file exists without a corresponding block is deleted. Could this cause a problem (that is if metadata file was created before a block file is created)?
+# DirectoryScanner is added to DataBlockScanner. While reconciling the difference between the disk and in-memory blocks, existing scanner functionality is suspended. Would this cause problem for DataBlockScanner in ensuring its constraints such as scanning with in certain period of time and using configured bandwidth?, Updating the patch based on comments from Raghu:
+- Names that used filescan is changed to directoryscan
+- Addition/deletion of blocks to FSDataset also add/deletes blocks to DataBlockScanner , New patch, New patch, New patch. During unit testing I noticed that TestBlockReplacement sporadically fails and TestRecoveryManager fails frequently., New patch with additional changes:
+# {{FSDataset.checkAndUpdate}} only reconciles the difference for finalized blocks
+# When block size in memory does not match the actual block file size, notify the block as corrupted to the namenode, Nice document. Thanks.
+
+When the DirectoryScanner scans the directory, does it need to keep the FSDataSet lock? If not, can you pl explain (in the document) why? What makes the DirectoryScanner scan all the blocks in the data directory atomically?, Here is why holding FSDataset lock is not required:
+# When reconciling, the difference flagged by the scanner is only a hint to check the. The actual state of the block on disk and volumeMap is used to decide if indeed the difference still exists. This takes care of the following conditions:
+#* Scanner finds a block but it has been deleted after it was found
+#* Scanner does not find a block that has been added during scan
+# DirectoryScanner might not find differences for the blocks that got added or deleted, while it compares the block report from memory and the disk. These differences will be found in the next iteration of the scanner.
+
+I will add this information to the document as well.
+, I am commenting on the design document.
+It seems that you can simplify the description of the algorithm. As I understood you generate 2 reports memory_report and disk_report, then compare them and generate a (diff) list of suspicious blocks. They are only suspicious, since they were different at the time the reports were generated, which may be not true at the current time. And then for each suspicious block you reconcile it under a lock in order to prevent immediate modifications of the block state.
+To simplify the algorithm you can completely drop the conditions reflecting the state of the block in the past when it was chosen as suspicious. The past state is irrelevant in the present because you still need to verify the state and act according to its present state rather than the past.
+I see the code in fact does exactly that.
+
+Other comments:
+- I don't think the directory scan interval in hdfs-default.xml should be in hours. This is radical. At least for testing you should be able to run the directory scanner more often.
+- {{DirectoryScanner()}} constructor and {{reconcile()}} should not be public. Please check other methods that do not need to be public.
+- It is better to give a hint in the override annotation which base class is overridden, e.g. {{@Override // Object}}
+- {{FSDataset.checkAndUpdate()}} You can make it much more readable if you add return statements inside if statements. This will let you drop a lot of else clauses and linearize the code making the logic clearer., Attaching new design document to cover comments from Dhruba and Konstantin. Will upload a patch that incorporates the comments  related to the code soon., Changes from the previous patch:
+# Incorporated changes suggested by Konstantin
+# Differences between disk and block are now compiled holding the {{FSDataset}} lock. This handles concurrent modification issues related to using the reference to the same block objects in the volumeMap.
+# {{FSDataset.getBlockReport()}} returns a deep copy of blocks.
+, Additional changes:
+# {{DirectoryScanner}} processes block and metadata files one directory at a time instead of all the files under the data directory
+# Additional testcases that verifies the number of blocks found by the DirectoryScanner
+, Previous patch results in a bug where blocks are marked corrupt. In the patch, block report is built by listing blocks from {{FSDataset.volumeMap}}. However the map has both finalized and non-finalized blocks. The non-finalized blocks are reported with size set to the default block size in the block report. When a last block is finalized, block received notification to the name node reports the new size  smaller than previously reported. Namenode marks such blocks as corrupt.
+
+ The new patch adds only finalized blocks to the block report.
+, Mostly looks good. A few comments :
+
+# default scan period is one hour (same as before).. I think it should be much less often (may be 6 to 24 hours). 
+# Since there is no throttling of directory scan, it is better to randomize the start time. The datanodes are usually started at the same time, the whole cluster could slow down at the same time.
+# regex patterns for block files : '.' in ".meta" needs to be escaped. Need a '$' at the end for more accuracy?
+# diskGS in checkAndUpdate() is calculated outside lock. Any correlation is valid only inside the lock. Could be a problem now or later.
+# At patchfile:834 : It updates generation stamp with 'diskGS'  without moving the meta file from prev directory to memBlock's directory. Could that result in block and meta files in different directories?, Will take care of other comments.
+bq. 1.  default scan period is one hour (same as before).. I think it should be much less often (may be 6 to 24 hours).
+I wanted to retain the old behavior of scanning a directory every 1 hour for now. Changing it to 6 hours, if no one expresses concerns.
+
+bq.   2. Since there is no throttling of directory scan, it is better to randomize the start time. The datanodes are usually started at the same time, the whole cluster could slow down at the same time.
+Randomizing between 0 and directory scan period?
+
+bq.   5. At patchfile:834 : It updates generation stamp with 'diskGS' without moving the meta file from prev directory to memBlock's directory. Could that result in block and meta files in different directories?
+I am not sure if I should be moving files. I think it is better to use the file if it exists in the same directory as the block file. Otherwise, update the GS to grandfather generation stamp.
+, > Randomizing between 0 and directory scan period?
+yes.
+
+> I am not sure if I should be moving files [...]
+
+any correct option is ok. I mainly wanted pointed out the issue with the patch as it is now., > > Randomizing between 0 and directory scan period?
+To be more specific, 'lastScanTime' should be set to 'now - rand(scan period)' instead of 'now'., Updated patch with changes suggested by Raghu, +1. Looks good.
+
+minor : values in hadoop-default.xml and default used in the code for scan period are different. Traditionally they are same., New patch makes the default scan period in the code same as the value in hdfs-default.xml, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12405095/4584.brthread.5.patch
+  against trunk revision 763728.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/177/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/177/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/177/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/177/console
+
+This message is automatically generated., Failures in the following tests are unrelated and is happening for other patches also:
+# org.apache.hadoop.hdfs.server.namenode.TestReplicationPolicy
+# org.apache.hadoop.mapred.TestMRServerPorts
+# org.apache.hadoop.mapred.TestQueueCapacities
+, I just committed this. Thanks Suresh., Editorial pass over all release notes prior to publication of 0.21. Bug.]

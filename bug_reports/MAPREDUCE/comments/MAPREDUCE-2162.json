@@ -1,0 +1,89 @@
+[For example, there are three finished task with progress rate (1, 2, 30)
+mean = 11
+std = 13.4
+std > mean
+
+The fourth task will never get speculation even if it stuck forever., This is interesting. The original LATE algorithm actually used a percentile (for example, the 25th percentile) instead of a standard deviation to determine tasks that are "slow enough". That guarantees that there are always tasks that are considered "slow enough". Maybe we should go back to that. I believe that Arun and Andy changed it to the current approach in HADOOP-2141 because they thought that the stddev would be more robust and they were afraid that computing the 25th percentile takes time. However, it doesn't take that long and it only needs to be computed periodically., i don't like the idea of simply speculating the bottom N percentile of tasks. it doesn't take into account the benefit of speculation. if those tasks were anyway going to complete 'fast enough' - then what's the point of speculating them? we just fixed a bunch of these types of problems (that were causing rampant over-speculation) - by preventing speculation of tasks that were anyway going to complete fast enough.
+
+it seems to me that speculation is an exercise in computing the cost (excess cpu consumption) to benefit (reduction in latency for user) ratio for different choices. a good algorithm would allow the user/admin to pick a threshold cost/benefit ratio and speculate if that threshold was met. it's not a completely trivial analysis (eg: the benefit of speculating the slowest task is limited by the latency of the next slowest task) - but i think it should be doable., The progress rate also depends on the data size that the tasks consume. A task with a lot of data to process might appear to be slower than tasks that have lesser data to process (and this is true for reduces especially), and the current speculative execution logic might end up speculating that. In the logic for choosing speculative tasks that's nowhere in the picture currently. I wanted to change this to take into account the processing rate via MAPREDUCE-718 but never could get to it .. Processing rate might be better than progress rate for all the calculations we do., definitely. we should definitely take processing rate into account. we have known from the time we started using the new speculation code that skewed jobs will end up speculating the larger tasks. fortunately that hasn't been a showstopper - speculation rates are pretty reasonable after solving some of the other jiras we have filed (having larger lag for tasks and not speculating tasks whose projected duration is small enough).
+
+but this problem is more fundamental imho. i spent some time doing a cost-benefit model to determine speculation. i don't have the complete model yet - but based on what i have seen so far - 'stddev' does not seem to enter the picture (not unless we fold risk into the model). it seems to me that we don't really understand how (and why) stddev should be used to determine speculation., it seems that the first thing to do is switch from deciding speculations based on progress rates and instead make decisions based by comparing the remaining time for a task (which can be computed using the progress rate) and the average completion time of tasks of the same type/job. justifications:
+
+- i asked Matei yesterday whether there was any fundamental reason for using progress rates in their original work. he didn't seem to recollect any.
+
+- let's assume for a minute that we used task durations instead of progress rates in the same equation (ie. speculate task T if duration(T) > avg_duration(Job) + stddev_duration(job)).  this does not suffer from the problem described in this jira. as a stalled task runs longer and longer - it eventually will go above the RHS.
+
+- it's much easier to describe the benefit of a speculation decision in terms of potential time saved. for example - if we speculated _only_ the slowest task (T ~N~ ) - then the best case time saved on the job becomes T ~N~ - T ~N-1~ . It's much easier for users/admins to understand speculation decisions that can be explained in terms of potential latency savings. It's also easier to build cost models (latency reduction, cpu cycles saved) based on run time (as opposed to progress rates).
+
+- if in future #rows processed are available - then they can be accomodated - One can normalize the task duration with the number of rows and use that instead of the raw duration time.
+
+---
+
+Assuming we use task durations - we still need to decide on a speculation criteria. There are couple of criteria that already in place (for us):
+- don't speculate tasks for first LAG seconds
+- don't speculate tasks that are projected (based on progress rate) to complete in N seconds (MAPREDUCE-2062)
+
+One other negative criteria is obvious. Assume we are dealing with a task with projected remaining time _R_ (using progress rate), total time _T_ where the job's average task duration is _M_:
+
+- if _R_ < _M_ - then it makes no sense to speculate (the logic being that if we relaunch the task - it can be expected to take around _M_ seconds. So the current task will outrun the speculative attempt).
+- if _T_ is in 'normal' range - then also it doesn't make sense to speculate. we need to define normal.
+
+i am not sure that normal is best measured by mean + stddev. The reason is that tasks are frequently multi-modal in their durations (for example we are joining data sets a, b, c - mapper splits from a b and c will have different run times (depending on compression, size of row, filter condition etc.). ideally we should track mean duration per data set - but we don't have that available. the mean and stddev don't mean much in these conditions.
+
+So my suggestion is to define normal to be in terms of percentiles. If a tasks total duration (projected) is within some N % (say 90) - then we should exclude it from speculation. if a task stalls  - it will eventually show up in the top percentile and be speculated. we can also supplement percentiles with absolute numbers (if a more than M tasks are slower than the task being considered - just don't speculate it)
+
+----
+
+elmination is great - but could still leave us with always trying to speculate slowest 10% (for example) of tasks. that's a lot for a busy cluster. at this point i think we should look at the cost/benefit of choosing some K slowest tasks (by remaining time) to speculate.
+
+The benefit of speculating a task is limited to the latency difference with the next slowest task. As an example: if the three slowest tasks had remaining time of  100s, 200s and 201s - then speculating only the last one will produce hardly any gain (1s !!!) - but speculating the last two can give us 101s gain (best case). The complication here is that one needs to consider the cost/benefit of speculating some K tasks at a time (and not one at a time).
+
+one simple way of specifying this may be to consider speculation opportunities that result in at least X% or Y seconds decrease in latency. this needs some more thinking.
+
+, This sounds pretty good, Joydeep. Just wanted to make one comment: even if we use, say, then 90th percentile to determine the "normal" range for tasks, it may not mean that we'll speculate 10% of tasks all the time. The reason for this is the other speculation criteria -- speculative lag and R < M. In particular, if we let each task run for some amount of time (say half the average task length) before deciding on whether to speculate it, then it's likely that even for many of these 90th percentile tasks, R will be less than M so we will not want to speculate. This might be enough to get a good speculation algorithm (that only speculates a few percent of the tasks and almost always picks ones that will beat their original tasks) without having to do the cost-benefit estimation at first., agree in general although i would need to collect some data to see how any particular scheme would turn out.  if we just shifted to percentiles, we could do it in terms of progress rates as well.
+
+> if we let each task run for some amount of time (say half the average task length) 
+
+seems like a good one to add to the list. 
+
+, spent a lot of time coding and thinking about this. i am more to make a simple change to cap the standardDeviation at some maximum value (say Mean/3).
+
+i did a detailed analysis that seems to suggest that doing so would be roughly equivalent to the scheme discussed above. we already have the notion of a 'speculative cap' - putting a speculative cap of 10% of the currently running tasks would be roughly equivalent of speculating the bottom 10%. (The LateComparator currently sorts speculatable tasks by remaining time (instead of progress rate). if it were to sort based on progress rate - it would be very similar to speculating the bottom 10%)
+
+the conditions discussed here (runningTime >= mean/2 and remainingTime<mean) are roughly equal to the current code (modulo the LateComparator) if stddev is capped at mean/3 (it's a somewhat long deduction)., here's the reasoning behind capping stddev at mean/3. we speculate if:
+* rate < mean - stddev
+
+implies
+* 1/rate > 1/(mean - stddev)
+
+implies
+* 1/rate > 1/mean + (1/(mean - stddev) - 1/mean)
+
+implies
+# projectedTime > meanTime + Delta
+
+where
+* Delta = (1/(mean - stddev) - 1/mean)
+
+if
+* stddev <= mean/3 // for example
+
+then
+* Delta > (1/(mean - mean/3) - 1/mean) ==>
+* Delta > 0.5/mean = 0.5 * MeanTime
+
+now our our equation _1_ becomes:
+# projectedTime > MeanTime + 0.5*MeanTime
+
+two observations:
+
+* by capping stddev - we have converted the rate check into a meaningful check on the running time of a task - tasks that run longer than a certain time (relative to the mean) will be guaranteed to be speculated.
+* the Meantime + 0.5*Meantime slack over the mean is same as the heuristic discussed in the jira where two rules were discussed:
+** dont speculate if runningTime <= MeanTime * 0.5
+** dont speculate if remainingTime < MeanTime
+* if we add these two together - since runningTime + remainingTime == projectedTime - this becomes (roughly): 
+** speculate only if projectedTime > MeanTime + MeanTime*0.5
+
+so the heuristics in the jira are structurally similar to capping the stddev at mean/3.
+
+as explained earlier - the percentile stuff is actually (approximately) being done by speculativeCap (no more than 10% of the tasks can be speculated and tasks are sorted (by latest finish time) before speculating).]

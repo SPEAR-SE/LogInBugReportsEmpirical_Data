@@ -1,0 +1,105 @@
+[After more looking I think I have a better understanding of what is happening.  Speculative execution would cause more tasks to be killed because in parallel tasks one task will finish before the other and the slower task will be killed.  Killed tasks are returned as completed immediately and have their output removed by a separate thread than the thread which completes a job.  Meaning it is possible for a job to complete and return before output for killed tasks is fully removed.
+
+Would it be useful to have a structure that checks if killed tasks are removed before allowing a job to complete?  I think it would but I might not be fully understanding why killed tasks are returned immediately., Dennis, the way it works is that there is a TaskCommitQueue thread that saves or discards outputs. And, yes, the job could be declared as "complete" before the killed tasks' outputs are discarded since the job is declared as successful as soon as all the tasks are successful (including saving their outputs)., I will say that this only happens because hadoop keep the output of tasks in a task_id directory directly beneath the output directory.  Another, perhaps better solutions would simply be to store the temporary task output somewhere else NOT beneath the output directory.  This way even if the killed tasks weren't finished removing output before the job finished it wouldn't matter as the only thing that would be read by later jobs is the final output directory and not the temp task directories. 
+
+If this sounds like a good solution I will make up a patch for it., bq. Another, perhaps better solutions would simply be to store the temporary task output somewhere else NOT beneath the output directory
++1, bq. I will say that this only happens because hadoop keep the output of tasks in a task_id directory directly beneath the output directory.
+
+Agreed.
+
+The reason this is done is that once we have file-permissions and/or quotas in HDFS this will continue to work seamlessly... the other option of putting the temporary outputs elsewhere is brittle as soon as we do permissions/quotas unless we ask the user to specify yet another temp-dir in his job-configuration; IMHO a needless complication.
+
+----
+
+Taking a step back, I'd argue the simplest solution is for your input format to just ignore input directories beginning with underscore, thus all ${mapred.output.dir}/__${taskid}_ dirs are silently ignored. 
+
+In fact {{FileInputFormat}} does exactly that: there is a {{hiddenFileFilter}} which ignores files starting with either "_" or ".". This bug then becomes a question of figuring why that filter isn't working..., The code in Nutch uses SequenceFileOutputFormat.getReaders which doesn't specify a file format path filter.  I have added an overloaded method to SequenceFileOutputFormat to allow passing in a PathFilter.  This should allow us to make changes in the nutch code to ignore work and temp directories., bq. Would it be useful to have a structure that checks if killed tasks are removed before allowing a job to complete?
+
+Maybe this makes sense (though in certain cases, especially in a busy cluster, the job might take a slightly longer time to declare itself a success)., I agree that adding yet another filter for files to ignore is taking a step back. We are going to add yet another bit of cruft to the code. It is much better to make sure that the file output directory only has final output, not intermediate garbage. (That is what /tmp is for.)
+
+If you really really want the temp files to be in the same output directory hierarchy, use a .inprocess directory and then delete that directory at the end of the job. If a job completes successfully there should not be any intermediate files to ignore., >  If a job completes successfully there should not be any intermediate files to ignore.
+
++1  The bug is that the job is marked complete when speculative tasks are still running., +1 - The bug is that the job is marked complete when speculative tasks are still running
+
+---
+
+Also we should discuss the '_' issue in more detail and fix related documentation.  I've started HADOOP-2715 to discuss., Setting Fix Version to Hadoop 0.16.1. Not only might users see this even when speculative execution is turned off, it's even more likely for users to see this when it's turned on. So, this patch is more or less preventing us from deploying speculative execution as the default for our clusters.
+, bq. After more looking I think I have a better understanding of what is happening. Speculative execution would cause more tasks to be killed because in parallel tasks one task will finish before the other and the slower task will be killed. Killed tasks are returned as completed immediately and have their output removed by a separate thread than the thread which completes a job. Meaning it is possible for a job to complete and return before output for killed tasks is fully removed.
+
+Yes.  One probable solution is we can store the temporary output files in {noformat} <output_dir>/_temporary/_<taskid> {noformat}  When the job is complete, we can delete the directory {noformat} <output_dir>/_temporary/ {noformat} . With the same functionality of task commit thread, it gets an exception in discarding the task output for the killed tasks which is ignored, because it is already deleted. 
+Thoughts?, We had a hallway discussion which discussed the following:
+
+1. The ${mapred.output.dir}/_temp/_${taskid} as illustrated by Amareshwari's comment.
+
+_Pros_ : 
+a) Easy to implement
+b) Keeps job's output in ${mapred.output.dir}, so it ensures there are no junk files on HDFS which aren't noticeable by anyone (we assume the user will notice this *smile*).
+
+_Cons_: This still doesn't solve the problem... the issue is that there might be tasks which get launched as the job is completing and go ahead and create the _${taskid} directory (see HADOOP-2759 i.e. HDFS *create* automatically creates parent-directories). This problem is further aggravated by tasks creating side-files in the _${taskid} directory; another point to remember is that the OutputFormat is user-code...
+
+2. Put task-outputs in a job-specific temporary system-directory outside the ${mapred.output.dir} and then move them into ${mapred.output.dir}.
+
+The problem with this approach is that although it is simple and solves the problems on-hand, we might be left with random files on HDFS which will never ever be noticed by anyone - leading to space-creep and at the very least requires a _tmpclean_ tool. We also need to study how this will work with permissions and quotas.
+
+3. Do not declare a job as complete till all it's TIPs have succeeded and all speculative tasks are killed.
+
+_Pros_:
+a) It's probably the most _correct_ solution of the lot.
+b) This will mostly work (see the _Cons_).
+
+_Cons_:
+a) Implementation is a little more involved... (we probably need to mark the Job as "done, but cleaning up")
+b) There are corner cases: think of a job which is complete, and whose speculative tasks are running on a TaskTracker which is _lost_ before the task is killed... we need to wait atleast 10mins (current timeout) before declaring the TaskTracker as _lost_ and the job as SUCCESS. Even this doesn't guarantee that the _task_ is actually dead since it could still be running on the TaskTracker node... and creating side-files etc. (again HADOOP-2759).
+c) The _lost tasktracker_ problem described above potentially adds a finite lag to jobs being declared a success. This doesn't play well with short-running jobs which need SLAs on completion/failure times (of course they can set the TaskTracker timeout to be less than 10mins on their clusters, just something to consider). 
+
+----
+
+Overall combination of 1 & 3 i.e. having a single ${mapred.output.dir}/_tmp as the parent of all temporary tasks' directories and also waiting for all tasks to be killed might work well in most cases. We still need to fix HADOOP-2759, or at least add a *create* api which doesn't automatically create parent directories for this to work. 
+
+Thoughts?
+
+Note: Adding a new *create* api which doesn't automatically create parent dirs is a part of the solution, the other part is to educate users to not use the _old_ create api in their own OutputFormats.
+  , As far as I understood we are trying to solve the problem:  "If JT is alive tasks will be cleanedup eventually by TaskCommitThread by discarding their outputs. We have garbage left in dfs if the JT dies before cleaning up."
+
+With option 1, we delete ${mapred.output.dir}/_tmp before we declare the job as successful which is going to delete all the garbage. Once we fix HADOOP-2759, we will be safe because when the task tries to create files ( output files or side-files), it will fail. I think option 1 would alone solve problem once HADOOP-2759 is done,  as tasks failing after job completion will be ignored.
+Do we still need to wait till all the speculative tasks die, as this is going to take a lot of time to declare job as Succeeded? , As I understand things...
+
+A little work on the creation order should fix things.  The task  
+tracker should create the task directory, the job tracker should  
+create the job directory, user code should just create files.  If we  
+did this, then the JT could rename and then remove the job directory  
+and then no task could start successfully.  The tasks should throw an  
+exception when they try to create new files, since their directory  
+will have been removed.
+
+Of course there is always windows...
+, bq. The tasks should throw an exception when they try to create new files, since their directory will have been removed.
+
+Note that due to HADOOP-2759, the tasks would end up creating the directory hierarchy implictly without their knowledge. I think HADOOP-2759 should be fixed to address this problem without having to complicate things to do with keeping track of speculative tasks after all the TIPs of a job complete, etc. (as Arun and Amareshwari pointed out). But the thing that is bothering me is - could addressing HADOOP-2759 lead to an incompatible change (and hence shouldn't be done for 0.16.1)?, bq. The tasks should throw an exception when they try to create new files, since their directory will have been removed.
+Do you mean to say that the tasks should first check the existence of the directory?, We can create task directory, job directory and files as suggested by Eric and add check for existence of parent directory in tasks. And throw an exception if it doesnt exist. This will take care of creating output files. However we will have issue of tasks creating side files until we fix  HADOOP-2759.  So, we can fix this for 16.1 and once HADOOP-2759 gets fixed, creating side files will be fixed automatically.
+Thoughts?, +1 (this will take care of the most usual case for now), Submiting patch with the proposed design. Added a test case to check if _temporary directory exists  after job completion., +1 overall.  Here are the results of testing the latest attachment 
+http://issues.apache.org/jira/secure/attachment/12375307/patch-2391.txt
+against trunk revision 619744.
+
+    @author +1.  The patch does not contain any @author tags.
+
+    tests included +1.  The patch appears to include 6 new or modified tests.
+
+    javadoc +1.  The javadoc tool did not generate any warning messages.
+
+    javac +1.  The applied patch does not generate any new javac compiler warnings.
+
+    release audit +1.  The applied patch does not generate any new release audit warnings.
+
+    findbugs +1.  The patch does not introduce any new Findbugs warnings.
+
+    core tests +1.  The patch passed core unit tests.
+
+    contrib tests +1.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/1782/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/1782/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/1782/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/1782/console
+
+This message is automatically generated., I just committed this. Thanks, Amareshwari!, Integrated in Hadoop-trunk #401 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/401/]), Integrated in Hadoop-trunk #422 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/422/])]

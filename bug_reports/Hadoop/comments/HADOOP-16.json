@@ -1,0 +1,145 @@
+[I'm seeing a similar problem with the latest code. I have a task that takes a lot of input files (currently ~1400, each several gigabytes each). The amount of time spent hitting hasTaskWithHit() for each task is exhorbitant, easily causing a timeout. This code does all of the work up front - if you had, say, 1400 tasks, and 2 taskrunners, you could easily dispatch the first 2xsimultaneous running tasks first, then go back and spend time calculating the rest of the matchups. Certainly, a lot of the steps in the job setup after listFiles() could be potentially slow for certain problem sizes., Everyone should probably be made aware of the strange behavior we see during indexing, at least for a relatively large number of large segments (topN=500K, depth=20) with a relatively large crawldb (50M URLs). Note that this was all performed with ipc.client.timeout set to 30 minutes.
+
+After launching the indexing job, the web UI shows all of the TaskTrackers, but the numbers in the "Secs since heartbeat" column just keep increasing. This goes on for about 10 minutes until the JobTracker finally loses all of them (and the tasks they were working on), as is shown in its log:
+
+060210 224115 parsing file:/home/crawler/nutch/conf/nutch-site.xml
+060210 225151 Lost tracker 'tracker_37064'
+060210 225151 Task 'task_m_4ftk58' has been lost.
+060210 225151 Task 'task_m_6ww2ri' has been lost.
+
+...(snip)...
+
+060210 225151 Task 'task_r_y6d190' has been lost.
+060210 225151 Lost tracker 'tracker_92921'
+060210 225151 Task 'task_m_9p24at' has been lost.
+
+...(etc)...
+
+At this point, the web UI is still up, the job shows 0% complete, and the TaskTrackers table is empty. It goes on for an hour or so like this, during which any rational person would probably want to kill the job and start over.
+
+Don't do this! Keep the faith!!!
+
+About an hour later, the JobTracker magically reestablishes its connection to the TaskTrackers (which now have new names), as is shown in its log:
+
+060210 225151 Task 'task_r_yj3y3o' has been lost.
+060210 235403 Adding task 'task_m_k9u9a8' to set for tracker 'tracker_85874'
+060210 235404 Adding task 'task_m_pijt4q' to set for tracker 'tracker_61888'
+
+...(etc)...
+
+The web UI also shows that the TaskTrackers are back (with their new names).
+
+There's nothing in the TaskTracker logs during the initial 10 minutes, then a bunch of exiting and closing messages, until finally the TaskTrackers start "Reinitializing local state":
+
+060210 225403 Stopping server on 50050
+060210 230102 Server handler 4 on 50050: exiting
+
+...(snip)...
+
+060210 230105 Server handler 7 on 50050: exiting
+060210 232024 Server listener on port 50050: exiting
+060210 232403 Stopping server on 50040
+060210 234902 Server listener on port 50040: exiting
+060210 234925 Server connection on port 50040 from 192.168.1.5: exiting
+
+...(snip)...
+
+060210 235009 Server connection on port 50040 from 192.168.1.10: exiting
+060210 235013 Client connection to 192.168.1.4:50040: closing
+060210 235014 Client connection to 192.168.1.7:50040: closing
+060210 235015 Server connection on port 50040 from 192.168.1.7: exiting
+060210 235016 Server handler 0 on 50040: exiting
+
+...(snip)...
+
+060210 235024 Server handler 2 on 50040: exiting
+060210 235403 Reinitializing local state
+060210 235403 Server listener on port 50050: starting
+060210 235403 Server handler 0 on 50050: starting
+
+...(etc)...
+
+During the time that the TaskTrackers are lost, neither the master nor the slave machines seem to be using much of the CPU or RAM, and the DataNode logs are quiet. I suppose that it's probably I/O bound on the master machine, but even that seems mysterious to me. It would seem particularly inappropriate for the JobTracker to punt the TaskTrackers because the master was too busy to listen for their heartbeats.
+
+At any rate, once the TaskTrackers go through the "Reinitializing local state" thing, the indexing job seems to proceed normally, and it eventually completes with no errors.
+, Looking further into my concern about hasTaskWithCacheHit overhead (called from obtainNewMapTask in JobInProgress).... it looks like obtainNewMapTask actually calls hasTaskWithCacheHit once for each map job, but always chooses the first choice - why even call the relatively expensive hasTaskWithCacheHit if you've already chosen a value for cacheTarget? Likewise, once you've filled in both cacheTarget and hasTarget, why not break out of that for loop entirely?
+
+Am I following the code flow incorrectly, or is obtainNewMapTask essentially making maps^2 RPC calls in response to a single incoming RPC call? Even if the jobtracker and namenode are running on the same host, that could easily explain the sensitivity to timeouts in the current code.
+, Bryan: I agree, this looks like a serious bug.  The TaskTracker should minimize the calls it makes to the NameNode.  Ideally it should only make a single call per job on each input split., 
+  Here's a patch for the problem.  I changed two things.
+
+  1) The comment is right, there's no need to iterate through all choices in JobTracker
+after we find a TaskInProgress to take the task.
+
+  2) Within a TaskInProgress (TIP), which tracks an individual split within a Job, we cache
+the results of the getHints() call to the Distributed File System.
+, 
+  Sorry, my blurb above was a little unclear.
+
+  I should have said:
+
+  1)  Bryan's comment is right, we don't need to iterate through the whole
+list in JobTracker's obtainNewMapTask call.  We now just do it until we
+find a good cacheTarget or stdTarget value.
+
+  2) A TIP object tracks each individual split in the Job.  We cache
+the data at each TIP.  This will be handy in case the TIP has to
+be re-executed due to machine failure.  
+
+  I don't mind caching the hints aggressively, because it's 
+just task-placement we're after.  If the hint is wrong (which only happens 
+in case of machine failure), we might send the task to a suboptimal 
+machine.  No big deal.
+
+, 
+  Patch comitted., I'm not sure this patch does quite what's desired.
+
+It looks like before it would try as hard as possible to find a task with a cache hit, then fail to running either just the first executable task. Now, it will search for the first task that's either a cache hit *or* executable..... In principle, wouldn't you only want to break out of the loop for finding a cache hit? This, of course, still causes timeouts - is there any way to actually precompute the list of cache hits, so that it's just a matter of picking a task from a priority queue?, Of course, given the existing code, maybe it's worth trying a little harder - iterate through the list as before, but keep track of the time that's been taken, and give up if it gets to 1/2 of the RPC timeout, or something of the like., But, you're right, Bryan, I think this is still not optimal.  It should certainly check to see if more map tasks have local input data for the calling node before it gives up.  Ideally it should not be iterating through all map tasks either, but rather create a mapping of node -> mapTask* for tasks that have local data for a node.  We could keep a queue of tasks whose entries in this table have not yet been computed.  When we fail to find a task with local data for a node, then we can pop a few (10?) entries off the queue and enter them in the map, and if there are still no matches, just give the node a task with remote input data.  This way we'd avoid ever doing too much work in a single call, and ever iterating over all tasks., I have another idea.
+
+First, switch the delegation of responsiblity for job assignment. Right now, it happens in the JobTracker instance, in response to an obtainNewMapTask call. This scales very poorly. In particular, it causes the RPC-timeouts if you do any sort of serious work in obtainNewMapTask. There's another bug, just reported as HADOOP-43, which occurs if you spend too long in a RPC call, and also described in the second comment, above.
+
+So, instead of having the JobTracker do this reactively, either:
+1) Precompute - probably most scalably done by starting a mini-job, which just computes the list of who has precached data from a given FileSplit.
+2) Compute on demand - as a TaskTracker job. This could work by some protocol of offering the TaskTracker a set of possible jobs it could do work on, letting it pick the ones it thinks are best, and return the remainders for assignment. This, of course, would only work well for instances where tasks >> tasktracker instances.
+
+I looked at implementing something like 1, but decided I think 2 is a much better option. 1 would put a lot more instantaneous demand on the namenode. Plus, once you've finished precomputing the best nodes, if nodes come or go you don't really have a solution. 2 seems to distribute both the work and some of the demand, and it makes it possible for the cluster to grow or shrink dramatically without failing to take advantage of the local storage available at each node. Unfortunately, without any pre-work, it's possible that, doing option 2, you'd pick bad subsets of work to distribute to each node, and get no local I/O improvement at all.
+
+I'd really like to see something done, perferably soon. With dozens of nodes, and hundreds of gbs of data in my current problem set, it's very nearly impossible to get the current code to make progress, without killing tasktrackers (some with lots of work units already completed). I can do some of the coding, if there's agreement for what direction to push., I'm re-opening this & assigning it to Mike.
+
+I think we can fix this by changing the TaskTracker to incrementally calculate things, as I alluded above.  The TaskTracker should avoid ever doing anything that might take very long.  RPC timeouts to the TaskTracker are very bad and must be avoided.
+
+We can maintain a mapping of taskTracker->split, initially empty, and a queue of splits, initially filled with all of the splits.  (If basic split-generation is too expensive, since it calls file-length on each input file,, then we can eventually change the split API into a generator, which incrementally enumerates splits and use that in place of this queue.)  When a request for a task arrives from a tasktracker we can first examine the table.  If any splits are present for the calling tracker, then we return one and remove it from the table.  Otherwise we pop a constant number of splits (10?) off of the queue, enumerate the tasktrackers that host each split by calling the namenode, and add entries to the table.  Then we consult the table again.  In most cases (many more splits than tasktrackers) we should identify suitable splits.  If we fail then we assign a randomly selected, non-local split to the tasktracker.  Make sense?, Eric Baldeschwieler wrote:
+> [...] why not just dedicate a thread  
+> to planning and then load a complete plan?  That can produce more  
+> optimal placement and a simpler to understand initialization sequence.
+
+A separate thread in the JobTracker?  That could be a good approach.  We'd have a queue of submitted but as-yet unplanned jobs.  The thread can then pop a job off the queue, compute its splits, then start populating a tasktracker->split table.  When tasktrackers poll for work they can consult this table, potentially while the thread is still populating it.
+
+I'm hesitant to move this out of the JobTracker into the TaskTracker, since that introduces complexity.  But a single thread in the JobTracker should be simple to add and should mostly solve this.  +1, My only concern is that this doesn't scale as well for really huge jobs, but, if implemented as you suggest (pre-filling, hand out non-matching jobs when you don't have matched jobs) seems like a reasonable trade off. 
+
+I'd still think it'd be nice to better handle the case of newly-discovered tasktrackers, but that's probably much more minor than other scaling/responsiveness issues. Maybe a future enhancement for the JobTracker thread that does this work., Having a separate thread in JobTracker can even pre-compute a data locality map that will enable optimal task assignment to task trackers.
+Here is the basic idea. As the thread computes the splits for a job, it can determine which nodes have local data for each split. The thread can populate 
+a map mapping a node to a  list of the splits whose data are on the node. When a tasktracker polls for a task, the JobTracker can look up the map by 
+the node name of the task tracker to see whether there are any un-assigned splits in the corresponding list. If yes,  assign one of them to the task tracker. 
+Otherwise, randomlly choose a split for the task tracker.   , 
+  I created a separate thread on the JobTracker that handles file-splitting and
+gathering info about split-caches.  The job is placed into the PREP state
+until it is processed by this JobTracker thread.  After processing, it moves
+into the RUNNING state.  
+
+  This should allow the hard split-work to continue but still allow the JobTracker
+to process heartbeats.  For now, the thread lives at the JobTracker but perhaps
+someday we'll move it to a TaskTracker thread.
+
+  I also fixed the alg for choosing a task-allocation given a tasktracker.
+(Whether cached, non-cached, or speculative.)
+
+  Let me know if this fixes some of the problems you've been seeing. 
+
+, I applied Mike's patch, with a few small changes, fixing an NPE and ArrayOutOfBounds in dfs.
+
+There's still a bug where, with mapred.tasktracker.tasks.maximum=2, only a single map and a single reduce are running on each node.  I believe the intent is that there should be up to two of each related to a single job, so that the reduce tasks can be copying data while the maps are still running., This is great, and finally fixes my issues with a large job that would never start.
+
+However, the way things are in this patch (and the current code), the job doesn't get started until the background thread finishes computing all of the cache hints. This takes far too long - it took 15 minutes on a recent run. During that time, of course, no other work was getting done. How about moving the cachedHints-filling-loop to the end of initTasks(), and go ahead and set the job to RUNNING and "tasksInited=true" in the meantime?
+
+Doing this locally lets work commence immediately, while the cache hints continue to get filled in for future task allocations.]

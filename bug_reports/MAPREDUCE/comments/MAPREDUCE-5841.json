@@ -1,0 +1,157 @@
+[This happens because the LocalContainerLauncher.SubtaskRunner thread handles the events and runs the mapper/reducer tasks in the same thread.
+
+Once the task is under way the subtask runner will not get to any of the events that are delivered to the event queue. As a result, the key event (CONTAINER_REMOTE_CLEANUP) sits in the queue until the mapper/reducer task finishes.
+
+I think a possible fix is to separate the event handling and the task running into their own threads respectively. On receiving the CONTAINER_REMOTE_CLEANUP event, the event handling thread can shut down the task running thread and continue with the rest of the state transition.
+
+I'll come up with a proposed patch soon., Attaching a patch that fixes the bug. I've tested it with a real uber job on a pseudo-distributed cluster, and verified it works correctly., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12640850/mapreduce-5841.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4534//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4534//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-mapreduce-client-app.html
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4534//console
+
+This message is automatically generated., The findbug warning is about the System.exit() call. It's an existing call that was refactored into another method., Any comments on the bug and/or the proposed fix? Thanks!, Thanks for the patch, Sangjin.  The approach looks fine to me.  A few comments:
+
+- I don't see any attempt to stop the task when CONTAINER_REMOTE_CLEANUP is received.  Before it didn't make sense to do so because by the time we received it there was no task running.  Now that there could be, I think we would want to track the Future for each task submitted that's in-flight and attempt to cancel the running task when the cleanup event is received.
+- The System.exit call should be ExitUtil.terminate instead, as it allows unit tests to disable the system exit in case something goes wrong during the test or to verify exit behavior if that's desired.
+- Speaking of unit tests, it'd be nice to verify the LocalContainerLauncher is able to respond to events while a long-running sleep task is executing., Thanks for the review [~jlowe]!
+
+I am almost done with a unit test, and am going to update the patch to include it soon. Yes, that's the approach I took (although it took a fair amount of mocking). With the test, you can easily reproduce the bug against the existing code, and confirm the fix.
+
+bq. The System.exit call should be ExitUtil.terminate instead, as it allows unit tests to disable the system exit in case something goes wrong during the test or to verify exit behavior if that's desired.
+
+Good point. I'll change it to ExitUtil.terminate.
+
+bq. I don't see any attempt to stop the task when CONTAINER_REMOTE_CLEANUP is received. Before it didn't make sense to do so because by the time we received it there was no task running. Now that there could be, I think we would want to track the Future for each task submitted that's in-flight and attempt to cancel the running task when the cleanup event is received.
+
+That is quite interesting. In fact, that's the very first approach I took, but when I ran the TestUberAM unit tests, interestingly it resulted in all unit tests hanging indefinitely. I spent some time to try to figure out why it was hanging but wasn't successful.
+
+Anyhow, the reason I arrived at the current fix is that once the state transition is completed, LocalContainerLauncher.stop() is invoked, and that shuts down the ExecutorService for the task runner. And that shut down interrupts any running task. So the end result is pretty much the same.
+
+Let me know what you think. If needed, I can look into the TestUberAM issue when cancelling the future task one more time., bq. Anyhow, the reason I arrived at the current fix is that once the state transition is completed, LocalContainerLauncher.stop() is invoked, and that shuts down the ExecutorService for the task runner.  And that shut down interrupts any running task. So the end result is pretty much the same.
+
+Yes I understand how the end result is the same for the mapred job -kill case, but doesn't the job still hang in the mapred job -fail-task or mapred job -kill-task case if the task is stuck?  Since we fake the exit of the "container" the AM will attempt to re-launch the task, the new task attempt will get submitted to the executor queue, but I think it hangs in the queue waiting for the stuck task since it's only executing one task at a time.  At that point the only recourse is to kill the entire job.
+
+If you could poke at it a bit more I think it'd be good to understand what's going on if we cancel the task.  If it proves particularly sticky then we can consider putting this in and filing a followup JIRA to track the remaining fail-task/kill-task issue., That's a good point. I had a pretty narrow focus on the kill job case, and hadn't thought about kill/fail task.
+
+I'll look at it again, and why that test is behaving that way. I'll update the JIRA once I have more finding., I just wanted to clarify a couple of things regarding -kill-task or -fail-task with uber jobs. Since the uber job executes task attempts serially, we can have a situation where a mapper attempt is killed but the new mapper attempt will be queued behind an existing reducer attempt. In that case, the job will not be able to make progress if the reducer needs the killed mapper to finish. I think this happens already before these changes, and what we do here is likely not going to change that.
+
+Also, another situation is if mapper/reducer tasks do not respond to interrupt (i.e. uninterruptible). If a task does not respond to interrupt, -kill-task won't necessarily work.
+
+Outside those cases, this fix can probably improve the situation and make the job complete successfully by interrupting the targeted attempt.
+
+Is that the same as your understanding?, Updated the patch.
+
+I added code that interrupts the task attempt for which a container clean-up is being requested via Future.cancel(). System.exit() was replaced with ExitUtil.terminate(). Also added a unit test.
+
+I ran some -kill-task scenarios to confirm the patch works for them. For example, for a 2-mapper (no reducer) uber job, if I kill any of the tasks, it gets interrupted promptly (provided the task responds to interruption), a new attempt is scheduled, and the job completes successfully.
+
+I also tried a 2-mapper, 1-reducer uber job. I killed a mapper task, and confirmed the running task is killed promptly. In this case the job eventually fails because the reducer attempt detects that not all the mappers ran successfully. I suspect this is somewhat of an expected behavior.
+
+Regarding the aforementioned unit test timeouts, it turned out to be a fluke. It may have been the state my machine was in when I ran the test network-wise. I can no longer reproduce the timeouts under a stable condition., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12641414/mapreduce-5841.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The following test timeouts occurred in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app:
+
+org.apache.hadoop.mapreduce.v2.app.TestRMContainerAllocator
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4548//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4548//console
+
+This message is automatically generated., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12641414/mapreduce-5841.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The following test timeouts occurred in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app:
+
+org.apache.hadoop.mapreduce.v2.app.TestRMContainerAllocator
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4550//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4550//console
+
+This message is automatically generated., bq. Since the uber job executes task attempts serially, we can have a situation where a mapper attempt is killed but the new mapper attempt will be queued behind an existing reducer attempt. In that case, the job will not be able to make progress if the reducer needs the killed mapper to finish. I think this happens already before these changes, and what we do here is likely not going to change that.
+
+Agreed, I think it's outside of the scope of this JIRA to fix that.  Sounds like an uber job shouldn't queue up any reduce tasks until all the map tasks have completed to avoid this.
+
+bq. Also, another situation is if mapper/reducer tasks do not respond to interrupt (i.e. uninterruptible). If a task does not respond to interrupt, -kill-task won't necessarily work.
+
+Also agreed, we can't do much if we can't control the task thread.
+
+Thanks for updating the patch, I'll try to look at it later today.  I'm assuming the TestRMContainerAllocator failure is unrelated, but it'd be good if you could verify., Thanks Jason.
+
+Yes, the test timeout is unrelated, and is reproduced on trunk. It is likely MAPREDUCE-5749., +1 latest patch looks good to me.  Committing this., Thanks, Sangjin!  I committed this to trunk, branch-2, and branch-2.4., SUCCESS: Integrated in Hadoop-trunk-Commit #5555 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/5555/])
+MAPREDUCE-5841. uber job doesn't terminate on getting mapred job kill. Contributed by Sangjin Lee (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1589524)
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/LocalContainerLauncher.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestLocalContainerLauncher.java
+, Thanks Jason for the review and great feedback!, ABORTED: Integrated in Hadoop-Yarn-trunk #550 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/550/])
+MAPREDUCE-5841. uber job doesn't terminate on getting mapred job kill. Contributed by Sangjin Lee (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1589524)
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/LocalContainerLauncher.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestLocalContainerLauncher.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1767 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1767/])
+MAPREDUCE-5841. uber job doesn't terminate on getting mapred job kill. Contributed by Sangjin Lee (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1589524)
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/LocalContainerLauncher.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestLocalContainerLauncher.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #1742 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1742/])
+MAPREDUCE-5841. uber job doesn't terminate on getting mapred job kill. Contributed by Sangjin Lee (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1589524)
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/LocalContainerLauncher.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestLocalContainerLauncher.java
+]

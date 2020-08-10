@@ -1,0 +1,581 @@
+[Particular sequence of events:
+
+# client finishes writing to block with 3 replicas
+# first DN happens to heartbeat, so addStoredBlock is called in the NN
+# client calls completeFile, which calls checkReplicationFactor(newFile) when finalizing the INode
+# NN adds block to pending replication
+# Replication monitor runs and schedules two replications
+# second and third pipeline DNs send their addStoredBlock notifications with their heartbeats
+# Replications finish, and the new replicas report the new blocks as well
+# NN notices the excess replicas and schedules deletion
+
+This doesn't cause major issues, but we do end up wasting a fair amount of disk and network resources.
+
+The question is why sometimes the immediate heartbeat on blockReceived doesn't trigger as it's supposed to., {quote}
+This doesn't cause major issues, but we do end up wasting a fair amount of disk and network resources.
+{quote}
+
+I guess it isn't 'major' but I get this all the time using Pig, it might be the same issue: 
+
+It looks like a file is written and closed, then re-opened before the NN knows the pipeline is done.
+
+----
+org.apache.pig.backend.executionengine.ExecException: ERROR 2135: Received error from store function.org.apache.hadoop.hdfs.server.namenode.NotReplicatedYetException: Not replicated yet:/tmp/temp1164506480/tmp1316947817/_temporary/_attempt_201005212210_0961_m_000055_0/part-m-00055
+	at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.getAdditionalBlock(FSNamesystem.java:1268)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.addBlock(NameNode.java:469)
+	at sun.reflect.GeneratedMethodAccessor14.invoke(Unknown Source)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)
+	at java.lang.reflect.Method.invoke(Method.java:597)
+	at org.apache.hadoop.ipc.RPC$Server.call(RPC.java:508)
+	at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:966)
+	at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:962)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:396)
+	at org.apache.hadoop.ipc.Server$Handler.run(Server.java:960)
+
+	at org.apache.pig.backend.hadoop.executionengine.physicalLayer.relationalOperators.POStore.getNext(POStore.java:151)
+	at org.apache.pig.backend.hadoop.executionengine.physicalLayer.relationalOperators.POSplit.runPipeline(POSplit.java:254)
+	at org.apache.pig.backend.hadoop.executionengine.physicalLayer.relationalOperators.POSplit.processPlan(POSplit.java:236)
+	at org.apache.pig.backend.hadoop.executionengine.physicalLayer.relationalOperators.POSplit.processPlan(POSplit.java:241)
+	at org.apache.pig.backend.hadoop.executionengine.physicalLayer.relationalOperators.POSplit.processPlan(POSplit.java:241)
+	at org.apache.pig.backend.hadoop.executionengine.physicalLayer.relationalOperators.POSplit.getNext(POSplit.java:228)
+	at org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.PigMapBase.runPipeline(PigMapBase.java:233)
+	at org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.PigMapBase.map(PigMapBase.java:228)
+	at org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.PigMapBase.map(PigMapBase.java:53)
+	at org.apache.hadoop.mapreduce.Mapper.run(Mapper.java:144)
+	at org.apache.hadoop.mapred.MapTask.runNewMapper(MapTask.java:583)
+	at org.apache.hadoop.mapred.MapTask.run(MapTask.java:305)
+	at org.apache.hadoop.mapred.Child.main(Child.java:170)
+Caused by: org.apache.hadoop.ipc.RemoteException: org.apache.hadoop.hdfs.server.namenode.NotReplicatedYetException: Not replicated yet:/tmp/temp1164506480/tmp1316947817/_temporary/_attempt_201005212210_0961_m_000055_0/part-m-00055
+	at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.getAdditionalBlock(FSNamesystem.java:1268)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.addBlock(NameNode.java:469)
+	at sun.reflect.GeneratedMethodAccessor14.invoke(Unknown Source)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)
+	at java.lang.reflect.Method.invoke(Method.java:597)
+, Perhaps when the write pipeline completes, it should pass back the block information so that the initial commit to the NN can atomically add all the blocks.
+
+Example:
+
+DN's in pipe are DN1, DN2, DN3.
+
+A block is being written, the client writes to DN1, which writes to DN2, which writes to DN3.  When DN3 completes, it notifies DN2 and provides its block replica information.  When DN2 completes and has DN3's response, it passes its information, along with DN3's, to DN1.  When DN1 completes, and has DN2's information along with DN3's, it reports to the NN the information about all 3 replicas, and lastly returns to the original client.
+
+This will have a few benefits:
+
+Fewer RPC's to the NN, and therefore less NN load.
+Atomic visibility of all replicas to the NN and clients., Can this be achieved by setting min.replication to something larger than the default value of 1? This means that the close call from the client will succeed only if the namenode has received confirmation from at least 'min.replication' number of replicas. (there could be performance overheads though), I run with min replication = 2, yet see this all the time.
+
+In fact, based on that idea I might want to try min.replication = 1 to see if they become more or less frequent!
+, I think there are a few solutions to this:
+
+- HDFS-611 should help a lot. We often have seen this issue after doing a largescale decrease in replication count, or a large directory removal, since the block deletions hold up the blockReceived call in DN.offerService. But this isn't a full solution - there are still other ways in which the DN can be slower at acking a new block than the client is in calling completeFile
+- Scott's solution of making the primary DN send the blockReceived on account of all DNs would work, but sounds complicated, expecially in the failure cases (eg what if the primary DN fails just before sending the RPC? Do we lose all the replicas? No good!)
+- UnderReplicatedBlocks could be augmented to carry a dontProcessUntil timestamp. When we check replication in response to a completeFile, we can mark the neededReplications with a "don't process until N seconds from now" which causes them to get skipped over by the replication monitor thread until a later time. This should give the DNs a bit of leeway to report the blocks, while not changing the control flow or distributed parts at all.
+
+Dhruba's workaround of upping min replication indeed helps, but as he said, it's at a great cost to the client, *especially* in the cases where it would help (eg if one DN is 10 seconds slow), > UnderReplicatedBlocks could be augmented to carry a dontProcessUntil timestamp. 
+
+To expand on this idea, we can delay replication of a block until a few seconds (configurable) after the modification time of the file. That could avoid storing an additional timestamp in UnderReplicatedBlocks. , Ah, very clever, Dhruba! I like that idea., bq. # Scott's solution of making the primary DN send the blockReceived on account of all DNs would work, but sounds complicated, expecially in the failure cases (eg what if the primary DN fails just before sending the RPC? Do we lose all the replicas? No good!)
+
+Yeah, its complicated.  To simplify failure scenarios, leave the rest to be similar to the current state -- the next regularly scheduled ping from a DN will provide the new block information, but the primary DN will still do its best to send all the block data it can gather so that the initial registration is as complete as possible.  Perhaps the NN treats this extra information as provisional, until it gets a ping from the other DN's to confirm.  
+
+Functionally, this won't differ much from Dhruba's proposition, and is more complicated., > Primary DN send the blockReceived on account of all DNs.
+This will cause race condition: primary DN reports that block B is received at DN1 but after that NN receives a block report from DN1 that it does not have B.
+
+One option is that checkReplicationFactor(newFile) put the block in PendingReplicationBlocks queue instead of neededReplication queue since NN knows exactly from whom it is expecting blockReceived., I think reusing PendingReplicationBlocks is probably the best idea so far - we already have confidence in that code, and should only be a very small patch., Does this patch looks like what has been discussed here?
+It puts underreplicated blocks into pending replication queue in case of newly created file.
+, putting it in pendingReplication means that replication (when needed) will occur only after 5 minutes. This is a long time, isn't it? Maybe it is better to put it in neededReplication but (somehow) ensure that it is not attempted to be replicated until after a small delay., I agree that 5 minutes is too long, but putting it into pendingReplication still seems to be more appropriate. May be we can modify pendingReplication monitor to adjust check interval dynamically to the next 'timing out' replication. This would, of course, require having timeOut value per replication (or we can reuse timeStamp for that)., I think this should be controlled by "dfs.namenode.replication.interval". It is currently set to 3 secs. If DNs do not keep up with reporting blocks it should be increased.
+Putting blocks to pendingReplication feels like a trick, although it slows down replication of the last block.
+I think the right solution would be to add logic to processing of a failed pipeline. When this happens the client asks for a new generation stamp. At this point NN can make a note that this block will not have enough replicas. This will distinguish between blocks that have not been reported yet, and those that will never be reported. This is much more work.
+In practice I think tuning up the "replication.interval" parameter should be sufficient., I worked on a similar solution for our internal branch. Let me explain what I did. Assume that a block's replication factor is r. When a block under construction is changed to be complete, if it has r1 finalized replicas and r2 unfinalized replicas, NN puts r2 replicas into pending queue. If r1+r2<r, NN also puts the block into the neededreplication queue. Does this algorithm make sense?, A block under construction keeps track of the pipeline. So NN knows the block's pipeline length, which is represented by r1+r2 in above algorithm., I  think this makes a lot of sense. Putting r2 into pending replication is correct as NN knows the replication (via pipeline) is in progress. This is exactly what is needed., An initial patch for review. Will add a unit test and do more testing., Fixing this issue will not only remove a performance issue, it will also help with memory management.  Every over-replicated block gets its "triplets" array re-allocated.  This is a set of (3 x replication) object references used to link the block into each datanode's blockList.  If the replica count becomes greater than the replication factor, this array gets re-allocated, and it never gets shrunk if the replica count decreases.  If this is happening with essentially every new block, then there's an awful lot of excess memory being wasted on unused triplets.  In a 200M block namenode, one excess triplet per block is 4.8GB!, This patch
+1. makes sure that blocks in a newly-closed file does not get over-replicated;
+2. makes sure that blocks except for the last block in a file under-construction get replicated when under-replicated; This will allow a decommissioning datanode to finish decommissioning even it has replicas in files under construction.
+3. adds a unit test., Thank Matt for pointing out the additional memory benefit that this fix could provide. This patch could benefit datanode decommission too., Resubmitting this to trigger hudson., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12476527/replicateBlocksFUC1.patch
+  against trunk revision 1094748.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    -1 javadoc.  The javadoc tool appears to have generated 1 warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these core unit tests:
+                  org.apache.hadoop.hdfs.TestFileConcurrentReader
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+    +1 system test framework.  The patch passed system test framework compile.
+
+Test results: https://hudson.apache.org/hudson/job/PreCommit-HDFS-Build/386//testReport/
+Findbugs warnings: https://hudson.apache.org/hudson/job/PreCommit-HDFS-Build/386//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://hudson.apache.org/hudson/job/PreCommit-HDFS-Build/386//console
+
+This message is automatically generated., This patch looks good. Only question: does the new unit test properly fail if you remove the fix in BlockManager? It seems we should be doing something to artifically delay the block report of of the DataNodes. In HDFS-1197 there is some test code that allows one to specify a delay in the DN configuration to simulate this kind of condition., Reassigning patch to try to get this fixed for 23., Here's a new patch against trunk for this issue.
+
+A few things changed since Hairong's original patch:
+
+- I removed the part of the test that changes the replication factor of a file while it's under construction. This part of the test wasn't succeeding reliably, since it was running into a different bug: HDFS-2283
+
+- added the test code from HDFS-1197 which allows the DNs to artificially delay blockReceived calls in the tests. This exposed some other bugs with the patch
+
+- the new replicateLastBlock code needed to be called in a different place:
+-- the original patch called this on every attempt of completeFile(), rather than on only the final/successful attempt. This meant that, if the replicas were very slow to check in, the targets would be added to pendingReplication many times, yielding a pending replica count much larger than the actual replication factor
+-- the code needs to be called for all blocks, not just the last block in a file
+
+I looped the new tests for a while and they pass reliably., Thanks Todd for taking care of this! :)
+
++1 to the patch
+- Nitpicking, should we just have a boolean cached for the isLastBlockOfUnderConstructionFile calls on 1131 and 1063?
+- Is line 1225 {noformat}return lastBlock == block;{noformat} the same as an equality check?
+- In TestReplication.java:testReplicationWhileUnderConstruction(), after marking one block as bad (line 588), is there a quick check we can do to verify that indeed a block was added to the pending queue?
+, I looked more closely. I think the return lastBlock == block; ought to to be return lastBlock.equals(block); IMO this would be a bug. So I'm taking back my precious +1.
+
+Todd can you please make the change / correct me if I'm wrong?, Hi Ravi. I think you're right, good catch. I spent some time yesterday working on writing a test that shows this bug, since the existing ones clearly don't do enough coverage. I'll upload something new soon., Hi Todd. Did you have a chance to update the patch?, Hi Ravi. I did spend some time on this last week but I ended up stuck in a rabbit hole of some sort (now I can't remember what it was). I will revive that branch and see if I can get a new patch up this week. Thanks for the reminder., Hi Todd! Sorry for bothering you again! :( Any progress?, Hi Todd! Are you going to be able to finish this patch? Is there anything more to be done than to change the == to .equals() and maybe my other nitpicks?, I went back and looked at my branch where I was working on this patch. The remaining work is to add a test which catches the issue you pointed out with == vs .equals. Since the tests were passing even with that glaring mistake, the coverage definitely wasn't good enough. I started to write one and I think I ran into some more issues, but I can't recall what they were. Since this issue has been around forever, I haven't been able to prioritize it above other 0.23 work. Is this causing big issues on your clusters that would suggest it should be prioritized higher?, Thanks Todd! Its not causing any big issues. Its just something our operations folks were expecting in the 0.23 release. And given that the first rc just got branched, I was hoping this would get in there. For now do you think it would be possible to commit the patch without the unit test and come back for the unit test later?, I'm worried that there are some other bugs lurking here -- ie the fact that our test coverage doesn't check this means that our understanding of the state of the world is somehow broken. So I'm hesitant to commit a change here until we really understand what's going on. If some other folks who know this area of the code well can take a look, I'd be more inclined to commit for 23., Updated patch rebased on trunk., @Todd, Is there any update on this? 
+We are hitting similar issue in our cluster and number of excess blocks are reaching to 1 Lakh in a day. I raised HDFS-4562 for the same, which would be duplicate of this.
+, Hi Todd, Once we convert the file to underConstruction, we are recreating BlockUnderCOnstruction object if it is already completed right?
+
+{code}
+public BlockInfoUnderConstruction convertToBlockUnderConstruction(
+      BlockUCState s, DatanodeDescriptor[] targets) {
+    if(isComplete()) {
+      return new BlockInfoUnderConstruction(
+          this, getBlockCollection().getBlockReplication(), s, targets);
+    }
+{code}
+So, here '==' comparision may create issue here? After this conversion, Even though it is in underConstruction state it may return false, since block references might be different from neededReplications list and lastBlock from InodeFileUnderConstruction? , Hey folks. Sorry I let this one drop off my radar for a couple years :) I don't think I'll have time to work on it in the coming months, so if you want to take it over, go ahead. I think the remaining issue was that the test coverage is still a little weak (and will probably need significant rebasing for 2.x/3.x), Changed Target Version to 1.3.0 upon release of 1.2.0. Please change to 1.2.1 if you intend to submit a fix for branch-1.2., I am able to consistently reproduce this issue with the following command on an 80 node cluster:
+hadoop jar $HADOOP_PREFIX/share/hadoop/mapreduce/hadoop-mapreduce-client-jobclient-*-tests.jar SliveTest -baseDir /user/someUser/slive -duration 120 -dirSize 122500 -files 122500 -maps 560 -reduces 1 -seed 1 -ops 100 -readSize 1048576,1048576 -writeSize 1048576,1048576 -appendSize 1048576,1048576 -replication 1,1 -blockSize 1024,1024 -delete 0,uniform -create 100,uniform -mkdir 0,uniform -rename 0,uniform -append 0,uniform -ls 0,uniform -read 0,uniform
+
+This litters the task logs with the NotReplicatedYetException
+at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.getAdditionalBlock(FSNamesystem.java:1268)
+at org.apache.hadoop.hdfs.server.namenode.NameNode.addBlock(NameNode.java:469)
+
+, bq. This litters the task logs with the NotReplicatedYetException
+
+This does look like client require a new block before the previous block pipeline is not finished., rebase against trunk., Thanks for the update [~azuryy], but the patch can not be applied to current trunk.
+
+I applied a part of the patch relating to {{TestReplication#testNoExtraReplicationWhenBlockReceivedIsLate}} and ran the TestReplication but the assertion below passed without fix of BlockManager. The test seems not to be able to reproduce the issue.
+{code}
+      // Check that none of the datanodes have serviced a replication request.
+      // i.e. that the NameNode didn't schedule any spurious replication.
+      assertNoReplicationWasPerformed(cluster);
+{code}
+, bq. Thanks for the update Fengdong Yu, but the patch can not be applied to current trunk.
+
+Sorry, I mentioned wrong username. Thanks for the update, [~walter.k.su]., I rebased the patch on current trunk and attached as HDFS-1172.008.patch.
+
+* I added calling {{BlockManagerTestUtil#computeAllPendingWork}} in {{TestReplication#pendingReplicationCount}} to make sure that replication is scheduled. This is needed for the {{TestReplication#testNoExtraReplicationWhenBlockReceivedIsLate}} to fail without the fix of BlockManager.
+
+* {{TestReplication#testReplicationWhenBlockCorruption}} succeeds without the fix of BlockManager but I left it in the patch because there is no equivalent test in the TestReplication.
+, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  17m 37s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 48s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  10m  7s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   1m 24s | The applied patch generated  2 new checkstyle issues (total was 193, now 194). |
+| {color:green}+1{color} | whitespace |   0m  1s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 28s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   2m 30s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | native |   3m 15s | Pre-build of native portion |
+| {color:red}-1{color} | hdfs tests | 163m 35s | Tests failed in hadoop-hdfs. |
+| | | 208m 43s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyWriter |
+|   | hadoop.hdfs.web.TestWebHDFSOAuth2 |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyPersistLockedMemory |
+|   | hadoop.tools.TestJMXGet |
+|   | hadoop.hdfs.TestCrcCorruption |
+|   | hadoop.hdfs.TestReplication |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyPersistReplicaPlacement |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12755693/HDFS-1172.008.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 6955771 |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/12424/artifact/patchprocess/diffcheckstylehadoop-hdfs.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12424/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12424/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf906.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12424/console |
+
+
+This message was automatically generated., Thanks for keeping working on the issue, [~walter.k.su] and [~iwasakims]. Looks like the rebased patches only put not-yet-received replicas into the pending replication queue, but {{BlockManager#checkReplication}} has not been updated accordingly. Thus the missing part is: we decide whether to add the block to under replicated queue or pending replica queue based on its finalized replica # and unfinalized replica #. Please see Hairong's [comment|https://issues.apache.org/jira/browse/HDFS-1172?focusedCommentId=13013749&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-13013749]., Thanks for the comment, [~jingzhao]. I'm looking into test failures and will update the patch., Any progress [~iwasakims] and [~walter.k.su]? , I'm working on now and will upload patch in few days. Sorry for late response., I attached updated patch as 009.
+
+* fixed intermittent failures of {{TestReplication#testNoExtraReplicationWhenBlockReceivedIsLate}}
+** Changed the number of DataNodes of MiniDFSCluster to 3.
+** Set {{blockReceivedDelayForTestsSetting}} for only 1 DataNode to get enough time window in which file is completed but at lease one of the replicas is not reported.
+** Got rid of randomizing sleep time in {{BPServiceActor#delayBeforeBlockReceivedForTests}}.
+
+* It turned out that some other JIRAs added fixes needed here.
+** {{BlockManager#hasEnoughEffectiveReplicas}} added by HDFS-8938 takes pending replicas into account.
+** {{numCurrentReplica}} in {{BlockManager#addStoredBlock}} was fixed to take pending replicas into account by HDFS-8623.
+
+* Test failures below are not related and already filed/fixed.
+** TestLazyWriter: HDFS-9067
+** TestLazyPersistLockedMemory: HDFS-9073
+** TestJMXGet: HDFS-9072
+** TestLazyPersistReplicaPlacement: HDFS-9074, bq. Looks like the rebased patches only put not-yet-received replicas into the pending replication queue, but BlockManager#checkReplication has not been updated accordingly
+
+I think it is better to leave {{BlockManager#checkReplication}} as is here. Though it may add block having pending replicas to {{neededReplications}}, the replication will not be scheduled as far as the replica is in {{pendingReplications}} because {{BlockManager#hasEnoughEffectiveReplicas}} takes it into account.
+
+{{BlockManager#isNeededReplication}} is used in other places. Keeping the condition for updating {{neededReplications}} consistent makes the code clear and will avoid potential bugs.
+
+
+bq. 2. makes sure that blocks except for the last block in a file under-construction get replicated when under-replicated; This will allow a decommissioning datanode to finish decommissioning even it has replicas in files under construction.
+
+{{TestReplication#testReplicationWhileUnderConstruction}} checks this is satisfied. , \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  20m 39s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:green}+1{color} | javac |   9m 29s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  12m 16s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 31s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   1m 35s | The applied patch generated  3 new checkstyle issues (total was 201, now 203). |
+| {color:green}+1{color} | whitespace |   0m  1s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 45s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   2m 31s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | native |   3m 11s | Pre-build of native portion |
+| {color:red}-1{color} | hdfs tests |  72m  4s | Tests failed in hadoop-hdfs. |
+| | | 124m 40s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.server.blockmanagement.TestBlockManager |
+| Timed out tests | org.apache.hadoop.hdfs.TestDatanodeReport |
+|   | org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyPersistFiles |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12762350/HDFS-1172.009.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 83e65c5 |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/12674/artifact/patchprocess/diffcheckstylehadoop-hdfs.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12674/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12674/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf909.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12674/console |
+
+
+This message was automatically generated., bq. BlockManager#hasEnoughEffectiveReplicas added by HDFS-8938 takes pending replicas into account. numCurrentReplica in BlockManager#addStoredBlock was fixed to take pending replicas into account by HDFS-8623.
+
+These two jiras are mainly doing only code refactoring. The logic has been there for a while.
+
+bq. I think it is better to leave BlockManager#checkReplication as is here. Though it may add block having pending replicas to neededReplications, the replication will not be scheduled as far as the replica is in pendingReplications because BlockManager#hasEnoughEffectiveReplicas takes it into account.
+
+The question is, if we expect later replication monitor to remove the block from {{neededReplication}}, why do we add it in the first place? Also if a block's effective replica number (including pending replica number) is >= than its replication factor, the block should not be in {{neededReplication}}. This is more consistent with the current logic.
+
+, bq. Also if a block's effective replica number (including pending replica number) is >= than its replication factor, the block should not be in neededReplication. 
+
+I rethinked about this and fixed {{checkReplication}} accordingly.
+
+I also fixed to address checkstyle warnings. Warning about file length of BlockManager.java is not introduced here. The failure of {{TestBlockManager.testBlocksAreNotUnderreplicatedInSingleRack}} seems not to be related to the patch and I could not reproduce it in my environment.
+, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | pre-patch |  20m 26s | Pre-patch trunk has 1 extant Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:green}+1{color} | javac |   9m  6s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  11m 51s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 28s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   1m 37s | The applied patch generated  1 new checkstyle issues (total was 201, now 201). |
+| {color:green}+1{color} | whitespace |   0m  1s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 40s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 40s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   2m 51s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | native |   3m 36s | Pre-build of native portion |
+| {color:red}-1{color} | hdfs tests | 170m 51s | Tests failed in hadoop-hdfs. |
+| | | 223m 11s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.server.namenode.ha.TestDNFencing |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12764169/HDFS-1172.010.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 151fca5 |
+| Pre-patch Findbugs warnings | https://builds.apache.org/job/PreCommit-HDFS-Build/12728/artifact/patchprocess/trunkFindbugsWarningshadoop-hdfs.html |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/12728/artifact/patchprocess/diffcheckstylehadoop-hdfs.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12728/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12728/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf907.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12728/console |
+
+
+This message was automatically generated., Thanks for updating the patch, [~iwasakims]. Comments on the latest patch:
+# It is not necessary to call {{numNodes}} again in the following code. We can directly use {{numNodes}}.
+{code}
+     int numNodes = curBlock.numNodes();
+     ......
++    DatanodeStorageInfo[] expectedStorages =
++        curBlock.getUnderConstructionFeature().getExpectedStorageLocations();
++    if (curBlock.numNodes() < expectedStorages.length) {
+{code}
+# We'd better place the new "adding block to pending replica queue" logic only in {{checkReplication}}. Several reasons for this: 
+#* {{completeBlock}} is also called by {{forceCompleteBlock}}, which is invoked when loading edits. At this time we should not update pending replication queue since the NN is just being started.
+#* {{completeBlock}} can often be called when NN has only received 1 block_received msg, updating pending replication queue at this time means later when further IBRs (incremental block reports) come we need to remove these DN from pending queue again.
+#* Semantically updating pending queue is more closely coupled with updating neededReplication queue.
+# Instead of making changes to {{PendingBlockInfo}}'s constructor, when updating the pending replication queue, you can prepare all the corresponding {{DatanodeDescriptor}} in an array first, and call {{pendingReplications.increment}} only once.
+# Do we need to call {{computeAllPendingWork}} in {{TestReplication#pendingReplicationCount}}?
+# Let's add a maximum retry count or total waiting time for {{waitForNoPendingReplication}}.
+, bq. We'd better place the new "adding block to pending replica queue" logic only in checkReplication.
+
+Thanks for the comment again. We can not get expected nodes in {{BlockManager#checkReplication}} because BlockUnderConstructionFeature is already removed by {{BlockInfo#convertToCompleteBlock}} at that point. I'm trying to update the pendingReplications only in the code path of {{completeFile}} now., bq. I'm trying to update the pendingReplications only in the code path of completeFile now
+
+Yeah, good idea. We can do it not necessarily in checkReplication, but in file completion stage., I attached updated patch as 011.
+
+* pendingReplications is updated only before file completeion.
+* refactored test code in TestReplication, using mockito rather than adding test code to BPOfferService., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  19m 59s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   8m 52s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  11m 22s | There were no new javadoc warning messages. |
+| {color:red}-1{color} | release audit |   0m 21s | The applied patch generated 1 release audit warnings. |
+| {color:red}-1{color} | checkstyle |   1m 34s | The applied patch generated  8 new checkstyle issues (total was 438, now 443). |
+| {color:red}-1{color} | whitespace |   0m  0s | The patch has 1  line(s) that end in whitespace. Use git apply --whitespace=fix. |
+| {color:green}+1{color} | install |   1m 39s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 37s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   2m 48s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | native |   3m 40s | Pre-build of native portion |
+| {color:red}-1{color} | hdfs tests | 235m 45s | Tests failed in hadoop-hdfs. |
+| | | 286m 42s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.server.namenode.TestCheckpoint |
+|   | hadoop.hdfs.server.blockmanagement.TestBlockManager |
+|   | hadoop.hdfs.TestRecoverStripedFile |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12765552/HDFS-1172.011.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 1107bd3 |
+| Release Audit | https://builds.apache.org/job/PreCommit-HDFS-Build/12860/artifact/patchprocess/patchReleaseAuditProblems.txt |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/12860/artifact/patchprocess/diffcheckstylehadoop-hdfs.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/12860/artifact/patchprocess/whitespace.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12860/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12860/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf909.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12860/console |
+
+
+This message was automatically generated., I update the patch.
+* addressed the failure of TestRecoverStripedFile: fixed to avoid updating pendingReplications if file is striped.
+* added calling to {{DataNodeTestUtils#triggerHeartbeat}} in order to make sure {{TestReplication#testNoExtraReplicationWhenBlockReceivedIsLate}} fails without the fix of BlockManager.
+* fixed checkstyle warning except for file length.
+* fixed whitespace error.
+* release audit is not related to the fix.
+* failure of TestBlockReport and TestCheckpoint is not related to the code path of the patch. I could not reproduce the failure on my env., Thanks for updating the patch, [~iwasakims]. The 012 patch looks good to me. Some minors:
+# Since every time when NN receives a block_received msg it will check and update the pendingReplication queue for the corresponding block, it may be fine to apply the same updating-pending-queue logic to all the blocks of a file. Thus can we also pass true to {{storeAllocatedBlock}}?
+# Instead of checking if the file is striped here, we can check if the block is striped inside of {{BlockManager#commitOrCompleteLastBlock}}. And in this way maybe we do not need the {{completeFile}} argument (the the above comment also stands).
+{code}
+    if (!blockManager.commitOrCompleteLastBlock(
+            fileINode, commitBlock, !fileINode.isStriped() && completeFile)) {
+{code}
+# In {{addExpectedReplicasToPending}}, maybe we can simplify the code by first adding pending replicas into a list (instead of an array) and converting the list into an array in the end. In this way, this part of code does not depend on the logic that "all the current reported storages should be included in the expected storage list". , \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  17m 55s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   8m  8s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  10m 30s | There were no new javadoc warning messages. |
+| {color:red}-1{color} | release audit |   0m 19s | The applied patch generated 1 release audit warnings. |
+| {color:red}-1{color} | checkstyle |   1m 24s | The applied patch generated  2 new checkstyle issues (total was 438, now 437). |
+| {color:red}-1{color} | whitespace |   0m  1s | The patch has 2  line(s) that end in whitespace. Use git apply --whitespace=fix. |
+| {color:green}+1{color} | install |   1m 30s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 34s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   2m 30s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | native |   3m 11s | Pre-build of native portion |
+| {color:red}-1{color} | hdfs tests | 188m 57s | Tests failed in hadoop-hdfs. |
+| | | 235m  2s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.server.datanode.TestDataNodeMetrics |
+|   | hadoop.tracing.TestTracingShortCircuitLocalRead |
+|   | hadoop.fs.TestResolveHdfsSymlink |
+|   | hadoop.hdfs.server.namenode.ha.TestEditLogTailer |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12765624/HDFS-1172.012.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 1107bd3 |
+| Release Audit | https://builds.apache.org/job/PreCommit-HDFS-Build/12869/artifact/patchprocess/patchReleaseAuditProblems.txt |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/12869/artifact/patchprocess/diffcheckstylehadoop-hdfs.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/12869/artifact/patchprocess/whitespace.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12869/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12869/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf903.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12869/console |
+
+
+This message was automatically generated., Thanks, [~jingzhao]! Your comment makes sense. I attached 013., Thanks [~iwasakims]! The 013 patch looks pretty good to me. Only nit is we can change the following if condition to {{if (b && !lastBlock.isStriped())}} to make sure we do not put duplicated records into the pending queue. Other than this +1.
+{code}
+      if (!bc.isStriped()) {
+        addExpectedReplicasToPending(lastBlock);
+      }
+{code}, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  18m  6s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   8m  0s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  10m 31s | There were no new javadoc warning messages. |
+| {color:red}-1{color} | release audit |   0m 19s | The applied patch generated 1 release audit warnings. |
+| {color:red}-1{color} | checkstyle |   1m 25s | The applied patch generated  1 new checkstyle issues (total was 165, now 164). |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 30s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 35s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   2m 30s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | native |   3m 11s | Pre-build of native portion |
+| {color:red}-1{color} | hdfs tests | 187m  8s | Tests failed in hadoop-hdfs. |
+| | | 233m 18s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.server.namenode.TestFSNamesystem |
+| Timed out tests | org.apache.hadoop.hdfs.server.namenode.TestCacheDirectives |
+|   | org.apache.hadoop.hdfs.server.balancer.TestBalancerWithMultipleNameNodes |
+|   | org.apache.hadoop.hdfs.server.namenode.TestDeadDatanode |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12765742/HDFS-1172.013.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / c32614f |
+| Release Audit | https://builds.apache.org/job/PreCommit-HDFS-Build/12894/artifact/patchprocess/patchReleaseAuditProblems.txt |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/12894/artifact/patchprocess/diffcheckstylehadoop-hdfs.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12894/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12894/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf904.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12894/console |
+
+
+This message was automatically generated., bq. Only nit is we can change the following if condition to if (b && !lastBlock.isStriped()) to make sure we do not put duplicated records into the pending queue.
+
+Sure. I attached 014. Tests failed in QA build succeeded on my environment., attaching the same file again to kick jenkins., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  21m 28s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |  10m 51s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  12m 53s | There were no new javadoc warning messages. |
+| {color:red}-1{color} | release audit |   0m 20s | The applied patch generated 1 release audit warnings. |
+| {color:red}-1{color} | checkstyle |   1m 37s | The applied patch generated  1 new checkstyle issues (total was 164, now 163). |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 41s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 42s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   3m 11s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | native |   3m 46s | Pre-build of native portion |
+| {color:red}-1{color} | hdfs tests | 102m  9s | Tests failed in hadoop-hdfs. |
+| | | 158m 43s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.web.TestWebHDFSOAuth2 |
+| Timed out tests | org.apache.hadoop.hdfs.qjournal.client.TestQJMWithFaults |
+|   | org.apache.hadoop.hdfs.server.namenode.TestNNStorageRetentionFunctional |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12766138/HDFS-1172.014.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / e617cf6 |
+| Release Audit | https://builds.apache.org/job/PreCommit-HDFS-Build/12934/artifact/patchprocess/patchReleaseAuditProblems.txt |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/12934/artifact/patchprocess/diffcheckstylehadoop-hdfs.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/12934/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/12934/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf900.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/12934/console |
+
+
+This message was automatically generated., +1 for the 014 patch. I will commit it later today or early tomorrow if no objections., I've committed this into trunk and branch-2. Thanks [~iwasakims] for continuing and finishing the work!, SUCCESS: Integrated in Hadoop-trunk-Commit #8628 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/8628/])
+HDFS-1172. Blocks in newly completed files are considered (jing9: rev 2a987243423eb5c7e191de2ba969b7591a441c70)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, Thanks for the reviews, [~jingzhao]!, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #526 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/526/])
+HDFS-1172. Blocks in newly completed files are considered (jing9: rev 2a987243423eb5c7e191de2ba969b7591a441c70)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2474 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2474/])
+HDFS-1172. Blocks in newly completed files are considered (jing9: rev 2a987243423eb5c7e191de2ba969b7591a441c70)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #538 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/538/])
+HDFS-1172. Blocks in newly completed files are considered (jing9: rev 2a987243423eb5c7e191de2ba969b7591a441c70)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #1262 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/1262/])
+HDFS-1172. Blocks in newly completed files are considered (jing9: rev 2a987243423eb5c7e191de2ba969b7591a441c70)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #493 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/493/])
+HDFS-1172. Blocks in newly completed files are considered (jing9: rev 2a987243423eb5c7e191de2ba969b7591a441c70)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #2431 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2431/])
+HDFS-1172. Blocks in newly completed files are considered (jing9: rev 2a987243423eb5c7e191de2ba969b7591a441c70)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+]

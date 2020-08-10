@@ -1,0 +1,457 @@
+[cc. [~ebadger], [~ebadger] YARN-8064 puts cmd file in the node manager private directory, and this seems to introduce a regression for DeletionService.  The container or container id is null when DeletionService is trying to clean up container.  A status check is called for docker container, but the cmd file can not be written because container does not exist., After looking at this failure a little more closely, I think that the fix is going to require more than simply fixing the NPE that showed up in the Docker deletion task. The NPE was caused because of the following lines: 
+{noformat}
+    String commandFile =
+        dockerClient.writeCommandToTempFile(dockerCommand,
+        nmContext.getContainers().get(ContainerId.fromString(containerId)),
+        nmContext);
+{noformat}
+Because the container is dead, the nmContext has no bookkeeping on it. So when the code does a lookup of the container from the containerID, it doesn't find it and passes back null. Then, we we enter into {{writeCommandToTempFile()}}, it immediately tries to get the containerId from the container and NPEs. This is an easily fixable problem because we don't need to get the container from the nmContext. {{writeCommandToTempFile()}} only uses the containerId, so we can just pass that into the function instead of the container. I figured this would fix the issue and be a minor patch update. However, that is not the case. 
+
+After fixing the NPE, I tested out the code again and found that some Docker containers were failing to be cleaned up after the debug delay, because the .cmd file was failing to be written. The .cmd file is what we pass to the container-executor to invoke all docker commands, including {{docker rm}}. 
+{noformat}
+2018-04-26 19:28:17,631 WARN  [DeletionService #0] docker.DockerClient (DockerClient.java:writeCommandToTempFile(151)) - Unable to write docker command to /tmp/hadoop-local/nmPrivate/application_1524758461670_0003/container_1524758461670_0003_01_000003
+{noformat}
+This is where it gets a little trickier. The container's directory inside of nmPrivate seems to be getting cleaned up before the docker .cmd file is being written, but it doesn't happen for all tasks. It actually appears to be a race in the code between the deletion threads for the nmPrivate directory and the {{DockerContainerDeletionTask}} thread.
+{noformat:title=ContainerImpl.java:1530}
+      if (DockerLinuxContainerRuntime.isDockerContainerRequested(
+          container.getLaunchContext().getEnvironment())) {
+        removeDockerContainer(container);
+      }
+
+      if (clCleanupRequired) {
+        container.dispatcher.getEventHandler().handle(
+            new ContainersLauncherEvent(container,
+                ContainersLauncherEventType.CLEANUP_CONTAINER));
+      }
+
+      container.cleanup();
+{noformat}
+{{removeDockerContainer(container);}} handles the creation of the {{DockerContainerDeletionTask}} thread, while {{container.cleanup();}} creates the {{FileDeletionTask}} that removes the container's nmPrivate directory. These both get scheduled to be executed after {{delete.debug-delay-sec}} seconds. But, they both get added to thread pools where there is no guarantee on the ordering between them. Sometimes, the {{DockerContainerDeletionTask}} wins the race (most of the time in my testing), and some times the {{FileDeletionTask}} wins the race. In the latter case, the docker .cmd file will fail to be written and so the docker container will fail to get removed, and will stick around in the Exited state until cleaned up manually. 
+
+Because of all of this, *I believe that the correct course of action is to revert YARN-8064 to unblock the impending 3.1 release*. That way, if they would like to go ahead with a new release, they may do so without this blocker. However, we should try and get a fix in quickly so that this can go in, since [~vinodkv] mentioned that he would like YARN-8064 in the next release. 
+
+As for a fix, my proposed solution would be to entirely remove the .cmd file requirement on invoking the container-executor for most docker commands. That way we can just call the container-executor directly from the {{DockerContainerDeletionTask}} without the need to write a file anywhere. Since we don't need to write a file, we won't race with the container's nmPrivate directory getting removed. 
+
+Additionally, I think this is just a good change overall regardless of fixing this removal. It is unnecessary to write a file to disk just so that we can do a {{docker rm <container>}}. If the disk is pegged, doing this write could be very slow and unreliable. Plus, it's just overall unnecessary and if we don't have to write to disk, we shouldn't. For things like the {{docker run}} command, it makes sense to use a .cmd file because of the potentially massive number of volume mount arguments. But, for smaller commands, I think we should just add them in as separate commands for the container executor. This also makes the code path significantly smaller within the container-executor, since it wouldn't have to parse the .cmd file. Overall, I think it gives us many wins. 
+
+cc [~shanekumpf@gmail.com], [~jlowe], [~eyang], [~Jim_Brennan], [~ebadger] Thank you for the insights. Cmd file is a serialization contract between node manager and container-executor.  If we want to step away from this contract, we need an alternate proposal.  If we read cmd from stdin, we still need to handle possible buffer overflow, and proper passing of environment variables to docker.  This is likely going in full circle that is likely ending to have a data file between node manager and container-executor.  How about we make a small modification for docker rm command to skip generation of cmd file and pass the docker container id via environment variable to container-executor.  If container-executor can not find .cmd file, and environment variable matches to delete a docker container, and it will perform accordingly.  This will decouple dependency for docker rm on .cmd file, and avoid the race condition between FileDeletionTask and DockerContainerDeletionTask.  Can this be a possible workaround to the race condition problem?, I don't think Eric Badger is proposing to remove the .cmd file for _all_ docker commands being sent to the command executor, rather just skipping it for the specific case of container removal as you propose.  It would be a significant change to remove the need for a .cmd file for all docker commands which I don't think is necessary to fix this particular instance.
+
+So I think we're all on the same page here.  I also agree it is quite unnecessary to write out a docker .cmd file for the case of removal.
+, {quote}I don't think Eric Badger is proposing to remove the .cmd file for _all_ docker commands being sent to the command executor, rather just skipping it for the specific case of container removal as you propose.
+{quote}
+Yes, my apologies. I accidentally contradicted myself in my comment above. I think we should remove the .cmd file for as many docker commands as make sense (i.e. the ones with 1 or 2 parameters). For example, I think the {{docker rm}} shouldn't require a .cmd file, but a {{docker run}} should. , [~jlowe] [~ebadger] Yes we have agreement on this issue.  The most frequent commands have structure:
+
+{code}
+docker-command
+format
+name
+{code}
+
+If we export those key value pair to container-executor environment, this approach will cover most of the cases.  Given that we have some idea to contain this problem, I think we can do this without reverting YARN-8064.  Thoughts?, Thanks for tracking down the issue [~ebadger] and my apologies for missing this in the .cmd file relocation discussion.
+
+{quote}I think we should remove the .cmd file for as many docker commands as make sense (i.e. the ones with 1 or 2 parameters).{quote}
+I agree, some of these docker commands are called multiple times per container, so this will be a nice improvement as well. I do want to call out that {{docker inspect}} will have to be addressed too, as it is used to check that the container is in a removable state prior to calling c-e to do the {{docker rm}}., bq. I do want to call out that docker inspect will have to be addressed too, as it is used to check that the container is in a removable state prior to calling c-e to do the docker rm.
+Good call, [~shanekumpf@gmail.com]. I'll put up a patch today that makes the changes for {{docker rm}} and {{docker inspect}}. We can file a follow-up JIRA for any other calls that we want to convert to straight invocations instead of using the .cmd file, Attaching patch that bypasses the command file when doing a {{docker inspect}} or a {{docker rm}}. This will make it so that there is no race between deleting the container's nmPrivate directory and the docker command getting written to do the container removal. I tested this out locally using the delayed docker removal feature., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 23s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 24m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 51s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m  1s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 46s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 18s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 17s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager: The patch generated 6 new + 11 unchanged - 0 fixed = 17 total (was 11) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 58s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 21s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 19m 32s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 23s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 70m 44s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.nodemanager.containermanager.scheduler.TestContainerSchedulerQueuing |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:abb62dd |
+| JIRA Issue | YARN-8209 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12921302/YARN-8209.001.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 3ae4cf7ef1e6 4.4.0-116-generic #140-Ubuntu SMP Mon Feb 12 21:23:04 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / fc074a3 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20539/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/20539/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20539/testReport/ |
+| Max. process+thread count | 410 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20539/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Fixing checkstyle, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 10m 53s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 26m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 37s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 15m 31s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 25s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 35s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 35s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 21s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 18m 42s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 25s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 90m 55s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:abb62dd |
+| JIRA Issue | YARN-8209 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12921313/YARN-8209.002.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 11f392bf38c8 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / fc074a3 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20541/testReport/ |
+| Max. process+thread count | 341 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20541/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, [~ebadger] Thank you for the patch.  Overall, this patch works on my system without seeing null pointer exception.
+
+REMOVE_DOCKER_CONTAINER and INSPECT_DOCKER_CONTAINER have different way of constructing arguments, but their usage screens are the same.  Developer may assume that INSPECT_DOCKER_CONTAINER to receive one argument to match the usage screen.  Docker inspect via container-executor seems to be overloading the format command as arguments to container-executor.  Container-executor expects the inspect format to be a certain format.  Would it simplify logic to move the formatting argument into container-executor to avoid future code breakage in Java code to introduce regression in container-executor C code?
+
+A few Nitpick: 
+1. invoke_docker_command, in execvp block, a couple lines are not indented correctly.
+2. args, docker_binary, docker_command_with_binary are not freed if execvp fails.
+
+, [~ebadger], a few comments:
+
+As [~eyang] said, invoke_docker_command() is failing to free docker_binary, docker_command_binary, and args if execve succeeds.  Looks like this might have been copy/pasted from run_docker, which has the same problem.
+
+It seems inefficient that in main, we are copying all of the arguments for inspect docker container into a flat string separated by spaces, only to pull it apart again in invoke_docker_command for the call to execve.   Could pass a char **argv and int argc instead.
+
+ , The patch looks functional to me, so the following are all code cleanup comments.  In the interest of unblocking 3.1.1 I'm OK with deferring these to another JIRA, but the non-nits should be addressed at some point.
+
+The instanceof checks are a bit hacky, and it would be nice to get those cleaned up.  For example, DockerCommand could have a method that generates the PrivilegedOperation.  The default implementation would generate the RUN_COMMAND operation with the command file, while DockerRmCommand and DockerInspectCommand can do their specializations without having the callers perform type checks to do the right thing.
+
+invoke_docker_command should not take a string of arguments that needs to be split but rather an arg array that is easier to pass to exec directly.  Right now main.c has to build a string just so invoke_docker_command can take it apart.
+
+Nit: execvp is not going to return if it succeeds, so we can simplify the conditionals by removing the exit_code local and always returning DOCKER_RUN_FAILED.
+
+Nit: exec_docker_command may be a more appropriate name to indicate this is not expected to return.
+, {quote}Nit: execvp is not going to return if it succeeds, so we can simplify the conditionals by removing the exit_code local and always returning DOCKER_RUN_FAILED.{quote}
+
+In doing so, the exit code of docker overlaps with container-executor.  This could confuse node manager which reads exit code from container-executor.  We might need a fork and exec to report container-executor only exit code to node manager., bq. In doing so, the exit code of docker overlaps with container-executor. This could confuse node manager which reads exit code from container-executor.
+
+run_docker is already doing execvp, so this behavior is not new with this patch.  In practice this is not an issue since the container executor exit code is essentially treated a boolean where zero means success and nonzero means failure.  docker (and just about every other Linux command) has the same behavior, so I believe the exec is appropriate here.  I personally would rather get the actual exit code from the docker inspect command logged in the NM logs rather than an exit code that meant "docker failed in some way" that hides the specific exit code from the docker command.
+, {quote}I personally would rather get the actual exit code from the docker inspect command logged in the NM logs rather than an exit code that meant "docker failed in some way" that hides the specific exit code from the docker command.{quote}
+
+There is no guarantee that system administrator have the programming knowledge to determine when a exit code is coming from container-executor or docker.  It will be extra confusing when it is not stated clearly.  It would be nice to log exit code from docker instead of allowing exit_code of docker to report in place of container-executor., Marking it as critical for 3.1.1., Thanks for the reviews, everyone! I just put up a new patch that I believe addresses all of the issues. , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 37s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 25m 41s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 24s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 35s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 18s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 52s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 23s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 20s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager: The patch generated 7 new + 14 unchanged - 0 fixed = 21 total (was 14) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  1s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 41s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 13s{color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 26s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 21s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 76m 10s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+|  |  Unread field:DockerInspectCommand.java:[line 41] |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:abb62dd |
+| JIRA Issue | YARN-8209 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12921457/YARN-8209.003.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 637f7b1d2248 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 8f42daf |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20556/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-YARN-Build/20556/artifact/out/new-findbugs-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.html |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20556/testReport/ |
+| Max. process+thread count | 334 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20556/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 29s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 23m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 51s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 21s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 23s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 18s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 16s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager: The patch generated 7 new + 12 unchanged - 0 fixed = 19 total (was 12) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 38s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  0m 56s{color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 17s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 19s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 19s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 68m 10s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+|  |  Unread field:DockerInspectCommand.java:[line 41] |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:abb62dd |
+| JIRA Issue | YARN-8209 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12921457/YARN-8209.003.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux bcef59cd2192 4.4.0-64-generic #85-Ubuntu SMP Mon Feb 20 11:50:30 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 8f42daf |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20557/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-YARN-Build/20557/artifact/out/new-findbugs-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.html |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20557/testReport/ |
+| Max. process+thread count | 407 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20557/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Fixed checkstyle in latest patch, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 35s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 26m 41s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 53s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 23s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 35s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 18s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 51s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 24s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 49s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  0m 49s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 50s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 20s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager: The patch generated 3 new + 14 unchanged - 0 fixed = 17 total (was 14) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 31s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  0m 59s{color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 22s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 18m 48s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 23s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 76m  3s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+|  |  Unread field:DockerInspectCommand.java:[line 41] |
+| Failed junit tests | hadoop.yarn.server.nodemanager.containermanager.TestContainerManagerRecovery |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:abb62dd |
+| JIRA Issue | YARN-8209 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12921582/YARN-8209.004.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 5b8d7501e8da 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / fe649bb |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20571/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-YARN-Build/20571/artifact/out/new-findbugs-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.html |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/20571/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20571/testReport/ |
+| Max. process+thread count | 309 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20571/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks for the patch, [~ebadger]! I tested the 004 patch and it fixes the issue. It would be good to address the findbugs and checkstyle issues here. The rest of the comments could be deferred until the follow on patch if needed. The failed test seems unrelated.
+ # javadoc is missing for {{DockerCommand#preparePrivilegedOperation}}
+ # The formatting change in {{DockerCommandExecutor#executeDockerCommand}} doesn't look to be necessary.
+ # Only {{DockerInspectCommand#getContainerStatus}} is addressed for {{docker inspect}}, is the plan to handle {{DockerInspectCommand#getIpAndHost}} in the follow on? It would be good to have consistency for a given docker command.
+ # I'm not sure if the {{containerId}} field is needed in {{DockerInspectCommand}} or {{DockerRmCommand}}, {{containerName}} seems like it would still be sufficient. Getting rid of it would also fix the findbugs warning., Thanks for the comments, [~shanekumpf@gmail.com]! Definitely all valid and I've fixed them in patch 005, which I have just uploaded. , | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 55s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 28m  8s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 56s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 21s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m 10s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 52s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 21s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 19s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m  2s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 20s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 52s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 24s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 76m  9s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:abb62dd |
+| JIRA Issue | YARN-8209 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12921599/YARN-8209.005.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux e9f7945481bb 4.4.0-89-generic #112-Ubuntu SMP Mon Jul 31 19:38:41 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 19ae588 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20573/testReport/ |
+| Max. process+thread count | 407 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20573/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #14112 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/14112/])
+YARN-8209.  Fixed NPE in Yarn Service deletion.             Contributed (eyang: rev 883f68222a9cfd06f79a8fcd75ec9fef00abc035)
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/runtime/docker/DockerClient.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/runtime/docker/DockerCommand.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/runtime/docker/DockerRmCommand.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/native/container-executor/impl/container-executor.h
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/runtime/docker/TestDockerCommandExecutor.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/runtime/docker/DockerInspectCommand.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/native/container-executor/impl/main.c
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/runtime/docker/DockerCommandExecutor.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/native/container-executor/impl/container-executor.c
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/privileged/PrivilegedOperation.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/runtime/DockerLinuxContainerRuntime.java
+, +1 Patch 005 looks good.  I just committed this to trunk and branch-3.1.  
+
+Thank you [~ebadger] for the patch.
+Thank you [~shanekumpf@gmail.com] [~Jim_Brennan] [~jlowe] for the review., Thanks for the reviews and commit, everyone!, With the recent backport of YARN-7973 and YARN-8194, the branch-3.1 is no longer applying this patch properly.  I will reapply the same patch for trunk on branch-3.1 for correctness.]

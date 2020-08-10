@@ -1,0 +1,304 @@
+[This seems to be related to what Sidd commented in HADOOP-9299, https://issues.apache.org/jira/browse/HADOOP-9299?focusedCommentId=13596283&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-13596283, Alejandro, what do you think the behaviour should be with security disabled ?
+The NN returns a null token (similar behaviour by the RM/HS I believe will be backward incompatible and a problem for Oozie). The MR client only asks for DFS tokens if security is enabled.
+In terms of security being disabled, MR client could short-circuit requests and send back a null or fake token.
+
+In this particular case, Oozie seems to be sending in a null renewer which is not valid. This likely needs to be fixed in Oozie.
+
+, Updating the description to match the insight from Sid, If we hope to allow a client to work with heterogenous clusters with security enabled/disabled, then clients must properly deal with a null response to a token request.  As an aside: in a generic sense, null means "no token is required" which currently means security is disabled but it doesn't necessarily have to mean that.  Semi-recent changes to MR will propagate credentials (tokens & secrets), even if security is off, because 1.x did that and I think hive was relying on it to pass a secret.  So a heterogeneous security mix will "sorta kinda" work.  Job submission really shouldn't be shorting out the request for fs tokens because it already properly handles null responses.
+
+Given the error, the job submission explicitly requested a RM token which "succeeded", which triggered an internal fetch of a HS token.  The implicit HS token request's renewer is the value of {{yarn.resourcemanager.principal}} which in this case appears to be null.  A RM token request requires an explicit renewer which should be that exact same value - which implies that oozie is using a different value or the RM protobuf is allowing a null (valid).
+
+So we need to know what conf value oozie is passing as the renewer for a RM token.  Technically I think oozie or other components shouldn't have to supply the renewer, the job submission should use the right value but that's a separate issue.  So for now, this may be an oozie issue and/or due to {{yarn.resourcemanager.principal}} not being set., bq. So we need to know what conf value oozie is passing as the renewer for a RM token. Technically I think oozie or other components shouldn't have to supply the renewer, the job submission should use the right value but that's a separate issue. So for now, this may be an oozie issue and/or due to yarn.resourcemanager.principal not being set.
+Oozie is passing in a non-null renewer for the RM call to have worked (ignore my last post - didn't notice the failure was on the HS token). I don't think yarn.resourcemanager.principal is required for a non-secure cluster. We should likely revert part of MAPREDUCE-4921, to fall back to using the specified renewer if it can't figure out a valid one.
+
+Whether we should return a token if security is disabled is another matter. This should likely be null, but that would be a backward incompatible change., bq. Oozie is passing in a non-null renewer for the RM call to have worked (ignore my last post - didn't notice the failure was on the HS token).
+
+Yes, it must have passed a non-null value for the RM token request - I verified the RM token request also NPEs on null renewer.  This begs the question of where is oozie obtaining the renewer to send?  A hardcoded value?
+
+bq.  Whether we should return a token if security is disabled is another matter. This should likely be null, but that would be a backward incompatible change.
+
+Sorry, I didn't mean to imply returning a token with security off.  I only meant it's correct for a non-secure server to return null to signify "no token required".  I think we are in agreement on that point?  Or do you believe returning null is backwards incompat too?  If so, why?
+
+bq.  We should likely revert part of MAPREDUCE-4921, to fall back to using the specified renewer if it can't figure out a valid one.
+
+A basic question to ponder is whether we should allow the submitter to "shoot themselves in the foot" with the wrong renewer?  If no, a trivial and arguably hacky solution might be for the HS token request to sub a null renewer with an empty {{Text}}?
+
+In any case, it will be useful to know what renewer is oozie passing for the RM token?, It looks like the RM throws an exception for token requests if security is off, so I don't oozie is requesting a RM token.  If true, is oozie maybe explicitly setting {{mapreduce.history.server.delegationtoken.required}} to true?
+
+Here's an proposed/untested patch that checks if a RM token is present rather than using a conf setting that was marked as a hack., Oozie is setting a renewer, following is the code. This was working fine before.
+
+{code}
+    static Text getMRTokenRenewerInternal(JobConf jobConf) throws IOException {
+        // Getting renewer correctly for JT principal also though JT in hadoop 1.x does not have
+        // support for renewing/cancelling tokens
+        String servicePrincipal = jobConf.get(RM_PRINCIPAL, jobConf.get(JT_PRINCIPAL));
+        Text renewer;
+        if (servicePrincipal != null) { // secure cluster
+            renewer = mrTokenRenewers.get(servicePrincipal);
+            if (renewer == null) {
+                // Mimic org.apache.hadoop.mapred.Master.getMasterPrincipal()
+                String target = jobConf.get(HADOOP_YARN_RM, jobConf.get(HADOOP_JOB_TRACKER_2));
+                if (target == null) {
+                    target = jobConf.get(HADOOP_JOB_TRACKER);
+                }
+                String addr = NetUtils.createSocketAddr(target).getHostName();
+                renewer = new Text(SecurityUtil.getServerPrincipal(servicePrincipal, addr));
+                LOG.info("Delegation Token Renewer details: Principal=" + servicePrincipal + ",Target=" + target
+                        + ",Renewer=" + renewer);
+                mrTokenRenewers.put(servicePrincipal, renewer);
+            }
+        }
+        else {
+            renewer = MR_TOKEN_ALIAS; //Doesn't matter what we pass as renewer
+        }
+        return renewer;
+    }
+{code}, bq. Sorry, I didn't mean to imply returning a token with security off. I only meant it's correct for a non-secure server to return null to signify "no token required". I think we are in agreement on that point? Or do you believe returning null is backwards incompat too? If so, why?
+Yep, I agree a non-secure server should return null - which would effectively signify no token required. Backward incompatible because the call in 1.X returns a token irrespective of the security settings (may not have been intentional). From a brief look at the Oozie code, looks like a null would be problematic.
+
+bq. It looks like the RM throws an exception for token requests if security is off, so I don't oozie is requesting a RM token. If true, is oozie maybe explicitly setting mapreduce.history.server.delegationtoken.required to true?
+I don't think the RM throws an exception in this case. isAllowedDelegationTokenOp returns true if security is disabled., Oh my, I feel sorry for the contortions oozie has to perform.  You're right on the exception, I assumed {{isAllowedDelegationTokenOp}} and its subsequent "you need kerberos" exception meant it rejected all non-kerberos.  It does indeed always return a token, even though it will never be used...
+
+An aside: It sure would be been nice if there was simply a key named something like "mapreduce.job.submit.allowed".  We could use it to trigger both getting a RM and HS token, if necessary, with the correct renewer.
+
+Anyway, is the dummy HS token actually required somewhere?  If not, what if the {noformat}if (hsProxy != null) { ...get hs token...}{noformat} is changed to: {noformat}if (hsProxy != null && Master.getMasterPrincipal(conf) != null) { ...get hs token...}{noformat}
+
+I think the HS token is invisible to the submitter so it's presence or lack thereof shouldn't have a compat issue?, bq. Yep, I agree a non-secure server should return null - which would effectively signify no token required. Backward incompatible because the call in 1.X returns a token irrespective of the security settings (may not have been intentional). From a brief look at the Oozie code, looks like a null would be problematic.
+
+ I think it is intentional to preserve the user that submitted the launcher job when the launcher submits the real job., bq. I think it is intentional to preserve the user that submitted the launcher job when the launcher submits the real job.
+
+I believe it already does w/o a token.  The ctors in {{Job}} and {{JobClient}} appear to capture the ugi and reuse the ugi for subsequent operations.
+
+Until my semi-recent SASL changes, I don't think the RPC client would even attempt to use a token if security is disabled - which rendered the RM token moot.  Now the client does attempt to use the token, but a non-secure RPC server will kick a client using a token back into simple auth - which again renders the token moot.  Overall the behavior hasn't changed in this case.  The captured ugi tracks the submitter which would match the token anyway.
+
+Per my last suggestion above, is it problematic to short-circuit obtaining a HS token?  I don't believe oozie has any special logic for the HS since it's "new" and implicitly obtained during submission?  The token isn't useful as explained above.  If there is an issue with not obtaining a HS token, I guess we could revert to track & reuse the renewer passed to get the RM token.  Thoughts?
+
+, bq. Per my last suggestion above, is it problematic to short-circuit obtaining a HS token? I don't believe oozie has any special logic for the HS since it's "new" and implicitly obtained during submission? The token isn't useful as explained above. If there is an issue with not obtaining a HS token, I guess we could revert to track & reuse the renewer passed to get the RM token. Thoughts?
+I think skipping the history token is oK, based on what you say about token usage. Can we make it more explicit though, with a UGI.isSecurityEnabled() check rather than just a null renewer ?, bq.  Can we make it more explicit though, with a UGI.isSecurityEnabled() check rather than just a null renewer ?
+
+Sure, it will just compound the sorta/kinda works problem for an "insecure" client with kerberos credentials being able to work with a secure cluster.  Mark your calendar for me saying:  I guess we can fix it later., Patch should work, but it doesn't look like it'll be easy to write a unit test.  Unfortunately I don't have time at the moment to figure it out, so I'd appreciate if someone could help out., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12574624/HADOOP-9409.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/2347//console
+
+This message is automatically generated., Daryn, I don't think we can remove the check on JobClient.HS_DELEGATION_TOKEN_REQUIRED . Getting a HS delegation token is only required if JobClient.getDelegationToken() is called. I'll try updating the patch., The last patch (which accidentally I made a level deep in the tree...) only gets a token if a RM token is present which implies that getDelegationToken was called.  I am attempting to make the comment described "hack" a little less hacky by not propagating/using a conf value set by submission.  Although the conf key appears to be considered private, I'd rather not having it become a defacto supported key if people start using it directly?, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12574791/MAPREDUCE-5088.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3449//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3449//console
+
+This message is automatically generated., bq. The last patch (which accidentally I made a level deep in the tree...) only gets a token if a RM token is present which implies that getDelegationToken was called. 
+Sorry, missed that last time. I could be missing something again :), but I think the RM token will be present when the oozie launcher submits a job (that's when it's really required). Trying to get a history token at that point will end up failing since krb auth isn't available.
+
+bq. I am attempting to make the comment described "hack" a little less hacky by not propagating/using a conf value set by submission. Although the conf key appears to be considered private, I'd rather not having it become a defacto supported key if people start using it directly?
+This is a private key (should at least be annotated if it isn't already). Maybe we need to change the method to getDelgationTokens and deprecate the current method.
+, Guys, thanks a million for the patch. So far I tried the one from yesterday (20/Mar/13) and it completely unblocks Oozie in my Bigtop fully distributed testing.
+
+I will try your latest patch today and report back.
+
+On a related note it seems like  MAPREDUCE-4820 is biting us again -- I'll reopen it., bq. I think the RM token will be present when the oozie launcher submits a job (that's when it's really required). Trying to get a history token at that point will end up failing since krb auth isn't available
+
+Aarg, good catch.
+
+bq. This is a private key (should at least be annotated if it isn't already). Maybe we need to change the method to getDelgationTokens and deprecate the current method.
+
+Unfortunately you can see in the patch that I removed it and it's not annotated, but annotations haven't stopped anyone in the past...  If we are going to change the api, I'd rather match {{FileSystem#addDelegationTokens(renewer, creds)}} because ideally that could be an interface.  I'd also favor a conf setting to trigger the new {{addDelegationTokens}}.  Job submitters really shouldn't have to deal with managing tokens - I mean just look at the contortions oozie has to do!  Ideally tokens should be a transparent implementation detail.  That would make other component maintainers life easier, as well as mine.
+
+Should we make a compatible fix here, and file another jira for a better fix, to avoid a co-dep on oozie?, Small tweak to get a HS token only if:
+# security is enabled
+# the job has a RM token
+# the job lacks a HS token , {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12574861/MAPREDUCE-5088.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3451//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3451//console
+
+This message is automatically generated., bq. Should we make a compatible fix here, and file another jira for a better fix, to avoid a co-dep on oozie?
+Agree, a separate jira for the api change, which can be used to figure out the API changes., Guys, what's the latest on this patch? I've tested it in Bigtop and it seems to do exactly what it needs as far as unblocking Oozie is concerned. What else is left before we can commit it to trunk and all the relevant branches?, Mapreduce patch looks correct to me, but I am perhaps not the world's foremost expert on Kerb., +1 for the previous patch. Adding a unit test to it., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12575662/MAPREDUCE-5088.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3473//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/3473//console
+
+This message is automatically generated., Sid, would you mind taking a look at MAPREDUCE-5117 ?, I can confirm that patch addressed oozie issue. I will commit it by the end of today if there's no objections., Patch committed to branch-2.0.4-alpha as r1463804. Thanks Daryn!, bq. Patch committed to branch-2.0.4-alpha as r1463804. Thanks Daryn!
+[~cos], looks like this went to branch-2.0.4-alpha only. Would you mind pulling this into trunk and beanch-2 as well ? Thanks, Sid, can you please commit to trunk and branch-2? Tx., bq. [~cos], looks like this went to branch-2.0.4-alpha only. Would you mind pulling this into trunk and beanch-2 as well?
+
+Yeah, the ticket _is_ marked for 2.0.4-alpha only. 
+I have committed it now both to trunk and branch-2. Will update the versions of the ticket as well., The patch is merged to all corresponding branches now., Integrated in Hadoop-trunk-Commit #3554 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/3554/])
+    MAPREDUCE-5088. MR Client gets an renewer token exception while Oozie is submitting a job (daryn)
+
+    merge -c1463804 from branch-2.0.4-alpha (Revision 1464153)
+
+     Result = SUCCESS
+cos : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1464153
+Files : 
+* /hadoop/common/trunk
+* /hadoop/common/trunk/hadoop-mapreduce-project
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/JobClient.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/ResourceMgrDelegate.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/YARNRunner.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/TestYARNRunner.java
+, Updated fixed version to 2.0.4-alpha as assumption is that anything committed to 2.0.4-alpha should also have been committed to trunk and branch-2., Integrated in Hadoop-Yarn-trunk #174 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/174/])
+    MAPREDUCE-5088. MR Client gets an renewer token exception while Oozie is submitting a job (daryn)
+
+    merge -c1463804 from branch-2.0.4-alpha (Revision 1464153)
+
+     Result = SUCCESS
+cos : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1464153
+Files : 
+* /hadoop/common/trunk
+* /hadoop/common/trunk/hadoop-mapreduce-project
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/JobClient.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/ResourceMgrDelegate.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/YARNRunner.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/TestYARNRunner.java
+, Integrated in Hadoop-Hdfs-trunk #1363 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1363/])
+    MAPREDUCE-5088. MR Client gets an renewer token exception while Oozie is submitting a job (daryn)
+
+    merge -c1463804 from branch-2.0.4-alpha (Revision 1464153)
+
+     Result = FAILURE
+cos : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1464153
+Files : 
+* /hadoop/common/trunk
+* /hadoop/common/trunk/hadoop-mapreduce-project
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/JobClient.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/ResourceMgrDelegate.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/YARNRunner.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/TestYARNRunner.java
+, Integrated in Hadoop-Mapreduce-trunk #1390 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1390/])
+    MAPREDUCE-5088. MR Client gets an renewer token exception while Oozie is submitting a job (daryn)
+
+    merge -c1463804 from branch-2.0.4-alpha (Revision 1464153)
+
+     Result = SUCCESS
+cos : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1464153
+Files : 
+* /hadoop/common/trunk
+* /hadoop/common/trunk/hadoop-mapreduce-project
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/JobClient.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/ResourceMgrDelegate.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/main/java/org/apache/hadoop/mapred/YARNRunner.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapred/TestYARNRunner.java
+, We're seeing an issue where Oozie can't submit to a secure cluster when the JHS is down because it can't get a delegation token from the Job History Server.  However, if I submit a job without Oozie (i.e. hadoop jar ....) it works fine.  When investigating, it looks like this JIRA may be the cause, or is at least related.  Any ideas on why this is happening?
+
+{noformat}
+2013-09-30 13:14:48,544  WARN ActionStartXCommand:542 - USER[testuser] GROUP[-] TOKEN[] APP[map-reduce-wf] JOB[0000055-130929201011702-oozie-oozi-W] ACTION[0000055-130929201011702-oozie-oozi-W@mr-node] Er
+ror starting action [mr-node]. ErrorType [TRANSIENT], ErrorCode [  JA006], Message [  JA006: Connection refused]
+org.apache.oozie.action.ActionExecutorException:   JA006: Connection refused
+        at org.apache.oozie.action.ActionExecutor.convertExceptionHelper(ActionExecutor.java:412)
+        at org.apache.oozie.action.ActionExecutor.convertException(ActionExecutor.java:392)
+        at org.apache.oozie.action.hadoop.JavaActionExecutor.submitLauncher(JavaActionExecutor.java:794)
+        at org.apache.oozie.action.hadoop.JavaActionExecutor.start(JavaActionExecutor.java:948)
+        at org.apache.oozie.command.wf.ActionStartXCommand.execute(ActionStartXCommand.java:215)
+        at org.apache.oozie.command.wf.ActionStartXCommand.execute(ActionStartXCommand.java:60)
+        at org.apache.oozie.command.XCommand.call(XCommand.java:280)
+        at org.apache.oozie.service.CallableQueueService$CompositeCallable.call(CallableQueueService.java:326)
+        at org.apache.oozie.service.CallableQueueService$CompositeCallable.call(CallableQueueService.java:255)
+        at org.apache.oozie.service.CallableQueueService$CallableWrapper.run(CallableQueueService.java:175)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1145)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:615)
+        at java.lang.Thread.run(Thread.java:722)
+Caused by: java.net.ConnectException: Connection refused
+        at sun.nio.ch.SocketChannelImpl.checkConnect(Native Method)
+        at sun.nio.ch.SocketChannelImpl.finishConnect(SocketChannelImpl.java:692)
+        at org.apache.hadoop.net.SocketIOWithTimeout.connect(SocketIOWithTimeout.java:206)
+        at org.apache.hadoop.net.NetUtils.connect(NetUtils.java:529)
+        at org.apache.hadoop.net.NetUtils.connect(NetUtils.java:493)
+        at org.apache.hadoop.ipc.Client$Connection.setupConnection(Client.java:547)
+        at org.apache.hadoop.ipc.Client$Connection.setupIOstreams(Client.java:642)
+        at org.apache.hadoop.ipc.Client$Connection.access$2600(Client.java:314)
+        at org.apache.hadoop.ipc.Client.getConnection(Client.java:1399)
+        at org.apache.hadoop.ipc.Client.call(Client.java:1318)
+        at org.apache.hadoop.ipc.Client.call(Client.java:1300)
+        at org.apache.hadoop.ipc.ProtobufRpcEngine$Invoker.invoke(ProtobufRpcEngine.java:206)
+        at com.sun.proxy.$Proxy31.getDelegationToken(Unknown Source)
+        at org.apache.hadoop.mapreduce.v2.api.impl.pb.client.MRClientProtocolPBClientImpl.getDelegationToken(MRClientProtocolPBClientImpl.java:211)
+        at org.apache.hadoop.mapred.YARNRunner.getDelegationTokenFromHS(YARNRunner.java:208)
+        at org.apache.hadoop.mapred.YARNRunner.addHistoryToken(YARNRunner.java:195)
+        at org.apache.hadoop.mapred.YARNRunner.submitJob(YARNRunner.java:280)
+        at org.apache.hadoop.mapreduce.JobSubmitter.submitJobInternal(JobSubmitter.java:430)
+        at org.apache.hadoop.mapreduce.Job$10.run(Job.java:1268)
+        at org.apache.hadoop.mapreduce.Job$10.run(Job.java:1265)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:415)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1477)
+        at org.apache.hadoop.mapreduce.Job.submit(Job.java:1265)
+        at org.apache.hadoop.mapred.JobClient$1.run(JobClient.java:557)
+        at org.apache.hadoop.mapred.JobClient$1.run(JobClient.java:552)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:415)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1477)
+        at org.apache.hadoop.mapred.JobClient.submitJobInternal(JobClient.java:552)
+        at org.apache.hadoop.mapred.JobClient.submitJob(JobClient.java:543)
+        at org.apache.oozie.action.hadoop.JavaActionExecutor.submitLauncher(JavaActionExecutor.java:779)
+        ... 10 more
+{noformat}, Unlike normal job submissions, oozie requires a JHS token to query job status if the AM is no longer running.  This is especially true for pig jobs to monitor its sub-jobs.  So oozie job submissions are expected to fail if the JHS is down., This means that we need to have JHS HA, correct?]]

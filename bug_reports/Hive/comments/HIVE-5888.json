@@ -1,0 +1,148 @@
+[if hive.optimize.skewjoin is set to false,we got right result, [~cyril.liao] If you have a reproducible test case, can you please add it here., We had the same problem for Hive 0.11. Ankit created a JIRA at https://issues.apache.org/jira/browse/HIVE-6520.
+
+Based on Ankit's observation, here is the root cause of the problem:
+
+--------------------------------------------------------------------------
+Hive's Skew join optimization is a physical optimization that changes the operator DAG (At compile time, Hive first creates a basic operator DAG and then various optimizations optimize it). After compile time skew join optimization, the skew join related nodes will look like: (MR job with Reduce Join Operator (Stage-1))->(Conditional Skew Join Task that performs Map Join (Stage-2)). When Skew Join optimization kicks in at compile time, it sets a flag "handleSkewJoin" in Stage-1. At run time, Stage-1 performs following (provided "handleSkewJoin" flag was set):
+
+1. Join unskewed keys through normal MR job.
+2. Copies data with skewed keys (from all tables) in a specific directory structure in hdfs.
+
+Stage-2 then picks the skewed data and performs Map Join. The Map Join of the skewed keys is the real optimization because it saves running reducer which has to copy intermediate data from mappers.
+
+Hive also has Map Join Optimization and this is the cause of the problem. A normal map-reduce join is converted to map join if (n-1) small tables can fit in memory. If this happens, at compile time, after both map join and skew join optimization, nodes will look like: (MR job with Map Join Operator (Stage-1))->(Conditional Skew Join Task that performs Map Join (Stage-2)).
+
+Now the problem is that Skew Join optimization sets "handleSkewJoin" only for "Reduce Join Operator" in Stage-1 (it assumes there will be a reducer). So, in case there is "Map Join Operator", "handleSkewJoin" flag is not set and Stage-1 doesn't copy skewed keys in hdfs. When Stage-2 runs, it is not able to find skewed key directory and it gets eliminated at run time. Therefore, no results are displayed. 
+---------------------------------------------------------
+
+I tried to set hive.optimize.skewjoin=true and hive.auto.convert.join=false so that stage-1 would not be converted to a mapjoin to work around this problem. But the reduce phase in stage-1 took an extremely long time. We had 200 reducers, most of them only have 5 or 6 input keys and all the remaining keys were distributed to two reducers. 
+
+Seems the two reducers created very big RowContainer files on local disk, for example.
+
+-rwxrwxrwx 1 hadoop hadoop 334G Mar  5 00:56 RowContainer6650985529012862786.[129].tmp
+-rw-r--r-- 1 hadoop hadoop 2.7G Mar  5 00:56 .RowContainer6650985529012862786.[129].tmp.crc
+
+This behavior is really weird. The inconsistent results caused a lot trouble for us. 
+
+Is there any way to work around this problem? 
+, I believe this is fixed by HIVE-6041, which is included in hive-0.13.0. There remains a minor issue in explain result. But it makes valid result now., Thanks a lot. Will try the fix in HIVE-6041. Could you please explain the weird behavior when I set  hive.optimize.skewjoin=true and hive.auto.convert.join=false? Why almost all keys were distributed to only two reducers? Like to make sure there is no other bugs in the skewjoin logic., Also, the two reducers often failed because no space left on device. This could be a big problem.
+
+
+java.lang.RuntimeException: org.apache.hadoop.fs.FSError: java.io.IOException: No space left on device
+	at org.apache.hadoop.hive.ql.exec.ExecReducer.reduce(ExecReducer.java:278)
+	at org.apache.hadoop.mapred.ReduceTask.runOldReducer(ReduceTask.java:528)
+	at org.apache.hadoop.mapred.ReduceTask.run(ReduceTask.java:429)
+	at org.apache.hadoop.mapred.Child$4.run(Child.java:255)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:415)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1140)
+	at org.apache.hadoop.mapred.Child.main(Child.java:249)
+Caused by: org.apache.hadoop.fs.FSError: java.io.IOException: No space left on device
+	at org.apache.hadoop.fs.RawLocalFileSystem$LocalFSFileOutputStream.write(RawLocalFileSystem.java:200)
+	at org.apache.hadoop.fs.FSDataOutputStream$PositionCache.write(FSDataOutputStream.java:57)
+	at java.io.DataOutputStream.write(DataOutputStream.java:107)
+	at org.apache.hadoop.fs.ChecksumFileSystem$ChecksumFSOutputSummer.writeChunk(ChecksumFileSystem.java:354)
+	at org.apache.hadoop.fs.FSOutputSummer.writeChecksumChunk(FSOutputSummer.java:150)
+	at org.apache.hadoop.fs.FSOutputSummer.flushBuffer(FSOutputSummer.java:132)
+	at org.apache.hadoop.fs.FSOutputSummer.flushBuffer(FSOutputSummer.java:121)
+	at org.apache.hadoop.fs.FSOutputSummer.write1(FSOutputSummer.java:112)
+	at org.apache.hadoop.fs.FSOutputSummer.write(FSOutputSummer.java:86)
+	at org.apache.hadoop.fs.FSDataOutputStream$PositionCache.write(FSDataOutputStream.java:57)
+	at java.io.DataOutputStream.write(DataOutputStream.java:107)
+	at org.apache.hadoop.io.SequenceFile$Writer.append(SequenceFile.java:1115)
+	at org.apache.hadoop.io.SequenceFile$Writer.append(SequenceFile.java:1076)
+	at org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat$1.write(HiveSequenceFileOutputFormat.java:77)
+	at org.apache.hadoop.hive.ql.exec.persistence.RowContainer.spillBlock(RowContainer.java:334)
+	at org.apache.hadoop.hive.ql.exec.persistence.RowContainer.add(RowContainer.java:164)
+	at org.apache.hadoop.hive.ql.exec.persistence.RowContainer.add(RowContainer.java:74)
+	at org.apache.hadoop.hive.ql.exec.JoinOperator.processOp(JoinOperator.java:127)
+	at org.apache.hadoop.hive.ql.exec.Operator.process(Operator.java:502)
+	at org.apache.hadoop.hive.ql.exec.ExecReducer.reduce(ExecReducer.java:257)
+	... 7 more
+Caused by: java.io.IOException: No space left on device
+	at java.io.FileOutputStream.writeBytes(Native Method)
+	at java.io.FileOutputStream.write(FileOutputStream.java:345)
+	at org.apache.hadoop.fs.RawLocalFileSystem$LocalFSFileOutputStream.write(RawLocalFileSystem.java:198)
+	... 26 more, Cherry picked HIVE-6041 patch from branch-0.13 to hive 0.11, but got the following errors. Are there any other patches I need to pick to make it work?
+
+Total MapReduce jobs = 9
+java.io.FileNotFoundException: java.io.FileNotFoundException: File does not exist: /mnt/var/lib/hive_0110/tmp/scratch/hive_2014-03-05_20-12-41_114_4395627082352200171/-mr-10002
+        at sun.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+        at sun.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:57)
+        at sun.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+        at java.lang.reflect.Constructor.newInstance(Constructor.java:526)
+        at org.apache.hadoop.ipc.RemoteException.instantiateException(RemoteException.java:95)
+        at org.apache.hadoop.ipc.RemoteException.unwrapRemoteException(RemoteException.java:57)
+        at org.apache.hadoop.hdfs.DFSClient.getContentSummary(DFSClient.java:1315)
+        at org.apache.hadoop.hdfs.DistributedFileSystem.getContentSummary(DistributedFileSystem.java:240)
+        at org.apache.hadoop.hive.ql.plan.ConditionalResolverCommonJoin.resolveMapJoinTask(ConditionalResolverCommonJoin.java:185)
+        at org.apache.hadoop.hive.ql.plan.ConditionalResolverCommonJoin.getTasks(ConditionalResolverCommonJoin.java:117)
+        at org.apache.hadoop.hive.ql.exec.ConditionalTask.execute(ConditionalTask.java:81)
+        at org.apache.hadoop.hive.ql.exec.Task.executeTask(Task.java:144)
+        at org.apache.hadoop.hive.ql.exec.TaskRunner.runSequential(TaskRunner.java:57)
+        at org.apache.hadoop.hive.ql.Driver.launchTask(Driver.java:1355)
+        at org.apache.hadoop.hive.ql.Driver.execute(Driver.java:1139)
+        at org.apache.hadoop.hive.ql.Driver.run(Driver.java:945)
+        at org.apache.hadoop.hive.cli.CliDriver.processLocalCmd(CliDriver.java:310)
+        at org.apache.hadoop.hive.cli.CliDriver.processCmd(CliDriver.java:231)
+        at org.apache.hadoop.hive.cli.CliDriver.processLine(CliDriver.java:466)
+        at org.apache.hadoop.hive.cli.CliDriver.processLine(CliDriver.java:401)
+        at org.apache.hadoop.hive.cli.CliDriver.processReader(CliDriver.java:499)
+        at org.apache.hadoop.hive.cli.CliDriver.processFile(CliDriver.java:514)
+        at org.apache.hadoop.hive.cli.CliDriver.run(CliDriver.java:773)
+        at org.apache.hadoop.hive.cli.CliDriver.main(CliDriver.java:674)
+        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:57)
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+        at java.lang.reflect.Method.invoke(Method.java:606)
+        at org.apache.hadoop.util.RunJar.main(RunJar.java:187)
+Caused by: org.apache.hadoop.ipc.RemoteException: java.io.FileNotFoundException: File does not exist: /mnt/var/lib/hive_0110/tmp/scratch/hive_2014-03-05_20-12-41_114_4395627082352200171/-mr-10002
+        at org.apache.hadoop.hdfs.server.namenode.FSDirectory.getContentSummary(FSDirectory.java:1158)
+        at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.getContentSummary(FSNamesystem.java:2089)
+        at org.apache.hadoop.hdfs.server.namenode.NameNode.getContentSummary(NameNode.java:948)
+        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:57)
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+        at java.lang.reflect.Method.invoke(Method.java:606)
+        at org.apache.hadoop.ipc.RPC$Server.call(RPC.java:573)
+        at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:1393)
+        at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:1389)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:415)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1140)
+        at org.apache.hadoop.ipc.Server$Handler.run(Server.java:1387)
+
+        at org.apache.hadoop.ipc.Client.call(Client.java:1067)
+        at org.apache.hadoop.ipc.RPC$Invoker.invoke(RPC.java:225)
+        at com.sun.proxy.$Proxy6.getContentSummary(Unknown Source)
+        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:57)
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+        at java.lang.reflect.Method.invoke(Method.java:606)
+        at org.apache.hadoop.io.retry.RetryInvocationHandler.invokeMethod(RetryInvocationHandler.java:83)
+        at org.apache.hadoop.io.retry.RetryInvocationHandler.invoke(RetryInvocationHandler.java:59)
+        at com.sun.proxy.$Proxy6.getContentSummary(Unknown Source)
+        at org.apache.hadoop.hdfs.DFSClient.getContentSummary(DFSClient.java:1313)
+        ... 22 more
+, Also tried to set hive.optimize.skewjoin=true and hive.auto.convert.join=false for the patched Hive-0.11, but still got the "two long running reducers" issue. How to solve this issue then?, Skew join in current implementation is infamous for not reducing total execution time. For checking skewness, all values should be shuffled first, which means all damages are already done in that state. Skewed keys are store in reducer and following MR job processes them.
+
+There are other options like list bucketing(HIVE-3073), or explicit skew join(HIVE-3286), and the former is available in hive-0.11.0., [~navis] After applying the patch from HIVE-6041 to hive 0.12, queries with auto MAPJOIN fails with the following error:  Any workarounds?
+set hive.optimize.skewjoin=true; set hive.auto.convert.join=true; SELECT ru.userid, SUM(ru.total_count) FROM BIGTABLE ru JOIN SMALLTABLE c on c.creative_id = ru.creative_id JOIN placement_dapi p ON p.placement_id = c.placement_id WHERE ru.realdate = '2014-01-02' AND ru.userid > 0 GROUP BY ru.userid;
+
+Stage-1 is selected by condition resolver.
+java.io.FileNotFoundException: java.io.FileNotFoundException: File does not exist: /tmp/hive-muthu.nivas/tmp/hive-muthu.nivas/hive_2014-02-26_18-17-04_075_3879899075227148508-1/-mr-10002
+at sun.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+at sun.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:57)
+at sun.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+at java.lang.reflect.Constructor.newInstance(Constructor.java:526)
+at org.apache.hadoop.ipc.RemoteException.instantiateException(RemoteException.java:96)
+at org.apache.hadoop.ipc.RemoteException.unwrapRemoteException(RemoteException.java:58)
+at org.apache.hadoop.hdfs.DFSClient.getContentSummary(DFSClient.java:917)
+at org.apache.hadoop.hdfs.DistributedFileSystem.getContentSummary(DistributedFileSystem.java:232)
+at org.apache.hadoop.hive.ql.plan.ConditionalResolverCommonJoin.resolveMapJoinTask(ConditionalResolverCommonJoin.java:185)
+at org.apache.hadoop.hive.ql.plan.ConditionalResolverCommonJoin.getTasks(ConditionalResolverCommonJoin.java:117)
+at org.apache.hadoop.hive.ql.exec.ConditionalTask.execute(ConditionalTask.java:81)
+at org.apache.hadoop.hive.ql.exec.Task.executeTask(Task.java:151)
+at org.apache.hadoop.hive.ql.exec.TaskRunner.runSequential(TaskRunner.java:65)
+at org.apache.hadoop.hive.ql.exec.TaskRunner.run(TaskRunner.java:55)
+]

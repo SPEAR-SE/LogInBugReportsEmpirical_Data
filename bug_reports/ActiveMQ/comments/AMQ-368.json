@@ -1,0 +1,167 @@
+[postgres has the follwing configuration:
+
+port = 5432
+max_connections = 100
+	# note: increasing max_connections costs about 500 bytes of shared
+	# memory per connection slot, in addition to costs from shared_buffers
+	# and max_locks_per_transaction.
+#superuser_reserved_connections = 2
+, I find that if I run a process that floods the broker with messages I get the 'unable to get connection' errors.  Pretty much the same stack trace.  I have followed the source around and I am pretty much perplexed.  I'm updating a ton of data by sending many messages; it appears that I send enough messages to max out my db's (MySQL) configuration's max connections (100) before ActiveMQ can broker them all, resulting in this error.
+
+I am using ActiveMQ 3.1.
+
+I looked to the stack trace for clues.  From the stacktrace: JDBCMessageStore.addMessage() line 74ish (persistenceAdapter is a JDBCPersistenceAdapter ):
+...
+        // Get a connection and insert the message into the DB.
+        Connection c = null;
+        try {
+            c = persistenceAdapter.getConnection();            
+            adapter.doAddMessage(c, seq, messageID, destinationName, data, message.getJMSExpiration());
+        } catch (SQLException e) {
+            throw JMSExceptionHelper.newJMSException("Failed to broker message: " + messageID + " in container: " + e, e);
+        } finally {
+        	persistenceAdapter.returnConnection(c);
+        }
+...
+
+And in JDBCPersistenceAdapter.getConnection() :
+...
+public Connection getConnection() throws SQLException {
+        Connection answer = TransactionContext.peekConnection();
+        if (answer == null) {
+            answer = dataSource.getConnection();
+            answer.setAutoCommit(true);
+        }
+        return answer;
+    }
+...
+
+So getting my connection from my DataSource is the problem.  I have configured my data source to be (as in the examples) a BasicDataSource:
+...
+    <persistence>
+          <jdbcPersistence dataSourceRef="mysql-ds"
+                         adapterClass="org.activemq.store.jdbc.adapter.BlobJDBCAdaptor"/>
+    </persistence>
+.
+.
+  <!-- The MYSQL Datasource that will be used by the Broker -->
+  <bean id="mysql-ds"
+    class="org.apache.commons.dbcp.BasicDataSource"
+    destroy-method="close">
+    <property name="driverClassName">
+      <value>com.mysql.jdbc.Driver</value>
+    </property>
+    <property name="url">
+      <value>jdbc:mysql://jmsbox.wendel.gov/activemq</value>
+    </property>
+    <property name="username">
+      <value>jms</value>
+    </property>
+    <property name="password">
+      <value>debugging</value>
+    </property>
+    <property name="poolPreparedStatements">
+      <value>true</value>
+    </property>
+    <property name="maxActive">
+      <value>5</value>
+    </property>
+    <property name="maxIdle">
+      <value>5</value>
+    </property>
+  </bean>
+...
+
+ActiveMQ seems to spawn a thread for every message, similar to a servlet container spawning a new thread for every request.  If the message is persisted, that thread needs a db connection, which it acquires from the GenericObjectPool instance (commons-pool).  That instance can be configured to behave differently if all the resources have been exhausted; specifically it can block, grow or fail (WHEN_EXHAUSTED_FAIL, WHEN_EXHAUSTED_BLOCK, WHEN_EXHAUSTED_GROW) using GenericObjectPool.setWhenExhaustedAction( ... );
+
+That instance is configured in BasicDataSource by creating a GenericObjectPool.createDataSource() using the default constructor then manually setting the pool's values from the configured values in the activemq.xml.  Nowhere is pool.setWhenExhaustedAction(..) called.  This is because the default constructor sets its default: DEFAULT_WHEN_EXHAUSTED_ACTION, which is statically defined as WHEN_EXHAUSTED_BLOCK.  This is the behavior I desire.
+
+Following the stack trace's recommendation, I looked at GenericObjectPool.borrowObject() around line 730.  This seems to happen because of one of two reasons:  either ActiveMQ's maxActive is set to indefinite (<=0) or I misbehave when my resources run out (_whenExhaustedAction):
+...
+// check if we can create one
+// (note we know that the num sleeping is 0, else we wouldn't be here)
+if(_maxActive <= 0 || _numActive < _maxActive) {
+// allow new object to be created
+} else {
+  // the pool is exhausted
+  switch(_whenExhaustedAction) {
+    case WHEN_EXHAUSTED_GROW:
+      // allow new object to be created
+      break;
+    case WHEN_EXHAUSTED_FAIL:
+      throw new NoSuchElementException();
+    case WHEN_EXHAUSTED_BLOCK:
+      try {
+        if(_maxWait <= 0) {
+          wait();
+        } else {
+          wait(_maxWait);
+        }
+      } catch(InterruptedException e) {
+        // ignored
+      }
+...
+
+I understand this to mean that when I run out of resources, I'll block until one is freed.  So I looked into configuration of maxActive.  I am clearly stating that I want a maxActive of 5 in my activemq.xml, and the code explicitly states that it uses the value configured by Spring beans.
+
+From the above discussion, I have absolutely NO idea why ActiveMQ is behaving the way it is.  It seems to indefinitely make database connections without regard for configuration, unless I'm missing something.  I'll admit that I'm not sure what the destroy-method="close" means (I assume it tells the pool how to return resources), but it DOES appear that no restrictive pooling is taking place.
+
+What kind of help can anyone offer?
+, Also, I can reproduce this pretty regularly.  I'm not sure specifically what the threshold of messages/minute is, but enough to where I have sent the max db connection number of messages in the time it takes to broker one message, yielding the Exception.
+
+That is my guess anyway.  FWIW., Is this related to AMQ-377 ?, I have found a workaround bypassing debugging.
+
+I plugged in c3p0 as my connection pooler and my connections are properly throttled; no more 'connection not available' exceptions.  Here is the configuration I used in activemq.xml.  Again, I'm using MySQL.  ActiveMQ now behaves properly.
+
+Be sure to include in c3p0.jar lib/optional/.  I am using c3p0-0.8.4.5.jar.  By default, c3p0 defaults to 3 minimum connectionts, max of 15 which is reasonable.  I changed them here to see that it is actually configuring the way I want.  It is.  c3p0 is super easy to use and apparantly works pretty well.
+
+Better than commons-dbcp/commons-pool in any case.  I feel this is a bug in either pool or dbcp relinquishing resources properly.
+
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE beans PUBLIC  "-//ACTIVEMQ//DTD//EN" "http://activemq.org/dtd/activemq.dtd">
+<beans>
+
+  <!-- ==================================================================== -->
+  <!-- ActiveMQ Broker Configuration -->
+  <!-- ==================================================================== -->
+  <broker name="AMQBroker">
+    <connector>
+      <tcpServerTransport uri="tcp://messaging.wendel.gov:61616" backlog="1000" useAsyncSend="true" maxOutstandingMessages="50"/>
+    </connector>
+
+    <persistence>
+          <jdbcPersistence dataSourceRef="mysql-ds"
+                         adapterClass="org.activemq.store.jdbc.adapter.BlobJDBCAdaptor"/>
+    </persistence>
+  </broker>
+
+  <!-- ==================================================================== -->
+  <!-- JDBC DataSource Configurations -->
+  <!-- ==================================================================== -->
+  <!-- The MYSQL Datasource that will be used by the Broker -->
+  <bean id="mysql-ds"
+        class="com.mchange.v2.c3p0.ComboPooledDataSource"
+        destroy-method="close">
+    <property name="driverClass">
+      <value>com.mysql.jdbc.Driver</value>
+    </property>
+    <property name="jdbcUrl">
+      <value>jdbc:mysql://jms.wendel.gov/activemq</value>
+    </property>
+    <property name="user">
+      <value>wendel</value>
+    </property>
+    <property name="password">
+      <value>go-c3p0!</value>
+    </property>
+    <property name="minPoolSize">
+      <value>6</value>
+    </property>
+    <property name="maxPoolSize">
+      <value>18</value>
+    </property>
+    <property name="acquireIncrement">
+      <value>3</value>
+    </property>
+  </bean>
+</beans>, I simulated the scenario in AMQ-377, which is to create connection for consumers and close. This process is repeated for 200 times, and no error/exception was generated. I used the latest build of amq-4.0 and postgresql-8.0.3, closing since we cannot reproduce, and a possible work around has been reported in case someone else can reproduce., The bug apparents to be in commons-dbcp (I'm seeing the issue myself), it occurs when you set  <property name="poolPreparedStatements" value="true"/> (if you remove it or set to false, dbcp correctly keeps the connecton count to the maxActive setting), ActiveMQ guys you might want to remove this "poolPreparedStatements" setting from your MySQL datasource examples (that's the reason I had it there in the first place).]

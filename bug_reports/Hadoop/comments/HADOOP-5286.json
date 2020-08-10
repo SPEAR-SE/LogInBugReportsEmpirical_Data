@@ -1,0 +1,76 @@
+[The attached snippet from the JobTracker log indicates the exceptions thrown by the DFS client. Also, please note the timestamps between the messages. Ultimately the system recovered after almost 90 minutes and continued to process this job., The NameNode log for the block blk_2044238107768440002_840946 shows the following:
+
+2009-02-19 09:52:50,952 INFO org.apache.hadoop.hdfs.server.namenode.FSNamesystem: commitBlockSynchronization(blk_2044238107768440002_840946) successful
+2009-02-19 09:52:50,975 WARN org.apache.hadoop.hdfs.server.namenode.FSNamesystem: Inconsistent size for block blk_2044238107768440002_840946 reported from <ip>:<port> current size is 195072 reported size is 1318567
+2009-02-19 09:52:50,975 WARN org.apache.hadoop.hdfs.StateChange: BLOCK* NameSystem.addStoredBlock: Redundant addStoredBlock request received for blk_2044238107768440002_840946 on <ip>:<port> size 1318567
+2009-02-19 09:57:41,786 INFO org.apache.hadoop.hdfs.StateChange: BLOCK* ask <ip>:<port> to replicate blk_2044238107768440002_840946 to datanode(s) <ip>:<port>
+2009-02-19 10:11:00,267 INFO org.apache.hadoop.hdfs.StateChange: BLOCK* ask <ip>:<port> to replicate blk_2044238107768440002_840946 to datanode(s) <ip>:<port>
+2009-02-19 11:27:00,030 INFO org.apache.hadoop.hdfs.StateChange: BLOCK* ask <ip>:<port> to replicate blk_2044238107768440002_840946 to datanode(s) <ip>:<port>
+, I checked the data node mentioned in the exception traces of the attached file. It was slow to the point of being dead, though ping was responding. The node was being listed in the 'Live nodes' list on the DFS web UI.
+
+This lockup caused HADOOP-5285, a complete lock-up of the Jobtracker cluster, which also exposed a bug in Map/Reduce., It looks that during the creation of the split file, a datanode in the pipeline was down and thus triggered pipeline recovery. The problem reported blow
+
+> 2009-02-19 09:52:50,975 WARN org.apache.hadoop.hdfs.server.namenode.FSNamesystem: Inconsistent size for block blk_2044238107768440002_840946 reported from <ip>:<port> current size is 195072 reported size is 1318567
+
+was also reported by HADOOP-5133 and fixed in HADOOP-5134. But I do not think this is the cause of the blocking read., > I checked the data node mentioned in the exception traces of the attached file. It was slow to the point of being dead, though ping was responding.
+
+I believe that the reading failure was caused by the slow datanode. I do not think that DFSClient could be blocked for 1 and half an hour. From the attached log, I do see that the same split file was read again and again. Does JobTrack reinsert a failed job back into the jobInitQueue?, From what I can see in the M/R code, the call to initTasks (done from the JobInitThread), is catching Throwable, logging it as an error, failing the job and going to the next job. I did not see the error message in the log file. There is no other exception handling in between. So if an exception was raised, the call would have been aborted. So, I believe the call to initTasks never returned.
+
+The reason why there are multiple reads on the split file is because a single split file is typically across the same block (given the type of jobs we are running). Hence when M/R reads multiple fields in the split file, it trying to read the block multiple times (it looks like). The really important thing here is the time difference between the two logs here:
+
+2009-02-19 10:26:00,504 INFO org.apache.hadoop.hdfs.DFSClient: Could not obtain block blk_2044238107768440002_840946 from any node:  java.io.IOException: No live nodes contain current block
+2009-02-19 11:29:25,054 INFO org.apache.hadoop.mapred.JobInProgress: Input size for job job_200902190419_0419 = 635236206196
+
+That's an hour - there are no logs in between on the M/R system. So, I believe the rest of the split file was being read slowly, but ultimately succeeding, because the job finally began to run.
+
+One question. If the data node is so slow in reading, then is there a way to make the calls timeout sooner by some configuration, and thus cause the DFS to throw an exception, that would abort the job, and let other jobs proceed ? We could try out with such a configuration and see if that helps., I was wrong about JobTracker reading the split file multiple times. Retry is done by the DFSClient to recover from read error. DataNode does have write timeout introuduced by HADOOP-2346. The default timeout is 8 mins. In case of read failure, DFSClient retries 3 datanodes which are different if different ones are available. With HADOOP-3831, each datanode is read 2 times. So DFSClient retries 6 times before it declares a read failure. in this case, it seems that the 5th or 6th retry succeeded but reading took nearly 1 hour.
+
+Hemanth, could you please provide related datanode logs to see what was really happened there? , Read timeout on client for reading from DataNode is 60 seconds (the write timeout of 8 minutes on DataNode does not matter).
+
+This jira says 'DFSClient was blocked for 1.5 hours' : Is there is any log on the client during that time? Please attache all of that log.  
+
+Or is it more like 'DFSClient took 1.5 hours to read x bytes'.. this is always possible with extremely slow datanode (say it is serving 10 bytes every one minute). 
+
+Which one is more accurate?
+
+, Thank Raghu for the clarification. I did not realize we have read timeout too. So either a slow reader or a slow writer might cause a read failure. But still multiple retries and slow writing by the datanode contributed to this 1.5 hours of reading. From the log, retries took at least 1/2 hour. The log did not show exactly how much time last successful read took because not every failed read was logged., A few questions that we were asked offline. I'm posting the comments here:
+
+bq. What is start and end time of the 1.5 hour wait? 
+
+bq. Did the client read() blocked for 1.5 hours or is that it failed to read  x bytes in 1.5 hours? I understand from clients point of view they might be same, but for HDFS, these two are different. 
+
+I think your last point is relevant. Let me try and describe this a bit better. I don't think a single call was blocked. i.e. a single read did not block for 1.5 hours. From the attached log, and the relevant source code, I see reads are made at 3 different places:
+
+bq. [2009-02-19 10:03:29] at org.apache.hadoop.mapred.JobClient$RawSplit.readFields(JobClient.java:983)
+bq. [2009-02-19 10:19:46] at org.apache.hadoop.mapred.JobClient$RawSplit.readFields(JobClient.java:981)
+bq. [2009-02-19 10:26:00,504] at org.apache.hadoop.mapred.JobClient$RawSplit.readFields(JobClient.java:987)
+
+Each of these calls result in a org.apache.hadoop.hdfs.DFSClient$DFSInputStream.read(DFSClient.java:1680) ultimately. And these logs come one after the other. So, the first call went from 10:03 to 10:19, and so on. Also, I don't think any call actually failed in the end. Because from the code (and line numbers), the code is progressing to make other read calls. Had there been an IOException, it would have bailed out right then. So, I believe the reads were happening very slowly., Thanks Hemanth. So it is the very slow reading that is causing the problem.
+
+There are two issue here :
+
+* first the block has only one replica while writing. 
+     ** Hairong mentioned earlier in the jira that root cause of this is fixed in HADOOP-5134
+
+* Unfortunately only replica is on a datanode that is extremely slow and hardly accessible. I will address this.
+   ** Some DataNodes are expected to be flaky and is a normal condition.
+   ** This is probably the reason why replication of the block also took very long time as well.
+
+As I understand, the application (JobTracker in this case) is very sensitive to this delay. I think for a good design, this slow reading should be handled in the application. There is no QOS for hadoop file systems. Even if HDFS has some kind of option, app could face the same problem with LocalFS. If a datanode node slowly trickles data, and that is the only replica left, options for a filesystem are limited. In that sense I am not sure if that is a real bug.
+
+Do you think a critical service like JobTracker should be  sensitive to flaky datanode delays? It probably gets less likely as bugs like HADOOP-5134 are fixed, but delays could occur for various other reasons.
+
+We reduce the timeout, number of retries etc in DFSClient while reading, but I don't think that addresses the basic issue.
+
+
+, I would propose that we make a pool of JobInit threads, so that a single slow data node can't block all of the progress. If the pool had 5 threads, that would be more than enough to prevent slow blocks from completely blocking the JobTracker., Reassigning to Devaraj for consideration in map/reduce code., Hi Raghu, as has been suggested, we will change M/R to introduce multiple threads for initialization. There was effort on this front in HADOOP-4664, that we propose to take forward. 
+
+However, I feel we should spend a little more time and look at the datanode log to make sure that it is indeed a hardware issue with the datanode in question and then keep it aside. Since this has only occurred once, I don't think it should be a blocker (I never did, in fact), and hence I've downgraded the severity and removed the fix in version. We will be providing the logs to you from the slow data node that we rebooted and it would be great if you can take a quick look to determine there's no hidden problem., Thanks Hemanth. I am attaching the datanode log.
+
+It might not be just the hard disks that are slow, even network might be affected too, since there are write timeouts while writing to clients. The follow log shows how severely degraded this machine is :
+
+{quote} 2009-02-19 10:10:58,297 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: BlockReport of 92 blocks got processed in 445591 msecs {quote}
+
+It took 7.5 minutes to scan and report 92 blocks. 
+
+To see what is actually wrong with the machine, someone in charge of the hardware needs to take a look. I will close this issue for now. , This should be fixed by HADOOP-4664 (linked). Resolving as "Duplicate".]

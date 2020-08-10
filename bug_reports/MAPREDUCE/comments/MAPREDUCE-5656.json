@@ -1,0 +1,206 @@
+[Attaching a testcase for the problem, which requires the same input file as used in one of Pig's bzip2 unit tests, [blockEndingInCR.txt.bz2|https://issues.apache.org/jira/secure/attachment/12438881/blockEndingInCR.txt.bz2].  Drop the file into hadoop-common-project/hadoop-common/src/test/resources/ and the unit test can be run via Maven.
+
+I've also manually verified the loss of records via a simple streaming job:
+
+{noformat}
+hadoop jar hadoop-*/share/hadoop/tools/lib/hadoop-streaming*.jar -Dmapreduce.input.fileinputformat.split.minsize=136498 -Dmapreduce.job.maps=3 -input blockEndingInCR.txt.bz2 -output streamout -mapper cat -reducer NONE
+{noformat}
+
+Examining the output of the job shows that the record after the carriage return in the file was dropped.  Running a similar streaming job with only one map (no splits) shows the record is not dropped., This is a bit tricky to get right, as I ran into PIG-3352 while investigating it.  
+
+However I think we can detect these CR/LF/CRLF boundary conditions properly, if the line reader that is building the record reads the data byte-by-byte and notices the exact character where the reported position goes past the end of the split.  At that point it can decide which of the cases it is in and react properly.  That would also solve similar problems that exist for custom, multi-byte delimiters that span block boundaries.
+
+Currently the line reader is buffered, and it would be a shame to have to give that up.  I think we can still use buffered reads from the codec stream with one critical assumption: the codec will *never* return data spanning two blocks in a single read.  I'm assuming that's the case today, since failure to do that would break the existing LineRecordReader->LineReader->SplittableCompressionCodec relationship today.  LineReader is buffering data from the codec, but LineRecordReader is checking the codec's position after each record returned., Attaching a draft of a patch that I believe will fix the issue.  Comments welcome.
+
+I no longer believe this is a codec issue, since the codec doesn't know anything about record delimiters.  The codec is properly reporting when the next split has started to be read.  The problem actually lies between the LineRecordReader and LineReader when the codec is involved, as the LineRecordReader is relying solely on the codec to report when the split has completed, oblivious to the buffering and peeking going on in LineReader.  If others agree, I can move this to a MAPREDUCE JIRA.
+
+The patch makes the LineRecordReader aware of the fact that the split ended in the middle of a delimiter, so it can decide to read another record after the codec reports the split ended.
+
+Added some unit tests which uses a couple of test files that I'm also attaching.  These need to be dropped into hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/resources/ so the unit tests can find them.
+
+Any feedback is appreciated.  I'll also work on some tests with multi-byte custom delimiters where the split ends in the middle of the delimiter., Looked over patch and approach seems reasonable. I'm not sure there is much else you can do without changing the codecs themselves, or forcing everything to move one byte at a time (so that we can know precisely when the codec moves beyond the split). 
+
+It might help to add some comments somewhere in the code which specifically illustrate the boundary conditions. As you said it's tricky (clearly since both pig and MR got it wrong in slightly different edge cases), it certainly couldn't hurt to add some more commentary in this area., Added a discussion of the various use cases and assumption on how compressed input streams read blocks to CompressSplitLineReader., Thanks for adding the detailed comment. Well explained!
++1 for the patch.
+, Looks like this patch is ready to go in as it still applies and the tests still pass. Is there anything else needed before this can go in?, +1 The unit test clearly demonstrates the bug and dropping records is severe enough that this case should be fixed.
+
+The comment is helpful, thanks for including it. {{inDelimiter}} is insufficient because {{LineReader::readDefaultLine}} will match \n, while {{LineReader::readCustomLine}} would consider a partial match incomplete and require an extra line? I looked briefly at the custom delimiter code, and I'm not seeing how it handles splits that start in the middle of a delimiter. I must be missing something obvious..., bq. {{inDelimiter}} is insufficient because {{LineReader::readDefaultLine}} will match \n, while {{LineReader::readCustomLine}} would consider a partial match incomplete and require an extra line?
+
+Yes, the crux of the issue is the default delimiter supports a subset of the delimiter as a valid delimiter (i.e.: \r\n is a delimiter but so is \r or \n).  The custom delimiter support does not allow a subset of the specified delimiter to be a valid delimiter as well, so it won't recognize the start of the characters as a delimiter and will read an extra line before starting.
+
+bq. I looked briefly at the custom delimiter code, and I'm not seeing how it handles splits that start in the middle of a delimiter. I must be missing something obvious...
+
+Yeah, it does look like there's a problem with the handling of custom record delimiters on uncompressed input.  For this to work properly we need the consumer of the previous split to handle all bytes up to and including the first full record delimiter that starts at or after its split ends.  With this patch I think we have this case covered for compressed input due to the needAdditionalRecordAfterSplit logic.  However since the custom delimiter line reader seems to be returning the size of the record and subsequent delimiter bytes as the bytes consumed, I think we will end up reporting the end of the split too early to the LineRecordReader for uncompressed data in the case where the delimiter straddles the split boundary.
+
+To verify there's a problem, I ran a simple wordcount on the following input data:
+
+{noformat}
+
+abcxxx
+defxxx
+ghixxx
+jklxxx
+mnoxxx
+pqrxxx
+stuxxx
+vw xxx
+xyzxxx
+{noformat}
+
+and then I ran it with the options {{-Dmapreduce.input.fileinputformat.split.maxsize=34 -Dtextinputformat.record.delimiter=xxx}}.  The resulting output looked like this:
+
+{noformat}
+abc	1
+def	1
+ghi	1
+jkl	1
+mno	1
+stu	1
+vw	1
+xyz	1
+{noformat}
+
+So we dropped the "pqr" record.  Not good.
+
+I'm tempted to handle this as a separate JIRA since I believe this will be an issue only with uncompressed inputs after this patch., bq. I'm tempted to handle this as a separate JIRA since I believe this will be an issue only with uncompressed inputs after this patch.
+
+Yeah, that makes sense. Particularly since this issue covers the codec and the custom delimiter bug is in in the text processing. Thanks for looking into it.
+
+bq. With this patch I think we have this case covered for compressed input due to the needAdditionalRecordAfterSplit logic.
+
+I... think that's true. We can think about it in the followup., Turns out there's already a followup for multibyte custom delimiters at HADOOP-9867, so I'll add the testcase and relevant details to that JIRA.
+
+Thanks for the review, Chris.  Given your earlier +1 I think this is now ready to go as-is.  If there are no objections I'll commit this in the next few days., Thanks Jason for the patch for this tricky issue.
+Patch looks good to me.
+
+One small nit.
+There are already two Test classes TestLineRecordReader in mapred and mapreduce.lib.input packages in hadoop-mapreduce-client-jobclient project. It will be better to move included tests to these classes instead of creating multiple classes., bq. There are already two Test classes TestLineRecordReader in mapred and mapreduce.lib.input packages in hadoop-mapreduce-client-jobclient project. It will be better to move included tests to these classes instead of creating multiple classes.
+
+I'd much rather keep the unit tests for LineRecordReader in the same package as the code, that way when the code is updated Jenkins will run the tests to catch errors.  If we move these unit tests to the jobclient module then if a patch touches only LineRecordReader in the core module we won't run the unit tests since they're in a different module.
+
+Instead I'd rather rename the TestLineRecordReader tests in the jobclient module to something like TestLineRecordReaderJobs.  Those tests are really integration tests rather than unit tests, since they're running a job for each test rather than just the LineRecordReader in isolation., Thats sounds better jason. 
++1 for the existing patch then., Cleanup work in preparation for commit.  Moving this JIRA to MAPREDUCE since it's primarily changes in that project.  Also uploading a binary patch that can be applied with git-apply as reference of what will be committed (same patch as before with binary test files added).
+
+Awating Jenkins confirmation and commit of MAPREDUCE-5640 to avoid test name conflicts., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12615899/MAPREDUCE-5656.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core:
+
+                  org.apache.hadoop.mapred.TestLineRecordReader
+                  org.apache.hadoop.mapreduce.lib.input.TestLineRecordReader
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4232//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4232//console
+
+This message is automatically generated., The two failed tests are expected because test-patch doesn't handle binary patches properly.  The new binary test files weren't added so the tests that need them failed., One small nit here,
+SplitLineReader is not formatted with 2 whitespaces., I have one doubt here,
+
+Say, last record ended between delimiters and {{needAdditionalRecord}} is true and one more record is read to buffer.
+What if this record also ended between delimiters..? 
+Now also {{needAdditionalRecord}} will be true and this will try to read one more record right..? This will be duplicated in next split.
+
+may be we need to set {{needAdditionalRecord}} only if its not already been set to true. Right?, That case is what the {{finished}} flag in CompressedSplitLineReader is intended to catch.  Here's the scenario:
+
+# LineRecordReader calls readLine
+# The line processing causes us to fetch the next compressed block beyond the split (i.e.: fillBuffer is called).  Let's say this causes us to set needAdditionalRecord=true.
+# LineRecordReader will process another iteration of the loop and call readLine again
+# readLine will notice that we are starting at a position past the end of the split and set finished=true.
+# At that point the needAdditionalRecordAfterSplit method will always return false and LineRecordReader should not read more than at most one record beyond the end of the split.
+
+The key is needAdditionalRecordAfterSplit() will always return false once readLine() is invoked at a position after the split ends., Slightly updated patch to fix the spacing issue in SplitLineReader., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12616562/MAPREDUCE-5656-2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core:
+
+                  org.apache.hadoop.mapred.TestLineRecordReader
+                  org.apache.hadoop.mapreduce.lib.input.TestLineRecordReader
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4235//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4235//console
+
+This message is automatically generated., As before, test failures are expected because test-patch.sh isn't dealing with the binary patch correctly.  The tests pass when I run them locally.
+
+[~vinayrpet], do you have any further concerns or is this ready to go as-is?, Thanks Jason for the update.
+I think patch is ready to go in. +1, Thanks to Nathan, Chris, and Vinay for the reviews!  I committed this to trunk and branch-2., SUCCESS: Integrated in Hadoop-trunk-Commit #4856 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/4856/])
+MAPREDUCE-5656. bzip2 codec can drop records when reading data in splits. Contributed by Jason Lowe (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1549705)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/LineReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/LineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/CompressedSplitLineReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/LineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/SplitLineReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapred/TestLineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/lib/input/TestLineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/resources/blockEndingInCR.txt.bz2
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/resources/blockEndingInCRThenLF.txt.bz2
+, FAILURE: Integrated in Hadoop-Yarn-trunk #417 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/417/])
+MAPREDUCE-5656. bzip2 codec can drop records when reading data in splits. Contributed by Jason Lowe (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1549705)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/LineReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/LineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/CompressedSplitLineReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/LineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/SplitLineReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapred/TestLineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/lib/input/TestLineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/resources/blockEndingInCR.txt.bz2
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/resources/blockEndingInCRThenLF.txt.bz2
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #1608 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1608/])
+MAPREDUCE-5656. bzip2 codec can drop records when reading data in splits. Contributed by Jason Lowe (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1549705)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/LineReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/LineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/CompressedSplitLineReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/LineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/SplitLineReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapred/TestLineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/lib/input/TestLineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/resources/blockEndingInCR.txt.bz2
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/resources/blockEndingInCRThenLF.txt.bz2
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1634 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1634/])
+MAPREDUCE-5656. bzip2 codec can drop records when reading data in splits. Contributed by Jason Lowe (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1549705)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/LineReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapred/LineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/CompressedSplitLineReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/LineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/SplitLineReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapred/TestLineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/java/org/apache/hadoop/mapreduce/lib/input/TestLineRecordReader.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/resources/blockEndingInCR.txt.bz2
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/test/resources/blockEndingInCRThenLF.txt.bz2
+]

@@ -1,0 +1,367 @@
+[I guess the issue here is figuring out which node(s) to kick out of the pipeline when the last datanode detects an error.  We shouldn't always just kick out the last node, since the error might have been introduced by an earlier datanode.  
+
+At first, you might think that you could simply tell all the nodes in the pipeline to perform a checksum of their un-committed data, and use that to catch the guilty node.  However, one example we've been talking about is a bad network interface that randomly corrupts outgoing packets.  In this case, even if the DN verifies its own buffer and it comes up clean, that DN might still be the problem because of its evil network interface.
+
+The DFSClient can tell that an error happened between two nodes.  For example, if D1 can verify its checksummed data and D2 cannot, the problem could be either D1 or D2.  But at least we know the problem is not D3.  But the DFSClient can't pinpoint the source of an error immediately.  This can be difficult for us.  We don't get a lot of "tries" to find the bad node.  If we kick out too many nodes from the pipeline, we may be left with *only* the bad node in the pipeline.  For example, with a 2-node pipeline, we have a 50% chance of getting it right the first time we kick out a node.
+
+I think ideally we would:
+1. Be able to "un-kick-out" nodes.  In the example I gave earlier with the 2-node pipeline, if we discover that kicking out D2 didn't solve the problem, we should be able to get D2 back and kick out D1 instead.  (I haven't looked at the code very closely, so maybe this is already implemented?  But I don't think so)
+
+2. Keep a count of which nodes are associated with problems at the DFSClient, and use this to intelligently kick out nodes., Hi [~cmccabe],
+
+Thanks for the comments and addition. 
+
+As proposed in the jira report, we need to have a way to communicate the DN3's status to DN2, I think DN3 even can tell DN2 where the checksum error happens, then DN2 can do a checksum checking, if the checksum happens at the same location, that means DN3 is not the culprit, so we should not take out DN3.  If DN2 is good, then DN3 is the culprit and we reconstruct the pipeline without DN3.
+
+If DN2's data is corrupted, DN2 can do the same by propagating back the checksum error info back to DN1, DN1 then do a checksum checking too and confirm whether itself has good data. If DN1's data is also corrupted, then DN1 is the one to take out. And the client need to reconstruct the pipeline by just throwing away DN1, and keep DN2 and DN3.
+
+If DN1 is good, then the issue is at DN2.
+
+This way, we minimize the impact of unnecessarily throwing away good DNs. We need to be aware of that, the corrupted chunks were already acknowledged previously to the client. Client better buffer the data block and be able to rewrite the whole block to the newly constructed pipeline.
+
+We need to have an infrastructure to communicate back error status to upstream DNs instead of just terminating, so we don't have to incur this run time cost most of the time (assuming checksum error happens infrequently).
+
+I'd prefer working out a functioning solution for the current issue, and have new jira to handle corner cases which were not handled previously.
+, Good day, any update on this? I seem to be running into a similar issue with Hbase WAL based on HDFS 2.6 chd 2.4.8. A pipeline is being reconstructed with many candidate datanodes, but none of the substitutes seems to be receiving the block replica correctly:
+
+Checksum error in block .... from /IP:port
+org.apache.hadoop.fs.ChecksumException: Checksum error: DFSClient_NONMAPREDUCE_1267344484_1 at 2048 exp: -652491368 got: -585724081    [note: checksums are the same on all new candidate nodes]
+
+java.io.IOException: Terminating due to a checksum error.java.io.IOException: Unexpected checksum mismatch while writing .... from /IP:port
+>···at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receivePacket(BlockReceiver.java:562)
+>···at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receiveBlock(BlockReceiver.java:780)
+>···at org.apache.hadoop.hdfs.server.datanode.DataXceiver.writeBlock(DataXceiver.java:783)
+>···at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opWriteBlock(Receiver.java:137)
+>···at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:74)
+>···at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:243)
+>···at java.lang.Thread.run(Thread.java:745)
+
+This is repeated until no datanode is left to try, and leads to data loss (?) and terminated Region Servers due to inability to write to WAL. (The cluster has 3 racks and 21 nodes), I'm proposing a simplified solution here:
+
+Instead of 
+{quote}
+So intuitively, a solution would be, when downstream DN (DN3 here) found checksum error, propagate this info back to upstream DN (DN2 here), DN2 checks the correctness of the data already written to disk, and truncate the replica to to MIN(correctDataSize, ACKedSize).
+{quote}
+
+what we can do is, when DN2 find DN3 failed, DN2 simply scan its own replica to check possible corruption, if so, DN2 reports itself as the firstBadLink. 
+
+Thanks Colin for earlier discussion.
+, Attached a draft patch that reports
+
+{code}
+2016-05-25 11:35:20,639 [DataStreamer for file /tmp/testClientReportBadBlock/CorruptTwoOutOfThreeReplicas1 block BP-198184347-127.0.0.1-1464201303610:blk_1073741825_1001] WARN  hdfs.DataStreamer (DataStreamer.java:handleBadDatanode(1400)) - Error Recovery for BP-198184347-127.0.0.1-1464201303610:blk_1073741825_1001 in pipeline [DatanodeInfoWithStorage[127.0.0.1:54392,DS-d6b01513-ac11-4fdf-99a1-fbb111d0f0c5,DISK], DatanodeInfoWithStorage[127.0.0.1:45555,DS-67174cd1-1f9c-46bc-9dea-8ece7190308d,DISK], DatanodeInfoWithStorage[127.0.0.1:55877,DS-8fe30be4-1244-4059-a567-bc156d49d01a,DISK]]: datanode 0(DatanodeInfoWithStorage[127.0.0.1:54392,DS-d6b01513-ac11-4fdf-99a1-fbb111d0f0c5,DISK]) is bad.
+{code}
+where 127.0.0.1:5439 is DN3 the reported example.
+
+With the fix, we can see
+
+{code}
+2016-05-25 14:15:29,831 [DataXceiver for client DFSClient_NONMAPREDUCE_1623233781_1 at /127.0.0.1:59590 [Receiving block BP-1085730607-127.0.0.1-1464210923866:blk_1073741825_1001]] WARN  datanode.DataNode (DataXceiver.java:determineFirstBadLink(494)) - Datanode 2 got response for connect ack  from downstream datanode with firstbadlink as 127.0.0.1:36300, however, the replica on the current Datanode host4:38574 is found to be corrupted, set the firstBadLink to this DataNode.
+{code}
+where host4:38574 is DN2 in the example. Thus it's reported bad in Error Recovery message:
+
+{code}
+2016-05-25 14:15:29,833 [DataStreamer for file /tmp/testClientReportBadBlock/CorruptTwoOutOfThreeReplicas1 block BP-1085730607-127.0.0.1-1464210923866:blk_1073741825_1001] WARN  hdfs.DataStreamer (DataStreamer.java:handleBadDatanode(1400)) - Error Recovery for BP-1085730607-127.0.0.1-1464210923866:blk_1073741825_1001 in pipeline [DatanodeInfoWithStorage[127.0.0.1:38574,DS-a743f66a-3379-4a1e-82df-5f6f26815df8,DISK], DatanodeInfoWithStorage[127.0.0.1:38267,DS-32e47236-c29f-435b-995b-f6f4f2a86acc,DISK], DatanodeInfoWithStorage[127.0.0.1:36300,DS-906d823d-0de5-40f1-9409-4c8c6d4edd08,DISK]]: datanode 0(DatanodeInfoWithStorage[127.0.0.1:38574,DS-a743f66a-3379-4a1e-82df-5f6f26815df8,DISK]) is bad.
+{code}
+
+I was able to see the fix constantly succeed in one debug version, and fail when removing the fix. However, before I post the patch now, I observed some intermittency in the unit test env, which is yet to understood. But I'd like to post the patch to let it rolling.
+
+Hi [~cmccabe],
+
+Would you please help taking a look? 
+
+Thanks a lot.
+
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 16s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 47s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 44s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 33s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 51s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 12s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 48s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 12s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 53s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 46s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 46s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 33s {color} | {color:red} hadoop-hdfs-project/hadoop-hdfs: patch generated 33 new + 529 unchanged - 4 fixed = 562 total (was 533) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 54s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 11s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 25 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 59s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 2s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 64m 9s {color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 36s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 84m 56s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestDatanodeDeath |
+|   | hadoop.hdfs.server.datanode.TestDiskError |
+|   | hadoop.hdfs.TestDFSClientExcludedNodes |
+|   | hadoop.hdfs.TestPipelineRecovery |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+|   | hadoop.hdfs.TestDecommissionWithStriped |
+|   | hadoop.hdfs.TestAsyncDFSRename |
+|   | hadoop.hdfs.server.namenode.ha.TestPipelinesFailover |
+|   | hadoop.hdfs.tools.TestDebugAdmin |
+|   | hadoop.hdfs.TestFileAppend |
+| Timed out junit tests | org.apache.hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:2c91fd8 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12806312/HDFS-6937.001.patch |
+| JIRA Issue | HDFS-6937 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux cd955b145953 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 77202fa |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/15576/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/15576/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/15576/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/15576/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/15576/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/15576/console |
+| Powered by | Apache Yetus 0.2.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, rev 002 for a better way to get the DNs in a pipeline.
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 13s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 5m 59s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 42s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 49s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 12s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 39s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 4s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 46s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 41s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 41s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 30s {color} | {color:red} hadoop-hdfs-project/hadoop-hdfs: patch generated 33 new + 529 unchanged - 4 fixed = 562 total (was 533) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 48s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 9s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 27 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 43s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 2s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 74m 9s {color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 19s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 92m 30s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestPipelineRecovery |
+|   | hadoop.hdfs.TestBlocksScheduledCounter |
+|   | hadoop.hdfs.TestDatanodeDeath |
+|   | hadoop.hdfs.tools.TestDebugAdmin |
+|   | hadoop.hdfs.server.datanode.TestDiskError |
+|   | hadoop.hdfs.TestDFSClientExcludedNodes |
+|   | hadoop.hdfs.TestRollingUpgrade |
+|   | hadoop.hdfs.TestAbandonBlock |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+| Timed out junit tests | org.apache.hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:2c91fd8 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12806370/HDFS-6937.002.patch |
+| JIRA Issue | HDFS-6937 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux fa1b66a08b96 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 77202fa |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/15578/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/15578/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/15578/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/15578/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/15578/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/15578/console |
+| Powered by | Apache Yetus 0.2.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, I am taking over Yongjun's patch because he'll not be able to access Internet for some time.
+
+This is a great work and I took some time to understand. I think that instead of throwing an IOException to simulate the injection of checksum failure at the last datanode, it should enqueue a ERROR_CHECKSUM to indicate the checksum failure. Without it, the last DN will shutdown the connection, and the second DN in the pipeline will not understand it's checksum failure.
+
+{code:title=BlockReceiver.java#sendAckUpstreamUnprotected}
+if (ack == null) {
+        // A new OOB response is being sent from this node. Regardless of
+        // downstream nodes, reply should contain one reply.
+        replies = new int[] { myHeader };
+      } else if (mirrorError) { // ack read error
+        int h = PipelineAck.combineHeader(datanode.getECN(), Status.SUCCESS);
+        int h1 = PipelineAck.combineHeader(datanode.getECN(), Status.ERROR);
+        replies = new int[] {h, h1};
+      } else {
+        short ackLen = type == PacketResponderType.LAST_IN_PIPELINE ? 0 : ack
+            .getNumOfReplies();
+        replies = new int[ackLen + 1];
+        replies[0] = myHeader;
+        for (int i = 0; i < ackLen; ++i) {
+          replies[i + 1] = ack.getHeaderFlag(i);
+        }
+        // If the mirror has reported that it received a corrupt packet,
+        // do self-destruct to mark myself bad, instead of making the
+        // mirror node bad. The mirror is guaranteed to be good without
+        // corrupt data on disk.
+        if (ackLen > 0 && PipelineAck.getStatusFromHeader(replies[1]) ==
+          Status.ERROR_CHECKSUM) {
+          throw new IOException("Shutting down writer and responder "
+              + "since the down streams reported the data sent by this "
+              + "thread is corrupt");
+        }
+      }
+{code}
+In this piece of code, if the next DN shutdown the connection, it is always assumed the local DN is good.
+{code}
+        int h = PipelineAck.combineHeader(datanode.getECN(), Status.SUCCESS);
+        int h1 = PipelineAck.combineHeader(datanode.getECN(), Status.ERROR);
+        replies = new int[] {h, h1};
+{code}
+On the other hand, if the next DN respond with a ERROR_CHECKSUM, it will thrown an IOException, and this will shutdown the connection with the previous DN in the pipeline. In the end, this will replace the middle datanode:
+
+{code:title=DataStreamer.java#createBlockOutputStream}
+// find the datanode that matches
+        if (firstBadLink.length() != 0) {
+          for (int i = 0; i < nodes.length; i++) {
+            // NB: Unconditionally using the xfer addr w/o hostname
+            if (firstBadLink.equals(nodes[i].getXferAddr())) {
+              errorState.setBadNodeIndex(i);
+              break;
+            }
+          }
+        }
+{code}, Upload my patch based on Yongjun's version 2., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 11s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 35s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 47s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 32s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 52s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 11s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 45s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 7s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 50s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 44s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 44s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 31s {color} | {color:red} hadoop-hdfs-project/hadoop-hdfs: The patch generated 35 new + 529 unchanged - 4 fixed = 564 total (was 533) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 49s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 9s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 23 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 49s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 0s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 63m 51s {color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 31s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 83m 32s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestDatanodeDeath |
+|   | hadoop.hdfs.server.datanode.TestDiskError |
+|   | hadoop.hdfs.TestDFSClientExcludedNodes |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+|   | hadoop.hdfs.tools.TestDebugAdmin |
+|   | hadoop.hdfs.TestAbandonBlock |
+|   | hadoop.hdfs.server.datanode.TestDataNodeErasureCodingMetrics |
+| Timed out junit tests | org.apache.hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:2c91fd8 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12807820/HDFS-6937.003.patch |
+| JIRA Issue | HDFS-6937 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 932d720a33fd 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 97e2449 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/15637/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/15637/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/15637/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/15637/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/15637/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/15637/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, So, I think this patch is not valid.
+
+If there is indeed a checksum error at the middle (second) node of pipeline, the tail node will detect it, sending ERROR_CHECKSUM code back to client and terminate the connection. This should effectively remove the middle node in the pipeline.
+
+If for some reason the error code is not sent before the connection was terminated, the pipeline recovery will be initiated, transferring the second node's replica to the downstream. Because the replica is corrupt, the destination will terminate the connection. When this happens, the second node will initiate VolumeScanner to check the integrity of local replica, and it should tell NameNode that the replica is bad, and NameNode should have exclude the datanode when client asks to update pipeline. The bug in HDFS-10512 is why it doesn't tell NameNode.
+
+To sum up, I think this patch is redundant if we can find a better fix for HDFS-10512., Hi [~jojochuang],
+
+Thanks for your continued work here.
+
+{quote}
+If there is indeed a checksum error at the middle (second) node of pipeline, the tail node will detect it, sending ERROR_CHECKSUM code back to client and terminate the connection. This should effectively remove the middle node in the pipeline.
+{quote}
+About the above statement, the initial issue I observed was, when the tail node detects corruption, the implementation will find a replacement DN, and tries to copy from the middle DN to the new DN again. Then checksum error happens again. And this process repeats.
+
+Why you think "This should effectively remove the middle node in the pipeline"?
+
+On the other hand, I think HDFS-10587 is very relevant here (thanks for the great findings there) and let's dig deeper there. My current thinking is, if HDFS-10587 is fixed, then there is less chance for a replica to get corrupted; however, when the replica on the middle DN does get corrupted, HDFS-6937 would help (waiting for block scanner is not a real solution).
+
+Thanks.
+, Remove my patch#3, Thanks for [~yzhangal] and [~jojochuang] thanks for deeper look here...
+
+We had come across one issue, where write is failed even 7 DN’s are available due to network fault at one datanode which is LAST_IN_PIPELINE.
+Scenario : (DN3 has N/W Fault and Min repl=2).
+
+Write pipeline:
+ DN1->DN2->DN3  => DN3 Gives ERROR_CHECKSUM ack. And so DN2 marked as bad
+DN1->DN4-> DN3 => DN3 Gives ERROR_CHECKSUM ack. And so DN4 is marked as bad
+….
+And so on ( all the times DN3 is LAST_IN_PIPELINE) ... Continued till no more datanodes to construct the pipeline.
+
+Thinking we can handle like below:
+
+Instead of throwing IOException for ERROR_CHECKSUM ack from downstream, If we can send back the pipeline ack and client side we can replace both DN2 and DN3 with new nodes as we can’t decide on which is having network problem.
+, Hi [~brahmareddy],
+
+Thanks for reporting the issue you ran into.
+
+If your problem is really a network issue, then your proposed solution sounds reasonable to me. However, it seems different than what HDFS-6937 intends to solve, and I think we can create a new jira for your issue. Here is why:
+
+HDFS-6937's scenario is that we keep replacing the third node in recovery, and did not detect that the middle node is corrupt. Thus adding a corruption checking for the middle node would solve the issue; In your case, even if we try to check the middle node, it would appear as not corrupt. The problem is that, we don't have a check for network issue (and probably adding a network check may not be feasible here). 
+
+On the other hand, if it's not a network issue, then it could be caused by HDFS-4660, if you don't already have the fix.
+
+Hope my explanation makes sense.
+, bq. If your problem is really a network issue, then your proposed solution sounds reasonable to me. However, it seems different than what HDFS-6937 intends to solve, and I think we can create a new jira for your issue. Here is why:
+
+Initially thought of handling with this issue only. Thanks for correction..Raised HDFS-10714 to handle seperately..]

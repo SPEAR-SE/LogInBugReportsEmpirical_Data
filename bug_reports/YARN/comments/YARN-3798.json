@@ -1,0 +1,654 @@
+[hi [~bibinchundatt] & [~varun_saxena],
+i think we should retry again before making the job fail, thoughts ?
+, We do retry a configurable number of times., Just to elaborate further, this issue comes because of Zookeeper being in an inconsistent state. 
+This is because one of the zookeeper instances goes down.
+
+The application node doesnt exist because Zookeeper instance hasn't yet synced the application node.
+Probably on first failure, we can try and make a call to {{sync()}} to get consistent data from zookeeper. Or we can catch the exception and fail job(After retries).
+Because IMHO RM should not go down.
+Thoughts ?, I meant "The application node doesnt exist because the new Zookeeper instance client connects to hasn't yet synced the application node.", [~varun_saxena], [~bibinchundatt] thank you for taking this. One of our users also faced same issue.
+sync() is effective only when accessing from multiple clients. ZKRMStateStore has only one client, so I think it's not effective in this case.
+
+BTW, expected behaviour can be done by catching NoNodeException, but we should check why and when it happens., [~ozawa] thnk you for looking into this issue. Multiple times the ZK services down had happened during crash and transition to standBy and active state on RM side. 
+{quote}
+ expected behaviour can be done by catching NoNodeException
+{quote}
+Yes we should try to find the root cause of the same. Soon will upload the part logs on RM and ZK during this exception. 
+[~Naganarasimha] 
+{quote}
+i think we should retry again before making the job fail?
+{quote}
+Already we do have retry and timeout for zk . *recovery.ZKRMStateStore$ZKAction.runWithRetries*, [~ozawa], hmm I am not sure if sync would work in this case or not. From documentation, it looked like it can. Have you tried before ?
+Anways, we can connect to multiple zookeeper servers (can configure a comma separated list in {{yarn.resourcemanager.zk-address}}) and this is passed to {{org.apache.zookeeper.ZooKeeper}}. So it means Zookeeper class internally will take care of connecting to multiple servers(if one is down) and hence can have a multiple client connections albeit not at the same time. This is what the documentation states :
+
+{panel:title=Simultaneously Conistent Cross-Client Views}
+ZooKeeper does not guarantee that at every instance in time, two different clients will have identical views of ZooKeeper data. Due to factors like network delays, one client may perform an update before another client gets notified of the change. Consider the scenario of two clients, A and B. If client A sets the value of a znode /a from 0 to 1, then tells client B to read /a, client B may read the old value of 0, depending on which server it is connected to. If it is important that Client A and Client B read the same value, Client B should should call the sync() method from the ZooKeeper API method before it performs its read.
+{panel}
+
+So from the documentation it seems inconsistent data can come depending on which server client is connected to. So I guess even ZKRMStateStore can get inconsistent data if it disconnects with one zookeeper server and connects to other. Not a 100% sure on this though. Maybe a zookeeper guy can chime in on this.  [~rakeshr], will sync work in this scenario ?, Anyways I will explain what happened as I had checked [~bibinchundatt]'s environment and found that application node did exist in zookeeper which was up but had thrown NoNode Exception. 
+# There are 2 zookeepers, zk1 and zk2. zk1 is initially up. Large number of applications are running. There are almost 10k apps in ZK RM state store.
+# RM creates app node for app1 by connecting to zk1.
+# zk1 goes down and zk2 becomes leader.
+# Few milliseconds later, update app attempt for app1 comes. RM tries to connect to zk2 as zk1 is down.
+# This happens before zk2 could sync the remaining data from zk1. 
+# As zk2 was in inconsistent state, it could not find app node for updating app attempt and hence threw NoNode Exception.
+# Because of NoNodeException, RM crashes.
+# A few minutes later when I checked, the app node was present in zk2. 
+
+This is what lead to the conclusion that issue came because zk2 was out of sync. And then I found about sync API so thought it may work. 
+Anyways we will have to catch the exception so that RM doesnt crash., Attaching RM logs for the same issue. [~varun_saxena] thnks for making the steps more clear to everyone., [~varun_saxena] [~bibinchundatt] Thank you for clarification. Let me explain. 
+
+{quote}
+So it means Zookeeper class internally will take care of connecting to multiple servers(if one is down) and hence can have a multiple client connections albeit not at the same time.
+{quote}
+
+Yes, but it doesn't mean a ZooKeeper's client, which has multiple server addresses via yarn.resourcemanager.zk-address, access to multiple servers at the same time.
+ZooKeeper ensures the semantics of virtual synchrony - ZooKeeper barriers all write operations against znodes and membership changes of Zookeeper servers(e.g. failures, joining new servers, and so on). 
+Because of virtual synchrony, all events including server failures and client failures detected by using ephemeral node looks totally ordered from point of view of clients.
+
+{quote}
+4. This happens before zk2 could sync the remaining data from zk1.
+5. As zk2 was in inconsistent state, it could not find app node for updating app attempt and hence threw NoNode Exception.
+{quote}
+
+In this case, IIUC, 5 cannot happen because a RM leader connecting to zk1 goes into standby mode since it looks a failure from other clients connecting to zk2. After a failure of a RM leader, new RM leader will do fence(). This fence operation will barriers inconsistent changes. Please let me know if I'm something missing., IMHO, this issue looks like a ZooKeeper issue. Based on the stack trace, {{createWithRetries}} called from {{updateApplicationAttemptStateInternal}} caused this NoNodeException. But {{existsWithRetries}} is called before {{createWithRetries}} is called, there is already a problem when {{existsWithRetries}} is called, {{existsWithRetries}} returns false, which is wrong. Because {{storeApplicationAttemptStateInternal}} already created the same node as {{updateApplicationAttemptStateInternal}} for appattempt_1433764310492_7152_000001 at 2015-06-09 10:08:40,710 and NoNodeException happened after 1 minute.
+It looks like there is a problem in the ZooKeeper servers. The ZooKeeper servers shouldn't have problem to sync the node for appattempt_1433764310492_7152_000001 in one minute. The other possibility is some other application/tool deleted the application node for application_1433764310492_7152 from ZooKeeper server before {{updateApplicationAttemptStateInternal}} is called, because {{createWithRetries}} will throw NoNodeException, if the parent node doesn't exist.
+
+The followings are the critical events from the RM logs [~bibinchundatt] attached:
+1. At 2015-06-09 10:08:40,710, ZooKeeper node for appattempt_1433764310492_7152_000001 was created.
+{code}
+2015-06-09 10:08:40,638 INFO org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptImpl: appattempt_1433764310492_7152_000001 State change from SCHEDULED to ALLOCATED_SAVING
+2015-06-09 10:08:40,710 INFO org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptImpl: appattempt_1433764310492_7152_000001 State change from ALLOCATED_SAVING to ALLOCATED
+{code}
+
+2. At 2015-06-09 10:09:32,322, the ZooKeeper session 0x30043b54df80002 used by ZKRMStateStore was disconnected.
+{code}
+2015-06-09 10:09:32,322 INFO org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore: ZKRMStateStore Session disconnected
+{code}
+
+3. At 2015-06-09 10:09:35,906 {{updateApplicationAttemptStateInternal}} is called to update ZooKeeper node for appattempt_1433764310492_7152_000001
+{code}
+2015-06-09 10:09:35,906 INFO org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptImpl: Updating application attempt appattempt_1433764310492_7152_000001 with final state: FINISHING, and exit status: -1000
+{code}
+
+4. At 2015-06-09 10:09:44,732, the ZooKeeper session 0x30043b54df80002 used by ZKRMStateStore was reconnected
+{code}
+2015-06-09 10:09:44,732 INFO org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore: ZKRMStateStore Session connected
+{code}
+
+5. At 2015-06-09 10:09:44,887, NoNodeException happened.
+{code}
+2015-06-09 10:09:44,887 ERROR org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore: Error updating appAttempt: appattempt_1433764310492_7152_000001
+org.apache.zookeeper.KeeperException$NoNodeException: KeeperErrorCode = NoNode
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.createWithRetries(ZKRMStateStore.java:970)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.updateApplicationAttemptStateInternal(ZKRMStateStore.java:671)
+{code}, [~zxu], I had talked to one zookeeper guy in our team. According to him, zookeeper can not always guarantee consistent data across servers. So this behavior is expected and well documented. If that is the case I guess RM should not go down. 
+
+I will check with him tomorrow though regarding what [~ozawa] is saying., [~ozawa], then why was application node present later on despite NoNode Exception being thrown. You suspect this is an issue from zookeeper end ?, I meant failure of one zookeeper server who was serving this RM instance. RM did not go down(till this exception occurred)., But as you say, whether or not zookeeper ensures consistent view, it should give a consistent view after atleast 1 minute., [~bibinchundatt], any zookeeper config change which you may have made which can explain these servers being out of sync even after 1 minute ?
+What is the configuration for {{tickTime}} and {{syncTime}} ?, Sorry, its {{syncLimit}}..., syncLimit=3, [~varun_saxena] Sorry by mistake assigned to my name . Reassigning to Varun, Thanks [~zxu] for your explanation.
+
+I also traced application_1433764310492_7152 in  the log, but the application was not removed from RMStateStore. It means application_1433764310492_7152 and appattempt_application_1433764310492_7152_* are not visible without removing the znodes. [~bibinchundatt] what's the ZK version are you using?
+
+BTW, I found an improvement point: when error code is CONNETIONLOSS or OPERATION TIMEOUT, ZKRMStateStore closes a current connection and try to create a new connection before retrying. This shouldn't be done in general. We should just wait for accepting a SyncConnected event until timeout occur, while current code looks good to me., {quote}
+while current code looks good to me.
+{quote}
+
+I found one corner case current code doesn't work correctly:
+
+1. [ZKRMStateStore] Receiving CONNECTIONLOSS or OPERATIONTIMEOUT in ZKRMStateStore#runWithRetries.
+2. [ZKRMStateStore] Failing to zkClient.close() in ZKRMStateStore#createConnection, but IOException is ignored.
+3. [ZK Server] Failing to accept close() request. A previous session is still alive.
+4. [ZKRMStateStore] Creating new connection in ZKRMStateStore#createConnection. 
+
+In this case, correct fix is to wait for SESSIONEXPIRED or SESSIONMOVED., 5. [ZKRMStateStore] ZKRMStateStore uses new connection and old connection is still alive. Old view can be seen from new connection since it's another client. In this case, there is no guarantee. 
+6. When old session is expired, all updates by old session can be seen because of virtual synchrony.
+
+, ZK version is {{3.5}} I think, [~ozawa], thanks for your explanation.
+This specific log scenario(Logs attached with the JIRA) looks like a zookeeper issue. We unfortunately lost the zookeeper logs. Otherwise could have confirmed. And are unable to reproduce it since then :(
+As you explained, consistent data is guaranteed if a single Zookeeper object is used.
+
+The scenario you explained above though is a good catch and I think we can fix it., [~varun_saxena] Thanks for your help. In addition to ZooKeeper version, could you share the Hadoop version? Is it 2.7.0? If it's 2.7.0, we can mark this issue as a blocker of 2.7.1 release.
+
+{quote}
+We unfortunately lost the zookeeper logs.
+{quote}
+
+The log of ZooKeeper when ZooKeeper#close() fails is dumped only with DEBUG mode. It's a bit difficult to get it.
+
+BTW, can I work with you to fix the corner case? I appreciate if you could help me to back port the fix to a branch you're using., [~ozawa] Hadoop version 2.7.0 and ZK 3.5.0 we are using, Thank you for the sharing, Bibin. Marking this as a blocker of 2.7.1. 
+
+BTW, this problem looks to be solved since 2.8 or later uses Curator. , Thanks!, Sure., Attaching a patch to fix the connection issue based on discussion., [~varun_saxena] Could you help us to port this to branch-2.6? Some users, including Yahoo!, use 2.6., [~kasha] [~xgong] could you check the latest patch? I think this fix should be included in 2.7.1 since I think this is a critical issue., Ok.., [~ozawa], the patch fix pretty much LGTM.
+
+One issue though.
+retry should be reset to 0 or retry atleast once after first round of retrying ?
+Let us say we get {{SessionMoved}} after last retry. As per this code, it wont create a new connection and try atleast once. I think there will be a pretty good chance of success if we do that.
+
+Moreover, there can be a case when a particular zookeeper server is forever down. In this case also, we will keep on getting {{ConnectionLoss}} IIUC till retries exhaust.
+
+So to handle these cases, I think we should retry with new connection atleast once. Thoughts ? , \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12739822/YARN-3798-branch-2.7.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | branch-2 / eb8e2c5 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8258/console |
+
+
+This message was automatically generated., Trying to follow the discussion so far.
+
+Seems like we couldn't really get to the bottom of the original issue and are fixing related but not the same issues. If my understanding is correct, someone should edit the title.
+
+Coming to the patch: By definition, CONNECTIONLOSS also means that we should recreate the connection?
+
+bq.  2. [ZKRMStateStore] Failing to zkClient.close() in ZKRMStateStore#createConnection, but IOException is ignored.
+I think this should be fixed in ZooKeeper. No amount of patching in YARN will fix this., [~ozawa], bumping for my comments and those from [~varun_saxena] and to figure out if I should hold 2.7.1 for this., [~vinodkv] thank you for taking a look at this issue.
+
+{quote}
+If my understanding is correct, someone should edit the title.
+{quote}
+
+Sure.
+
+{quote}
+Coming to the patch: By definition, CONNECTIONLOSS also means that we should recreate the connection?
+{quote}
+
+IIUC, we should not recreate new connection when CONNECTIONLOSS happens by definition. ZooKeeper client tries to reconnect automatically since it's recoverable error. It's written in the Wiki of ZooKeeper(http://wiki.apache.org/hadoop/ZooKeeper/ErrorHandling). Curator also does same thing.
+
+{quote}
+Recoverable errors: the disconnected event, connection timed out, and the connection loss exception are examples of recoverable errors, they indicate a problem that happened, but the ZooKeeper handle is still valid and future operations will succeed once the ZooKeeper library can reestablish its connection to ZooKeeper.
+
+The ZooKeeper library does try to recover the connection, so the handle should not be closed on a recoverable error, but the application must deal with the transient error.
+{quote}
+
+{quote}
+> 2. (ZKRMStateStore) Failing to zkClient.close() in ZKRMStateStore#createConnection, but IOException is ignored.
+
+I think this should be fixed in ZooKeeper. No amount of patching in YARN will fix this.
+{quote}
+
+I took a look at the code of ZooKeeper#close deeply. I found IOException is not related.
+However, the way of our error handling affects this phenomena as follows: 
+
+# (ZKRMStateStore) CONNETIONLOSS happens -> calling closeZkClients inside createConnection.
+# (ZooKeeper client in ZKRMStateStore) submitRequest -> wait() for finishing the packet for close().
+# (ZooKeeper client # SendThread) Exception happens because of timeout -> cleanup the packet for the close(). The reply header of the packet has CONNECTIONLOSS again. notify to caller of close().
+# (ZooKeeper client in ZKRMStateStore) return to closeZkClients().
+# (ZKRMStateStore) continuing to createConnection() normally.
+
+I think the error handling when CONNECTIONLOSS happens and the connection management in YARN-side are wrong as described above. We should fix it at our side. Please correct me if I'm wrong., Sorry for the delay. I took a time to investigate the behaviour of ZooKeeper yesterday. Now I'm checking the comment by Varun., [~varun_saxena] thank you for your review. It helps me a lot.
+
+{quote}
+Moreover, there can be a case when a particular zookeeper server is forever down. In this case also, we will keep on getting ConnectionLoss IIUC till retries exhaust.
+{quote}
+
+It looks exhaust, but it's not: reconnection to other ZooKeeper servers are done at ClientCnxn#startConnect in a main thread of ZooKeeper's client. Please note that a session is not equal to a connection in ZooKeeper. What we can do it to retry with current zookeeper client. I also noticed that we shouldn't create new session when SESSIONMOVED occurs. Updating a patch soon.
+
+{quote}
+So to handle these cases, I think we should retry with new connection atleast once. Thoughts ?
+{quote}
+
+I think we shouldn't create new ZooKeeper session unless SESSIONEXPIRED occurs: from http://wiki.apache.org/hadoop/ZooKeeper/FAQ : 
+{quote}
+Only create a new session when you are notified of session expiration (mandatory)
+{quote}, Attaching v2 patch to handle SESSIONMOVED correctly., [~vinodkv] [~varun_saxena] Feel free to ask me if you have unclear points., [~varun_saxena], sorry I didn't see your ping. I have gone through few ZooKeeper related comments in the jira. Based on my understanding I will try to help you guys:)
+
+bq. So I guess even ZKRMStateStore can get inconsistent data if it disconnects with one zookeeper server and connects to other. Not a 100% sure on this though. Maybe a zookeeper guy can chime in on this. Rakesh R, will sync work in this scenario ?
+Generally sync() is recommended only when accessing ZooKeeper service from multiple clients. If only one ZooKeeper client is performing the update operation it is not required to call syncup after the connection re-establishment. For example, zkclient connected to ZK1 and successfully created a znode. Now, assume zkclient got disconnected and successfully reconnected to ZK2 the client zkclient will see the same znode in this server also. I agree with [~ozawa]'s comments [about sync()|https://issues.apache.org/jira/browse/YARN-3798?focusedCommentId=14584141&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14584141]
+
+FYI: sync() call is a costly operation, internally this will force the connected server to sync up the data from the Leader ZK server. Probably in your logic after creating the new ZooKeeper connection it can do a sync() call before performing any operation.
+
+bq. It looks exhaust, but it's not: reconnection to other ZooKeeper servers are done at ClientCnxn#startConnect in a main thread of ZooKeeper's client. Please note that a session is not equal to a connection in ZooKeeper. What we can do it to retry with current zookeeper client. I also noticed that we shouldn't create new session when SESSIONMOVED occurs.
+IMHO it is fine not to recreate a connection on SESSIONMOVED. If someone uses saved sessionid and uses the constructor {{new ZooKeeper(connectString, sessionTimeout, watcher, sessionId, sessionPasswd)}}, it may give unexpected result. I hope you are not using this one in YARN.
+
+bq. Coming to the patch: By definition, CONNECTIONLOSS also means that we should recreate the connection?
+Not required to create a new zkclient connection on errors except SESSIONEXPIRED. Because zkclient internally does connection retries to all the servers that are passed in the ZooKeeper constructor. I have one suggestion, after creating new ZooKeeper connection it can do a {{sync()}} call before performing any operation. This way will ensure consistency of data I feel., [~rakeshr], thanks for coming to this. I have one question,  in trunk version, we have moved to use curator. I assume curator will automatically handle this scenario ? like creating a new connection on SESSIONEXPIRED, and sync the data if required. , \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12740206/YARN-3798-branch-2.7.002.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 49f5d20 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8293/console |
+
+
+This message was automatically generated., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12740206/YARN-3798-branch-2.7.002.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 445b132 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8310/console |
+
+
+This message was automatically generated., The latest one looks good to me. Let me try uploading the patch with the right name for Jenkins to pick up., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12741098/YARN-3798-2.7.002.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 445b132 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8312/console |
+
+
+This message was automatically generated., Thanks [~ozawa]. Explanation given by you and subsequent discussions with [~rakeshr] helped a lot in clarifying behavior of zookeeper., I think we should also create a new session for SessionMovedException.
+We hit the SessionMovedException before, the following is the reason for the SessionMovedException we find:
+# ZK client tried to connect to Leader L. Network was very slow, so before leader processed the request, client disconnected.
+# Client then re-connected to Follower F reusing the same session ID. It was successful.
+# The request in step 1 went into leader. Leader processed it and invalidated the connection created in step 2. But client didn't know the connection it used is invalidated.
+# Client got SessionMovedException when it used the connection invalidated by leader for any ZooKeeper operation.
+
+IMHO, the only way to recover from this error at RM side is to take SessionMovedException as SessionExpiredException, close current ZK client and create a new one., [~zxu] In the case of SessionMovedException, I think zk client should retry to connect to another zk server with same session id automatically without creating new session. If we create new session for SessionMovedException, we'll face the same issue as Bibin and Varun reported. With new patch, SessionMovedException is handled in same session. After we get SessionMovedException, the zk client in ZKRMStateStore waits for passing specified period and retrying operations. At that time, zk server should detect the session has moved and close the client 
+as a document for ZooKeeper mentions: http://zookeeper.apache.org/doc/r3.4.0/zookeeperProgrammers.html#ch_zkSessions
+{quote}
+When the delayed packet arrives at the first server, the old server detects that the session has moved, and closes the client connection.
+{quote}
+
+If this behaviour is not same as described, we should fix ZooKeeper., [~vinodkv] the patch is only applied to branch-2.7 because ZKRMStateStrore of 2.8 or later uses Apache Curator. I'm running test locally under hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager, so I'll report the result manually. Double checking is welcome., After zk server closes the client, zk client in ZKRMStateStore will accept CONNECTIONLOSS and handle it without creating new session., Result with test-patch.sh against branch-2.7 is as follows:
+{quote}
+$ dev-support/test-patch.sh ../YARN-3798-2.7.002.patch 
+...
+-1 overall.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 javadoc.  The javadoc tool appears to have generated 48 warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version ) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+{quote}
+
+javadoc warning is not related to the patch since it doesn't change any signatures and javadocs., Sorry, I missed your comment. If curator sync up the data it would be fine. Otherwise there could be a chance of lag like we discussed earlier. Truly I haven't tried Curator yet, probably some one can cross check this part., [~zxu] Do you have any scenarios the latest patch doesn't cover? , [~ozawa], thanks for the document.
+bq. When the delayed packet arrives at the first server, the old server detects that the session has moved, and closes the client connection.
+I didn't see this happen based on the logs. The real scenario based on the logs is the client connection to ZK Follower is not closed until the session is closed. This may be a bug in ZooKeeper server, I create ZOOKEEPER-2219 for this issue.
+I think it will be better to not make change for SessionMovedException until ZOOKEEPER-2219 is fixed, because we may have regression for SessionMovedException retry. Based on the logs, I think we can recover from SessionMovedException by closing old session and creating a new session.
+The followings are the logs:
+logs from RM 
+{code}
+2015-03-16 09:46:04,009 INFO org.apache.zookeeper.ClientCnxn: Session establishment complete on server c315yhk/?.?.?.66:2181, sessionid = 0x14be28f50f4419d, negotiated timeout = 10000
+2015-03-16 10:59:40,078 INFO org.apache.zookeeper.ClientCnxn: Client session timed out, have not heard from server in 6670ms for sessionid 0x14be28f50f4419d, closing socket connection and attempting reconnect
+2015-03-16 10:59:40,735 INFO org.apache.zookeeper.ClientCnxn: Opening socket connection to server c045dkh/?.?.?.67:2181. Will not attempt to authenticate using SASL (unknown error)
+2015-03-16 10:59:40,735 INFO org.apache.zookeeper.ClientCnxn: Socket connection established to c045dkh/?.?.?.67:2181, initiating session
+2015-03-16 10:59:44,071 INFO org.apache.zookeeper.ClientCnxn: Client session timed out, have not heard from server in 3336ms for sessionid 0x14be28f50f4419d, closing socket connection and attempting reconnect
+
+2015-03-16 10:59:44,673 INFO org.apache.zookeeper.ClientCnxn: Opening socket connection to server c470udy/?.?.?.65:2181. Will not attempt to authenticate using SASL (unknown error)
+2015-03-16 10:59:44,673 INFO org.apache.zookeeper.ClientCnxn: Socket connection established to c470udy/?.?.?.65:2181, initiating session
+2015-03-16 10:59:44,688 INFO org.apache.zookeeper.ClientCnxn: Session establishment complete on server c470udy/?.?.?.65:2181, sessionid = 0x14be28f50f4419d, negotiated timeout = 10000
+
+2015-03-16 10:59:45,693 INFO org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore: Exception while executing a ZK operation.
+org.apache.zookeeper.KeeperException$SessionMovedException: KeeperErrorCode = Session moved
+	at org.apache.zookeeper.KeeperException.create(KeeperException.java:131)
+	at org.apache.zookeeper.ZooKeeper.multiInternal(ZooKeeper.java:945)
+	at org.apache.zookeeper.ZooKeeper.multi(ZooKeeper.java:911)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$4.run(ZKRMStateStore.java:857)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$4.run(ZKRMStateStore.java:854)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$ZKAction.runWithCheck(ZKRMStateStore.java:973)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$ZKAction.runWithRetries(ZKRMStateStore.java:992)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.doMultiWithRetries(ZKRMStateStore.java:854)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.access$500(ZKRMStateStore.java:75)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$VerifyActiveStatusThread.run(ZKRMStateStore.java:945)
+2015-03-16 10:59:45,694 INFO org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore: Maxed out ZK retries. Giving up!
+2015-03-16 10:59:45,697 INFO org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore: Exception while executing a ZK operation.
+org.apache.zookeeper.KeeperException$SessionMovedException: KeeperErrorCode = Session moved
+	at org.apache.zookeeper.KeeperException.create(KeeperException.java:131)
+	at org.apache.zookeeper.ZooKeeper.multiInternal(ZooKeeper.java:945)
+	at org.apache.zookeeper.ZooKeeper.multi(ZooKeeper.java:911)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$4.run(ZKRMStateStore.java:857)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$4.run(ZKRMStateStore.java:854)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$ZKAction.runWithCheck(ZKRMStateStore.java:973)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$ZKAction.runWithRetries(ZKRMStateStore.java:992)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.doMultiWithRetries(ZKRMStateStore.java:854)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.doMultiWithRetries(ZKRMStateStore.java:868)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.setDataWithRetries(ZKRMStateStore.java:885)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.updateApplicationStateInternal(ZKRMStateStore.java:578)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.handleStoreEvent(RMStateStore.java:627)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore$ForwardingEventHandler.handle(RMStateStore.java:766)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore$ForwardingEventHandler.handle(RMStateStore.java:761)
+	at org.apache.hadoop.yarn.event.AsyncDispatcher.dispatch(AsyncDispatcher.java:173)
+	at org.apache.hadoop.yarn.event.AsyncDispatcher$1.run(AsyncDispatcher.java:106)
+	at java.lang.Thread.run(Thread.java:745)
+2015-03-16 10:59:45,697 INFO org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore: Maxed out ZK retries. Giving up!
+2015-03-16 10:59:45,707 INFO org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore: Exception while executing a ZK operation.
+org.apache.zookeeper.KeeperException$SessionMovedException: KeeperErrorCode = Session moved
+	at org.apache.zookeeper.KeeperException.create(KeeperException.java:131)
+	at org.apache.zookeeper.ZooKeeper.multiInternal(ZooKeeper.java:945)
+	at org.apache.zookeeper.ZooKeeper.multi(ZooKeeper.java:911)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$4.run(ZKRMStateStore.java:857)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$4.run(ZKRMStateStore.java:854)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$ZKAction.runWithCheck(ZKRMStateStore.java:973)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore$ZKAction.runWithRetries(ZKRMStateStore.java:992)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.doMultiWithRetries(ZKRMStateStore.java:854)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.doMultiWithRetries(ZKRMStateStore.java:868)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.setDataWithRetries(ZKRMStateStore.java:885)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore.updateApplicationAttemptStateInternal(ZKRMStateStore.java:621)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.handleStoreEvent(RMStateStore.java:675)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore$ForwardingEventHandler.handle(RMStateStore.java:766)
+	at org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore$ForwardingEventHandler.handle(RMStateStore.java:761)
+	at org.apache.hadoop.yarn.event.AsyncDispatcher.dispatch(AsyncDispatcher.java:173)
+	at org.apache.hadoop.yarn.event.AsyncDispatcher$1.run(AsyncDispatcher.java:106)
+	at java.lang.Thread.run(Thread.java:745)
+2015-03-16 10:59:45,708 INFO org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore: Maxed out ZK retries. Giving up!
+
+2015-03-16 10:59:45,710 INFO org.apache.zookeeper.ZooKeeper: Session: 0x14be28f50f4419d closed
+{code}
+
+logs from ZK Leader:
+{code}
+2015-03-16 10:59:45,668 INFO org.apache.zookeeper.server.ZooKeeperServer: Client attempting to renew session 0x14be28f50f4419d at /?.?.?.65:50271
+2015-03-16 10:59:45,668 INFO org.apache.zookeeper.server.ZooKeeperServer: Established session 0x14be28f50f4419d with negotiated timeout 10000 for client /?.?.?.65:50271
+2015-03-16 10:59:45,670 WARN org.apache.zookeeper.server.NIOServerCnxn: Exception causing close of session 0x14be28f50f4419d due to java.io.IOException: Broken pipe
+2015-03-16 10:59:45,671 INFO org.apache.zookeeper.server.NIOServerCnxn: Closed socket connection for client /?.?.?.65:50271 which had sessionid 0x14be28f50f4419d
+2015-03-16 10:59:45,693 INFO org.apache.zookeeper.server.PrepRequestProcessor: Got user-level KeeperException when processing sessionid:0x14be28f50f4419d type:multi cxid:0x86e3 zxid:0x1c002a4e53 txntype:-1 reqpath:n/a aborting remaining multi ops. Error Path:null Error:KeeperErrorCode = Session moved
+2015-03-16 10:59:45,695 INFO org.apache.zookeeper.server.PrepRequestProcessor: Got user-level KeeperException when processing sessionid:0x14be28f50f4419d type:multi cxid:0x86e5 zxid:0x1c002a4e56 txntype:-1 reqpath:n/a aborting remaining multi ops. Error Path:null Error:KeeperErrorCode = Session moved
+2015-03-16 10:59:45,700 INFO org.apache.zookeeper.server.PrepRequestProcessor: Got user-level KeeperException when processing sessionid:0x14be28f50f4419d type:multi cxid:0x86e7 zxid:0x1c002a4e57 txntype:-1 reqpath:n/a aborting remaining multi ops. Error Path:null Error:KeeperErrorCode = Session moved
+2015-03-16 10:59:45,710 INFO org.apache.zookeeper.server.PrepRequestProcessor: Processed session termination for sessionid: 0x14be28f50f4419d
+{code}
+
+logs from ZK Follower:
+{code}
+2015-03-16 10:59:44,673 INFO org.apache.zookeeper.server.NIOServerCnxnFactory: Accepted socket connection from /?.?.?.65:42777
+2015-03-16 10:59:44,674 INFO org.apache.zookeeper.server.ZooKeeperServer: Client attempting to renew session 0x14be28f50f4419d at /?.?.?.65:42777
+2015-03-16 10:59:44,674 INFO org.apache.zookeeper.server.quorum.Learner: Revalidating client: 0x14be28f50f4419d
+2015-03-16 10:59:44,675 INFO org.apache.zookeeper.server.ZooKeeperServer: Established session 0x14be28f50f4419d with negotiated timeout 10000 for client /?.?.?.65:42777
+2015-03-16 10:59:45,715 INFO org.apache.zookeeper.server.NIOServerCnxn: Closed socket connection for client /?.?.?.65:42777 which had sessionid 0x14be28f50f4419d
+{code}, Seeing as the discussion still going on, and that this issue has been long existing since 2.6, I am moving this out of 2.7.1 into 2.7.2. Let me know if you disagree., Sure. After fixing this, I'd like to release 2.7.2 soon., [~zxu] thank for your explanation.
+
+Based on your log, when ZKRMStateStore meets SessionMovedException, I think we should close the session and fail over to another RM as a workaround since we cannot recover from the exception. If we close and open new session without fencing, same issue as Bibin reported will come up. 
+
+I'll create a patch to going standby mode when ZKRMSTateStore meets SessionMovedException. Please let me know if I have something missing., [~ozawa], thanks for the information.
+For SessionMovedException, most likely we can workaround it by increasing the Session Timeout. For example if we increase the session timeout from 10 seconds to 30 seconds, the timeout for connection will be increased to 10 seconds from 3.3 seconds, which is calculated by {{connectTimeout = negotiatedSessionTimeout / hostProvider.size();}}. The above SessionMovedException can't happen because the Leader processed the request from client after 5 seconds which is less than 10 seconds time out.
+One question: For SessionExpiredException, we will close and open new session without fencing, Why the issue Bibin reported won't come up for SessionExpiredException?, I'm replying today., [~zxu] I see, the workaround makes sense to me.
+
+{code}
+One question: For SessionExpiredException, we will close and open new session without fencing, Why the issue Bibin reported won't come up for SessionExpiredException?
+{code}
+
+Thank you for the good question. As [~rakeshr], Bibin, Varun suggested, we should do sync() after creating new session since ZooKeeper's sessions don't have guarantee of consistency of view between sessions in addition to fix correct error handling. I'll create a new patch to fix the issue.
+
+{quote}
+I have one suggestion, after creating new ZooKeeper connection it can do a sync() call before performing any operation.
+{quote}
+, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12742762/YARN-3798-branch-2.7.003.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 77588e1 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8386/console |
+
+
+This message was automatically generated., Hi Devaraj,
+I was not the watcher of this issue.
+, The result of test-patch.sh is as follows. javadoc warning is not related to the patch since it doesn't include any changes and method signatures.
+{quote}
+-1 overall.
+                                                                                                                                                                                                                                                              
+    +1 @author.  The patch does not contain any @author tags.
+                                                                                                                                                                                                                                                              
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.                                                                                                                                                                            
+                        Also please list what manual steps were performed to verify this patch.
+                                                                                                                                                                                                                                                              
+    -1 javadoc.  The javadoc tool appears to have generated 48 warning messages.
+                                                                                                                                                                                                                                                              
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+                                                                                                                                                                                                                                                              
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+                                                                                                                                                                                                                                                              
+    +1 findbugs.  The patch does not introduce any new Findbugs (version ) warnings.
+                                                                                                                                                                                                                                                              
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+{quote}, I'll ping here after releasing 2.7.1., thanks for the new patch [~ozawa]!
+sync() is asynchronous sync. The result is returned from AsyncCallback. Should we wait for the result from AsyncCallback to make sure the sync operation is done at ZooKeeper server? Should we also {{createConnection}} for SessionMovedException similar as SessionExpiredException to avoid regression? since ZOOKEEPER-2219 is not fixed yet. Should we sync RM ZK root path {{zkRootNodePath}} for safety purposes?, [~zxu] Sorry for the delay. I missed you comment. Agree. fixing it shortly., Attaching a new patch., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12744468/YARN-3798-branch-2.7.004.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / fffb15b |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8477/console |
+
+
+This message was automatically generated., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12744474/YARN-3798-branch-2.7.004.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / fffb15b |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8478/console |
+
+
+This message was automatically generated., Thanks for the new patch [~ozawa]!
+# It looks like {{retry}} is added twice when we do retry with new connection. Should we move {{++retry}} to if statement when we check {{shouldRetry}}?
+# Should we call {{cb.latch.await}} with timeout {{zkSessionTimeout}}? Since we do sync for the new session,  Will it be reasonable not to use the left timeout value from the old session for the new session?
+# Based on the document: http://zookeeper.apache.org/doc/r3.3.2/api/org/apache/zookeeper/KeeperException.html#getPath(), {{ke.getPath()}} may return null, Should we check if {{ke.getPath()}} is null and handle it differently?, [~zxu] thank you for the review.
+
+{quote}
+1. It looks like retry is added twice when we do retry with new connection. Should we move ++retry to if statement when we check shouldRetry?
+{quote}
+
+It works as expected, meaning that retry wont be incremented doubly, since the loop will call continue after shouldRetry() and shouldRetryWithNewConnection. However, I think it's a bit tricky for readers of the code and it's worth a fix. Updating.
+
+{quote}
+Should we call cb.latch.await with timeout zkSessionTimeout? Since we do sync for the new session, Will it be reasonable not to use the left timeout value from the old session for the new session?
+{quote}
+
+Agree.
+
+{quote}
+Based on the document: http://zookeeper.apache.org/doc/r3.3.2/api/org/apache/zookeeper/KeeperException.html#getPath(), ke.getPath() may return null, Should we check if ke.getPath() is null and handle it differently?
+{quote}
+
+Okay. I'll also add a error handling code to the callback when rc != Code.OK.intValue., bq. It works as expected...
+yes, you are right. {{retry}} is only incremented once. moving {{++retry}} outside {{if}} condition check will make it more readable.
+bq. Okay. I'll also add a error handling code to the callback when rc != Code.OK.intValue.
+yes, that is a good point., Attaching a patch to address [~zxu]'s comment., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12745414/YARN-3798-branch-2.7.005.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / edcaae4 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8543/console |
+
+
+This message was automatically generated., The test result:
+{quote}
+-1 overall.  
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 javadoc.  The javadoc tool appears to have generated 48 warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version ) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+{quote}
+
+I checked javadoc warning, but I found no diff. I think it looks like false positive warning by a script. , Thanks for the new patch [~ozawa]! the patch looks good to me except two nits:
+# Using {{rc == Code.OK.intValue()}} instead of {{rc == 0}} may be more maintainable and readable when checking the return value from AsyncCallback.
+# It may be better to add {{Thread.currentThread().interrupt();}} to restore the interrupted status after catching InterruptedException from {{syncInternal}}., [~zxu] thank you for the comment. Attaching a patch to address your comment. 
+
+1. Using rc == Code.OK.intValue() instead of rc == 0.
+2. Calling Thread.currentThread().interrupt(); to restore the interrupted status after catching InterruptedException from syncInternal., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12746388/YARN-3798-branch-2.7.006.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 3b7ffc4 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8598/console |
+
+
+This message was automatically generated., The test result is as follows:
+{quote}
+-1 overall.  
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 javadoc.  The javadoc tool appears to have generated 48 warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version ) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+{quote}
+A javadoc warning looks not related to the patch., [~varun_saxena], sorry for taking this issue on 2.7 branch. Are you interested in porting this to branch-2.6, which is targeting 2.6.2 release?, OK, will update a 2.6 patch, Updated branch-2.6 patch.
+Will run test-patch.sh and update results later., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12746555/YARN-3798-branch-2.6.01.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 4025326 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8613/console |
+
+
+This message was automatically generated., [~vinodkv] [~zxu] could you check the latest patches?, [~ozawa], Yes, the latest patch YARN-3798-branch-2.7.006.patch looks good to me., zhihai, Thanks a lot.
+
+[~vinodkv] cc: [~jianhe]　please notify us if we need to update the patch. I think it's ready., Cannot stop 2.6.1 for this anymore, it is already way too late. Moving this to 2.6.2 and beyond., [~varun_saxena], [~ozawa], [~zxu], where are we on this? Are we good to commit this? Note that 2.6.2 will be released fairly soon., [~sjlee0] I think it's ready to merge., [~jianhe] could you take a look at patches?, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12746555/YARN-3798-branch-2.6.01.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 439f43a |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/9329/console |
+
+
+This message was automatically generated., This patch is only for branch-2.7 and branch-2.6. We need to test it on local., I think you can name your patch {{YARN-3798-branch-2.6.001.patch}} for it to be tested against branch-2.6., Please disregard. I thought the patch was misnamed, but it wasn't. Somehow jenkins checked out trunk for this test., Any progress on this? FYI, we will cut the first RC for 2.6.2 next week., The patches are already there. Maybe you can have a look and check if it is good enough to go in :), [~sjlee0] thank you for pinging. Tests pass locally on both branch-2.6 and branch-2.7. Currently, it's waiting for review. 
+, Oh, I think the review is done by [~zxu]. It's ready for review. I'm checking this in., s/It's ready for review/It's ready for committing/, Committed this to branch-2.7. Thanks all you for helping us.  Thanks [~varun_saxena] for working with me. Thanks [~zxu] for the iterative review. The reports by [~bibinchundatt] and [~varun_saxena] helped us very much. Thanks [~rakeshr] for your precious advice. 
+
+[~varun_saxena] do you mind refreshing a patch for branch-2.6? Unfortunately, it conflicts in now., Updated 2.6 patch, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  1s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12767461/YARN-3798-branch-2.6.02.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 6144e01 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/9481/console |
+
+
+This message was automatically generated., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12767461/YARN-3798-branch-2.6.02.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 6144e01 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/9482/console |
+
+
+This message was automatically generated., [~ozawa], can it be verified and merged today? I am targeting tomorrow to cut the branch and create the release candidate for 2.6.2. Thanks!, YARN-3798-branch-2.6.02.patch should apply. Let me know if there is any further conflict., It's applied cleanly, and I'm reviewing it. Please wait a moment., +1, checking this in., Committed the patch for branch-2.6. Thanks for updating, [~varun_saxena]!, [~jianhe] 
+
+{quote}
+If curator sync up the data it would be fine. Otherwise there could be a chance of lag like we discussed earlier. Truly I haven't tried Curator yet, probably some one can cross check this part.
+{quote}
+
+FYI, when Curator detects the same situation, it call sync automatically in {{doSyncForSuspendedConnection}} method in Curator Framework. Therefore, we don't need to call sync operation on trunk and branch-2.8 code.]

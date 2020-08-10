@@ -1,0 +1,746 @@
+[Any update on this issue ?, Hello, [~Alexandre LINTE].  Thank you for filing this issue.  I tested the same scenario against a Linux local file system, and I confirmed that HDFS is showing different behavior, just like you described.
+
+I also confirmed that this is a divergence from the POSIX ACL specs.  Here is a quote of the relevant section:
+
+{quote}
+The permissions of inherited access ACLs are further modified by the mode parameter that each system call creating file system objects has. The mode parameter contains nine permission bits that stand for the permissions of the owner, group, and other class permissions. The effective permissions of each class are set to the intersection of the permissions defined for this class in the ACL and specified in the mode parameter.
+
+If the parent directory has no default ACL, the permissions of the new file are determined as defined in POSIX.1. The effective permissions are set to the permissions defined in the mode parameter, minus the permissions set in the current umask.
+
+The umask has no effect if a default ACL exists.
+{quote}
+
+Changing this behavior is going to be somewhat challenging.  Note the distinction made in the spec between mode and umask.  When creating a new child (file or directory) of a directory with a default ACL, the mode influences the inherited access ACL entries, but the umask has no effect.  Unfortunately, our current implementation intersects mode and umask on the client side before passing them to the NameNode in the RPC.  This happens in {{DFSClient#mkdirs}} and {{DFSClient#create}}:
+
+{code}
+  public boolean mkdirs(String src, FsPermission permission,
+      boolean createParent) throws IOException {
+    if (permission == null) {
+      permission = FsPermission.getDefault();
+    }
+    FsPermission masked = permission.applyUMask(dfsClientConf.uMask);
+{code}
+
+{code}
+  public DFSOutputStream create(String src, 
+                             FsPermission permission,
+                             EnumSet<CreateFlag> flag, 
+                             boolean createParent,
+                             short replication,
+                             long blockSize,
+                             Progressable progress,
+                             int buffersize,
+                             ChecksumOpt checksumOpt,
+                             InetSocketAddress[] favoredNodes) throws IOException {
+    checkOpen();
+    if (permission == null) {
+      permission = FsPermission.getFileDefault();
+    }
+    FsPermission masked = permission.applyUMask(dfsClientConf.uMask);
+{code}
+
+On the NameNode side, when it copies the default ACL from parent to child, we've lost the information.  We just have a single piece of permissions data, with no knowledge of what was the mode vs. the umask on the client side.
+
+A potential solution is to push both mode and umask explicitly to the NameNode in the RPC requests for {{MkdirsRequestProto}} and {{CreateRequestProto}}.  Those messages already contain an instance of {{FsPermissionProto}}.  We could add a second optional instance.  If both instances are defined, then the NameNode would interpret one as being mode and the other as being umask.  There would still be a possibility of an older client still passing just one instance, and in that case, we'd have to fall back to the current behavior.  It's a bit messy, but it could work.
+
+We also have one additional problem specific to the shell for files (not directories).  The implementation of copyFromLocal breaks down into 2 separate RPCs: creating the file, followed by a separate chmod call.  The NameNode has no way of knowing if that chmod call is part of a copyFromLocal or not though.  It's too late to enforce the mode vs. umask distinction.
+
+I'm tentatively targeting this to 2.7.0.  I think this will need more investigation to make sure there are no compatibility issues with the solution.  If there is an unavoidable compatibility problem, then it might require pushing out to 3.x.  We won't know for sure until someone starts coding.
+
+Thank you again for the very detailed bug report., [~cnauroth], after reading your comment above I have studied the relevant code and this is what I think. 
+
+The umask should be loaded and applied on the server, depending on whether the parent directory has default acls or not. Only if default acls do not exist, umask will be applied to the mode. For mode, client will either pass the source permissions(cp, put, copyFromLocal) or the default permissions if no source permissions exist(create, mkdir etc). Currently the client code wrongly applies the mask to the permissions before making RPC calls. This happens at several places and this needs to be changed. 
+
+For the copyFromLocal command, I have compared the behavior with 'cp' on Linux local file system. The resultant permissions of the destination file are determined by the parent directory's default permissions and the source file's permissions (mode). The umask is used only when the parent directory doesn't have default permissions. This is just like create api, except that in case of 'create', the mode takes default value (0666).
+The second RPC to 'setPermission' is only used when 'preserve attributes' option -p is used and permissions/ACLs are expected to be retained and in this case umask is not required. So, the only change 'copyFromLocal' may require is pass the the source file's permissions as mode, without masking.
+
+Compatibility: Older clients applying the mask before passing the mode to server will retain their existing behavior if the parent directory has default permissions. In case the parent directory does not have default permissions, the mask gets applied one more time on the server without causing any change to the permissions. So, effectively the clients see the same behavior as existing.
+
+I am attaching a prototype patch, please take a look. I will add tests later once the approach is validated., Hello, [~usrikanth].  Thank you for posting a prototype patch and providing a great written summary.
+
+I'm now certain that it's impossible to make this change in a backwards-compatible way in the 2.x line.  The biggest challenge is what happens if someone upgrades the client ahead of the NameNode.  In that case, neither the client nor the NameNode would apply the umask.  Effectively, that means the upgraded client would start creating directories with 777 and files with 666, which of course would compromise security.
+
+Another potential issue is that existing users may be accustomed to the behavior of the current implementation, despite this deviation from the POSIX ACL spec.  The effect of the proposed change would be to widen access, because it would stop applying umask in certain cases.  Users might find it surprising if their default ACLs stopped restricting access after an upgrade, and some would argue that this is a form of incompatibility with existing persistent data (metadata).  This is always a fine line, but I do suspect some would see it as an incompatibility.
+
+I'm retargeting this to 3.0.0.  That means we'll also have the option of creating a much simpler patch, because we'll have freedom to make backwards-incompatible changes.
+
+Here are a few notes on the prototype patch, although I suspect it will go in a very different direction for 3.0.0 anyway.
+# {{CommandWithDestination}}: This change also probably would have constituted a backwards incompatibility.  Prior versions create files as 666 filtered by {{fs.permissions.umask-mode}}, not based on the permissions from the source file system.  I see from your notes that you were aiming to replicate the behavior you saw on Linux.  It might be worthwhile for us to consider doing that for consistency with other file systems, but it would be backwards-incompatible in 2.x.
+# {{FSDirectory}}: Here, the NameNode is applying umask based on its configured value for {{fs.permissions.umask-mode}}.  Unfortunately, this won't work in the general case, because it's not guaranteed that the client and the NameNode are running with the same set of configuration files.  They might have different values configured for {{fs.permissions.umask-mode}}, or the client might have overridden it with a -D option on the command line., Bumping the importance of this issue for Hadoop 3.0. [~supputuri] are you still interested in working on this JIRA?, [~supputuri] and [~andrew.wang] I am picking it up., Patch 001:
+* Just a rebase of HDFS-6962.1.patch
+* Pass build, Hi [~cnauroth],
+
+In order to maintain backwards compatibility in Hadoop 2.x, could we add a new NameNode flag {{dfs.namenode.posix.acl.inheritance.enabled}}, default false in Hadoop 2.x, default true in Hadoop 3?
+
+Changes to message {{CreateRequestProto}} and {{MkdirsRequestProto}}
+* Add optional field {{FsPermissionProto unmasked}} to store unmasked mode parameter
+* Preserve the existing meaning of field {{FsPermissionProto masked}}: mode + umask.
+* Please note this approach is slightly different from what you suggested above. I am ok either way but find this a little less possibility for misunderstanding.
+
+Wrap around {{AclStorage#copyINodeDefaultAcl}}:
+{code:java}
+    // TODO: How to query NameNode config?
+    boolean isPosixAclInheritanceEnabled = true;
+    FsPermission masked = child.getMaskedPermission();
+    FsPermission unmasked = child.getUnmaskedPermission();
+
+    if (isPosixAclInheritanceEnabled && unmasked != null) {
+      //
+      // HDFS-6962: POSIX ACL inheritance
+      //
+      // Set permission to unmasked
+      child.setPermission(unmasked);
+      if (!copyINodeDefaultAclInternal(child)) {
+        // No default ACL in parent dir
+        // Set permission to masked
+        child.setPermission(masked);
+      }
+    } else {
+      //
+      // Old behavior before HDFS-6962
+      //
+      assert child.getFsPermission().equals(masked);
+      copyINodeDefaultAclInternal(child);
+    }
+{code}
+Here {{INode#getUnmaskedPermission}} returns the unmasked mode sent by DFSClient; {{INode#getMaskedPermission}} returns the masked mode., Patch 002 (prototype):
+* Create a new class {{FsPermissionDuo}} that extends {{FsPermission}} to store both masked and unmasked permissions. HDFS client uses it to sneak unmasked permission from FileContext/FileSystem -> AFS -> Hdfs -> DFSClient -> RPC. NN uses it to sneak unmasked permission from RPC -> NameNodeRpcServer.create (placed into PermissionStatus) -> FSNamesystem.startFile -> FSDirWriterFileOp.startFile/addFile -> INodeFile -> INodeWithAdditionalFields.
+* Add field {{unmasked}} to protobuf message {{CreateRequestProto}} and {{MkdirsRequestProto}}
+* Modify {{copyINodeDefaultAcl}} to switch between old and new ACL inheritance behavior.
+
+Questions:
+* How to query NN config in {{copyINodeDefaultAcl}}?
+* Anyway to avoid adding field FsPermissionDuo to {{INodeWithAdditionalFields}}?
+* {{PermissionStatus#applyUMask}} never used, remove it?
+* {{DFSClient#mkdirs}} and {{{{DFSClient#primitiveMkdir}} use file default if permission is null. Should use dir default permission?
+
+TODO:
+* Investigate the use of permissions in FSDirMkdirOp.createAncestorDirectories call tree
+* Add and run unit tests
+* Run system compatibility tests
+* Update {{HdfsPermissionsGuide.md}}
+
+[~cnauroth] Could you please take a look at Patch 002 to check whether backwards compatibility can be achieved with an NN flag and the changes are going in the right direction? Thanks., [~cnauroth] I will start working on a fully functional patch., Is there any possible workarounds for this?, What is your exact scenario? What are possible parent dir's default ACLs? Is it ok for you to set umask to 0 or something that will not affect any default ACL?, [~cnauroth] Are there automated tests for section {{Default Acls}} in test plan {{Test-Plan-for-Extended-Acls-2.pdf}}? Either extend that section or add a new section in test plan to cover ACL inheritance. Currently these are ACL related tests: TestAcl,TestAclCommands,TestAclCLI,TestViewFileSystemWithAcls,TestViewFsWithAcls,TestAclWithSnapshot,TestAclConfigFlag,TestAclTransformation,TestFileContextAcl,TestFSImageWithAcl,TestNameNodeAcl,TestAclsEndToEnd,TestOfflineImageViewerForAcl,TestWebHDFSAcl. Will add a new test class {{namenode/TestAclInheritance}}., [~jzhuge], I know {{FSAclBaseTest}} has test cases that cover inheritance of default ACLs to newly created files and sub-directories.  Possibly the other suites you mentioned would have test cases for default ACL inheritance too.  If those are what you're looking for, then you might not need a new {{TestAclInheritance}} suite.
+
+Sorry for my delay in reviewing this more deeply.  I will aim for no later than next week to take a closer look., [~cnauroth], Thanks for the info. I will work with the existing test classes as much as possible., Patch 003 (almost complete, unit tests passed):
+* Create a new class {{FsPermissionDuo}} that extends {{FsPermission}} to store both masked and unmasked permissions. HDFS client uses it to sneak unmasked permission from FileContext/FileSystem -> AFS -> Hdfs -> DFSClient -> RPC. NN uses it to sneak unmasked permission from RPC -> NameNodeRpcServer.create (placed into PermissionStatus) -> FSNamesystem.startFile -> FSDirWriterFileOp.startFile/addFile -> INodeFile -> INodeWithAdditionalFields.
+* Add field {{unmasked}} to protobuf message {{CreateRequestProto}} and {{MkdirsRequestProto}}
+* Modify {{copyINodeDefaultAcl}} to switch between old and new ACL inheritance behavior.
+* Add 2 unit tests to {{FSAclBaseTest}}
+
+Questions:
+* {{PermissionStatus#applyUMask}} never used, remove it?
+* {{DFSClient#mkdirs}} and {{{{DFSClient#primitiveMkdir}} use file default if permission is null. Should use dir default permission?
+* Better name for {{FsPermissionDuo}}?
+
+TODO:
+* Investigate why TestWebHDFSAcl does not support the 2 new unit tests
+* Run system tests and compatibility tests
+* Update {{HdfsPermissionsGuide.md}}
+* Investigate the use of permissions in FSDirMkdirOp.createAncestorDirectories call tree
+
+[~cnauroth], please take a look at 003 which plugs some loose ends and adds 2 unit tests., To support webhdfs, the REST api for {{CREATE}} and {{MKDIRS}} must be extended with a new parameter for unmasked permission. Let us add the support in a separate jira if deemed necessary. For now, the 2 new unit tests are disabled for {{TestWebHDFSAcl}}., {{FSDirMkdirOp.createAncestorDirectories}} is unrelated to the current inode being created, thus should not use the current create modes., Patch 004 passed system and compatibility tests on a pseudo cluster. Upload test logs. Focus on group WRITE permission. The test script is {{run}}, the command line is
+{code}
+test_tag=disabled_new_client ; script ~/test/$test_tag.log ~/test/run $test_tag
+{code}
+
+Test server is running {{3.0.0-alpha1 + Patch 004}} with POSIX ACL Inheritance either enabled or disabled. There are 2 versions of test clients. The POSIX ACL inheritance is only in effect when the flag is true and the requests come from a compatible client. The following table shows the matrix for the log files.
+
+|| Client Version\POSIX ACL Inheritance || Enabled || Disabled ||
+| 2.6.0 | enabled_old_client.log | disabled_old_client.log |
+| 3.0.0-alpha1 + Patch 004 | enabled_new_client.log | disabled_new_client.log |
+
+In each log file, there is a test matrix of the following dimensions:
+* Parent dir has default ACL or not
+* Umask 002 or 027
+* Create a file (create request) or a sub-directory (mkdirs request), Patch 004 passed the following ACL related unit tests including the new {{FSAclBaseTest#testUMaskDefaultAclNewFile}} and {{FSAclBaseTest#testUMaskDefaultAclNewDir}}: TestAcl, TestAclCommands, TestAclCLI, TestViewFileSystemWithAcls, TestViewFsWithAcls, TestAclWithSnapshot, TestAclConfigFlag, TestAclTransformation, TestFileContextAcl, TestFSImageWithAcl, TestNameNodeAcl, TestAclsEndToEnd, TestOfflineImageViewerForAcl, and TestWebHDFSAcl., Patch 004 (passed system and compatibility tests):
+* Create a new class {{FsCreateModes}} that extends {{FsPermission}} to store both masked and unmasked create modes. HDFS client uses it to sneak unmasked permission from FileContext/FileSystem -> AFS -> Hdfs -> DFSClient -> RPC. NN uses it to sneak unmasked permission from RPC -> NameNodeRpcServer.create (placed into PermissionStatus) -> FSNamesystem.startFile -> FSDirWriterFileOp.startFile/addFile -> INodeFile -> INodeWithAdditionalFields.
+* Add field {{unmasked}} to protobuf message {{CreateRequestProto}} and {{MkdirsRequestProto}}
+* Modify {{copyINodeDefaultAcl}} to switch between old and new ACL inheritance behavior.
+* Add 2 unit tests to {{FSAclBaseTest}}
+
+Questions:
+* {{PermissionStatus#applyUMask}} never used, remove it?
+* {{DFSClient#mkdirs}} and {{{{DFSClient#primitiveMkdir}} use file default if permission is null. Should use dir default permission?
+
+TODO:
+* Create a separate jira to to support WebHDFSAcl and NFS if necessary
+* More updates to {{HdfsPermissionsGuide.md}}
+
+[~cnauroth] and [~atm], please review patch 004., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 30s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 34s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 40s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 29s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 56s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 12s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 44s{color} | {color:green} root: The patch generated 0 new + 1130 unchanged - 3 fixed = 1130 total (was 1133) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  2s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m  6s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m  2s{color} | {color:green} hadoop-hdfs-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 61m 58s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 24s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}122m 46s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.namenode.ha.TestRetryCacheWithHA |
+|   | hadoop.hdfs.server.mover.TestMover |
+|   | hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer |
+|   | hadoop.hdfs.server.datanode.TestDataNodeLifeline |
+|   | hadoop.hdfs.server.namenode.TestNNThroughputBenchmark |
+|   | hadoop.hdfs.server.namenode.TestStripedINodeFile |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:85209cc |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12814567/HDFS-6962.004.patch |
+| JIRA Issue | HDFS-6962 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  cc  xml  |
+| uname | Linux f1e99d6ec51a 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 77031a9 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/15941/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/15941/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/15941/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Saw {{TestDataNodeLifeline}} and {{TestOfflineEditsViewer}} failures on my local Mac with stock trunk, so they are not regressions. {{TestMover,TestNNThroughputBenchmark,TestNNThroughputBenchmark,TestStripedINodeFile,TestRetryCacheWithHA}} failures are regressions., Patch 005 over 004:
+* Fix test regressions, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 25s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 35s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 32s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 29s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m  1s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 11s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 27s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  6m 27s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  6m 27s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 35s{color} | {color:green} root: The patch generated 0 new + 1131 unchanged - 2 fixed = 1131 total (was 1133) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 16s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 38s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  1s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m  1s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 19m  7s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 56s{color} | {color:green} hadoop-hdfs-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 61m  0s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 23s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}127m 33s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.balancer.TestBalancer |
+| Timed out junit tests | org.apache.hadoop.http.TestHttpServerLifecycle |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:85209cc |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12816005/HDFS-6962.005.patch |
+| JIRA Issue | HDFS-6962 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  cc  xml  |
+| uname | Linux d30fa212b65f 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 2e835d9 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/15972/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/15972/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/15972/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/15972/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, {{TestBalancer}} failures seem unrelated., Patch 006 over 005:
+* Remove the ugly calls of "instanceof FsCreateModes", | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 31s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 21s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 56s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 29s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 31s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 16s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m  9s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m  5s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m  5s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m  5s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 35s{color} | {color:orange} root: The patch generated 1 new + 1152 unchanged - 0 fixed = 1153 total (was 1152) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  1s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  9m  2s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 58s{color} | {color:green} hadoop-hdfs-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 74m 18s{color} | {color:green} hadoop-hdfs in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 27s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}135m  3s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:85209cc |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12816153/HDFS-6962.006.patch |
+| JIRA Issue | HDFS-6962 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  cc  xml  |
+| uname | Linux 3d49e69f46bd 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 8b4b525 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/15981/artifact/patchprocess/diff-checkstyle-root.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/15981/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/15981/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Hello [~jzhuge].  I apologize for my delayed response.  Thank you for working on this tricky issue.
+
+I think what you are proposing for configurability and extending the protocol messages makes sense as a way to provide deployments with a choice of which behavior to use.  However, I'm reluctant to push it into 2.8.0 now due to the complexity of the changes required to support it.  Considering something like a cross-cluster DistCp, with a mix of old and new versions in play, it could become very confusing to explain the end results to users.  Unless you consider it urgent for 2.8.0, would you consider targeting it to the 3.x line, as I had done a while ago?
+
+I don't think we can realistically ship without the WebHDFS support in place.  At this point, there is a user expectation of feature parity for ACL commands whether the target is an hdfs: path or a webhdfs: path.  If you want to track WebHDFS work in a separate JIRA, then I think that's fine, but I wouldn't want to ship a non-alpha release lacking the WebHDFS support.
+
+I am concerned about adding the {{createModes}} member to {{INodeWithAdditionalFields}} because of the increased per-inode memory footprint in the NameNode.  Even for a {{null}}, there is still the pointer cost.  I assume this was done because it was the easiest way to get the masked vs. unmasked information passed all the way down to {{FSDirectory#copyINodeDefaultAcl}} during new file/directory creation.  That information is not valuable beyond the lifetime of the creation operation, so paying memory to preserve it longer is unnecessary.  I think we'll need to explore passing the unmasked information along separately from the inode object.  Unfortunately, this likely will make the change more awkward, requiring changes to method signatures to accept more arguments.
+
+{code}
+      if (modes == null) {
+        LOG.warn("Received create request without unmasked create mode");
+      }
+{code}
+
+I expect this log statement would be noisy in practice.  I recommend removing it or changing it to debug level if you find it helpful.
+
+The documentation of {{dfs.namenode.posix.acl.inheritance.enabled}} in hdfs-default.xml and HdfsPermissionsGuide.md looks good overall.  I saw one typo in both places: "comppatible" instead of "compatible".  Could you also add a clarifying statement that umask would be ignored if the parent has a default ACL?  It could be as simple as "...will apply default ACLs from the parent directory to the create mode and ignore umask."
+
+In addition to the new tests you added to {{FSAclBaseTest}}, I recommend testing through the shell.  The XML-driven shell tests don't have a way to reconfigure the mini-cluster under test.  I expect you'll need to make a new test suite, similar to {{TestAclCLI}}, but with {{dfs.namenode.posix.acl.inheritance.enabled}} set to {{true}}.
+
+bq. PermissionStatus#applyUMask never used, remove it?
+
+bq. DFSClient#mkdirs and {{DFSClient#primitiveMkdir use file default if permission is null. Should use dir default permission?
+
+You might consider filing separate JIRAs for these 2 observations, so that we keep the scope here focused on the ACL inheritance issue.
+, Thank you very much [~cnauroth]. Valid points.
+
+One additional question before responding to your comments. I added {{getMasked}} and {{getUnmasked}} with default implementations to {{FsPermission}} which is public and stable. Is that ok? The alternative to this approach is to use {{instanceof}} to detect {{FsCreateModes}} object with an {{FsPermission}} reference.
+
+bq. target it to the 3.x line
+
+I think it is ok. Will it affect our plan to backport the fix to CDH branches based on 2.6.0?
+
+bq. WebHDFS support
+
+Will implement it in this jira.
+
+bq. adding the {{createModes}} member to {{INodeWithAdditionalFields}}
+
+Yes, I made the trade-off between adding a field to {{INodeWithAdditionalFields}} and changing method signatures along the NN stack from RPC to {{FSDirectory#copyINodeDefaultAcl}}. I will revisit the decision.
+
+bq. LOG.warn("Received create request without unmasked create mode");
+
+Changed to {{debug}}.
+
+bq. "comppatible"
+
+Fixed.
+
+bq. add a clarifying statement that umask would be ignored 
+
+Done.
+
+bq. make a new test suite, similar to TestAclCLI, but with dfs.namenode.posix.acl.inheritance.enabled set to true.
+
+Will do., bq. One additional question before responding to your comments. I added getMasked and getUnmasked with default implementations to FsPermission which is public and stable. Is that ok? The alternative to this approach is to use instanceof to detect FsCreateModes object with an FsPermission reference.
+
+Adding new methods to a public/stable class is acceptable according to [Apache Hadoop Compatibility|http://hadoop.apache.org/docs/r2.7.2/hadoop-project-dist/hadoop-common/Compatibility.html] guidelines.  We took a similar approach when adding the ACL bit.  We added {{FsPermission#getAclBit}} with a default implementation.  The HDFS-specific {{FsPermissionExtension}} subclass overrides that method.
+
+bq. I think it is ok. Will it affect our plan to backport the fix to CDH branches based on 2.6.0?
+
+I can't comment definitively on CDH concerns, but I expect that any distro could make the choice to apply the patch to prior maintenance lines if they come to a different risk assessment decision.  The ACL code changes infrequently at this point, so I expect it would be trivial to backport, with low likelihood of complex merge conflicts., [~cnauroth] and [~eddyxu] Please review patch 007.
+
+Diff from 006:
+* Add CLI tests {{TestAclCLIWithPosixAclInheritance}} based on {{TestAclCLI}}
+* No longer add field {{createModes}} to {{INodeWithAdditionalFields}}. Instead, add new feature {{CreateModesFeature}} to store create modes. In this way, no penalty when POSIX ACL inheritance is disable or for any inode not being created.
+* Remove the feature {{CreateModesFeature}} once default ACL has been processed, so the feature only exists in inode for a short period of time.
+* There is cost of adding and removing the new feature.
+
+TODO:
+* Support webhdfs, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 22s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 6 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 15s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 20s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 43s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 46s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 23s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 17s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  8m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  8m 55s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  2m  3s{color} | {color:orange} root: The patch generated 1 new + 1153 unchanged - 0 fixed = 1154 total (was 1153) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  4s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 32s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m  5s{color} | {color:green} hadoop-hdfs-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 79m  9s{color} | {color:green} hadoop-hdfs in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 30s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}143m 12s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12819176/HDFS-6962.007.patch |
+| JIRA Issue | HDFS-6962 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  cc  xml  |
+| uname | Linux 61097d96ed6a 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 38128ba |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/16110/artifact/patchprocess/diff-checkstyle-root.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16110/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16110/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Hi, [~jzhuge] Thanks for providing the patch:
+
+* {{FSDirectory.copyINodeDefaultACL}} should be private.
+* Is it true that after creation,  the createMode is not useful for INode, as its mode has already been established? I feel that we do not need to store it as a feature in INode.
+* In {{copyINodeDefaultAcl()}}. 
+{code}
+
+if (posixAclInheritanceEnabled && modes != null) {
+      //
+      // HDFS-6962: POSIX ACL inheritance
+      //
+      child.setPermission(modes.getUnmasked());
+      if (!AclStorage.copyINodeDefaultAcl(child)) {
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("{}: no parent default ACL to inherit", child);
+        }
+        child.setPermission(modes.getMasked());
+        child.removeCreateModes();
+      }
+}
+{code}
+
+If the client sends the INode with {{CreateMode}}, but {{inherenceEnabled=false}}, the feature is not removed and thus consume more space? Or when {{AclStorage.copyINodeDefaultAcl()}} returns true. 
+
+* Can we use {{FsPermission.getUnmasked() == null?}} to replace using {{CreateModeFeature}} related methods in INode? It can make {{INode}} interface unchanged.
+, Thanks [~eddyxu] for the review! Great comments. I will fix the issues..
+
+bq. Is it true that after creation, the createMode is not useful for INode, as its mode has already been established? I feel that we do not need to store it as a feature in INode.
+
+Yes it is true, create modes are only needed during inode creation. It is a stretch to call CreateModes a feature, but it has be stored somewhere in inode or another data structure 1-1 tied to inode. Suggestions are welcome., Patch 008:
+* Support webhdfs
+* Incorporate review comments, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 21s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  8m 10s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 33s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 59s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 15s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m  5s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 31s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 42s{color} | {color:orange} root: The patch generated 4 new + 1339 unchanged - 3 fixed = 1343 total (was 1342) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 27s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  3s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m  7s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m  1s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  7m  8s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 58s{color} | {color:green} hadoop-hdfs-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 58m  1s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 23s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}118m 38s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.metrics2.impl.TestGangliaMetrics |
+|   | hadoop.ipc.TestIPC |
+|   | hadoop.hdfs.server.datanode.TestDataNodeErasureCodingMetrics |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12819286/HDFS-6962.008.patch |
+| JIRA Issue | HDFS-6962 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  cc  xml  |
+| uname | Linux 130a8451afd9 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 557a245 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/16137/artifact/patchprocess/diff-checkstyle-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/16137/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/16137/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16137/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16137/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Unit test failures seem unrelated. There is nothing I can do about the 3 checkstyle {{ParameterNumber}} errors. Anyway to suppress warnings? I will research some ways to do it. As for "FsCreateModes.java:0:: Missing package-info.java file.", I guess I will add a {{package-info.java}} file., [~cnauroth] and [~eddyxu], could you please review patch 008 that has new and isolated changes to support webhdfs?, As suggested by [~eddyxu], I found a way not to store {{FsCreateModes}} in {{INode}}. Only have to change {{addINode}} and {{addLastINode}} signatures., Patch 009:
+* No longer store anything in {{INode}}
+* Modify {{addINode}} and {{addLastINode}} to pass create modes from RPC to {{copyINodeDefaultAcl}} on NameNode
+* Do not modify {{addLastINodeNoQuotaCheck}} because all its callers (rename related) do not have create modes to pass, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 13s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 6 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  6m 57s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 46s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 24s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 40s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 29s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m  2s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  6m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  6m 43s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 42s{color} | {color:orange} root: The patch generated 3 new + 1433 unchanged - 4 fixed = 1436 total (was 1437) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  2s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  7m 59s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 55s{color} | {color:green} hadoop-hdfs-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 58m  2s{color} | {color:green} hadoop-hdfs in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 23s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}121m  2s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12819775/HDFS-6962.009.patch |
+| JIRA Issue | HDFS-6962 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  cc  xml  |
+| uname | Linux 1ec010a2db50 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / b79ba4f |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/16164/artifact/patchprocess/diff-checkstyle-root.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16164/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16164/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Ignore the 3 checkstyle {{ParameterNumber}} errors for now. I will file a jira for a new method to suppress them individually, e.g., using annotation {{SuppressWarning("checkstyle:parameternumber")}}., [~cnauroth] and [~eddyxu], have you got a chance to look at 009? I believe all major review issues are resolved.
+
+I plan to run all Hadoop unit tests twice: one with the flag off and one with the flag on., The {{-09}} patch LGTM.  +1. , Uploaded script {{unit_tests}} that runs regression unit tests., Upload {{test_plan.md}}., Upload updated test plan and scripts., [~jzhuge], thank you so much for your diligence with this patch.  Revision 009 looks good to me, but the patch needs to be rebased for the current trunk.  Would you please provide an updated patch?  I'll get on the final review quickly so that we don't run the risk of the patch going stale again.
+
+Also, there were Checkstyle warnings in the last pre-commit run.  The report is gone now, so I can't check to see if they were worthwhile to fix.  If so, please include those fixes in the next revision too., Thanks [~cnauroth], I will rebase and post another patch.
+
+As the 3 checkstyle warnings, there is no fix. Please see my comment https://issues.apache.org/jira/browse/HDFS-6962?focusedCommentId=15390740&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15390740.
+
+Filed HADOOP-13411 Checkstyle suppression by annotation or comment and posted a patch. With that, I should be able to suppress this specific type of checkstyle warning.
+
+, Looking into some unit test failures in {{TestFileContextAcl}} after the rebase., Patch 010:
+* Rebase with minor fixes in {{FileContext.java}} and {{DFSClient#applyMaskDir}}
+* Pass unit tests and compatibility tests listed in {{test_plan.md}}, | (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 19s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 6 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 45s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 53s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 43s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 20s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m  1s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  6m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  6m 50s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 42s{color} | {color:orange} root: The patch generated 3 new + 1432 unchanged - 3 fixed = 1435 total (was 1435) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  3s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m  2s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m  6s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 56s{color} | {color:green} hadoop-hdfs-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 71m 50s{color} | {color:green} hadoop-hdfs in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 23s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}129m 29s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HDFS-6962 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12826999/HDFS-6962.010.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  cc  xml  |
+| uname | Linux c753d045fbb8 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 07650bc |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/16631/artifact/patchprocess/diff-checkstyle-root.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16631/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16631/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Ignore the checkstyle warnings:
+{noformat}
+./hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/web/resources/NamenodeWebHdfsMethods.java:311:  public Response putRoot(:19: More than 7 parameters (found 28).
+./hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/web/resources/NamenodeWebHdfsMethods.java:382:  public Response put(:19: More than 7 parameters (found 29).
+./hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/web/resources/NamenodeWebHdfsMethods.java:468:  private Response put(:20: More than 7 parameters (found 29).
+{noformat}
+
+Once HADOOP-13411 is checked in, we can suppress specific warnings., +1 for patch revision 010.  I have committed this to trunk.  [~jzhuge], thank you for your hard work on this patch.  [~eddyxu], thank you for reviewing., Thank you [~eddyxu] and [~cnauroth] for the great reviews and commit, [~Alexandre LINTE] for reporting the issue., SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #10398 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/10398/])
+HDFS-6962. ACL inheritance conflicts with umaskmode. Contributed by (cnauroth: rev f0d5382ff3e31a47d13e4cb6c3a244cca82b17ce)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirSymlinkOp.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/web/resources/PermissionParam.java
+* (add) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/cli/TestAclCLIWithPosixAclInheritance.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/AclStorage.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSAclBaseTest.java
+* (edit) hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/FsPermission.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirMkdirOp.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirectory.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/HdfsPermissionsGuide.md
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/proto/ClientNamenodeProtocol.proto
+* (add) hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/package-info.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/WebHdfsHandler.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirWriteFileOp.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestGetBlockLocations.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/web/webhdfs/ParameterParser.java
+* (edit) hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/web/resources/NamenodeWebHdfsMethods.java
+* (edit) hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileContext.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/snapshot/TestRenameWithSnapshots.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/cli/TestAclCLI.java
+* (add) hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/permission/FsCreateModes.java
+* (add) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/web/resources/UnmaskedPermissionParam.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/web/WebHdfsFileSystem.java
+* (add) hadoop-hdfs-project/hadoop-hdfs/src/test/resources/testAclCLIWithPosixAclInheritance.xml
+, Oh no!  I botched the commit message on this, so it says "Contributed by Chris Nauroth" instead of "Contributed by John Zhuge".  This can't really be fixed, because it would require a force push and cause grief for anyone who has sync'd the repo since the commit.
+
+[~jzhuge], I'm really sorry about that.  The JIRA issue remains assigned to you for proper attribution though., No problem, [~cnauroth]., Hi [~jzhuge], could you help me understand the compatibility impact of this change? The release note says:
+bq. This change is considered backward-incompatible, so the new behavior is off by default and must be explicitly configured by setting dfs.namenode.posix.acl.inheritance.enabled to true in hdfs-site.xml. 
+
+Does that mean it can be safely backported to branch-2 without breaking applications as long as {{dfs.namenode.posix.acl.inheritance.enabled}} continues to default to false? Thanks!, [~arpitagarwal] Yes, you are right., Yes, agreed with John.
+
+That might then lead to the question of why this wasn't included in branch-2.  I have an earlier comment where I stated that the compatibility story looks good, but I thought it was a risky change close the 2.8.0 cutoff:
+
+{quote}
+I think what you are proposing for configurability and extending the protocol messages makes sense as a way to provide deployments with a choice of which behavior to use. However, I'm reluctant to push it into 2.8.0 now due to the complexity of the changes required to support it. Considering something like a cross-cluster DistCp, with a mix of old and new versions in play, it could become very confusing to explain the end results to users. Unless you consider it urgent for 2.8.0, would you consider targeting it to the 3.x line, as I had done a while ago?
+{quote}
+
+If users are asking for this change in the 2.x line, I think we could probably make it happen.  At this point, it would have to be tracked in a separate JIRA with a separate release note targeted to a 2.x release.
+
+However, if there isn't user demand for shipping the change in 2.x, then it's still probably safer to leave it in 3.x only., Thank you for the quick clarification [~jzhuge] and [~cnauroth].
+
+Yes we have users who want to see this fixed on Hadoop 2.x so we'll be looking into back-porting it to branch-2. We'll take a careful look at the changes to verify that there is no incompatibility/DistCp confusion with the default settings to ensure we don't affect anyone who doesn't opt into the new behavior., Thanks [~cnauroth] for the clarification.
+
+Sounds like a good plan [~arpitagarwal]. I will be happy to review the backport., I looked through the comments, but don't see any update on port this patch to hadoop 2.7.x (or similar). Just curious about it status. Thanks!]

@@ -1,0 +1,384 @@
+[Been looking at this ticket tonight. I'm not sure exactly what you're getting it. As I am understanding it, the wrapping looks something like:
+
+User Reader -> FSInputChecker -> FSInputChecker subclass -> BufferedInputStream -> Underlying source
+
+e.g:
+{noformat}
+        java.io.FileInputStream.readBytes(FileInputStream.java:Unknown line)
+        java.io.FileInputStream.read(FileInputStream.java:199)
+        org.apache.hadoop.fs.RawLocalFileSystem$TrackingFileInputStream.read(RawLocalFileSystem.jav
+a:90)
+        org.apache.hadoop.fs.RawLocalFileSystem$LocalFSFileInputStream.read(RawLocalFileSystem.java
+:143)
+        java.io.BufferedInputStream.fill(BufferedInputStream.java:218)
+        java.io.BufferedInputStream.read1(BufferedInputStream.java:258)
+        java.io.BufferedInputStream.read(BufferedInputStream.java:317)
+        java.io.DataInputStream.read(DataInputStream.java:132)
+        org.apache.hadoop.fs.FSInputChecker.readFully(FSInputChecker.java:385)
+        org.apache.hadoop.fs.ChecksumFileSystem$ChecksumFSInputChecker.readChunk(ChecksumFileSystem.java:224)
+        org.apache.hadoop.fs.FSInputChecker.readChecksumChunk(FSInputChecker.java:238)
+        org.apache.hadoop.fs.FSInputChecker.read1(FSInputChecker.java:190)
+        org.apache.hadoop.fs.FSInputChecker.read(FSInputChecker.java:158)
+        java.io.DataInputStream.read(DataInputStream.java:83)
+        org.apache.hadoop.io.IOUtils.copyBytes(IOUtils.java:72)
+{noformat}
+
+The user's buffer size passed in to fs.open(...) controls the size of the BufferedInputStream that wraps the underlying input stream (ie raw file or socket). The FSInputChecker does indeed call read() on that BufferedInputStream once for every 512 bytes (directly into the user buffer), but in my profiling this doesn't seem to be a CPU hog, since it only results in one syscall to the underlying stream for every io.file.buffer.size.
+
+As a test of the CPU overhead, I put an 800M file (checksummed) in /dev/shm and profiled hadoop fs -cat with io.file.buffer.size=64K. This obviously stresses the CPU hogs and syscall overhead without any actual disk involved. The top consumers are:
+
+{noformat}
+   1 61.17% 61.17%    4363 300617 org.apache.hadoop.fs.FSInputChecker.readChecksumChunk
+   2 13.11% 74.28%     935 300618 java.io.FileInputStream.readBytes
+   3  7.71% 82.00%     550 300632 java.io.DataInputStream.read
+   4  5.02% 87.02%     358 300600 java.io.FileOutputStream.writeBytes
+   5  3.76% 90.77%     268 300657 java.io.DataInputStream.readFully
+   6  1.67% 92.44%     119 300631 java.io.DataInputStream.readFully
+{noformat}
+
+The particular line of readChecksumChunk that's consuming the time is line 241 (sum.update) - this indicates that the overhead here is just from checksumming and not from memory copies. The one possible gain I could see here would be to revert to a JNI implementation of CRC32 that can do multiple checksum chunks at once - we found that JNI was slow due to a constant overhead "jumping the gap" to C for small sizes, but we can probably get 50% checksum speedup for some buffers. This was originally rejected in HADOOP-6148 due to the complexity of maintaining two different CRC32 implementations.
+
+Are you suggesting here that we could do away with the internal buffer and assume that users are always going to do large reads? Doesn't that violate the contract of fs.open taking a buffer size?, I think it would be greate if native checksumming code operates on direct buffers and verifies many 512B chunks at a time.
+
+Something like what I suggested here: http://developer.yahoo.net/blogs/hadoop/2009/08/the_anatomy_of_hadoop_io_pipel.html, Hi Hong,
+
+Thanks for the input. How do others feel about using a separate CRC32 path for the "bulk checksum checking" in the read path, probably through JNI when available? I had suggested this in HADOOP-6148 and people said it would be unmaintainable. Given that checksum algorithms rarely change and are easy to verify, I disagree, but would like to have some +1s for this direction before I spend the time writing the code.
+
+Regarding the other points in your blog post, it seems to imply that we'd have to change around a lot of the APIs to work with ByteBuffers rather than byte[], potentially all the way down to the user-facing layer. This would be a big API change. Where is a good place to start, and what kind of backwards compatibility layer will we need?, bq. This was originally rejected in HADOOP-6148 due to the complexity of maintaining two different CRC32 
+
+This jira is not about CRC32 cost, but I don't see why we can't use pure java CRC32 from HADOOP-6148. It is already used in DataNode. CRC32 implementation is transparent to FSInputChecker. If it is good for multiple other places in Hadoop, it is good for FileSystem as well.
+
+bq. Are you suggesting here that we could do away with the internal buffer and assume that users are always going to do large reads? Doesn't that violate the contract of fs.open taking a buffer size?
+
+essentially, yes. When the user gives large buffer, there is no need to copy to intermediate buffer. We would not require or assume the user gives a large buffer but the common case is that user does. DFSClient would read fixed length packet header from the underlying socket and then read the data directly to user buffer if the size is comparable or larger than the packet (64k).
+
+I don't see how any this would violate the contract. fs.open buffer size is only a hint.. underlying FS should know what is more optimal., bq. I don't see why we can't use pure java CRC32 from HADOOP-6148
+
+We already do use this - the microbenchmark above (reading checksummed files from /dev/shm) shows that CRC is the majority of the CPU overhead in FSInputChecker and that array copying makes up very little of the time.
+
+bq. When the user gives large buffer, there is no need to copy to intermediate buffer
+
+I see... so I guess what you're saying is that we should do away with the internal BufferedInputStream in DFSClient.BlockReader, and then occasionally insert a buffer only in the case when the user-provided buffer is small? This seems like a fair amount of confusing complexity due to the buffer management involved.
+
+Do we have some kind of benchmark that indicates that these copies make up any appreciable overhead compared to the fairly slow checksumming?
+
+, 
+obviously, one buffer copy is not expected to consume more CPU than a CRC32 checksum (much less for checksum of small chunks like 512). I roughly esitmated each buffer copy to take around 1/3rd of what CRC32 takes (ratio might be larger with improved CRC32). Does it mean it is not worth fixing second or third large CPU hogs on client? Of course when there is compression and other higher processing is involved, even CRC32 wouldn't be the largest CPU hog.
+
+We reduced CPU on DataNode while serving (HADOOP-2758, HADOOP-3164) mainly by avoiding buffer copies (there is CRC involved). All the benchmarks there measure CPU consumed based on actual CPU reported by the OS (not by a profiler).. it is also essentially a 'dfs -cat'.
+
+In your tests is it reading a dfs file? I used 'dfs -cat' extensively in Datanode CPU benchmarks reported in the above Jiras.
+
+bq. This seems like a fair amount of confusing complexity due to the buffer management involved.
+
+I am not so sure. But just not buffering at all might be good enough (the smallest size would still be 512 bytes)., Also, as Hong's blog post points out, there are copies at many places. Advantage of improving the interface is not just avoiding one copy, but could eventually support better handling of direct buffers. 
+
+Plus, looking at how long this jira has been open, it is no blocker :-), Looking at the source of BufferedInputStream (at http://www.docjar.com/html/api/java/io/BufferedInputStream.java.html) it actually seems like BufferedInputStream is already handling pass-through to the underlying stream in the case that the read buffer is as large as its own buffer. That was the crucial bit I was missing that explains why performing the underlying reads in larger chunks would make a difference, even without removing the BIS.
+
+I'll give it a go and see if there is any discernible performance increase.
+
+bq. Plus, looking at how long this jira has been open, it is no blocker
+
+Of course :), Here's a patch that implements the FSInputChecker side of this ticket.
+
+Benchmark results are promising. I put a 700MB file in /dev/shm with its associated checksum and then timed "hadoop fs -cat /dev/shm/bigfile" 100 times with the patch and without the patch. Here is R output from the analysis of these times:
+
+{noformat}
+> p.user <- read.table(file="/tmp/times.patch.user")
+> p.sys <- read.table(file="/tmp/times.patch.sys")
+> p.wall <- read.table(file="/tmp/times.patch.wall")
+> t.user <- read.table(file="/tmp/times.trunk.user")
+> t.sys <- read.table(file="/tmp/times.trunk.sys")
+> t.wall <- read.table(file="/tmp/times.trunk.wall")
+> t.test(t.user,p.user,alternative="greater")
+
+        Welch Two Sample t-test
+
+data:  t.user and p.user 
+t = 21.0552, df = 134.54, p-value < 2.2e-16
+alternative hypothesis: true difference in means is greater than 0 
+95 percent confidence interval:
+ 0.4654936       Inf 
+sample estimates:
+mean of x mean of y 
+ 3.713000  3.207763 
+
+> 3.2077/3.713
+[1] 0.8639106
+> t.test(t.sys,p.sys,alternative="greater")
+
+        Welch Two Sample t-test
+
+data:  t.sys and p.sys 
+t = 1.3567, df = 137.286, p-value = 0.08856
+alternative hypothesis: true difference in means is greater than 0 
+95 percent confidence interval:
+ -0.003768599          Inf 
+sample estimates:
+mean of x mean of y 
+ 0.980500  0.963421 
+
+> t.test(t.wall,p.wall,alternative="greater")
+
+        Welch Two Sample t-test
+
+data:  t.wall and p.wall 
+t = 6.5711, df = 118.318, p-value = 7.034e-10
+alternative hypothesis: true difference in means is greater than 0 
+95 percent confidence interval:
+ 0.3020628       Inf 
+sample estimates:
+mean of x mean of y 
+ 7.667800  7.263816
+{noformat}
+
+To interpret the results for those who don't know R:
+- The user time is reduced with 100% confidence. With 95% confidence it's reduced by at least 0.465s = 12.5%
+- The sys time is not significantly reduced - p > 0.05. This is consistent with our expectation that we're doing the same number of syscalls, just avoiding buffer copies in user space.
+- Wall clock time is reduced with 100% confidence. With 95% confidence it's reduced by at least 0.302s = 3.9%.
+
+I didn't include the R output, but analyis on the "CPU%" column of the "time" results gives 100% confidence of a reduction in CPU percent util, 95% confidence of at least 3.34%.
+
+The patch itself can probably be improved - just wanted to get early comments. I did briefly test that HDFS still functions, but have not run through all the unit tests. I also want to rerun the above benchmarks with io.file.buffer.size tuned up to 64K or 128K as most people do in production., results looking good, Renaming ticket to focus on FSInputChecker. Let's do this one step at a time and open another JIRA for OutputSummer, Just reran benchmarks with 128K io.file.buffer.size. All of the improvements stayed practically identical, percentage-wise., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12424076/hadoop-3205.txt
+  against trunk revision 832590.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/126/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/126/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/126/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/126/console
+
+This message is automatically generated., Here's a patch which fixes the bugs that caused the unit test failures.
+
+There's one TODO still in the code to figure out a good setting for MAX_CHUNKS (ie the max number of checksum chunks that should be read in one call to the underlying stream).
+
+This is still TODO since I made an odd discovery about this - the logic we were going on here was that the performance improvement was due to an eliminated buffer copy when the size of the read where >= the size of the buffer in the underlying BufferedInputStream. This would mean that the correct size for MAX_CHUNKS is ceil(io.file.buffer.size / 512) (ie 256 for a 128KB buffer I was testing with). If MAX_CHUNKS is less than that, then reads to the BIS would be less than its buffer size and thus you'd incur a copy.
+
+However, my benchmarking shows that this *isn't* the performance gain. Even with MAX_CHUNKS set to 4, there's a significant performance gain over MAX_CHUNKS set to 1. There is no significant difference between MAX_CHUNKS=127 and MAX_CHUNKS=128 for a 64K buffer, whereas the understanding above would indicate that 128 would eliminate a copy whereas 127 would not.
+
+So, I think this is actually improving performance because of some other effect like better cache locality by operating in larger chunks. Admittedly, cache locality is always the fallback excuse for a performance increase, but I don't have a better explanation yet. Anyone care to hazard a guess?, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12424165/hadoop-3205.txt
+  against trunk revision 832590.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/128/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/128/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/128/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/128/console
+
+This message is automatically generated., Previously I had been testing on a trunk from before HADOOP-6223. This new patch includes the same changes to ChecksumFs as were made to ChecksumFileSystem to fix TestLocalFSFileContextMainOperations., 
+I briefly went through the patch. looks fine. will review  soon. It updates readChunk()'s contract to include multiple chunks. 
+
+Are the DFSClient changes going to be part of a different jira? Let me know if I should do that.
+I think hdfs client's read numbers would as good as slightly better., > So, I think this is actually improving performance because of some other effect like better cache locality by operating in larger chunks. Admittedly, cache locality is always the fallback excuse for a performance increase, but I don't have a better explanation yet. Anyone care to hazard a guess?
+
+hmm... avoiding a copy should save measurable CPU. I will run some experiments as well., Yea, DFSClient will need a small edit as well, and I guess it will be a different JIRA since it's a different project. Annoyingly, the two jiras may have to be committed at the exact same time, since depending on the current implementation in DFSClient it may crash after this core change. I'll compile a core jar with this change and see whether HDFS still passes tests., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12424169/hadoop-3205.txt
+  against trunk revision 832590.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/129/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/129/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/129/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/129/console
+
+This message is automatically generated., New patch adds back the static checksum2Long function, since it was public and in use by HDFS code. HDFS continues to compile and pass tests on my machine using a common jar built from this patch. I made checksum2Long be @Deprecated since it's no longer used by FSInputChecker and with this patch it makes more sense to use IntBuffer to store multiple checksums.
+
+I created HDFS-755 to track progress taking advantage of this feature for DFSClient., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12424246/hadoop-3205.txt
+  against trunk revision 833553.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/130/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/130/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/130/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/130/console
+
+This message is automatically generated., bq. -1 tests included. The patch doesn't appear to include any new or modified tests.
+
+I believe this code path to be well exercised by existing tests (almost all the tests that do file IO go through this path and exercise it pretty well - note that existing tests failed when there were bugs in prior versions of the patch), Hey Todd,
+
+Nice change! 
+
+Would be good to add a comment where the checksum array gets created indicating that the size of the  array determines the size of the underlying IO. 
+
+In readChunk an invalid size checksum file currently results in a ChecksumException, is now an EOFException, would be good to revert back to ChecksumException and add a unit test for this.
+
+For sanity, do the existing tests cover both small, odd-size single block files?
+
+In readChecksum I'd make expected and calculated ints (know they were longs before your change) since the code deals w 32-bit sums and just truncate sum.getValue() rather than cast and truncate the checksumInts.get() return value. Could assert sum.getValue() == 0xffffffffL & sum.getValue() if we're feeling paranoid.
+
+It would be good to test the LocalFs version (appears LocalFs is untested) but since the LocalFs and LocalFileSystem diffs are the same let's leave that to a separate jira.
+
+Nits:
+- Idealy the new illegal argument exception in FSInputChecker.set would be an assert since the given checkSumSize is not configurable or passed in at runtime, however since we don't enable asserts yet by default perhaps ok to leave as is.
+
+- The new code in readChecksum would be more readable if it were left pulled out into a separate function (how verifySum was).
+
+- Was this way before your change but the back-to-back if statements on line 252-253 could be combined triviallly.
+
+Thanks,
+Eli, Circled around on this issue tonight and tried to look into the mysterious behavior with the value of MAX_CHUNKS (the constant that determines how many checksum chunks worth we'll read in a single go)
+
+I wrote a quick benchmark which read a 1GB file out of /dev/shm with checksums using different values of MAX_CHUNKS. For each value, I ran 50 separate trials and calculated the average, as well as doing t-tests to figure out which results were within noise of each other.
+
+{noformat}
+../hadoop-3205-bench/mc_64.user          3.0954
+../hadoop-3205-bench/mc_128.user         3.1036
+../hadoop-3205-bench/mc_8.user   3.1054
+../hadoop-3205-bench/mc_256.user         3.1104
+../hadoop-3205-bench/mc_32.user          3.1156 ** everything below here is within noise
+../hadoop-3205-bench/mc_16.user          3.1214
+../hadoop-3205-bench/mc_4.user   3.2896
+../hadoop-3205-bench/mc_2.user   3.427
+../hadoop-3205-bench/mc_1.user   3.6832
+
+../hadoop-3205-bench/mc_16.elapsed       3.423
+../hadoop-3205-bench/mc_64.elapsed       3.425
+../hadoop-3205-bench/mc_8.elapsed        3.4288
+../hadoop-3205-bench/mc_256.elapsed      3.4294
+../hadoop-3205-bench/mc_128.elapsed      3.434
+../hadoop-3205-bench/mc_32.elapsed       3.4392 ** everything below here is within noise
+../hadoop-3205-bench/mc_4.elapsed        3.6108
+../hadoop-3205-bench/mc_2.elapsed        3.7032
+../hadoop-3205-bench/mc_1.elapsed        3.9846
+{noformat}
+
+These were all done with a 64KB io.file.buffer.size, which would make us expect an optimal value of 128, since it should eliminate a copy. The results show that there are no gains to be had after 16 or 32 chunks being read at a time (8-16KB). The L1 cache on this machine is 128K, so that's not the magic number either.
+
+So basically, the performance improvement here remains a mystery to me, but it's clear there is one - about 13% for reading out of RAM on the machine above. Given these results, I'd propose hard coding MAX_CHUNKS to 32 rather than basing it on io.file.buffer.size as I earlier figured.
+
+On a separate note, some review responses:
+
+bq. Was this way before your change but the back-to-back if statements on line 252-253 could be combined triviallly.
+
+I think you missed the "chunkPos += read;" outside the inner if? Java seems to occasionally return -1 for EOF for some reason so I was nervous about letting that happen outside the if. I'd be happy to add an assert read >= 0 though for this case and make it part of the contract of readChunks to never return negative.
+
+
+The rest of the review makes sense, and I'll address those things and upload a new patch., I did some further investigation on this:
+
+- I ran the 1GB cat test using hprof=cpu=times to get accurate invocation counts for the various read calls. Increasing MAX_CHUNKS from 1 to 16 does exactly what's expected and reduces the number of calls to readChunks (and thus the input stream reads, etc) by exactly a factor of 16. The same is true of 128 - no noticeable differences. This is because System.arraycopy doesn't get accounted by hprof in this mode, for whatever reason.
+
+- I imported a copy of the BufferedInputStream source and made BufferedFSInputStream extend from it rather than from the java.io one. I added a System.err printout right before the System.arraycopy inside read1(). When I changed MAX_CHUNKS over from 127 to 128, I verified that it correctly avoided these copies and read directly into the buffer. So the goal of the JIRA to get rid of a copy was indeed accomplished.
+
+Now the confusing part: eliminating this copy does nothing in terms of performance. Comparing the MAX_CHUNKS=127 to MAX_CHUNKS=128 has no statistically significant effect on the speed of catting 1G from RAM.
+
+So my best theory right now on why it's faster is that it's simply doing fewer function calls, each of which does more work with longer loops. This is better for loop unrolling, instruction cache locality, and avoiding function call overhead. Perhaps it inspires the JIT to work harder as well - who knows what black magic lurks there :)
+
+I think at this point I've sufficiently investigated this, unless anyone has questions. I'll make the changes that Eli suggested and upload a new patch., New version of the patch. This addresses Eli's review comments, and adds some extra tests (one for truncated checksum file throwing ChecksumException, another for odd sized read buffers in a file with a few chunks). I also tidied up some of the comments to make it clearer to implementors what's going on.
+
+Just to be doubly sure, I reran all the benchmarks overnight and confirmed that reading 32 chunks at once had all the performance improvement benefits of a larger value (and uses less memory). Also reran HDFS-755 tests against this build with assertions on and everything looked good (plenty of assertion failures, but none in the new code!), +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12426818/hadoop-3205.txt
+  against trunk revision 886645.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 5 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h1.grid.sp2.yahoo.net/22/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h1.grid.sp2.yahoo.net/22/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h1.grid.sp2.yahoo.net/22/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h1.grid.sp2.yahoo.net/22/console
+
+This message is automatically generated., bq. I think you missed the "chunkPos += read;" outside the inner if? Java seems to occasionally return -1 for EOF for some reason so I was nervous about letting that happen outside the if. I'd be happy to add an assert read >= 0 though for this case and make it part of the contract of readChunks to never return negative.
+
+Yup, I think the way it is now is good. 
+
+Patch looks great. Like the new comments and test modifications. Thanks for running the additional experiments. 
+
++1, 
++1. The patch looks good.  
+
+> Like the new comments and test modifications. 
+thanks for good comments and javadoc.
+
+I find it surprising as well, that avoiding a buffer copy does not show any improvement (so is 13% for function calls or other java voodoo). 
+
+Limit of 32 chunks : it is true that your tests didn't show benefit beyond that for LocalFileSystem.. not sure if that justifies limiting fs implementation's access to user buffer. Is to reduce memory allocated for checksum buffer?
+
+I will run the tests on my laptop. The jira need not wait for my results., I've just committed this. Thanks Todd!, Integrated in Hadoop-Common-trunk-Commit #133 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Common-trunk-Commit/133/])
+    . Read multiple chunks directly from FSInputChecker subclass into user buffers. Contributed by Todd Lipcon.
+, Integrated in Hadoop-Common-trunk #210 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Common-trunk/210/])
+    . Read multiple chunks directly from FSInputChecker subclass into user buffers. Contributed by Todd Lipcon.
+]

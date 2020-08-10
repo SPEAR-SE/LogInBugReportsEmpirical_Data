@@ -1,0 +1,73 @@
+[bq. It seems that the interrupted condition can be set by log4j (of which there are many calls inside TaskLauncher)
+
+Really? Do you have a scenario of the execution inside the AsyncAppender that could lead to this?, no i don't know the exact code path that caused this to happen. however:
+
+- we had an instance of the TaskLauncher dying. the logs indicated it died because of an interrupted condition or interrupted exception. jobs got hung because of this.
+- Thread.interrupted() state is a global state. any subsystem (like log4j) can set it. it's very unsafe to use this as a way of determining whether the thread should exit. we should gate thread exit on running flag.
+
+note that all the other threads in the TaskTracker check the running flag to determine thread exit condition. I used the log4j code as a potential example of a subsystem that can set the interrupted flag - i am not even sure we are using asyncappender., When the TT re-inits, the launcher threads are interrupted and they are created again in the initialization (just stating the obvious). Are you sure that there was no issue in the creation of the launcher threads? I want to see if we can narrow down the problem further before going down the route of gating the thread exit on the running flag. I am still not convinced that if the interrupted status was set, it wasn't intentional (intentional -> TaskTracker.close())..., i grepped through both the tasktracker and jobtracker log and looked for anything matching reinit. nothing there.
+
+the TT log is very clear in indicating that the map launcher just stopped working at some point (it never emerged from a wait call). The reduce task launcher kept working. unfortunately i didn't take a stack dump of the TT before we restarted things. These are the log entries after which the Launcher disappeared:
+
+2010-10-23 22:16:59,381 INFO org.apache.hadoop.mapred.TaskTracker: LaunchTaskAction (registerTask): attempt_201010171815_32743_m_000019_0 task's s\
+tate:UNASSIGNED
+2010-10-23 22:16:59,381 INFO org.apache.hadoop.mapred.TaskTracker: Trying to launch : attempt_201010171815_32743_m_000019_0 which needs 1 slots
+2010-10-23 22:16:59,381 INFO org.apache.hadoop.mapred.TaskTracker: TaskLauncher : Waiting for 1 to launch attempt_201010171815_32743_m_000019_0, currently we have 0 free slots
+
+looking back - the only way this could have happened is actually via the InterruptedException code path (and not the interrupted() state). (since if we bailed out via the interrupted() check - there would have been some more log entries filed after coming out of the wait. (But that doesn't make sense as per Java's contract of InterruptedException)., see: https://issues.apache.org/bugzilla/show_bug.cgi?id=44157
+
+with the patch for this - log4j is setting interrupted state for threads. i think this bug and the comments suggest that there may be cases where InterruptedException is still being propagated from log4j (which is actually the more likely culprit for MAPREDUCE-2157). so it makes sense, as a precaution, to check for shutdown conditions inside interruptedexception handlers before exiting., i think i have a idea now on why InterruptedExceptions can also happen unexpectedly. Consider this hadoop-20 TT code:
+
+{quote}
+        try { 
+           ...
+           while (numFreeSlots.get() < task.getNumSlotsRequired()) {
+              LOG.info("...");
+              numFreeSlots.wait();
+            }
+        catch (InterruptedException e) {
+           return;
+        }
+{quote}
+
+LOG.info can set the thread interrupted state because it can get an InterruptedIOException. InterruptedIOException can be thrown for reasons other than threads getting interrupted via Java Thread.interrupt() invocations. Documentation seems to suggest that it will be thrown on interrupted read/write system calls (which log4j does plenty of). 
+
+If thread interrupted state is set - then the succeeding numFreeSlots.wait() call will throw an InterruptedException. This is as per documentation. Bingo - thread will now terminate.
+
+I think the bottomline is that we should *never* depend solely on InterruptedException of interrupted status to determine shutdown. it might be ok if the only thing that the code does is Object.wait() and has while/try blocks around it - but if file/socket operations are involved in the mix - this is very dangerous.
+, another thing i figure out: we are actually running log4j 1.2.15 which does not have the fix for the bug referenced above. I looked through 1.2.15 log4j code and couldn't figure out who sets the interrupted status of the thread. Finally found out that JVM PrintStream class does it in the guts of the write() method (look at source in http://hg.openjdk.java.net/jdk7/jdk7/jdk/file/cf44386c8fe3/src/share/classes/java/io/PrintStream.java).
+
+So everything's explained. log4j.info call went to printstream.write. which is going to ConsoleAppender being redirected to a file. For some reason the write system call was interrupted - and printstream set the thread interrupted status. tasklauncher hit wait() call and got interruptedexception and terminated., If this is the case (which seems plausible), we should do a check of other places where we have log.* calls before a blocking call..., agreed - there are many cases where the handling of InterruptedException is unsafe in MR code. I will post a patch addressing all of these. Renaming to reflect altered scope., - get rid of 'interrupted()' check for termination (only one case in mr code base)
+- don't rely on interruptedexception to determine thread termination condition. always check (and set) separate shutdown flag to check termination condition.
+- mark some threads as daemon threads where they were not previously marked so. this is to alleviate any concerns around threads ignoring signals now and not shutting down., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12458689/mapreduce-2157.1.patch
+  against trunk revision 1074251.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these core unit tests:
+                  org.apache.hadoop.mapred.TestLostTracker
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+    +1 system test framework.  The patch passed system test framework compile.
+
+Test results: https://hudson.apache.org/hudson/job/PreCommit-MAPREDUCE-Build/56//testReport/
+Findbugs warnings: https://hudson.apache.org/hudson/job/PreCommit-MAPREDUCE-Build/56//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://hudson.apache.org/hudson/job/PreCommit-MAPREDUCE-Build/56//console
+
+This message is automatically generated., Sorry to come in late, the patch has gone stale. Can you please rebase? Thanks.
+
+Given this is not an issue with MRv2 should we still commit this? I'm happy to, but not sure it's useful. Thanks.]

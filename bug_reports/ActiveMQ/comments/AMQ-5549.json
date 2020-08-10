@@ -1,0 +1,165 @@
+[This seems to be related: https://issues.apache.org/jira/browse/AMQ-4705
+
+Tested with the following configurations:
+
+- Grace Time 45s, Lease Time 10s
+- lockKeepAlivePeriod=15000
+- lockAcquireSleepInterval=5000
+
+- Grace Time 45s, Lease Time 10s
+- lockKeepAlivePeriod=15000
+- lockAcquireSleepInterval=5000
+
+- Grace Time 60s, Lease Time 30s
+- lockKeepAlivePeriod=15000
+- lockAcquireSleepInterval=5000
+
+- Grace Time 60s, Lease Time 30s
+- lockKeepAlivePeriod=5000
+- lockAcquireSleepInterval=15000
+
+All tests came out with the same results as the original.
+
+Configuration:
+
+{code:xml}
+        <persistenceAdapter>
+            <kahaDB directory="${activemq.data}/kahadb" lockKeepAlivePeriod="15000">
+              <locker>
+                <shared-file-locker lockAcquireSleepInterval="5000"/>
+              </locker>
+            </kahaDB>
+        </persistenceAdapter>
+{code}
+, The following combination seems to work IF the network outage between the NFS client(s) and the NFS server is short (a couple of seconds):
+
+* Grace Time 90s, Lease Time 60s
+* lockKeepAlivePeriod=5000
+* lockAcquireSleepInterval=15000
+
+In this case the master broker is able to renew the lock and continue operating and the slave broker fails to get the lock.
+
+However if the network outage is significantly longer (tested with various durations between 30 and 300 seconds), both brokers are able to get lock on the file and start working simutaneously. Even though the master brokers dmesg shows the following message after the outage:
+
+"NFS: nfs4_reclaim_open_state: Lock reclaim failed!"
+
+It seems that this happens if the lock reclaiming (keepAlive?) operation on the master broker gets blocked for long enough time for the NFS server lease timeout to pass. In this case the slave is able to claim the lock (if it's NFS filesystem stops blocking earlier) and after the master stops blocking it continues to operate even though NFS client reports "Lock reclaim failed!".
+
+Seems also that the time it takes for the individual NFS client to recover from blocking I/O varies between clients., Hi, the config
+
+{code:xml}
+<kahaDB directory="${activemq.data}/kahadb" lockKeepAlivePeriod="15000">
+  <locker>
+    <shared-file-locker lockAcquireSleepInterval="5000"/>
+  </locker>
+</kahaDB>
+{code}
+has an error. lockKeepAlivePeriod should be much lower than lockAcquireSleepInterval (at max half of lockAcquireSleepInterval, perhaps even below that).
+
+{code:xml}
+<levelDB directory="/nfs-import/leveldb" lockKeepAlivePeriod="5000">
+  <locker>
+    <shared-file-locker lockAcquireSleepInterval="10000"/>
+  </locker>
+</levelDB>
+{code}
+
+You also want to explicitly configure for restartAllowed="false" on the broker config.
+
+Finally, what are your mount options? We have learned the mount options used play a significant role.
+
+
+
+, Hi, thanks for the comments.
+
+In later testing, different configurations were tested and finally the settings were:
+
+{code:xml}
+<kahaDB directory="${activemq.data}/kahadb" lockKeepAlivePeriod="5000">
+  <locker>
+    <shared-file-locker lockAcquireSleepInterval="15000"/>
+  </locker>
+</kahaDB>
+{code}
+
+as mentioned in the last comment. This setup combined with NFSv4 lease timeout of 60 seconds yielded the best results although still failing when the network outage was long enough for the NFS filesystem to block for a long time (even after the connection was restored).
+
+Mount options are there in the issue description but I re-visited them for further testing and finally used these (trying to increase the timeout value to maximum):
+
+rw,nfsvers=4,proto=tcp,timeo=6000,retrans=3,hard,wsize=65536,rsize=65536
+
+Although this didn't make much difference compared to the default timeout of 600 deciseconds.
+
+I will give restartAllowed a try.
+
+Furthermore I tested the exact same setup with a NetApp filer NFSv4 server with the exact same settings and brokers behaved as they should have. Master was able to continue operating and slave did not get the lock after 5, 30, 45 or 180 second outages.
+, Some of the NFS mount options may not support a quick broker failover from master to slave. 
+The options we finally got best results with where
+
+{code}
+timeo=100,retrans=1,soft,noac
+{code}
+
+We reduced the timeout to 10 seconds and also reduced the retry to just 1. 
+In addition a hard mount seems to retry NFS operations forever (according to man page) and using soft operations will fail after retrans transmission attempts. Most likely what you want to ensure a quick failover.
+And finally the noac option seemed to had a big effect as well on the speed at which the master broker detects the NFS failure as it also caused a sync write to NFS, which seems to propagate exceptions more quickly. It most likely has a negative impact on performance though.
+
+I can't provide a scientific support for these arguments other than above but with these settings the master broker would should down much quicker upon an NFS failure. 
+, I'm a bit hesitant on using soft mounts unless ActiveMQ explicitly requires them. NetApp and others always advice against using soft mounts with NFSv4. Problem we're having is not with the broker failover but with what happens if the shared storage fails (both brokers lose the connection) and how the brokers recover from it after the NFSv4 lock lease has expired.
+
+Have you tested your setup with failing the NFS server connection or killing the server ungracefully? For me soft mounts only made the situation worse (which kind of makes sense).
+
+Here's some other issues around the subject (for those with RHN access):
+
+https://access.redhat.com/solutions/1195703
+https://access.redhat.com/solutions/478053
+https://access.redhat.com/solutions/382283
+
+https://issues.jboss.org/browse/ENTMQ-391, I am not suggesting ActiveMQ requires a soft NFS mount. Just noticed we got NFS errors propagated much quicker using soft mounts. 
+
+Yes, the fix for ENTMQ-391 will be needed and its contained in 5.9.0. See AMQ-4705.
+
+In my tests I shut down the nic of the nfs client machine that runs the broker and tested how quickly this resulted in an error on the master broker and how quickly a slave broker running on a different machine takes over. 
+
+With the NFS options 
+
+{code}
+timeo=50,retrans=1,soft,noac
+{code}
+
+and the previously suggested broker configuration the master broker would raise an exception within 15 secs after loosing access to the NFS share and would shutdown within another 1-2 minutes. During the shutdown the broker tries to close all file pointing to the persistence store and that close() call hangs too and needs to timeout as well.
+It took about 60 - 80 seconds for the slave broker to take over. 
+
+Previously testing with default NFS mount options the master broker would some times not shut down within 10+ minutes. 
+
+I took various thread dumps along the way and the broker was always hung in a Java I/O operation that took a long time to finally raise an exception. 
+Was able to reproduce the same behavior using a very simple Java application that only tries the same Java I/O. So IMHO the entire issue is really down to configuring NFS in a way that it quickly raises errors to the application stack.
+ 
+, Yes that is the case when you break the connection between one of the brokers and the NFS storage. What I'm after and testing is the situation when you break the connection to the NFS storage altogether so that _both_ brokers lose the connectivity simultaneously and what happens _after_ the connection to the NFS share comes back. This is when both brokers are able to grab the lock.
+
+Maybe I wasn't clear enough in the original issue description but this is about NFS server failures (crash, network outage, ungraceful shutdown, ...) affecting all the NFS clients., Hi 
+
+The two cases are different, but I'm not sure if this makes a difference. 
+
+When, for whatever reason, the shared storage lock is released by the shared storage provider (after the grace period), the slave can grab the lock, becomes master and works as expected. This works fine in all cases I have seen.
+
+The key question is how the former master behaves. In all descriptions about two active master brokers, the problem arises because the former master continues to do so. So the real problem is that the master does not recognize that he has lost the lock. This can happen in all shared storage configurations. 
+
+Jean-Baptiste Onofré describes the same problem with a shared JDBC datastore here: http://blog.nanthrax.net/2013/10/apache-activemq-5-7-5-9-and-master-slave. 
+
+In my tests with shared LevelDB-Store over NFS4 and hard mounts, the former master broker NEVER realized that another broker has taken the lock. With a soft mount it was realizing the new situation after a massive delay (about 5 minutes). With the NFS options Torsten mentioned the master broker realizes the new situation after 15 to 30 seconds. I am not saying that these settings are save for production, I just observed that changes to NFS settings lead to completely different results. 
+
+So my guess is that the whole problem is just a matter of NFS settings. But this part is never mentioned in example setups etc. Is anybody out there who has a working and tested shared-filesystem architecture with NFS? It would be very helpful to have a "reference configuration" that works. , {quote}
+Maybe I wasn't clear enough in the original issue description but this is about NFS server failures (crash, network outage, ungraceful shutdown, ...) affecting all the NFS clients.
+{quote}
+Got you. Have not tested that. With restartAllowed=false the master should shut down at the least and stop its transport connectors.
+
+Also did some more reading on sync mount option. It is discouraged in some posts but I would hope that by also using noac or sync mount option, it should be okay as writes are sync now. So data should not get corrupted. This however comes at the expense of a performance degradation.
+
+
+, One thing to make clear here (it seemed unclear from the title and original bug description).  There's a choice that must be made here - either allow for the possibility of neither broker being active (NFS v3 approach) or allow for the possibility of both being active (NFS v4) -- for some period of time.
+
+It will be possible to reduce the amount of time the two brokers in an H/A pair are simultaneously active through NFS options - if the broker can detect the condition.  But it's not possible to eliminate the possibility of both being active for some time with NFS v4.
+
+With that said, if the original active broker does not stop once it realizes that it lost the lock, or it cannot reliably detect a lost lock, a fix is welcome.  Just be aware that even with such a fix, there's a possibility of corruption to the KahaDB.  Documentation of various NFS settings and their outcomes would also be welcome., Also see AMQ-5568., The window if closed via https://git1-us-west.apache.org/repos/asf?p=activemq.git;a=commit;h=9bc602be
+]

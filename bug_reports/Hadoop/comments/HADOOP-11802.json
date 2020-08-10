@@ -1,0 +1,511 @@
+[In the main finally block of the {{DomainSocketWatcher#watcherThread}}, the call to {{sendCallback}} can encounter an {{IllegalStateException}}, and leave some cleanup tasks undone.
+
+{code}
+      } finally {
+        lock.lock();
+        try {
+          kick(); // allow the handler for notificationSockets[0] to read a byte
+          for (Entry entry : entries.values()) {
+            // We do not remove from entries as we iterate, because that can
+            // cause a ConcurrentModificationException.
+            sendCallback("close", entries, fdSet, entry.getDomainSocket().fd);
+          }
+          entries.clear();
+          fdSet.close();
+        } finally {
+          lock.unlock();
+        }
+      }
+{code}
+
+The exception causes {{watcherThread}} to skip the calls to {{entries.clear()}} and {{fdSet.close()}}.
+
+{code}
+2015-04-02 11:48:09,941 [DataXceiver for client unix:/home/gs/var/run/hdfs/dn_socket [Waiting for operation #1]] INFO DataNode.clienttrace: cliID: DFSClient_NONMAPREDUCE_-807148576_1, src: 127.0.0.1, dest: 127.0.0.1, op: REQUEST_SHORT_CIRCUIT_SHM, shmId: n/a, srvID: e6b6cdd7-1bf8-415f-a412-32d8493554df, success: false
+2015-04-02 11:48:09,941 [Thread-14] ERROR unix.DomainSocketWatcher: Thread[Thread-14,5,main] terminating on unexpected exception
+java.lang.IllegalStateException: failed to remove b845649551b6b1eab5c17f630e42489d
+        at com.google.common.base.Preconditions.checkState(Preconditions.java:145)
+        at org.apache.hadoop.hdfs.server.datanode.ShortCircuitRegistry.removeShm(ShortCircuitRegistry.java:119)
+        at org.apache.hadoop.hdfs.server.datanode.ShortCircuitRegistry$RegisteredShm.handle(ShortCircuitRegistry.java:102)
+        at org.apache.hadoop.net.unix.DomainSocketWatcher.sendCallback(DomainSocketWatcher.java:402)
+        at org.apache.hadoop.net.unix.DomainSocketWatcher.access$1100(DomainSocketWatcher.java:52)
+        at org.apache.hadoop.net.unix.DomainSocketWatcher$2.run(DomainSocketWatcher.java:522)
+        at java.lang.Thread.run(Thread.java:722)
+{code}
+
+Please note that this is not a duplicate of HADOOP-11333, HADOOP-11604, or HADOOP-10404. The cluster installation is running code with all of these fixes.
+
+The place in {{sendCallback}} where it is encountering the exception is
+{code}
+    if (entry.getHandler().handle(sock)) {
+{code}
+
+Once the {{IllegalStateException}} occurs, I am seeing 4069 datanode threads getting stuck in {{DomainSocketWatcher#add}} when {{DataXceiver}} is trying to request a new short circuit read. This is similar to the symptoms seen in HADOOP-11333, but, as I mentioned above, the cluster is already running with that fix.
+
+Here is the stack trace from the stuck threads, for reference:
+{noformat}
+"DataXceiver for client unix:/home/gs/var/run/hdfs/dn_socket [Waiting for operat
+ion #1]" daemon prio=10 tid=0x00007fcbbcae1000 nid=0x498a waiting on condition [
+0x00007fcb61132000]
+   java.lang.Thread.State: WAITING (parking)
+        at sun.misc.Unsafe.park(Native Method)
+        - parking to wait for  <0x00000000d06c3a78> (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)
+        at java.util.concurrent.locks.LockSupport.park(LockSupport.java:186)
+        at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await(AbstractQueuedSynchronizer.java:2043)
+        at org.apache.hadoop.net.unix.DomainSocketWatcher.add(DomainSocketWatcher.java:323)
+        at org.apache.hadoop.hdfs.server.datanode.ShortCircuitRegistry.createNewMemorySegment(ShortCircuitRegistry.java:322)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.requestShortCircuitShm(DataXceiver.java:403)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opRequestShortCircuitShm(Receiver.java:214)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:95)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:235)
+        at java.lang.Thread.run(Thread.java:722)
+{noformat}, Hi Eric,
+
+You should never be in "the main finally block" of DomainSocketWatcher unless you are in a unit test.  If you are in this finally block in the actual DataNode, something is wrong.  You should see a string like "terminating on InterruptedException" or "terminating on IOException" explaining why you ended up in this finally block in the first place.  This should be the root cause.  Do you have a log line like that?, Thanks [~cmccabe] for your comment and interest in this issue.
+
+This problem is happening in multiple different live clusters. Only a small percentage of datanodes are affected each day, but once they hit this and the threads pile up, the datanodes must be restarted.
+
+The only 'terminating on' message in the DN log is coming from DomainSocketWatchers unhandled exception handler. That is, it's the one documented in the description above:
+{quote}
+{noformat}
+2015-04-04 13:12:31,059 [Thread-12] ERROR unix.DomainSocketWatcher: Thread[Thread-12,5,main] terminating on unexpected exception
+java.lang.IllegalStateException: failed to remove 17e33191fa8238098d7d22142f5787e2
+2015-04-02 11:48:09,941 [DataXceiver for client unix:/home/gs/var/run/hdfs/dn_socket [Waiting for operation #1]] INFO DataNode.clienttrace: cliID: DFSClient_NONMAPREDUCE_-807148576_1, src: 127.0.0.1, dest: 127.0.0.1, op: REQUEST_SHORT_CIRCUIT_SHM, shmId: n/a, srvID: e6b6cdd7-1bf8-415f-a412-32d8493554df, success: false
+2015-04-02 11:48:09,941 [Thread-14] ERROR unix.DomainSocketWatcher: Thread[Thread-14,5,main] terminating on unexpected exception
+java.lang.IllegalStateException: failed to remove b845649551b6b1eab5c17f630e42489d
+...
+{noformat}
+{quote}
+However, as you pointed out, that is happening after something went wrong in the main try block of the watcher thread. Since I'm seeing neither 'terminating on InterruptedException' nor 'terminating on IOException', there must be some other exception occurring. However, the only reference in the DN log of {{DomainSocketWatcher}} is in the stack trace already mentioned.
+
+However, just above the IllegalStateException stacktrace is the following that indicated a premature EOF occurred. There were several of these, but it's not clear that they are related to the reason why the DomainSocketWatcher exited.
+Your input would be greatly appreciated.
+{noformat}
+2015-04-02 11:48:09,885 [DataXceiver for client DFSClient_attempt_1427231924849_569467_m_000135_0_346288762_1 at /xxx.xxx.xxx.xxx:41908 [Receiving block BP-658831282-xxx.xxx.xxx.xxx-1351509219914:blk_3365919992_1105804585360]] ERROR datanode.DataNode: gsta70851.tan.ygrid.yahoo.com:1004:DataXceiver error processing WRITE_BLOCK operation  src: /xxx.xxx.xxx.xxx:41908 dst: /xxx.xxx.xxx.xxx:1004
+java.io.IOException: Premature EOF from inputStream
+        at org.apache.hadoop.io.IOUtils.readFully(IOUtils.java:194)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.PacketReceiver.doReadFully(PacketReceiver.java:213)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.PacketReceiver.doRead(PacketReceiver.java:134)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.PacketReceiver.receiveNextPacket(PacketReceiver.java:109)
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receivePacket(BlockReceiver.java:467)
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receiveBlock(BlockReceiver.java:781)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.writeBlock(DataXceiver.java:730)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opWriteBlock(Receiver.java:137)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:74)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:235)
+        at java.lang.Thread.run(Thread.java:722)
+{noformat}, Sorry, I just noticed that the following was the first exception in the series:
+{noformat}
+2015-04-02 11:48:09,866 [DataXceiver for client unix:/home/gs/var/run/hdfs/dn_socket [Waiting for operation #1]] ERROR datanode.DataNode: gsta70851.tan.ygrid.yahoo.com:1004:DataXceiver error processing REQUEST_SHORT_CIRCUIT_SHM operation  src: unix:/home/gs/var/run/hdfs/dn_socket dst: <local>
+java.net.SocketException: write(2) error: Broken pipe
+        at org.apache.hadoop.net.unix.DomainSocket.writeArray0(Native Method)
+        at org.apache.hadoop.net.unix.DomainSocket.access$300(DomainSocket.java:45)
+        at org.apache.hadoop.net.unix.DomainSocket$DomainOutputStream.write(DomainSocket.java:601)
+        at com.google.protobuf.CodedOutputStream.refreshBuffer(CodedOutputStream.java:833)
+        at com.google.protobuf.CodedOutputStream.flush(CodedOutputStream.java:843)
+        at com.google.protobuf.AbstractMessageLite.writeDelimitedTo(AbstractMessageLite.java:91)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.sendShmSuccessResponse(DataXceiver.java:380)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.requestShortCircuitShm(DataXceiver.java:418)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opRequestShortCircuitShm(Receiver.java:214)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:95)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:235)
+{noformat}
+, It's clear to me that the proximate cause of the {{DomainSocketWatcher}} thread exiting on the {{DataNode}} is that it tried to remove a shared memory segment ID that was not registered.  But if I'm reading these stack traces right, the attempted removal is happening in the finally block-- a place where we should never actually be, except in unit tests.  That means  that there was another exception that triggered this whole problem.  Without knowing what that root cause is, I don't think we can get any farther on this.
+
+I suggest adding another catch block here: 
+
+{code}
+        doPoll0(interruptCheckPeriodMs, fdSet);
+        }
+      } catch (InterruptedException e) {
+        LOG.info(toString() + " terminating on InterruptedException");
+      } catch (IOException e) {
+        LOG.error(toString() + " terminating on IOException", e);
+      } finally {
+        lock.lock();
+ {code}
+
+If we had a catch block catching {{RuntimeException}} and printing it out, that might give you the true root cause., I thought about this a little bit more, and I wonder whether this finally block inside requestShortCircuitShm is causing a "double removal":
+
+{code}
+  public void requestShortCircuitShm(String clientName) throws IOException {                                             
+    NewShmInfo shmInfo = null;                                                                                           
+    boolean success = false;                                                                                             
+    DomainSocket sock = peer.getDomainSocket();                                                                          
+    try {                                                                                                                
+...
+    } finally {                                                                                                          
+...
+      if ((!success) && (peer == null)) {
+        // If we failed to pass the shared memory segment to the client,                                                 
+        // close the UNIX domain socket now.  This will trigger the                                                      
+        // DomainSocketWatcher callback, cleaning up the segment.                                                        
+        IOUtils.cleanup(null, sock);                                                                                     
+      }
+      IOUtils.cleanup(null, shmInfo);                                                                                    
+    }                                                                                                                    
+{code}
+
+Closing the socket will remove that shmID, but so will closing the NewShmInfo object... let me look into this.
+
+edit: NewShmInfo#close just closes the shared memory segment, but not the domain socket.  Since DomainSocketWatcher is watching the domain socket rather than the shm fd, doing both close operations should not be a problem.  So I would still recommend adding the catch block and seeing what that tells us., Thanks again, [~cmccabe], for your comments and taking time on this issue.
+
+One thing to note is that just prior to these problems, a 195-second GC was taking place on the DN.
+
+I added a catch of {{Throwable}} in the main thread of the {{DomainSocketWatcher}} and reproduced the problem. AFAICT, the following represents what is happening:
+
+- Request for short circuit read is received
+- {{DataXceiver#requestShortCircuitShm}} calls {{ShortCircuitRegistry#createNewMemorySegment}}, which creates a shared memory segment and associates it with the passed domain socket in the {{DomainSocketWatcher}}. Then, in that thread, {{createNewMemorySegment}} waits on that socket/shm entry in {{DomainSocketWatcher#add}}.
+{code}
+  public NewShmInfo createNewMemorySegment(String clientName,
+...
+    watcher.add(sock, shm);
+...
+{code}
+- It's at this point that things get confusing, and I'm still working on why this happens. The wait wakes up, but things are not normal, but it wasn't woken up because of an exception, either. You can tell that no exception was thrown inside {{createNewMemorySegment}} to wake it up because the following code goes on to call {{sendShmSuccessRespons}}, which is where the next bad thing happens:
+{code}
+    public void requestShortCircuitShm(String clientName) throws IOException {
+...
+      try {
+        shmInfo = datanode.shortCircuitRegistry.
+            createNewMemorySegment(clientName, sock);
+        // After calling #{ShortCircuitRegistry#createNewMemorySegment}, the
+        // socket is managed by the DomainSocketWatcher, not the DataXceiver.
+        releaseSocket();
+      } catch (UnsupportedOperationException e) {
+        sendShmErrorResponse(ERROR_UNSUPPORTED, 
+            "This datanode has not been configured to support " +
+            "short-circuit shared memory segments.");
+        return;
+      } catch (IOException e) {
+        sendShmErrorResponse(ERROR,
+            "Failed to create shared file descriptor: " + e.getMessage());
+        return;
+      }
+      sendShmSuccessResponse(sock, shmInfo);
+...
+{code}
+- At this point, the call to {{sendShmSuccessResponse}} gets an exception:
+{noformat}
+2015-04-04 13:12:30,973 [DataXceiver for client unix:/home/gs/var/run/hdfs/dn_socket [Waiting for operation #1]]
+      INFO DataNode.clienttrace: cliID: DFSClient_attempt_1427231924849_569269_m_002116_0_-161414780_1,
+      src: 127.0.0.1, dest: 127.0.0.1, op: REQUEST_SHORT_CIRCUIT_SHM, shmId: n/a,
+      srvID: a2d3bac0-e98b-4b73-a5a1-82c7eb557a7a, success: false
+2015-04-04 13:12:30,984 [DataXceiver for client unix:/home/gs/var/run/hdfs/dn_socket [Waiting for operation #1]]
+      ERROR datanode.DataNode: host.domain.com:1004:DataXceiver error processing
+      REQUEST_SHORT_CIRCUIT_SHM operation  src: unix:/home/gs/var/run/hdfs/dn_socket dst: <local>
+     
+java.net.SocketException: write(2) error: Broken pipe
+        at org.apache.hadoop.net.unix.DomainSocket.writeArray0(Native Method)
+        at org.apache.hadoop.net.unix.DomainSocket.access$300(DomainSocket.java:45)
+        at org.apache.hadoop.net.unix.DomainSocket$DomainOutputStream.write(DomainSocket.java:601)
+        at com.google.protobuf.CodedOutputStream.refreshBuffer(CodedOutputStream.java:833)
+        at com.google.protobuf.CodedOutputStream.flush(CodedOutputStream.java:843)
+        at com.google.protobuf.AbstractMessageLite.writeDelimitedTo(AbstractMessageLite.java:91)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.sendShmSuccessResponse(DataXceiver.java:380)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.requestShortCircuitShm(DataXceiver.java:418)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opRequestShortCircuitShm(Receiver.java:214)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:95)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:235)
+        at java.lang.Thread.run(Thread.java:722)
+{noformat}
+- At this point, it bubbles back up to {{DataXceiver#requestShortCircuitShm}}, which cleans up, closing the socket:
+{code}
+...
+      if ((!success) && (peer == null)) {
+        // If we failed to pass the shared memory segment to the client,
+        // close the UNIX domain socket now.  This will trigger the 
+        // DomainSocketWatcher callback, cleaning up the segment.
+        IOUtils.cleanup(null, sock);
+      }
+{code}
+- Then, the main {{DomainSocketWatcher}} thread wakes up (after regular timeout interval has expired), and tries to call {{sendCallbackAndRemove}}, which encounters the following {{IllegalArgumentException}}:
+{code}
+  final Thread watcherThread = new Thread(new Runnable() {
+...
+        while (true) {
+          lock.lock();
+          try {
+            for (int fd : fdSet.getAndClearReadableFds()) {
+              sendCallbackAndRemove("getAndClearReadableFds", entries, fdSet,
+                  fd);
+            }
+...
+{code}
+{noformat}
+ERROR unix.DomainSocketWatcher: org.apache.hadoop.net.unix.DomainSocketWatcher$2@76845081
+      terminating on Throwable
+java.lang.IllegalArgumentException: DomainSocketWatcher(103231254): file descriptor 249 was closed
+      while still in the poll(2) loop.
+        at com.google.common.base.Preconditions.checkArgument(Preconditions.java:88)
+        at org.apache.hadoop.net.unix.DomainSocketWatcher.sendCallback(DomainSocketWatcher.java:421)
+        at org.apache.hadoop.net.unix.DomainSocketWatcher.sendCallbackAndRemove(DomainSocketWatcher.java:448)
+        at org.apache.hadoop.net.unix.DomainSocketWatcher.access$500(DomainSocketWatcher.java:52)
+        at org.apache.hadoop.net.unix.DomainSocketWatcher$2.run(DomainSocketWatcher.java:470)
+        at java.lang.Thread.run(Thread.java:745)
+{noformat}
+
+I welcome your suggestions and look forward to your feedback.
+Thanks,
+Eric, Thanks for following up, [~eepayne].
+
+{code}
+java.net.SocketException: write(2) error: Broken pipe
+        at org.apache.hadoop.net.unix.DomainSocket.writeArray0(Native Method)
+        at org.apache.hadoop.net.unix.DomainSocket.access$300(DomainSocket.java:45)
+{code}
+This error means that the socket was closed by the remote end.  This is not surprising since there was a really long GC, and the client read operation timed out.
+
+bq. Then, the main DomainSocketWatcher thread wakes up (after regular timeout interval has expired), and tries to call sendCallbackAndRemove
+
+Small correction, {{DomainSocketWatcher}} is event-triggered rather than timeout triggered.  The only timeout we have is so we can check if someone sent a Java {{InterruptedException}}.
+
+{code}
+ERROR unix.DomainSocketWatcher: org.apache.hadoop.net.unix.DomainSocketWatcher$2@76845081
+      terminating on Throwable
+java.lang.IllegalArgumentException: DomainSocketWatcher(103231254): file descriptor 249 was closed
+      while still in the poll(2) loop.
+        at com.google.common.base.Preconditions.checkArgument(Preconditions.java:88)
+{code}
+This is the root cause.  {{DomainSocket#close}} is not supposed to be closed while the socket is in the poll(2) loop.  Another file descriptor could be opened and get the same number, which would cause bad behavior.  I can see now that the call to {{DomainSocket#close}} in DataXceiver is a mistake., version 1 of the patch:
+* {{DataXceiver.java}}: do not close the DomainSocket on an error.  This is bad because the socket might already be getting poll()ed by the thread.  Instead, call {{shutdown(RDWR)}} on the socket.
+* Log all {{Throwables}} that terminate the {{DomainSocketWatcher}} thread.  If there is a follow-on error, we don't want it to obscure the true cause of the problem.
+* {{DomainSocketWatcher.c}}: look for both {{POLLIN}} and {{POLLHUP}} events when calling {{poll()}}.  Some UNIX variants (although not Linux) return POLLHUP instead of POLLIN when shutdown is called on the socket.
+* {{BlockReaderFactory.java}}: add a {{injectRequestShortCircuitShmFailure}} method to the {{BlockReaderFactory#FailureInjector}} class.
+* {{TestShortCircuitCache}}: add unit test, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12725419/HADOOP-11802.001.patch
+  against trunk revision fddd552.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:red}-1 javac{color:red}.  The patch appears to cause the build to fail.
+
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/6102//console
+
+This message is automatically generated., fix typo, {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12725472/HADOOP-11802.002.patch
+  against trunk revision fddd552.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/6103//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/6103//console
+
+This message is automatically generated., [~cmccabe], Thanks very much for the patch.
+
+I was able to manually verify that the patch fixed the problem we were encountering when {{DomainSocketWatcher}}'s main thread was dying. Using the same methods as used previously to generate the exception in {{DataXceiver#requestShortCircuitShm}}, I was able to verify that the main thread of {{DomainSocketWatcher}} remains running.
+
+However, I don't think the unit test is verifying this use case. Here's what I did:
+1. I patched branch-2 with {{HADOOP-11802.002.patch}}, built it, and ran the test for {{TestShortCircuitCache#testDataXceiverHandlesRequestShortCircuitShmFailure}}. This was successful.
+2. I commented out the following code in {{DataXceiver#requestShortCircuitShm}}
+{code}
+      if ((!success) && releasedSocket) {
+        try {
+          sock.shutdown();
+        } catch (IOException e) {
+          LOG.warn("Failed to shut down socket in error handler", e);
+        }
+      }
+{code}
+and replaced it with the original code:
+{code}
+      if ((!success) && (peer == null)) {
+        IOUtils.cleanup(null, sock);
+      }
+{code}
+This also succeeded., Hi Eric,
+
+Good catch.  I think the issue here is that there is a lot of buffering in the domain socket.  So it's difficult to get the DataNode to fail when doing its write on the socket.  In my experience, the write will succeed even when the other end has already shut down the socket.  This buffering can be set by configuring SO_RCVBUF, but even the smallest value still buffers enough that the unit test will pass under every condition.  This buffering is not a problem since in the event of a communication failure, the client will close the socket, triggering the DataNode to free the resources.  However, it does make unit testing by injecting faults on the client side more difficult to do.
+
+The solution to this problem is to inject the failure directly on the DataNode side.  The latest patch does this.  I have confirmed that it fails without the fix applied., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12726751/HADOOP-11802.003.patch
+  against trunk revision 44872b7.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+Test results: https://builds.apache.org/job/PreCommit-HADOOP-Build/6134//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HADOOP-Build/6134//console
+
+This message is automatically generated., Thanks for the new patch, [~cmccabe].
+
+I have verified that patch 003 still fixes the problem of the dying {{DomainSocketWatcher}} thread in my manual tests. I have also verified that the new unit test fails without the patch and succeeds with it.
+
++1 : LGTM, Cool patch, only have nit-like stuff. +1 pending, though it is a lot of nits.
+
+* There's CHANGES.txt included in the patch
+* extra imports in DataXCeiver, though really you probably meant to add the @Private annotation and just forgot.
+* Add a newline in the DSW C file change, break the new POLLHUP check to the next line (like the other if you changed). Adding a link to the webpage reference (along with mentioning portability / Cygwin) would also be nice, since I wondered why we didn't have to catch yet more poll errors.
+* Typo "repsponse" in DataXceiver
+* We typically have used a singleton to do fault injection, would be good to be consistent since it doesn't look like we need per-instance injection. See DataNodeFaultInjector, probably the best home. 
+* Good fix on the javadoc for allocSlot, but mind adding the blockId param doc too for full coverage?
+* The Throwable catch, it subsumes the IOException catch, so can we just delete it? I think the more specific name of the exception will be printed by its toString.
+* Param indentation in TestSCCache#checkNumberOfSeg... is inconsistent, I think we typically do double indent?
+* TestSCCache, the comment "Remove the failure injector" should be moved up a few lines, bq. extra imports in DataXCeiver, though really you probably meant to add the @Private annotation and just forgot.
+
+fixed
+
+bq. Add a newline in the DSW C file change, break the new POLLHUP check to the next line (like the other if you changed)
+
+ok
+
+bq. Adding a link to the webpage reference (along with mentioning portability / Cygwin) would also be nice, since I wondered why we didn't have to catch yet more poll errors.
+
+I added a comment explaining why POLLHUP
+
+bq. Typo "repsponse" in DataXceiver
+
+fixed
+
+bq. We typically have used a singleton to do fault injection, would be good to be consistent since it doesn't look like we need per-instance injection. See DataNodeFaultInjector, probably the best home.
+
+OK.  That would eliminate the need to make the DataXceiver class public, which would be nice.
+
+bq. Good fix on the javadoc for allocSlot, but mind adding the blockId param doc too for full coverage?
+
+Hey, I'm trying to make incremental changes here :)  Fixed.
+
+bq. The Throwable catch, it subsumes the IOException catch, so can we just delete it? I think the more specific name of the exception will be printed by its toString.
+
+ok
+
+bq. Param indentation in TestSCCache#checkNumberOfSeg... is inconsistent, I think we typically do double indent?
+
+ok
+
+bq. TestSCCache, the comment "Remove the failure injector" should be moved up a few lines
+
+let me just get rid of that since the log messages says the same thing, Thanks Colin, +1 pending Jenkins., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 26s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | javac |   7m 24s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 34s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   5m 29s | The applied patch generated  2  additional checkstyle issues. |
+| {color:green}+1{color} | install |   1m 32s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   4m 46s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:green}+1{color} | common tests |  22m 55s | Tests passed in hadoop-common. |
+| {color:green}+1{color} | hdfs tests | 168m  3s | Tests passed in hadoop-hdfs. |
+| | | 235m  9s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12727690/HADOOP-11802.004.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 416b843 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/6169/artifact/patchprocess/checkstyle-result-diff.txt |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HADOOP-Build/6169/artifact/patchprocess/testrun_hadoop-common.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HADOOP-Build/6169/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/6169/testReport/ |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/6169/console |
+
+
+This message was automatically generated., the checkstyle plugin has some known issues right now.  committing to 2.7.1  thanks for the reviews., SUCCESS: Integrated in Hadoop-trunk-Commit #7658 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/7658/])
+HADOOP-11802. DomainSocketWatcher thread terminates sometimes after there is an I/O error during requestShortCircuitShm (cmccabe) (cmccabe: rev a0e0a63209b5eb17dca5cc503be36aa52defeabd)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DomainSocketFactory.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/shortcircuit/TestShortCircuitCache.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* hadoop-common-project/hadoop-common/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DfsClientShmManager.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocketWatcher.java
+* hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocketWatcher.c
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #2105 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2105/])
+HADOOP-11802. DomainSocketWatcher thread terminates sometimes after there is an I/O error during requestShortCircuitShm (cmccabe) (cmccabe: rev a0e0a63209b5eb17dca5cc503be36aa52defeabd)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/shortcircuit/TestShortCircuitCache.java
+* hadoop-common-project/hadoop-common/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DomainSocketFactory.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocketWatcher.java
+* hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocketWatcher.c
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DfsClientShmManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #164 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/164/])
+HADOOP-11802. DomainSocketWatcher thread terminates sometimes after there is an I/O error during requestShortCircuitShm (cmccabe) (cmccabe: rev a0e0a63209b5eb17dca5cc503be36aa52defeabd)
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocketWatcher.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DomainSocketFactory.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DfsClientShmManager.java
+* hadoop-common-project/hadoop-common/CHANGES.txt
+* hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocketWatcher.c
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/shortcircuit/TestShortCircuitCache.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #173 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/173/])
+HADOOP-11802. DomainSocketWatcher thread terminates sometimes after there is an I/O error during requestShortCircuitShm (cmccabe) (cmccabe: rev a0e0a63209b5eb17dca5cc503be36aa52defeabd)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DomainSocketFactory.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DfsClientShmManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/shortcircuit/TestShortCircuitCache.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocketWatcher.java
+* hadoop-common-project/hadoop-common/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocketWatcher.c
+, SUCCESS: Integrated in Hadoop-Yarn-trunk #907 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/907/])
+HADOOP-11802. DomainSocketWatcher thread terminates sometimes after there is an I/O error during requestShortCircuitShm (cmccabe) (cmccabe: rev a0e0a63209b5eb17dca5cc503be36aa52defeabd)
+* hadoop-common-project/hadoop-common/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DfsClientShmManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocketWatcher.c
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DomainSocketFactory.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/shortcircuit/TestShortCircuitCache.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocketWatcher.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #174 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/174/])
+HADOOP-11802. DomainSocketWatcher thread terminates sometimes after there is an I/O error during requestShortCircuitShm (cmccabe) (cmccabe: rev a0e0a63209b5eb17dca5cc503be36aa52defeabd)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/shortcircuit/TestShortCircuitCache.java
+* hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocketWatcher.c
+* hadoop-common-project/hadoop-common/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DfsClientShmManager.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocketWatcher.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DomainSocketFactory.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2123 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2123/])
+HADOOP-11802. DomainSocketWatcher thread terminates sometimes after there is an I/O error during requestShortCircuitShm (cmccabe) (cmccabe: rev a0e0a63209b5eb17dca5cc503be36aa52defeabd)
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocketWatcher.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DomainSocketFactory.java
+* hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocketWatcher.c
+* hadoop-common-project/hadoop-common/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/DfsClientShmManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/shortcircuit/TestShortCircuitCache.java
+, If we are going to backport this issue to branch-2.6, we need to backport HDFS-7915 before. If we backport these, we should backport HDFS-8070 as well because HDFS-7915 breaks it., Attaching a patch to backport this issue to branch-2.6.
+, Thanks [~ajisakaa]. Pulled this into 2.6.1 after running compilation and TestShortCircuitCache.]

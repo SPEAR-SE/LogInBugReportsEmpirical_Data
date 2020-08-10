@@ -1,0 +1,122 @@
+[This problem was introduced in Hadoop-4348 when the following line that resets ByteArrayOutputStream is accidentally removed:
+{noformat}
+-          buf.reset();
+{noformat}
+
+This results in growth of byte[] in ByteArrayOutputStream (which doubles in size every time it fills up)., After looking at the code further, I has missed seeing the code where reset is being called in Server.setupResponse(). Need to investigate further for understanding growth in array., Is the space taken by a few very large buffers (on the order of number of handlers) or large number of smaller buffers?
+
+'reset()' does not change the underlying array size, it keeps growing if you have larger and larger responses to RPCs. 
+, IPC handler uses ByteArrayOutputStream  for serializing response. It grows doubling every time. Any large response results in growth of this buffer, resulting in large heap usage. This memory is never reclaimed by GC. 
+
+On namenode, the following RPC calls have huge impact on the buffer growth:
+# publi# BlocksWithLocations NameNodeProtocol.getBlocks(DatanodeInfo datanode, long size)
+# public DatanodeInfo[] ClientProtocol.getDatanodeReport(FSConstants.DatanodeReportType type)
+# public FileStatus[] ClientProtocol.getListing(String src)
+
+Of this, I think getBlocks() is the issue. On production clusters I saw this heap growing to 167MB. This does not explain buffers growing to the size of 167MB (byte[] grew to as big as 167772160 entries). Given this kind of large responses, we should relinquish the old buffer and create a new one, when ever the response buffer grows to a large size and let the old buffer garbage collected. This is safe, as currently the buffer is used as intermediate storage for serializing the response.
+
+, The attached patch:
+# Introduces shrinkable byte array stream to be used by the handler for serializing response. The underlying byte array in the stream is discarded when the array exceeds the maximum size (1MB).
+# Added a log to print the RPC call for which the response size exceeded the max size., 
+I think it would be simpler to just create new ByteArrayOutputStream when the array size crosses the limit (inside Handler.run()).
+
+This issue was discussed in HADOOP-4802., > Is the space taken by a few very large buffers (on the order of number of handlers) or large number of smaller buffers?
+There is one buffer per handler. These buffers grow to a large size., I did consider creating new ByteArrayOutputStream. But that makes testing really hard. With this, I can have a simple unit test to verify the functionality., Creating a smaller byte array output stream for Server.authFailedResponse() as before., I do not have preference on weather creating a new ByteArrayOutputStream or having a Shrinkable stream. A shrinkable stream seems to be a more modular way.
+
+>     if (response.size() > MAX_RESP_BUF_SIZE) {
+>      LOG.warn("Large respone size " + response.size() + " for call " + call);
+>    }
+Response.size() counts the valid bytes in the stream. However, ShrinkableByteArrayOutputStream#reset() uses the capacity of the array.  Should the first response.size() above be response.capacity()?, It would be enough to test the new warning (and creating a BAOS) manually. It would make patch trivial.
+
+The new test added tests the new class added :). I don't think either is required.
+
+Btw, the warning and resize could have adverse effect on users of heavy RPCs (HBase). The upper limit could be made configurable if required., From a QA standpoint, there is bug that is being fixed.  There should be a regression test.  Even if the new classes is removed from the patch., I think having a separate class is a good idea; current behavior is when the buffer has grown large, we make a copy to send in response. Then we release the large buffer in the stream and create a new small one. I am thinking of adding optimization later where the buffer in the stream will be used for sending response (no copy created) and a smaller buffer is created for the stream to continue with. Also I get access to capacity of the buffer that is being used.
+
+As regards to printing the warning, would we be hitting response sizes of more than 1MB very often? In that case the logic of resetting the buffer back to 10240 does not seem like a good idea. Hoping that log would give a good idea about the size of the buffer for large responses and based on that we could make additional tweaks., Based on Raghu's input I will attach a new simpler patch.
+
+As regards to starting the buffer with 10K size and shrinking back to it, I was wondering if 10K is a good choice. In getListing() operation, the returned file path is full path (we should consider changing that and return only file name). Assuming 128 bytes per FileStatus object, the response could easily grow beyond 10K for a directory with just 80 files. Should we consider increasing the initial size sufficiently large to 128K to accommodate 1K files, to avoid having to grow the buffer by doubling from 10K all the time and incurring the cost of memory allocation and copies?, How often the array shrinks and grows depends on how often the response the high water mark (1MB in the patch). 10KB does not matter much if HWM is covers most of the RPCs., bq. As regards to printing the warning, would we be hitting response sizes of more than 1MB very often? In that case the logic of resetting the buffer back to 10240 does not seem like a good idea. Hoping that log would give a good idea about the size of the buffer for large responses and based on that we could make additional tweaks.
+
+In the case of NN, the log is is fine. Not sure if HBase clients still fetch data over RPCs those servers could see a lot warnings with some tables., New patch, +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12428798/hadoop-6460.5.patch
+  against trunk revision 893306.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/232/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/232/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/232/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/232/console
+
+This message is automatically generated., +1  The new allocation should use INITIAL_RESP_BUF_SIZE instead of hard coding 10240 right? May require modifying the test.  Ideally the test wouldn't modify INITIAL_RESP_BUF_SIZE or MAX_RESP_BUF_SIZE but rather grow the buf > MAX_RESP_BUF_SIZE itself.
+, Releasing the bigger buffer should be done immediately after setupResponse.  With the patch, it does not get released until generating response for the next request., Thanks Eli for the comments:
+
+# New patch uses the constant for initial buffer size
+# Moves releasing of larger buffer right after setupResponse method call., +1  Looks good to me., +1. Thanks Suresh. minor: how about moving warning and resize to one place after setupResponse? Also the log could include buf.count() for accurate size of response buffer., buf.count() assuming you mean length of underlying byte array size is not exposed by ByteArrayOutputStream. setupResponse() is also called for Server.authFailedResponse. I do not think that grows to a large size, but having the log in setup response will make it generic for all streams. , +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12428856/hadoop-6460.6.patch
+  against trunk revision 893490.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/234/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/234/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/234/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/234/console
+
+This message is automatically generated., New patch combines printing warning and resetting buffer into a single if. This should be alright currently given only one of the buffers grows to large size. Also fixes a typ0 (respone to response)., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12428878/hadoop-6460.7.patch
+  against trunk revision 893612.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/235/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/235/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/235/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-h4.grid.sp2.yahoo.net/235/console
+
+This message is automatically generated., Integrated in Hadoop-Common-trunk-Commit #128 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Common-trunk-Commit/128/])
+    . Reinitializes buffers used for serializing responses in ipc server on exceeding maximum response size to free up Java heap. Contributed by Suresh Srinivas.
+, Committed the patch to trunk and 0.21 branch., Attaching patch for 0.20 branch, Integrated in Hadoop-Common-trunk #197 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Common-trunk/197/])
+    . Reinitializes buffers used for serializing responses in ipc server on exceeding maximum response size to free up Java heap. Contributed by Suresh Srinivas.
+]

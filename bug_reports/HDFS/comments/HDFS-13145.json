@@ -1,0 +1,249 @@
+[I noticed this as well and don't really think that the approach of sending a second "dummy" batch to update commitTxnId is the right one. It also gives additional work to the ANN which I would like to avoid.
+
+I am about to post a design for a "fast path" for an Observer to read from JNs which can reduce the lag time for a txn to appear on Observer after going through on the ANN down to a few ms. I have an idea for incorporating some logic to remove the necessity for this dummy batch. Details coming soon..., Sounds great [~xkrogen]! Looking forward to the design. :), Did more research on this issue. I think this issue happens in the following order:
+ 1. Active NN exits right before flushing the dummy batch. Also, because of the abrupt exit (in our case, it exited with SIGNAL 15: SIGTERM, even when we call {{hadoop-daemon.sh stop namenode}}), it will not stop the active services, and most importantly, will not finalize the current log segment. As result, the {{committedTxnId}} on the remote journal will be less than the {{endTxId}}.
+2. When the SBN take over, it will [catch up to the latest edits from old active|https://github.com/apache/hadoop/blob/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java#L1214]. When selecting input stream, it will set the {{endTxId}} to be {{committedTxnId}} if the latter is smaller: 
+{code:java}
+        // If it's bounded by durable Txns, endTxId could not be larger
+        // than committedTxnId. This ensures the consistency.
+        if (onlyDurableTxns && inProgressOk) {
+          endTxId = Math.min(endTxId, committedTxnId);
+          if (endTxId < remoteLog.getStartTxId()) {
+            LOG.warn("Found endTxId (" + endTxId + ") that is less than " +
+                "the startTxId (" + remoteLog.getStartTxId() +
+                ") - setting it to startTxId.");
+            endTxId = remoteLog.getStartTxId();
+          }
+        }
+    {code}
+
+ 3. After catching up all edits, the SBN [set the nextTnId to be endTxId + 1|https://github.com/apache/hadoop/blob/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java#L1238]{{}} and call {{FSEditLog::openForWrite}}, which will select all input streams from remote journals using the {{nextTnId}} as the starting transaction ID. The result will be non-empty because of the issue in 1). 
+4. Exception is thrown because of 3).
+
+[~xkrogen]: I could be wrong but I think the step 1) could still happen even if we get rid of the dummy patch, unless we constantly making sure that the {{committedTxnId}} is up-to-date with the {{endTxId}}. One potential fix would be to *not* tail in-progress log when the SBN catches up the latest edits in failover. This seems to me benign.The change is simple and I've tested in our dev environment. , I agree that the issue is still possible even without the dummy sync. IMO the underlying issue is that the {{committedTxnId}} on JNs was not meant to be used for consistency, but rather as a sanity check:
+{code}
+  /**
+   * Lower-bound on the last committed transaction ID. This is not
+   * depended upon for correctness, but acts as a sanity check
+   * during the recovery procedures, and as a visibility mark
+   * for clients reading in-progress logs.
+   */
+  private BestEffortLongFile committedTxnId;
+{code}
+So it is not surprising that trying to use it for correctness causes issues. The design I am proposing for fast path (just finishing internal review now) no longer uses {{committedTxnId}} which is another benefit.
+
+I agree that we should not read in-progress edit logs while catching up for failover. However, actually, I think the problem is that the if-statement, instead of
+{code}
+        if (onlyDurableTxns && inProgressOk) {
+{code}
+should be
+{code}
+        if (onlyDurableTxns && inProgressOk && remoteLog.isInProgress()) {
+{code}
+In the case you described above, the remote log you are currently reading from is not actually in progress. It has been finalized by
+{code}
+        // May need to recover
+        editLog.recoverUnclosedStreams();
+{code}
+In a finalized segment, we are sure that all transactions are committed. Thus we only need to do any modifications as a result of {{onlyDurableTxns}} _if_ the edit log in question is in-progress., Thanks [~xkrogen]! Very good points. I like the change on the if-statement which is even simpler than the solution I'm proposing. It seems we still need to resolve this JIRA rather than waiting for [HDFS-13150|https://issues.apache.org/jira/browse/HDFS-13150]? If that's so, I'll submit a patch on this., Agreed, SGTM., Submit patch v0., v0 LGTM overall. Simple fix. Verified that the test fails without your change. Considering that HDFS-10519 is in 3.0, I'm thinking we should target this for branch-3.0 and up?
+
+Minor nit: Can we extend the comment above the if-statement explaining that if the log isn't in progress, all edits are guaranteed to be committed? And also maybe a comment on the test case explaining the real world situation it tests, i.e. replace:
+{code}
+    // Do recovery from a separate QJM.
+{code}
+with something like
+{code}
+  // Do recovery from a separate QJM, like during failover
+{code}
+It wasn't immediately obvious to me what was happening. I don't have strong feelings about this one, though. Maybe it's already clear and I just missed it :) 
+
+Last nit: Should we add a {{checkRecovery()}} to the test? , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 42s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 15m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 52s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 56s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m 18s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 50s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 52s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 43s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}124m 40s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 23s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}172m 11s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.web.TestWebHdfsTimeouts |
+|   | hadoop.hdfs.TestDFSStripedOutputStreamWithFailure |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | HDFS-13145 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12911818/HDFS-13145.000.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux f59f4dca3303 4.4.0-64-generic #85-Ubuntu SMP Mon Feb 20 11:50:30 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 68ce193 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/23179/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/23179/testReport/ |
+| Max. process+thread count | 3619 (vs. ulimit of 10000) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/23179/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 25s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 20m  6s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 15s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 23s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 26s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  9s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 32s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 50s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}125m 51s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 23s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}186m 20s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestBlocksScheduledCounter |
+|   | hadoop.hdfs.TestSafeModeWithStripedFileWithRandomECPolicy |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+|   | hadoop.hdfs.server.datanode.TestDirectoryScanner |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | HDFS-13145 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12911816/HDFS-13145.000.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 212343408dbf 3.13.0-135-generic #184-Ubuntu SMP Wed Oct 18 11:55:51 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 68ce193 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/23178/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/23178/testReport/ |
+| Max. process+thread count | 2980 (vs. ulimit of 10000) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/23178/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thank you for the review [~xkrogen]! I've attached patch v1 addressing the comments. Also I used {{verifyEdits()}} to check the selected input streams, which seems a better choice.
+
+ {quote}
+Considering that HDFS-10519 is in 3.0, I'm thinking we should target this for branch-3.0 and up?
+{quote}
+Yes I think we should target this as branch-3.0 and up., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 23s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 17m 15s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 31s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 53s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 36s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m 55s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}127m  4s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 26s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}178m 54s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.namenode.TestNameNodeMetadataConsistency |
+|   | hadoop.hdfs.server.blockmanagement.TestBlockStatsMXBean |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | HDFS-13145 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12911876/HDFS-13145.001.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux cc8ff5e5c254 3.13.0-135-generic #184-Ubuntu SMP Wed Oct 18 11:55:51 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 1e84e46 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/23187/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/23187/testReport/ |
+| Max. process+thread count | 2838 (vs. ulimit of 10000) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/23187/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, +1 Will commit in a bit., I just committed this to trunk, branch-3.1, and branch-3.0. Thank you [~csun], SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #13722 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/13722/])
+HDFS-13145. SBN crash when transition to ANN with in-progress edit (shv: rev ae290a4bb4e514e2fe9b40d28426a7589afe2a3f)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/QuorumJournalManager.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/client/TestQuorumJournalManager.java
+, Thanks [~xkrogen] for the review and [~shv] for committing the patch. :)]

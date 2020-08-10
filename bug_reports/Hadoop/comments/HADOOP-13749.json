@@ -1,0 +1,369 @@
+[I believe HADOOP-13381 should take care of this., Agree with Arun. Closing this as a dup of HADOOP-13381. Feel free to reopen/comment if this is not true.
+
+Thanks for reporting this, [~sershe].,   I think storing the {{actualUgi}} in KMSClientProvider is incorrect because the providers are cached for a long time, and the currentUGI may be completely different from the actualUGI.  Therefore, it may be a good idea to consider removing actualUgi from KMSClientProvider. I am inclined to say that setting up of the UGI should be done by client code using the FileSystem. The KMSClientProvider on every call should only check following: If the currentUGI has a realUgi, use the realUgi as actualUgi or use the currentUgi as the actualUgi. 
+  I may not have the whole context on why actualUgi was added in the constructor of KMSClientProvider, but would like to understand., Re-opening for the discussion, we can close again if it is concluded that no further work needed here., AFAIK the ugi cached in KMSCP was added at first by HADOOP-10698 to support proxy user. There are later issues such as HADOOP-11176, HADOOP-12787 too. 
+And caching KMSCP instead of creating a new one each time is because of HDFS-7718.
+
+Above said, this predates me so [~asuresh] may have a better explanation. Since we have had quite some fixes around this in history, I'd love to see if we can solve the problem from a new angle/design as well.. m2c., [~jnp],
+> If the currentUGI has a realUgi, use the realUgi as actualUgi or use the currentUgi as the actualUgi
+if currentUgi is a proxy user, the later case wont work... right ?
+
+As Xiao commented, the actualUgi was added to support proxy users. 
+, If the currentUgi is a proxy user it will have a real UGI. {{currentUgi.getRealUser()}} should give us the actual ugi., Hmmm... I think I remember the context for why it was implemented as such.
+
+bq. If the currentUgi is a proxy user it will have a real UGI. currentUgi.getRealUser() should give us the actual ugi.
+That is true, but the KMSCP was being implemented around the same time as HADOOP-10835. That JIRA was meant to plumb proxy user through HTTP. If you look at this [snippet|https://github.com/apache/hadoop/blob/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/web/DelegationTokenAuthenticationFilter.java#L247-L267] of code, you will notice that if the currentUser is authenticated via a delegation token, the realUser is actually a dummy user created via {{UserGroupInformation.createRemoteUser()}} and does not have any credentials to create the connection, which is why I guess it was decided to have a loginUgi/actualUgi created in the KMSCP constructor., [~asuresh], thanks for explaining the context.
+  In this context it works because the server has a login user that is stored as the actualUgi and that is the one always needed, but in some other scenarios as in HADOOP-13381 the actualUgi becomes incorrect. 
+  Many servers, that are processing an incoming request that was  authenticated via proxy mechanism, setup a proxy-UGI with a real user without credentials, because the credentials of the real-user are not really available on the server. Therefore, the proxy-ugi is relevant for real authentication only in the context of a client. The proxyUgi setup by the server in this context should not be propagated for further calls to other services. That means a new proxy user should be explicitly setup to make further calls.
+   Suppose a general flow goes like this: (===> denotes a remote call)
+
+  client1 ====> Server1 (Hive, Oozie) Authenticates and creates ugi1----> Server1 Processes ---> Server1 creates client2 to read encrypted data ===> Server2 (NN or KMS)
+
+When Server1 authenticates client1 it creates a ugi1 (which may be a proxy ugi) to preserve the context in which authentication of client1 was performed. Now when Sever1 instantiates a client2 to make a call to Server2 it should not use ugi1 because the authentication context in ugi1 is not relevant for this call. In my opinion a new ugi2 should be explicitly setup, which has the right credentials. 
+, Thanks [~xiaochen], [~asuresh] and [~jnp] for the discussion. The original issue leaking thread in the title of HDFS-7718 has been fixed with HADOOP-11368 before HDFS-7718 is resolved. HDFS-7718 introduced KeyProviderCache to the ClientContext. Maybe we should revisit the goal of KeyProviderCache, which seems to be one of the sources of the problem. KeyProviderCache contains a map with key based on KMS URI. When combining with KMSClientProvider that caches UGI(actualUgi), wrong context may be used as the example [~jnp] mentioned above.
+
+HADOOP-13381 changed the KMSClientProvider#createConnection() by checking if the currentUGI contains kms-dt but only for non-proxy currentUGI. Correct me if I'm wrong: when the currentUGI is a new proxy user with kms-dt, I don't think we should use the stale actualUGI here. 
+
+In a recent change of KMSClientProvider by HADOOP-13155, we can see that the KeyProviderCache is bypassed by creating a new instance of KMSClientProvider for each of the renew/cancel operation. , Thanks for the comments.
+
+I'm open to changes on how the cache is done (hence also handling the proxy cases Jitendra mentioned), providing that we thoroughly test to make sure there's no leaking. Looks to me, HDFS-7718 and HADOOP-11368 are separate issues, which is why HDFS-7718 is done even when HADOOP-11368 is in place.
+
+bq. when the currentUGI is a new proxy user with kms-dt, I don't think we should use the stale actualUGI here.
+The intention of HADOOP-13381 is that, when using a delegation token, the underlying UGI is bypassed and hence does not matter. See code at [client|https://github.com/apache/hadoop/blob/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/web/DelegationTokenAuthenticationHandler.java#L326] and [server|https://github.com/apache/hadoop/blob/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/delegation/web/DelegationTokenAuthenticationHandler.java#L326] side for details.
+
+bq. In a recent change of KMSClientProvider by HADOOP-13155, we can see that the KeyProviderCache is bypassed
+This is not from HADOOP-13155. Token renew/cancellation is done by the [token class with service loader|https://github.com/apache/hadoop/blob/20f0eb871c57cc4c5a6d19aae0e3745b6175509b/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/token/Token.java#L446], so HADOOP-13155 is simply hooking that up. The KeyProviderCache is indeed not used, since this should be done by a service (e.g. yarn), instead of by each client., bq. Now when Sever1 instantiates a client2 to make a call to Server2 it should not use ugi1 because the authentication context in ugi1 is not relevant for this call. In my opinion a new ugi2 should be explicitly setup, which has the right credentials.
+[~jnp], I agree with you. I also feel maybe the ugi should be setup outside of the KMSCSP. This would also simplify the code. We could
+# either modify the apis to include a ugi argument and the caller should ensure the ugi has the credentials (This would be equivalent to probably documenting somewhere that the client has to ensure that the keyprovider apis are always called inside a ugi.doAs())
+# Maybe create a new {{KeyProviderExtension}} implementation that takes an existing KeyProvider, and a ugi and invokes all the keyprovider's API via the the provided ugi.doAs() context.
+Option 2 might actually be easier to implement.
+
+Thoughts ?, Thanks [~arun197] and [~jnp] for the discussion. Adding a new KeyProvdierExtension with UGI support could be complicated as we have KeyproviderCryptoExtension for encrypt/decrypt related operations and KeyProviderDelegationTokenExtension for delegation token related operations. 
+
+A third option would be remove the KMSCP instance variable actualUGI and make it a local variable of methods (such as createConnection/addDelegationTokens, etc) that need to use it for doAs. This way, the KMSCP cached by KeyProviderCache will be stateless. 
+
+Let me know your thoughts, Thanks!, Attach a low risk patch to make KMSCP stateless for discussion. , | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 19s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red}  0m  0s{color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 25s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  9m 11s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 23s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  2s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 46s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  9m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  9m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 23s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 24s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 44m 17s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HDFS-10757 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12827270/HDFS-10757.00.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 0a302299dfdb 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / f414d5e |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16661/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16661/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, [~xyao], thanks for the patch. However, I am bit concerned about reliance on AuthenticationMethod in the UGI, particularly {{AuthenticationMethod.TOKEN}}. In the context of a server authenticating an incoming request, authentication method is setup accurately in the RPC layer. However, in a client context, I am not sure it is set correctly in all cases. 
+ How about just doing following in getActualUGI.
+{code}
+     if (authMethod == UserGroupInformation.AuthenticationMethod.PROXY) {
+	      actualUgi = UserGroupInformation.getCurrentUser().getRealUser();
+     else {
+	      actualUgi =UserGroupInformation.getCurrentUser();
+      }
+{code}
+That essentially means the caller of the API has to setup UGI correctly. I am also assuming AuthenticationMethod.PROXY is set up correctly in all cases. However we could also check for {{UserGroupInformation.getCurrentUser().getRealUser() != null}}.
+
+There is one more angle here, users are not directly calling KMS APIs. They call DFSClient API which internally calls KMS. The token users must additionally get KMS tokens and populate the UGI. Yarn job client already takes care of populating the UGI with KMS delegation tokens. 
+
+{{KeyProviderExtension}} still leaves the onus on the caller of the API to figure the right UGI, and since KMS calls are internal within DFSClient, the user code still has to wrap the DFS calls in a doAs with the right UGI.
+ , Thanks [~jnp] for the feedback. 
+
+bq. However, in a client context, I am not sure it is set correctly in all cases. How about just doing following in getActualUGI.
+
+Good point. Attach a new patch as suggested. 
+
+Also simplify some logic added from HADOOP-13381. [~asuresh]/[~xiaochen], thoughts?, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 13s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red}  0m  0s{color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 35s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 49s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 21s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 56s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 16s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 36s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  6m 44s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 22s{color} | {color:orange} hadoop-common-project/hadoop-common: The patch generated 6 new + 15 unchanged - 0 fixed = 21 total (was 15) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  7m 33s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 21s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 36m 36s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HDFS-10757 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12827808/HDFS-10757.01.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 89a569346260 3.13.0-92-generic #139-Ubuntu SMP Tue Jun 28 20:42:26 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 9f192cc |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/16688/artifact/patchprocess/diff-checkstyle-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16688/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16688/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks [~xyao] for the new patch and [~jnp] for reviews.
+
+It seems this will change the best-effort ugi from the currentUser of KMSCP creator, to loginUser at invoke time. Could you explain why?
+
+Some minor comments unrelated to correctness:
+- Typo in {{// Or if the current UGI contains or Keberos credential, doAs it to do}}
+- Maybe we can merge the 3 debug logs into UGI class, with a helper function like UGI#printAllUsers?, Thanks [~xiaochen] for the review. Attached a new patch to address the comments., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 12s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red}  0m  0s{color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 51s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 24s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 20s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 38s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  6m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 28s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 20s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 20s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 38m 26s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HDFS-10757 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12829469/HDFS-10757.02.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux b622f117e0be 3.13.0-93-generic #140-Ubuntu SMP Mon Jul 18 21:21:05 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 5a58bfe |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16818/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16818/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks [~xyao] for the new patch. I see {{UserGroupInformation.AuthenticationMethod.TOKEN}} in the condition, is the concern by [~jnp]'s comment above dropped?
+Also was this tested in clusters? For cases like HADOOP-12787 we don't have test coverage., Thanks [~xiaochen] for the feedback. Attach a new patch that removes the checking based on UserGroupInformation.AuthenticationMethod as it is not a reliable way for non-server scenario usage of KMSClientProvider. 
+
+Add logic to use loginUser only if the currentUGI does not have either kerberos  credential or kms delegation token. If the currentUGI has Kerberos credential but not kms delegation token, we should go through the SPNEGO authentication rather than using loginUGI directly. 
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 24s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red}  0m  0s{color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 31s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 25s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 24s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 42s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  7m 42s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 21s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 39m 55s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HDFS-10757 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12834564/HDFS-10757.03.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux d52b84b66568 3.13.0-92-generic #139-Ubuntu SMP Tue Jun 28 20:42:26 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 262827c |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/17242/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/17242/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks [~xyao] for the new rev, looks good to me.
+Could you clarify what testing you have done with this patch?, Thanks [~xiaochen] for the review. I've done all the manual testing that I've done with HADOOP-12787 before, i.e., distcp between 
+1) encryption zone and non-encryption zone
+2) encryption zone and encryption zone
+with 
+1) webhdfs->hdfs
+2) webhdfs->webhdfs
+3) hdfs->webhdfs
+Everything passed as expected. , Thanks [~xyao] for the explanation.
+
+On the final pass I see 1 trivial trivial nit:
+{code}
+      for (Token<?> token : ugi.getTokens()) {
+        LOG.debug("+UGI token:" + token);
+      }
+{code}
+Could add a space for readability....
+
++1 after that. It's a small enough change that I don't think need an extra precommit. Feel free to edit that line when you check-in. :)
+
+Thanks for working on this., Thanks [~sershe] for reporting the issue, [~xiaochen] and [~jnp] for the reviews and discussions. I've commit the v03 patch with an extra space in log output as Xiao suggested (Good catch, [~xiaochen]!) to trunk, branch-2 and branch-2.8., SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #10658 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/10658/])
+HDFS-10757. KMSClientProvider combined with KeyProviderCache can result (xyao: rev be7237224819e2491aef91cd4f055c7efcf7b90d)
+* (edit) hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
+* (edit) hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+, After this commit {{TestKMS}} testcases are failing,[QA Link| https://builds.apache.org/job/hadoop-qbt-trunk-java8-linux-x86/202/testReport/]
+ HADOOP-13748 to track this failues.
+{noformat}
+java.lang.AssertionError: Key k1 already exists in jceks://file@/testptch/hadoop/hadoop-common-project/hadoop-kms/target/78df8767-fddd-4ac6-8f9c-55f7702a4427/kms.keystore
+	at org.junit.Assert.fail(Assert.java:88)
+	at org.apache.hadoop.crypto.key.kms.server.TestKMS$10$4.run(TestKMS.java:1326)
+	at org.apache.hadoop.crypto.key.kms.server.TestKMS$10$4.run(TestKMS.java:1317)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:422)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1795)
+	at org.apache.hadoop.crypto.key.kms.server.TestKMS.doAs(TestKMS.java:291)
+	at org.apache.hadoop.crypto.key.kms.server.TestKMS.access$100(TestKMS.java:79)
+  {noformat}
+
+
+ *How jenkins missed here..? As it's raised in HDFS ,all the hadoop-common testcases did not run.* 
+
+IMO, we should revert this and  *{color:red}move to common{color}*  and then fix the testcase.
+
+
+
+, Thanks [~brahma] for reporting the issue. HADOOP-13748 is a test bug that was surfaced with this change. 
+I've revert this one from trunk, branch-2 and branch-2.8 and convert it to hadoop common. 
+The new patch attached include the original change from HDFS-10757 and the unit test fix for TestKMS. Please review. Thanks!, SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #10663 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/10663/])
+, Removed the fix versions.[~xyao] thanks for updating patch.Latest patch LGTM,Pending for jenkins., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 14s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m  6s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 40s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 53s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 30s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 15s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 25s{color} | {color:green} trunk passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  0m 22s{color} | {color:red} hadoop-common-project/hadoop-kms in trunk has 2 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 54s{color} | {color:green} trunk passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m  7s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  6m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m  3s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m  8s{color} | {color:green} hadoop-kms in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 46m 15s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HADOOP-13749 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12834847/HADOOP-13749.00.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 88df55e8ac43 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / da901b6 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| findbugs | https://builds.apache.org/job/PreCommit-HADOOP-Build/10863/artifact/patchprocess/branch-findbugs-hadoop-common-project_hadoop-kms-warnings.html |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/10863/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-common-project/hadoop-kms U: hadoop-common-project |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/10863/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, {{findbugs}} are unrelated. Those are from HADOOP-13669,I commented same there.., Thanks [~brahmareddy] for the confirmation, I will commit the latest patch shortly., Fix committed to trunk, branch-2 and branch-2.8. Thanks all!, SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #10664 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/10664/])
+HADOOP-13749. KMSClientProvider combined with KeyProviderCache can (xyao: rev d0a347984da175948b553a675dc357491df2fd0f)
+* (edit) hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/crypto/key/kms/KMSClientProvider.java
+* (edit) hadoop-common-project/hadoop-kms/src/test/java/org/apache/hadoop/crypto/key/kms/server/TestKMS.java
+* (edit) hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/UserGroupInformation.java
+, Thanks [~xyao] for taking care the issue quickly! The patch fixes the issue reported in HADOOP-13748.]

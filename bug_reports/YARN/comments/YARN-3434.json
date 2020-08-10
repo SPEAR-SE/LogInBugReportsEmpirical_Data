@@ -1,0 +1,385 @@
+[The issue here is that in if we allow the user to continue from the user limit checks in assignContainers because they have reservations, when it gets down into the assignContainer routine and its allowed to get a container and the node has space we don't double check the user limit in this case.  We recheck in all other cases but this one is missed.  , [~tgraves],
+I feel like this issue and several related issues are solved by YARN-3243 already. Could you please check if this problem is already solved?
+
+Thanks,, [~wangda] YARN-3243 fixes part of the problem with the max capacities, but it doesn't solve the user limit side of it.   The user limit check is never done again in assignContainer() if it skipped the checks in assignContainers() based on reservations but then is allowed to shouldAllocOrReserveNewContainer.  I'll have a patch up for this shortly I would appreciate it if you could take a look and give me feedback., Note I had a reproducible test case for this.  Set userlimit% to 100%, user limit factor to 1.  15 nodes, 20GB each.  1 queue configured for capacity 70, the 2nd queue configured capacity 30.
+In one queue I started a sleep job needing 10 - 12GB containers in the first queue.  I then started a second job in the 2nd queue that needed 25,  12GB containers, the second job got containers but then had to reserve others waiting for the first job to release some.   
+
+Without this change when the first job started releasing containers the second job would grab them and go over the user limit.  With this fix it stayed within the user limit.  , [~tgraves],
+I think a maybe simpler/more consistent approach to solve this problem is considering reserved resource for each user when computing user-limit. My understanding for reserved resource is, it should be counted as "usage", we added reserved resource to queue's usage but we don't add them to user's usage. But I think we should do the same thing for user: When the more resource/containers a user reserves, the more opportunity the user will get, and it will block other users in the same queue receives resources.
+
+Is there any side effect if we doing this?, [~wangda]  I'm not sure I follow what are saying?  The reservations are already counted in the users usage and we do consider reserved when doing the user limit calculations.   Look at LeafQueue.assignContainers call to allocateResource is where it ends up adding to user usage.    The canAssignToUser is where it does user limit check and substracts the reservations off to see if it can continue.  
+
+Note I do think we should just get rid of the config for reservationsContinueLooking, but that is a separate issue., [~tgraves], you're right. But I'm wondering why this could happen:
+
+When continousReservation enabled, it will do check in assignContainer:
+{code}
+        if (reservationsContinueLooking && rmContainer == null) {
+          // we could possibly ignoring parent queue capacity limits when
+          // reservationsContinueLooking is set.
+          // If we're trying to reserve a container here, not container will be
+          // unreserved for reserving the new one. Check limits again before
+          // reserve the new container
+          if (!checkLimitsToReserve(clusterResource, 
+              application, capability)) {
+            return Resources.none();
+          }
+        }
+{code}
+
+When continousReservation disabled, assignContainers will ensure user-limit will not be violated.
+
+My point is, *user-limit and queue max capacity are all checked before reserve new container*. And allocation from reserved container will unreserve before continue. So I think in your case, https://issues.apache.org/jira/browse/YARN-3434?focusedCommentId=14485834&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14485834: job-2 cannot reserve 25 * 12 GB containers. Did I miss anything?
+
+And I've a question about continous reservation checking behavior, may or may not related to this issue: Now it will try to unreserve all containers under a user, but actually it will only unreserve at most one container to allocate a new container. Do you think is it fine to change the logic to be:
+
+When (continousReservation-enabled) && (user.usage + required - min(max-allocation, user.total-reserved) <=user.limit), assignContainers will continue. This will prevent doing impossible allocation when user reserved lots of containers. (As same as queue reservation checking)., The code you mention is in the else part of that check where it would do a reservation.  The situation I'm talking about actually allocates a container, not reserve one.  I'll try to explain better:
+
+Application ask for lots of containers. It acquires some containers, then it reserves some. At this point it hits its normal user limit which in my example = capacity.  It hasn't hit the max amount if can allocate or reserved (shouldAllocOrReserveNewContainer()).  The next node heartbeats in that isn't yet reserved and has enough space for it to place a container on.  It first checked in assignContainers -> canAssignToThisQueue.  That passes since we haven't hit max capacity. Then it checks assignContainers -> canAssignToUser. That passes but only because used - reserved < the user limit.  This allows it to continue down into assignContainer.  In assignContainer the node has available space and we haven't hit shouldAllocOrReserveNewContainer(). reservationsContinueLooking is on and labels are empty so it does the check:
+
+{noformat}
+if (!shouldAllocOrReserveNewContainer
+            || Resources.greaterThan(resourceCalculator, clusterResource,
+                minimumUnreservedResource, Resources.none()))
+{noformat}
+
+as I said before its allowed to allocate or reserve so it passes that test.  Then it hasn't met its maximum capacity (capacity = 30% and max capacity = 100%) yet so that is None and that check doesn't kick in, so it doesn't go into the block to findNodeToUnreserve().   Then it goes ahead and allocates when it should have needed to unreserve.  Basically we needed to also do the user limit check again and force it to do the findNodeToUnreserve. 
+
+
+, {quote}
+And I've a question about continous reservation checking behavior, may or may not related to this issue: Now it will try to unreserve all containers under a user, but actually it will only unreserve at most one container to allocate a new container. Do you think is it fine to change the logic to be:
+When (continousReservation-enabled) && (user.usage + required - min(max-allocation, user.total-reserved) <=user.limit), assignContainers will continue. This will prevent doing impossible allocation when user reserved lots of containers. (As same as queue reservation checking).
+{quote}
+
+I do think the reservation checking and unreserving can be improved.  I basically started with very simple thing and figured we could improve.  I'm not sure how much that check would help in practice.  I guess it might help the cases where you have 1 user in the queue and a second one shows up and your user limit gets decreased by a lot.  In that case it may prevent it from continuing when it can short circuit here.  So it would seem to be ok for that.  
+, Thanks for explanation [~tgraves], now I can understand this problem now.
+
+Instead of extending canAssignToThisQueue/User, I think a less complicated way is adding user-limit check to {{getMinimumResourceNeedUnreserved}}, Now it's equals to:
+{{minimumResourceNeedUnreserved = queue.used  + now-requires - limit}}
+You can change it to be
+{{minimumResourceNeedUnreserved = max(queue.used - limit + now-requires, user.usage - user.limit)}}
+
+Which should solve the problem as well.
+
+To make sure user.limit isn't recomputed, it can be cached in LeafQueue. Sounds good?, That would work, but it requires recomputing.  We already know that unreserve is required from the first check.  You will notice that this patch got rid of a bunch of code and re-computing in assignContainer simply by passing this down.  So in that aspect I think this method simplifies things.  
+
+, [~tgraves],
+I understand the motivation of doing this, but actually ResourceLimits class in LeafQueue is created for this purpose, ideally all limits info will be saved in the ResourceLimits.
+
+I suggest to reuse ResourceLimits for this proposal:
+- Add a field minimumResourceNeedUnreserve to ResourceLimits so that we don't need to compute getMinimumResourceNeedUnreserved. The field will be updated when we compute & compared user-limit
+- needToUnreserve seems not necessary, check minimumResourceNeedUnreserve <= 0 should be enough
+- shouldContinue seems not necessary to me to, allocation will directly return when shouldContinue == false
+
+With this, we can avoid some method signature changes in LeafQueue, and we don't need to change ParentQueue., So I had considered putting it in the ResourceLimits but ResourceLimits seems to be more of a queue level thing to me (not a user level). For instance parentQueue passes this into leafQueue. ParentQueue cares nothing about user limits.  If you stored it there you would either need to track the user it was for or track for all users. ResourceLimits get updated when nodes are added and removed.  We don't need to compute a particular user limit when that happens.    So it would then be out of date or we change to update it when that happens, but that to me is fairly large change and not really needed.
+
+The user limit calculation are lower down and recomputed per user, per application, per current request regularly and putting this into the global based on how being calculated and used didn't make sense to me. All you would be using it for is passing it down to assignContainer and then it would be out of date.  If someone else started looking at that value assuming it was up to date then it would be wrong (unless of course we started updating it as stated above).  But it would only be for a single user, not all users unless again we changed to calculate for every user whenever something changed. That seems a bit excessive.
+
+You are correct that needToUnreserve could go away.  I started out on 2.6 which didn't have our changes and I could have removed it when I added in amountNeededUnreserve.  If we were to store it in the global ResourceLimit then yes the entire LimitsInfo can go away including shouldContinue as you would fall back to use the boolean return from each function.   But again based on my above comments I'm not sure ResourceLimit is the correct place to put this.
+
+I just noticed that we are already keeping the userLimit in the User class, that would be another option.  But again I think we need to make it clear about what it is. This particular check is done per application, per user based on the current requested Resource.  The value stored that wouldn't necessarily apply to all the users applications since the resource request size could be different.  
+
+thoughts or is there something I'm missing about ResourceLimits?, [~tgraves],
+I think your concerns may not be a problem, ResourceLimits will be replaced (instead of updated) when node heartbeat. And ResourceLimits object itself is to decouple Parent and Child (e.g. ParentQueue to Children, LeafQueue to apps), Child doesn't need to understand how Parent compute limits, it only need to respect limits. For example, app doesn't need to understand how queue computing queue capacity/user-limit/continous-reservation-looking, it only need to know what's the "limit" considering all factors, so it can make decision to allocate/release-before-allocate/cannot-continue.
+
+The usage of ResourceLimits in my mind for user-limit case is:
+- ParentQueue compute/set limits
+- LeafQueue store limits (why store see 1.)
+- LeafQueue recompute/set user-limit when trying to do allocate for each app/priority
+- LeafQueue check user-limit as well as limits when trying to allocate/reserve container
+- The user-limit saved in ResourceLimits is only used in normal allocation/reservation path, if it's a reserved allocation, we will reset user-limit to un-limited.
+
+1. Why store limits in LeafQueue instead of passing down?
+This is required by headroom computing, app's headroom is affected by queue's parent as well as sibling changes, we cannot update all app's headroom when that changes, but we need recompute headroom when app do heartbeat, so we have to store latest ResourceLimits in LeafQueue. See YARN-2008 for more information.
+
+I'm not sure if above can make you understand better about my suggestion. Please let me know your thoughts., bq. All you would be using it for is passing it down to assignContainer and then it would be out of date. If someone else started looking at that value assuming it was up to date then it would be wrong (unless of course we started updating it as stated above). But it would only be for a single user, not all users unless again we changed to calculate for every user whenever something changed. That seems a bit excessive.
+To clarify, ResourceLimits is the bridge between parent and child, parent will tell child "hey, this is the limit you can use", LeafQueue will do the same thing to app, ParentQueue doesn't compute/pass-down user-limit to LeafQueue at all, LeafQueue will do that and make sure it get updated for every allocation., I am not saying child needs to know how parent calculate resource limit.  I am saying user limit and whether it needs to unreserve to make another reservation has nothing to do with the parent queue (ie it doesn't apply to parent queue).  Remember I'm not needing to store user limit, I'm needing to store the fact of whether it needs to unreserve and if it does how much does it need to unreserve.
+
+When a node heartbeats it goes through the regular assignments and updates the leafQueue clusterResources based on what the parent passes in. When a node is removed or added then it updates the resource limits (none of these apply to calculation of whether it needs to unreserve or not). 
+
+Basically it comes down to is this information useful outside of the small window between when it calculates it and when its needed in assignContainer() and my thought is no.  And you said it yourself in last bullet above.  Although we have been referring to the userLImit and perhaps that is the problem.  I don't need to store the userLimit, I need to store whether it needs to unreserve and if so how much.  Therefore it fits better as a local transient variable rather then a globally stored one.  If you store just the userLImit then you need to recalculate stuff which I'm trying to avoid.
+
+I understand why we are storing the current information in ResourceLimits because it has to do with headroom and parent limits and is recalculated at various points, but the current implementation in canAssignToUser doesn't use headroom at all and whether we need to unreserve or not on the last call to assignContainers doesn't affect the headroom calculation.
+
+Again basically all we would be doing is placing an extra global variable(s) in the ResourceLimits class just to pass it on down a couple of functions. That to me is a parameter.   Now if we had multiple things needing this or updating it then to me fits better in the ResourceLimits.  
+
+, [~tgraves],
+Make sense to me, especially for the {{local transient variable rather then a globally stored one}}. So I think after the change, flows to use/update ResourceLimit will be:
+{code}
+In LeafQueue:
+
+Both:
+  updateClusterResource |
+                        |--------------> resource-limit 
+  assignContainers      | update&store   (only for compute headroom)
+
+Only:
+  assignContainers
+        |
+        V
+     check queue limit
+        |
+        V
+     check user limit
+        |
+        V
+     set how-much-should-unreserve to ResourceLimits and pass down
+ {code}
+
+ Is that what you also think about?, I agree with Both section.  I'm not sure I completely follow the Only section. Are you suggesting we change the patch to modify ResourceLimits and pass down rather then using the LimitsInfo class?  If so that won't work, at least not without adding the shouldContinue flag to it.  Unless you mean keep LimitsInfo class for use locally in assignContainers and then pass ResourceLimits down to assignContainer with the value of amountNeededUnreserve as the limit.  That wouldn't really change much exception the object we pass down through the functions. , bq. Are you suggesting we change the patch to modify ResourceLimits and pass down rather then using the LimitsInfo class? 
+Yes, that's my suggested.
+
+bq. at least not without adding the shouldContinue flag to it
+Kind of, what I'm thinking is we can add "amountNeededUnreserve" to ResourceLimits. canAssignToThisQueue/User will return boolean means shouldContinue, and set "amountNeededUnreserve" (instead of limit, we don't need to change limit). That very similar to your original logic and we don't need the extra LimitsInfo. After we get the updated the ResourceLimit and pass down, problem should be resolved.
+
+Did I miss anything?, so you are saying add amountNeededUnreserve to ResourceLimits and then set the global currentResourceLimits.amountNeededUnreserve inside of canAssignToUser?  This is what I was not in favor of above and there would be no need to pass it down as parameter.
+
+Or were you saying create a ResourceLimit and pass it as parameter to canAssignToUser and canAssignToThisQueue and modify that instance. That instance would then be passed down though to assignContainer()?
+
+I don't see how else you set the ResourceLimit., bq. Or were you saying create a ResourceLimit and pass it as parameter to canAssignToUser and canAssignToThisQueue and modify that instance. That instance would then be passed down though to assignContainer()?
+I prefer the above one which is according to your previously comment "local transient variable rather than a globally stored one". Is this also what you preferred?, Ok, I'll make the changes and post an updated patch, Updated patch with review comments., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12726635/YARN-3434.patch
+  against trunk revision f967fd2.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/7404//console
+
+This message is automatically generated., Upmerged to latest, {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12726663/YARN-3434.patch
+  against trunk revision d50e8f0.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/7406//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/7406//console
+
+This message is automatically generated., [~tgraves], thanks for updating, some comments on latest patch:
+1) I suggest to rename LeafQueue.currentResourceLimit -> cachedResourceLimitsToComputeHeadroom (or other shorter name), to make a clear scope of this field.
+
+2) Better to copy currentResourceLimit in updateCurrentResourceLimits and save to cachedResourceLimitsToComputeHeadroom, but it's not necessary since we copied when passing down from ParentQueue and we don't change getLimit in following computings. 
+
+3) If you agree with 2), we don't need to copy resourceLimit:
+{code}
+          ResourceLimits userResourceLimits = new ResourceLimits(this.cachedResourceLimitsToComputeHeadroom
+              .getLimit());
+{code}.
+The ResourceLimit is already copied when passing down to LeafQueue in ParentQueue.getResourceLimitsOfChild, so we don't need to copy it here.
+
+4) canAssignToUser parameter list: localResourceLimits->currentResoureLimits, it should as same as other methods. And limit->userLimit
+
+5) There're several limitInfo, rename to currentResourceLimits for consistency?, updated based on review comments, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12726966/YARN-3434.patch
+  against trunk revision 997408e.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/7432//console
+
+This message is automatically generated., Upmerged patch to latest , \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 33s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | javac |   7m 33s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 34s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   5m 30s | The applied patch generated  1  additional checkstyle issues. |
+| {color:green}+1{color} | install |   1m 34s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 17s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:green}+1{color} | yarn tests |  55m  9s | Tests passed in hadoop-yarn-server-resourcemanager. |
+| | |  96m  8s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12727222/YARN-3434.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / b08908a |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/7447/artifact/patchprocess/checkstyle-result-diff.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/7447/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/7447/testReport/ |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7447//console |
+
+
+This message was automatically generated., Fixed the line length and the white space style issues.  Other then that I moved things around and its just complaining about the same things more., Thanks for update [~tgraves]. Latest patch LGTM, +1., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 35s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:red}-1{color} | whitespace |   0m  0s | The patch has 1  line(s) that end in whitespace. |
+| {color:green}+1{color} | javac |   7m 35s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 34s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   5m 36s | The applied patch generated  1  additional checkstyle issues. |
+| {color:green}+1{color} | install |   1m 35s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 15s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:red}-1{color} | yarn tests |  52m 23s | Tests failed in hadoop-yarn-server-resourcemanager. |
+| | |  93m 31s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.yarn.server.resourcemanager.scheduler.fair.TestAllocationFileLoaderService |
+|   | hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRestart |
+|   | hadoop.yarn.server.resourcemanager.TestSubmitApplicationWithRMHA |
+|   | hadoop.yarn.server.resourcemanager.scheduler.fifo.TestFifoScheduler |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12727317/YARN-3434.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / a3b1d8c |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/7455/artifact/patchprocess/whitespace.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/7455/artifact/patchprocess/checkstyle-result-diff.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/7455/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/7455/testReport/ |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7455//console |
+
+
+This message was automatically generated., Attaching exact same patch to kick jenkins again, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 42s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:red}-1{color} | whitespace |   0m  0s | The patch has 1  line(s) that end in whitespace. |
+| {color:green}+1{color} | javac |   7m 32s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 34s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   3m 57s | The applied patch generated  1  additional checkstyle issues. |
+| {color:green}+1{color} | install |   1m 33s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 15s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:green}+1{color} | yarn tests |  51m 29s | Tests passed in hadoop-yarn-server-resourcemanager. |
+| | |  90m 59s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12727350/YARN-3434.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 0ebe84d |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/7460/artifact/patchprocess/whitespace.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/7460/artifact/patchprocess/checkstyle-result-diff.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/7460/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/7460/testReport/ |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7460//console |
+
+
+This message was automatically generated., FAILURE: Integrated in Hadoop-trunk-Commit #7646 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/7646/])
+YARN-3434. Interaction between reservations and userlimit can result in significant ULF violation (tgraves: rev 189a63a719c63b67a1783a280bfc2f72dcb55277)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ResourceLimits.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/AbstractCSQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestReservations.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+, I fixed the whitespace change before committing. 
+
+Checked into trunk and branch-2, FAILURE: Integrated in Hadoop-Hdfs-trunk #2105 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2105/])
+YARN-3434. Interaction between reservations and userlimit can result in significant ULF violation (tgraves: rev 189a63a719c63b67a1783a280bfc2f72dcb55277)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestReservations.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/AbstractCSQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ResourceLimits.java
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #164 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/164/])
+YARN-3434. Interaction between reservations and userlimit can result in significant ULF violation (tgraves: rev 189a63a719c63b67a1783a280bfc2f72dcb55277)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/AbstractCSQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestReservations.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ResourceLimits.java
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #173 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/173/])
+YARN-3434. Interaction between reservations and userlimit can result in significant ULF violation (tgraves: rev 189a63a719c63b67a1783a280bfc2f72dcb55277)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestReservations.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/AbstractCSQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ResourceLimits.java
+, SUCCESS: Integrated in Hadoop-Yarn-trunk #907 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/907/])
+YARN-3434. Interaction between reservations and userlimit can result in significant ULF violation (tgraves: rev 189a63a719c63b67a1783a280bfc2f72dcb55277)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ResourceLimits.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestReservations.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/AbstractCSQueue.java
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #174 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/174/])
+YARN-3434. Interaction between reservations and userlimit can result in significant ULF violation (tgraves: rev 189a63a719c63b67a1783a280bfc2f72dcb55277)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/AbstractCSQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ResourceLimits.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestReservations.java
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2123 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2123/])
+YARN-3434. Interaction between reservations and userlimit can result in significant ULF violation (tgraves: rev 189a63a719c63b67a1783a280bfc2f72dcb55277)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/AbstractCSQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/ResourceLimits.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestReservations.java
+* hadoop-yarn-project/CHANGES.txt
+, Attaching patch for branch2.7.
+
+[~leftnoteasy] could you take a look when you have a chance?, Reopen to kick Jenkins., [~tgraves],
+Patch looks good, will commit after Jenkins get back., I'm not sure jenkins will work on this since this is for branch-2.7 unless we've hook it up to run for specific branches other then trunk.  Patch won't apply on trunk., I'm not sure, but I've tried to run all capacity scheduler tests, all passed after apply the patch. Let's wait for some time to see if Jenkins get can get back., Jenkins doesn't get back, sent a mail to hadoop-dev for help., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12731239/YARN-3434-branch2.7.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / b9cebfc |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7864/console |
+
+
+This message was automatically generated., whats your question exactly?  For branch patches jenkins has never been hooked up. We generally download the patch, build and possibly the run the tests that apply and commit., Just read [~aw]'s comment: https://issues.apache.org/jira/browse/HADOOP-11746?focusedCommentId=14499458&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14499458. Now it can only support branches after branch-2.7. So I will run all RM tests locally for YARN-3434 and commit., You can run test-patch.sh locally and specify the branch using --branch., Thanks Allen! Trying it., Ran it locally, all tests can passed, committing., Committed to branch-2.7, and moved change in CHANGES.txt from 2.8 to 2.7.1, thanks [~tgraves] and help from [~aw]., FAILURE: Integrated in Hadoop-trunk-Commit #7799 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/7799/])
+Moved YARN-3434. (Interaction between reservations and userlimit can result in significant ULF violation.) From 2.8.0 to 2.7.1 (wangda: rev 1952f88889395870e7b631d43418e075e774b9d2)
+* hadoop-yarn-project/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Yarn-trunk #925 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/925/])
+Moved YARN-3434. (Interaction between reservations and userlimit can result in significant ULF violation.) From 2.8.0 to 2.7.1 (wangda: rev 1952f88889395870e7b631d43418e075e774b9d2)
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #194 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/194/])
+Moved YARN-3434. (Interaction between reservations and userlimit can result in significant ULF violation.) From 2.8.0 to 2.7.1 (wangda: rev 1952f88889395870e7b631d43418e075e774b9d2)
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2141 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2141/])
+Moved YARN-3434. (Interaction between reservations and userlimit can result in significant ULF violation.) From 2.8.0 to 2.7.1 (wangda: rev 1952f88889395870e7b631d43418e075e774b9d2)
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #2123 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2123/])
+Moved YARN-3434. (Interaction between reservations and userlimit can result in significant ULF violation.) From 2.8.0 to 2.7.1 (wangda: rev 1952f88889395870e7b631d43418e075e774b9d2)
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #183 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/183/])
+Moved YARN-3434. (Interaction between reservations and userlimit can result in significant ULF violation.) From 2.8.0 to 2.7.1 (wangda: rev 1952f88889395870e7b631d43418e075e774b9d2)
+* hadoop-yarn-project/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk-Java8 #193 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/193/])
+Moved YARN-3434. (Interaction between reservations and userlimit can result in significant ULF violation.) From 2.8.0 to 2.7.1 (wangda: rev 1952f88889395870e7b631d43418e075e774b9d2)
+* hadoop-yarn-project/CHANGES.txt
+]

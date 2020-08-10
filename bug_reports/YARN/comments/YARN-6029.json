@@ -1,0 +1,250 @@
+[Thanks for working on the patch [~Tao Yang], Actually whats happening is inversion of the lock order, in one flow we are holding the lock of the Leaf and trying to get the lock of the parent (completedContainer flow) and in the other we are holding the lock of the Parent and then trying to get the lock of the Leaf (getQueueUserAclInfo flow) . Better solution to this would be to have as per the 2.9/trunk where in read locks are introduced such that *getQueueUserAclInfo* uses read lock and *completedContainer* uses write lock. so that we can avoid the this inversion. This would be a big change but i am not completely sure about your fix as you are only removing from the LeafQueue, Thanks [~Tao Yang] for reporting the issue. I think this issue is valid given existing code flow and your jstack shows. For your current patch, I am a little concern that totally removing synchronized in getQueueUserAclInfo could cause other concurrent issues. 
+However, [~Naganarasimha],  I don't quite understand your proposed solution here - if we do exactly the same change as trunk/branch-2.9, thread A (completedContainer flow) can hold write lock on queue of Root.A and pending on write lock on queue of Root, while thread B (getQueueUserAclInfo flow) may hold read lock on queue of Root and pending on read lock on queue of Root.A. Nothing becomes better. Do I miss anything here?, Thanks [~Tao Yang] for reporting this issue.
+
+[~Naganarasimha], branch-2/trunk solves the problem after YARN-5706. 
+
+However to fix the issue, backporting of YARN-5706 needs huge effort. I don't think it is even a plan. 
+
+We can make some changes to LeafQueue:
+
+1. Remove synchronized lock of assignContainers
+2. Make changes:
+
+{code}
+# BEGINNING of LeafQueue#assignContainers
+synchronized {
+   // do stuffs
+}
+
+call-complete-containers (which locks parent) 
+
+synchronized {
+   // do rest stuffs
+}
+# END of LeafQueue#assignContainers
+{code}
+
+Removing synchronized will cause data inconsistency issue when fetch, and there're some other possible methods with the same pattern need change as well. (Grab LeafQueue lock while holding ParentQueue lock and do not grab CapacityScheduler's lock). , Thanks [~djp] & [~wangda], for correcting me, missed to realize earlier that write lock needs to wait till all read read locks are finished.
+But [~wangda] agree your solution solves the problem but current flow is {{CapacityScheduler.allocateContainersToNode \-> LeafQueue.assignContainers (hold the lock on leaf) \-> LeafQueue.handleExcessReservedContainer \-> LeafQueue.completedContainer \-> ParentQueue.completedContainer  (try to get the lock here)}}
+Agree that we need to fix in this flow but simpler temporary correction in *ParentQueue* (assuming that 2.9/ trunk avoids the issue) could be 
+{code}
+@Override
+  public List<QueueUserACLInfo> getQueueUserAclInfo(
+      UserGroupInformation user) {
+    List<QueueUserACLInfo> userAcls = new ArrayList<QueueUserACLInfo>();
+    synchronized (this) {
+      // Add parent queue acls
+      userAcls.add(getUserAclInfo(user));
+    }
+    // Add children queue acls
+    for (CSQueue child : childQueues) {
+      userAcls.addAll(child.getQueueUserAclInfo(user));
+    }
+
+    return userAcls;
+  }
+{code}
+
+Thoughts ?, Thanks [~Naganarasimha] [~djp] [~leftnoteasy] for your suggestions. 
+[~Naganarasimha] I think there maybe have a problem when iterating childQueues and at the same time ParentQueue#setChildQueues is called.
+[~leftnoteasy] I agree your solution solves the problem. But I still think synchronized modifier of LeafQueue#getQueueUserAclInfo is not required. In my opinion, This method doesn't affect the data structure of LeafQueue instance (check permissions of the given user, create new QueueUserACLInfo instance then return.), and it's only called by ParentQueue#getQueueUserAclInfo. By the way, take FairScheduler as a reference, FSLeafQueue#getQueueUserAclInfo is not synchronized.
+Maybe I haven't realized the potential problem, Please correct me if I am wrong., I'm not a scheduler expert, but "not affecting any data structure" sounds like a wrong reason to not to synchronize. [~wangda] will there be any potential data races according to Java memory model[1]? If not we can safely remove those synchronize keywords. Otherwise we have to stick to it no matter how appealing it appears to be. 
+
+[1]:  http://www.cs.umd.edu/~pugh/java/memoryModel/, Thanks [~gtCarrera9] for correcting me. There is something wrong in my words, sorry about that. I have already considered data races but not found, maybe missed somewhere., Thanks all for comments,
+
+[~Tao Yang] / [~gtCarrera9].
+
+Yes removing synchronized lock will not damage internal data structure. But it could cause inconsistency read data, for example, queue acl could be updated while it being updated. So I will not in favor of this solution.
+
+[~Naganarasimha],
+
+I still prefer to fix the issue in scheduling logic, there're some other similar logics like GetQueueInfo, etc. We need to identify all these issues and again it could cause inconsistency of read data when queue is being refreshed at the same time., Thanks [~wangda]! 
+bq. But it could cause inconsistency read data, for example, queue acl could be updated while it being updated.
+Makes sense to me. Let's keep and fix the synchronized blocks then... , Thanks [~wangda] &  [~Tao Yang]
+bq.  I think there maybe have a problem when iterating childQueues and at the same time ParentQueue#setChildQueues is called
+Yes you are right this happens during CS initialize or reinitialize and during this time if {{getQueueUserAclInfo}} is called then some anamolies can happen as getQueueUserAclInfo is not holding lock on CS. 
+
+bq. But it could cause inconsistency read data, for example, queue acl could be updated while it being updated. So I will not in favor of this solution.
+Agree but IIUC based on 2.8 code its less dependent on locking of child queue as acls are updated during reinitialization all the  queues at one shot, So to ensure acls are returned appropriately i presume we should be holding the lock on CS.getQueueUserAclInfo which is not happening currently in 2.8. 
+
+bq. I still prefer to fix the issue in scheduling logic, there're some other similar logics like GetQueueInfo, etc. 
+Hmm so you are suggesting to apply 2.9/trunk's patch  or reorganize the flow in CS with synchronized blocks itself ? 
+, Thanks [~wangda] & [~Naganarasimha] !
+{quote}
+Agree but IIUC based on 2.8 code its less dependent on locking of child queue as acls are updated during reinitialization all the queues at one shot
+{quote}
+We also noticed that it doesn't hold the lock of LeafQueue instance when updating acls (CapacityScheduler#setQueueAcls) so that current logic doesn't guarantee the consistency of acls.
+{quote}
+So to ensure acls are returned appropriately i presume we should be holding the lock on CS.getQueueUserAclInfo which is not happening currently in 2.8.
+{quote}
+I'm not clear about this. Is it worth to ensure consistency of acls through reducing the efficiency of scheduler? , bq. I'm not clear about this. Is it worth to ensure consistency of acls through reducing the efficiency of scheduler?
+It gonna be inefficient, previously getQueueInfo hold scheduler lock and that causes problems.
+
+bq. We also noticed that it doesn't hold the lock of LeafQueue instance when updating acls (CapacityScheduler#setQueueAcls) so that current logic doesn't guarantee the consistency of acls.
+Yeah you're correct... 
+I think we could directly get queue ACL info from CS by invoking authorizer#checkPermissions, and we can have a separate lock to protect permission get/set. cc: [~jianhe]
+But this is should be a separated patch, since we need to fix getQueueInfo as well.
+
+I think we can go ahead to fix locks inside LQ#assignContainers, thoughts?, And in addition, I suggest to downgrade severity to critical to unblock 2.8, since this only happens rarely., Thanks [~wangda].
+Updated priority to Critical and Attached new patch for review.
+This patch needs add indentation in synchronized block. Diff code without changing space like this:
+{code}
+   @Override
+-  public synchronized CSAssignment assignContainers(Resource clusterResource,
++  public CSAssignment assignContainers(Resource clusterResource,
+       FiCaSchedulerNode node, ResourceLimits currentResourceLimits,
+       SchedulingMode schedulingMode) {
++    synchronized (this) {
+       updateCurrentResourceLimits(currentResourceLimits, clusterResource);
+
+       if (LOG.isDebugEnabled()) {
+@@ -906,6 +907,7 @@ public synchronized CSAssignment assignContainers(Resource clusterResource,
+       }
+
+       setPreemptionAllowed(currentResourceLimits, node.getPartition());
++    }
+
+     // Check for reserved resources
+     RMContainer reservedContainer = node.getReservedContainer();
+@@ -923,6 +925,7 @@ public synchronized CSAssignment assignContainers(Resource clusterResource,
+       }
+     }
+
++    synchronized (this) {
+       // if our queue cannot access this node, just return
+       if (schedulingMode == SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY
+           && !accessibleToPartition(node.getPartition())) {
+@@ -1019,6 +1022,7 @@ public synchronized CSAssignment assignContainers(Resource clusterResource,
+
+       return CSAssignment.NULL_ASSIGNMENT;
+     }
++  }
+{code}, Thanks [~Tao Yang], generally looks good, but we need to wrap application.assignContainers with leafqueue's synchronized lock as well. So how about changing first part of synchronized lock like this:
+
+{code}
+    FiCaSchedulerApp reservedApp = null;
+    CSAssignment reservedCSAssignment = null;
+
+    synchronized (this) {
+      updateCurrentResourceLimits(currentResourceLimits, clusterResource);
+
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(
+            "assignContainers: node=" + node.getNodeName() + " #applications="
+                + orderingPolicy.getNumSchedulableEntities());
+      }
+
+      setPreemptionAllowed(currentResourceLimits, node.getPartition());
+
+      // Check for reserved resources
+      RMContainer reservedContainer = node.getReservedContainer();
+      if (reservedContainer != null) {
+        reservedApp = getApplication(
+            reservedContainer.getApplicationAttemptId());
+        synchronized (reservedApp) {
+          reservedCSAssignment = reservedApp.assignContainers(
+              clusterResource, node, currentResourceLimits, schedulingMode,
+              reservedContainer);
+        }
+      }
+    }
+
+    // Handle possible completedContainer out of synchronized lock to avoid
+    // deadlock.
+    if (reservedCSAssignment != null) {
+      handleExcessReservedContainer(clusterResource, reservedCSAssignment, node,
+          reservedApp);
+      killToPreemptContainers(clusterResource, node, reservedCSAssignment);
+      return reservedCSAssignment;
+    }
+    
+   synchronized(this) { ... }
+{code}, And the patch need to be renamed to "YARN-6029-branch-2.8.(version).patch to make Jenkins to test it with correct branch name., Thanks [~wangda] and [~Tao Yang],
+Yes agree with [~wangda] that this is where we need to fix as the cause for the deadlock is the reverse locking rather than ParentQueue calling the child queue (as it can be happen in other flows too). And solution looks much simpler than i initially thought !
+
+bq. And in addition, I suggest to downgrade severity to critical to unblock 2.8, since this only happens rarely.
+As solution looks simple and can go in quickly, hope it can get in by 2.8 itself. Based on your previous comment, i presume you also plan the same.
+
+Also checked other places where *getParent()* is called in the LeafQueue and its call hierarchy, seems like there is no other similar issues causing deadlock.
+
+
+
+
+, Thanks [~wangda] for correcting me. I missed to realize that application.assignContainers without the lock of LeafQueue instance can cause data inconsistency issue for apps (applicationAttemptMap). I'll adopt your suggestion and update the patch later., Patch updated.
+Update Assignee to [~leftnoteasy] since I have made little contribution for the final solution. Thanks., Thanks [~Tao Yang] and [~wangda],
+Overall i am ok with the patch but just one last clarification with above comments :
+bq.  but we need to wrap application.assignContainers with leafqueue's synchronized lock as well. 
+bq.  missed to realize that application.assignContainers without the lock of LeafQueue instance can cause data inconsistency issue for apps applicationAttemptMap).
+I missed to understand that why we exactly require Leaf Queue's lock while calling {{application.assignContainers}} and neither i could understand data inconsistency issue for apps (applicationAttemptMap). Can you please elaborate ?
+, May be I did not understand correctly what [~naganarasimha_gr@apache.org] has mentioned. As far I understood, {{application.assignContainers}} is been invoked from one node heartbeat and is under writelock of LeafQueue. If another node heartbeat is happening at same time which may be operating on same leaf queue, we need to hold off such invocations, correct? So i think we need that lock while operating in apps allocation as well. Pls add if I missed something., submitting the patch to trigger jenkins
+, Hi，[~Naganarasimha]
+I thought the application could be finished in another thread which is calling LQ#finishApplicationAttempt meanwhile. Perhaps app will still assign container after finished., Just reassigned back. [~Tao Yang], Typically no need to reassign if you're still actively working on it, and your help to report and analysis the problem itself is the key to the final solution. :) 
+
+Latest patch looks good to me as well. 
+
+[~naganarasimha_gr@apache.org], I understand there could be some potential improvements that we can make for lockings of queues / apps. I was trying to keep the original logic as much as possible while I was working on YARN-3140/3141/5706 just to make it safe. Unless it becomes performance bottleneck, I don't suggest to make big changes to these logics.
+
+Now Jenkins has some issues, will rekick Jenkins once it back to normal., Agree with you [~wangda], lesser the modification now is better and agree that trunk has optimizations for the same already.
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 14m 13s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red}  0m  0s{color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  8m 45s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 28s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_111 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 31s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 19s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 38s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 18s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 11s{color} | {color:green} branch-2.8 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 20s{color} | {color:green} branch-2.8 passed with JDK v1.8.0_111 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 23s{color} | {color:green} branch-2.8 passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 25s{color} | {color:green} the patch passed with JDK v1.8.0_111 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 29s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 29s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 16s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 4 new + 52 unchanged - 2 fixed = 56 total (was 54) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 17s{color} | {color:green} the patch passed with JDK v1.8.0_111 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 20s{color} | {color:green} the patch passed with JDK v1.7.0_121 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 73m 57s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_121. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 19s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}180m 34s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_111 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+| JDK v1.7.0_121 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:5af2af1 |
+| JIRA Issue | YARN-6029 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12845143/YARN-6029-branch-2.8.001.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux df9293be45a2 3.13.0-95-generic #142-Ubuntu SMP Fri Aug 12 17:00:09 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.8 / d61af93 |
+| Default Java | 1.7.0_121 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_111 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_121 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/14530/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/14530/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_121.txt |
+| JDK v1.7.0_121  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/14530/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/14530/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Committing ..., Committed to branch-2.8, thanks [~Tao Yang] for working on the patch and thanks reviews from [~Naganarasimha]/[~gtCarrera9]/[~djp]!]

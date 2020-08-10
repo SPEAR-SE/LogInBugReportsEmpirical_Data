@@ -1,0 +1,657 @@
+[The following configuration will cause this:
+
+|| queue || capacity || max || pending || used || user limit
+| root | 100 | 100 | 40 | 90 | N/A |
+| A | 10 | 100 | 20 | 70 | 70 |
+| B | 10 | 100 | 20 | 20 | 20 |
+
+One app is running in each queue. Both apps are asking for more resources, but they have each reached their user limit, so even though both are asking for more and there are resources available, no more resources are allocated to either app.
+
+The preemption monitor will see that {{B}} is asking for a lot more resources, and it will see that {{B}} is more underserved than {{A}}, so the preemption monitor will try to make the queues balance by preempting resources (10, for example) from {{A}}.
+
+|| queue || capacity || max || pending || used || user limit
+| root | 100 | 100 | 50 | 80 | N/A |
+| A | 10 | 100 | 30 | 60 | 70 |
+| B | 10 | 100 | 20 | 20 | 20 |
+
+However, when the capacity scheduler tries to give that container to the app in {{B}}, the app will recognize that it has no headroom, and refuse the container. So the capacity scheduler offers the container again to the app in {{A}}, which accepts it because it has headroom now, and the process starts over again.
+
+Note that this happens even when used cluster resources are below 100% because the used + pending for the cluster would put it above 100%., [~eepayne],
+This is a very interesting problem, actually not only user-limit causes it.
+
+For example, fair ordering (YARN-3306), hard locality requirements (I want resources from rackA and nodeX only), AM resource limit; In the near future we can have constraints (YARN-3409), all can lead to resource is preempted from one queue, but the other queue cannot use it because of specific resource requirement and limits.
+
+One thing I've thought for a while is adding a "lazy preemption" mechanism, which is: when a container is marked preempted and wait for max_wait_before_time, it becomes a "can_be_killed" container. If there's another queue can allocate on a node with "can_be_killed" container, such container will be killed immediately to make room the new containers.
+
+This mechanism can make preemption policy doesn't need to consider complex resource requirements and limits inside a queue, and also it can avoid kill unnecessary containers.
+
+If you think it's fine, could I take a shot at it?
+
+Thoughts? [~vinodkv]., [~leftnoteasy],
+{quote}
+One thing I've thought for a while is adding a "lazy preemption" mechanism, which is: when a container is marked preempted and wait for max_wait_before_time, it becomes a "can_be_killed" container. If there's another queue can allocate on a node with "can_be_killed" container, such container will be killed immediately to make room the new containers.
+{quote}
+IIUC, in your proposal, the preemption monitor would mark the containers as preemptable, and then after some configurable wait period, the capacity scheduler would be the one to do the killing if it finds that it needs the resources on that node. Is my understanding correct?, [~eepayne], Exactly., [~leftnoteasy]
+bq. If you think it's fine, could I take a shot at it?
+It sounds like it would work. It's fine with me if you want to work on that., Thanks [~eepayne], I reassigned it to me, I will upload a design doc shortly for review., [~leftnoteasy], for better tracking purposes, would it be better to update the title of this JIRA to something more general, e.g., *CapacityScheduler: Improve preemption to preempt only those containers that would satisfy the incoming request* (similar to YARN-2154)? This ticket can then be used to address preemption ping-pong issue for both new container request and container resource increase request.
+
+Besides the proposal that you have presented, an alternative solution to consider is: once we collect the list of preemptable containers, we immediately have a *dry run* of the scheduling algorithm to match the preemptable resources against outstanding new/increase resource requests. We then only preempt the resources that can find a match.
+
+Thoughts?
+
+Meng
+, {quote}
+One thing I've thought for a while is adding a "lazy preemption" mechanism, which is: when a container is marked preempted and wait for max_wait_before_time, it becomes a "can_be_killed" container. If there's another queue can allocate on a node with "can_be_killed" container, such container will be killed immediately to make room the new containers.
+
+I will upload a design doc shortly for review.
+{quote}
+
+[~leftnoteasy], because it's been a couple of months since the last activity on this JIRA, would it be better to use this JIRA for the purpose of making the preemption monitor "user-limit" aware and open a separate JIRA to address a redesign?
+
+Towards that end, I am uploading a couple of patches:
+- {{YARN-3769.001.branch-2.7.patch}} is a patch to 2.7 (and also 2.6) which we have been using internally. This fix has dramatically reduced the instances of "ping-pong"-ing as I outlined in [the comment above|https://issues.apache.org/jira/browse/YARN-3769?focusedCommentId=14573619&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14573619]. 
+- {{YARN-3769.001.branch-2.8.patch}} is similar to the fix made in 2.7, but it also takes into consideration node label partitions.
+Thanks for your help and please let me know what you think., Sorry [~eepayne], I didn't make any progress on this :(, assigned this to you. I will create a new JIRA for long term solution., bq. I didn't make any progress on this, assigned this to you.
+No problem. Thanks [~leftnoteasy]., [~eepayne].
+
+Thanks for working on the patch, the approach general looks good. Few comments on implementation:
+
+{{getTotalResourcePending}} is misleading, I suggest to rename it to something like {{getTotalResourcePendingConsideredUserLimit}}, and add a comment to indicate it will be only used by preemption policy.
+
+And for implementation:
+I think it's no need to store a appsPerUser. It will be a O(apps-in-the-queue) memory cost, and you need O(apps-in-the-queue) insert opertions as well. Instead, you can do following logic:
+{code}
+Map<UserName, Headroom> userNameToHeadroom;
+
+Resource userLimit = computeUserLimit(partition);
+Resource pendingAndPreemptable = 0;
+
+for (app in apps) {
+	if (!userNameToHeadroom.contains(app.getUser())) {
+		userNameToHeadroom.put(app.getUser(), userLimit - app.getUser().getUsed(partition));
+	}
+	pendingAndPreemptable += min(userNameToHeadroom.get(app.getUser()), app.getPending(partition));
+	userNameToHeadroom.get(app.getUser()) -= app.getPending(partition);
+}
+
+return pendingAndPreemptable;
+{code}
+
+And could you add a test to verify it works?, Thanks very much [~leftnoteasy]!
+I think the above is much more efficient, but I think it needs one small tweak, On this line:
+{code}
+userNameToHeadroom.get(app.getUser()) -= app.getPending(partition);
+{code}
+If {{app.getPending(partition)}} is larger than {{userNameToHeadroom.get(app.getUser())}}, then {{userNameToHeadroom.get(app.getUser())}} could easily go negative. I think what we may want is something like this:
+
+{code}
+Map<UserName, Headroom> userNameToHeadroom;
+
+Resource userLimit = computeUserLimit(partition);
+Resource pendingAndPreemptable = 0;
+
+for (app in apps) {
+	if (!userNameToHeadroom.contains(app.getUser())) {
+		userNameToHeadroom.put(app.getUser(), userLimit - app.getUser().getUsed(partition));
+	}
+        Resource minPendingAndPreemptable = min(userNameToHeadroom.get(app.getUser()), app.getPending(partition));
+	pendingAndPreemptable += minPendingAndPreemptable;
+	userNameToHeadroom.get(app.getUser()) -= minPendingAndPreemptable;
+}
+
+return pendingAndPreemptable;
+{code}
+
+Also, I will work on adding a test case., Thank you very much, [~leftnoteasy], for your suggestions and help reviewing this patch. I am attaching an updated patch (version 002) for both branch-2.7 and branch-2. , \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12764916/YARN-3769-branch-2.7.002.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 3b85bd7 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/9341/console |
+
+
+This message was automatically generated., {quote}
+||Subsystem||Report/Notes||
+|Patch URL|http://issues.apache.org/jira/secure/attachment/12764916/YARN-3769-branch-2.7.002.patch
+|Optional Tests|javadoc javac unit findbugs checkstyle
+|git revision|trunk / 3b85bd7|
+{quote}
+It looks like the build tried to apply the branch-2.7 version of this patch to trunk. I will cancel the patch and re-upload the branch-2 version of the patch so that Hadoopqa will run the 2.8 build and comment on that patch., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  17m 30s | Pre-patch branch-2 compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:green}+1{color} | javac |   5m 56s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  10m  3s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   0m 58s | The applied patch generated  6 new checkstyle issues (total was 145, now 150). |
+| {color:red}-1{color} | whitespace |   0m  6s | The patch has 26  line(s) that end in whitespace. Use git apply --whitespace=fix. |
+| {color:green}+1{color} | install |   1m 15s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 28s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:red}-1{color} | yarn tests |  56m  6s | Tests failed in hadoop-yarn-server-resourcemanager. |
+| | |  94m 23s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.yarn.server.resourcemanager.scheduler.fair.TestAllocationFileLoaderService |
+|   | hadoop.yarn.server.resourcemanager.monitor.capacity.TestProportionalCapacityPreemptionPolicyForNodePartitions |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12765015/YARN-3769-branch-2.002.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | branch-2 / d843c50 |
+| checkstyle |  https://builds.apache.org/job/PreCommit-YARN-Build/9347/artifact/patchprocess/diffcheckstylehadoop-yarn-server-resourcemanager.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/9347/artifact/patchprocess/whitespace.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/9347/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/9347/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf906.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/9347/console |
+
+
+This message was automatically generated., Investigating test failures and checkstyle warnings, [~leftnoteasy], Thanks for all of your help on this JIRA.
+
+Attaching version 003.
+
+{{YARN-3769.003.patch}} applies to both trunk and branch-2
+
+{{YARN-3769-branch-2.7.003.patch}} applies to branch-2.7, Re submitting the patch to hopefully kick-start the build., Sorry [~eepayne] for my late response, will take a look at this issue today., This time I totally removed the trunk patch and re-uploaded it., [~eepayne], some quick comments:
+- Why this is needed? {{MAX_PENDING_OVER_CAPACITY}}. I think this could be problematic, for example, if a queue has capacity = 50, and it's usage is 10 and it has 55 pending resource, if we set MAX_PENDING_OVER_CAPACITY=0.1, the queue cannot preempt resource from other queue.
+- In LeafQueue, it uses getHeadroom() to compute how many resource that the user can use. But I think it may not correct:  getHeadroom is computed by 
+{code}
+     * Headroom is:
+     *    min(
+     *        min(userLimit, queueMaxCap) - userConsumed,
+     *        queueMaxLimit - queueUsedResources
+     *       )
+{code}
+(Please note the actual code is slightly different from the original comment, it uses queue's MaxLimit instead of queue's Max resource)
+One negative example is:
+{code}
+a  (max=100, used=100, configured=100
+a.a1 (max=100, used=30, configured=40)
+a.a2 (max=100, used=70, configured=60)
+{code}
+For above queue status, headroom for a.a1 is 0 since queue-a's {{currentResourceLimit}} is 0.
+So instead of using headroom, I think you can use {{computed-user-limit - user.usage(partition)}} as the headroom. You don't need to consider queue's max capacity here, since we will consider queue's max capacity at following logic of PCPP.
+
+Thoughts?, Correction: 
+bq. and it's usage is 10 and it has 55 pending resource,
+Should be:
+bq. and it's usage is 10 and it has 45 pending resource,, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  17m 21s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 3 new or modified test files. |
+| {color:green}+1{color} | javac |   8m  5s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  10m 40s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 24s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   0m 52s | The applied patch generated  1 new checkstyle issues (total was 145, now 145). |
+| {color:green}+1{color} | whitespace |   0m  5s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 30s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 36s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 31s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | yarn tests |  57m 50s | Tests passed in hadoop-yarn-server-resourcemanager. |
+| | |  98m 58s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12766884/YARN-3769.003.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 8d2d3eb |
+| checkstyle |  https://builds.apache.org/job/PreCommit-YARN-Build/9461/artifact/patchprocess/diffcheckstylehadoop-yarn-server-resourcemanager.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/9461/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/9461/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf902.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/9461/console |
+
+
+This message was automatically generated., [~leftnoteasy], Thank you for your review, and sorry for the late reply.
+
+{quote}
+- Why this is needed? MAX_PENDING_OVER_CAPACITY. I think this could be problematic, for example, if a queue has capacity = 50, and it's usage is 10 and it has 45 pending resource, if we set MAX_PENDING_OVER_CAPACITY=0.1, the queue cannot preempt resource from other queue.
+{quote}
+Sorry for the poor naming convention. It is not really being used to check against the queue's capacity, it is used to check for a percentage over the currently used resources. I changed the name to {{MAX_PENDING_OVER_CURRENT}}.
+
+As you know, there are multiple reasons why preemption could unnecessarily preempt resources (I call it "flapping"). Only one of which is the lack of consideration for user limit factor. Another is that an app could be requesting an 8-gig container, and the preemption monitor could conceivably preempt 8, one-gig containers, which would then be rejected by the requesting AM and potentially given right back to the preempted app.
+
+The {{MAX_PENDING_OVER_CURRENT}} buffer is an attempt to alleviate that particular flapping situation by giving a buffer zone above the currently used resources on a particular queue. This is to say that the preemption monitor shouldn't consider that queue B is asking for pending resources unless pending resources on queue B are above a configured percentage of currently used resources on queue B.
+
+If you want, we can pull this out and put it as part of a different JIRA so we can document and discuss that particular flapping situation separately.
+
+{quote}
+- n LeafQueue, it uses getHeadroom() to compute how many resource that the user can use. But I think it may not correct: ... For above queue status, headroom for a.a1 is 0 since queue-a's currentResourceLimit is 0.
+So instead of using headroom, I think you can use computed-user-limit - user.usage(partition) as the headroom. You don't need to consider queue's max capacity here, since we will consider queue's max capacity at following logic of PCPP.
+{quote}
+Yes, you are correct. {{getHeadroom}} could be calculating zero headroom when we don't want it to. And, I agree that we don't need to limit pending resources to max queue capacity when calculating pending resources. The concern for this fix is that user limit factor should be considered and limit the pending value. The max queue capacity will be considered during the offer stage of the preemption calculations., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 9s {color} | {color:blue} docker + precommit patch detected. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 3m 37s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 30s {color} | {color:green} trunk passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 14s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 18s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 25s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 30s {color} | {color:green} trunk passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 31s {color} | {color:green} trunk passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 34s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 14s {color} | {color:red} Patch generated 1 new checkstyle issues in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager (total was 120, now 120). {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 37s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 30s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 32s {color} | {color:green} the patch passed with JDK v1.7.0_79 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 68m 40s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 68m 56s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_79. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 37s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 151m 52s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+| JDK v1.7.0_79 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=1.7.0 Server=1.7.0 Image:test-patch-base-hadoop-date2015-11-02 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12770128/YARN-3769.004.patch |
+| JIRA Issue | YARN-3769 |
+| Optional Tests |  asflicense  javac  javadoc  mvninstall  unit  findbugs  checkstyle  compile  |
+| uname | Linux bf3c1ee1bf85 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-YARN-Build/patchprocess/apache-yetus-e77b1ce/precommit/personality/hadoop.sh |
+| git revision | trunk / 9e7dcab |
+| Default Java | 1.7.0_79 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_66 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_79 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/9615/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/9615/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/9615/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_79.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/9615/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-YARN-Build/9615/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_79.txt |
+| JDK v1.7.0_79  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/9615/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Max memory used | 226MB |
+| Powered by | Apache Yetus   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/9615/console |
+
+
+This message was automatically generated.
+
+, Tests {{hadoop.yarn.server.resourcemanager.TestClientRMTokens}} and {{hadoop.yarn.server.resourcemanager.TestAMAuthorization}} are not failing for me in may own build environment., [~eepayne], Thanks for update.
+
+bq. If you want, we can pull this out and put it as part of a different JIRA so we can document and discuss that particular flapping situation separately.
+I would prefer to make it to be a separate JIRA, since it is a not directly related fix. Will review PCPP after you separate those changes (since you're OK with making it separated :))
+
+bq. Yes, you are correct. getHeadroom could be calculating zero headroom when we don't want it to. And, I agree that we don't need to limit pending resources to max queue capacity when calculating pending resources. The concern for this fix is that user limit factor should be considered and limit the pending value. The max queue capacity will be considered during the offer stage of the preemption calculations.
+
+I agree with your existing appoarch, user-limit should be capped by max queue capacity as well.
+
+One nit for LeafQueue changes:
+{code}
+1534        minPendingAndPreemptable =
+1535            Resources.componentwiseMax(Resources.none(),
+1536                Resources.subtract(
+1537                    userNameToHeadroom.get(userName), minPendingAndPreemptable));
+1538  
+{code}
+
+you don't need to do componmentwiseMax here, since minPendingAndPreemptable <= headroom, and you can use substractFrom to make code simpler., Moving out all non-critical / non-blocker issues that didn't make it out of 2.7.2 into 2.7.3., bq. you don't need to do componmentwiseMax here, since minPendingAndPreemptable <= headroom, and you can use substractFrom to make code simpler.
+[~leftnoteasy], you are right, we do know that {{minPendingAndPreemptable <= headroom}}. Thanks for the catch. I will make those changes., [~leftnoteasy], Attaching YARN-3769.005.patch with the changes we discussed.
+
+I have another question that may be an enhancement:
+In {{LeafQueue#getTotalPendingResourcesConsideringUserLimit}}, the calculation of headroom is as follows in this patch:
+{code}
+        Resource headroom = Resources.subtract(
+            computeUserLimit(app, resources, user, partition,
+                SchedulingMode.RESPECT_PARTITION_EXCLUSIVITY),
+                user.getUsed(partition));
+{code}
+Would it be more efficient to just do the following?
+{code}
+     Resource headroom =
+            Resources.subtract(user.getUserResourceLimit(), user.getUsed());
+{code}, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 9s {color} | {color:blue} docker + precommit patch detected. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 3m 14s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 25s {color} | {color:green} trunk passed with JDK v1.8.0_60 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 26s {color} | {color:green} trunk passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 14s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 16s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 17s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 25s {color} | {color:green} trunk passed with JDK v1.8.0_60 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 30s {color} | {color:green} trunk passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 26s {color} | {color:green} the patch passed with JDK v1.8.0_60 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 26s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 26s {color} | {color:green} the patch passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 26s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 12s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 15s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 23s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 27s {color} | {color:green} the patch passed with JDK v1.8.0_60 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 32s {color} | {color:green} the patch passed with JDK v1.7.0_79 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 65m 47s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_60. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 64m 35s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_79. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 26s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 142m 58s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_60 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+|   | hadoop.yarn.server.resourcemanager.TestWorkPreservingRMRestart |
+|   | hadoop.yarn.server.resourcemanager.TestRM |
+| JDK v1.7.0_79 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=1.7.1 Server=1.7.1 Image:test-patch-base-hadoop-date2015-11-12 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12771905/YARN-3769.005.patch |
+| JIRA Issue | YARN-3769 |
+| Optional Tests |  asflicense  javac  javadoc  mvninstall  unit  findbugs  checkstyle  compile  |
+| uname | Linux dbfe7410cae9 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-YARN-Build@2/patchprocess/apache-yetus-72645f4/precommit/personality/hadoop.sh |
+| git revision | trunk / 9ad708a |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/9669/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_60.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/9669/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_79.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/9669/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_60.txt https://builds.apache.org/job/PreCommit-YARN-Build/9669/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_79.txt |
+| JDK v1.7.0_79  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/9669/testReport/ |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Max memory used | 227MB |
+| Powered by | Apache Yetus   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/9669/console |
+
+
+This message was automatically generated.
+
+, Unit tests {{TestAMAuthorization}} {{TestClientRMTokens}} {{TestRM}} {{TestWorkPreservingRMRestart}} are all working for me in my local build environment.
+
+Attaching branch-2.7 patch, which is a little different, since the 2.7 preemption monitor doesn't consider labels., [~eepayne], thanks for update:
+
+bq. Would it be more efficient to just do the following? ... 
+The problem is getUserResourceLimit is not always updated by scheduler. If a queue is not traversed by scheduler OR apps of a queue-user have long heartbeat interval, the user resource limit could be staled.
+
+I found 0005 patch for trunk is computing user-limit every time and 0005 patch for 2.7 is using getUserResourceLimit.
+
+Thoughts? , [~leftnoteasy], thanks for your comments.
+{quote}
+The problem is getUserResourceLimit is not always updated by scheduler. If a queue is not traversed by scheduler OR apps of a queue-user have long heartbeat interval, the user resource limit could be staled.
+{quote}
+Got it
+{quote}
+I found 0005 patch for trunk is computing user-limit every time and 0005 patch for 2.7 is using getUserResourceLimit.
+{quote}
+Yes, I was concerned about using the 2.7 version of {{computeUserLimit}}. It is different than the branch-2 and trunk versions, and it expects a {{required}} parameter which, in 2.7, is calculated in {{assignContainers}}  based on an app's capability requests for a given container priority. I noticed that in branch-2 and trunk, it looks like this {{required}} parameter is just given the value of {{minimumAllocation}}.
+
+So, in {{YARN-3769-branch-2.7.006.patch}} I passed {{minimumAllocation}} in the {{required}} parameter of {{computeUserLimit}}., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 12s {color} | {color:blue} docker + precommit patch detected. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 2m 13s {color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 25s {color} | {color:green} branch-2.7 passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 26s {color} | {color:green} branch-2.7 passed with JDK v1.7.0_85 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 16s {color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 31s {color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 16s {color} | {color:green} branch-2.7 passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red} 1m 13s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager in branch-2.7 has 1 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 25s {color} | {color:green} branch-2.7 passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 27s {color} | {color:green} branch-2.7 passed with JDK v1.7.0_85 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 25s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 25s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 25s {color} | {color:green} the patch passed with JDK v1.7.0_85 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 25s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 15s {color} | {color:red} Patch generated 3 new checkstyle issues in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager (total was 1075, now 1077). {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 32s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 16s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 2s {color} | {color:red} The patch has 2436 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 1m 6s {color} | {color:red} The patch has 127 line(s) with tabs. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 22s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 24s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 28s {color} | {color:green} the patch passed with JDK v1.7.0_85 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 57m 3s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 57m 12s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_85. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red} 49m 32s {color} | {color:red} Patch generated 71 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 177m 23s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRestart |
+|   | hadoop.yarn.server.resourcemanager.rmapp.TestRMAppTransitions |
+|   | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestLeafQueue |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+|   | hadoop.yarn.server.resourcemanager.TestResourceTrackerService |
+| JDK v1.7.0_85 Failed junit tests | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+|   | hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRestart |
+|   | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestLeafQueue |
+|   | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+|   | hadoop.yarn.server.resourcemanager.TestResourceTrackerService |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:date2015-11-17 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12772841/YARN-3769-branch-2.7.006.patch |
+| JIRA Issue | YARN-3769 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux dc4f18b2f701 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-YARN-Build/patchprocess/apache-yetus-4659377/precommit/personality/hadoop.sh |
+| git revision | branch-2.7 / 1b0f277 |
+| findbugs | v3.0.0 |
+| findbugs | https://builds.apache.org/job/PreCommit-YARN-Build/9713/artifact/patchprocess/branch-findbugs-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-warnings.html |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/9713/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/9713/artifact/patchprocess/whitespace-eol.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/9713/artifact/patchprocess/whitespace-tabs.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/9713/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/9713/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_85.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/9713/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-YARN-Build/9713/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_85.txt |
+| JDK v1.7.0_85  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/9713/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-YARN-Build/9713/artifact/patchprocess/patch-asflicense-problems.txt |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Max memory used | 207MB |
+| Powered by | Apache Yetus   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/9713/console |
+
+
+This message was automatically generated.
+
+, Attaching {{YARN-3769-branch-2.7.007.patch}}.
+
+{{TestLeafQueue}} was failing for the previous patch. Of the others, they all work for me in my local build environment except {{TestResourceTrackerService}}, which may be related to YARN-4317., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 9s {color} | {color:blue} docker + precommit patch detected. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 12m 28s {color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 27s {color} | {color:green} branch-2.7 passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 30s {color} | {color:green} branch-2.7 passed with JDK v1.7.0_85 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 20s {color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 36s {color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} branch-2.7 passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red} 1m 16s {color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager in branch-2.7 has 1 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 24s {color} | {color:green} branch-2.7 passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 25s {color} | {color:green} branch-2.7 passed with JDK v1.7.0_85 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 33s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 30s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 30s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed with JDK v1.7.0_85 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 14s {color} | {color:red} Patch generated 3 new checkstyle issues in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager (total was 1080, now 1082). {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 15s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 2s {color} | {color:red} The patch has 2798 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 1m 14s {color} | {color:red} The patch has 127 line(s) with tabs. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 23s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 21s {color} | {color:green} the patch passed with JDK v1.8.0_66 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 25s {color} | {color:green} the patch passed with JDK v1.7.0_85 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 52m 36s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.8.0_66. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 53m 23s {color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed with JDK v1.7.0_85. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red} 49m 19s {color} | {color:red} Patch generated 72 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 179m 37s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_66 Failed junit tests | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+|   | hadoop.yarn.server.resourcemanager.TestResourceTrackerService |
+|   | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+| JDK v1.7.0_85 Failed junit tests | hadoop.yarn.server.resourcemanager.TestAMAuthorization |
+|   | hadoop.yarn.server.resourcemanager.TestResourceTrackerService |
+|   | hadoop.yarn.server.resourcemanager.TestClientRMTokens |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:date2015-11-18 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12773093/YARN-3769-branch-2.7.007.patch |
+| JIRA Issue | YARN-3769 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 8416848b5b51 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-YARN-Build@2/patchprocess/apache-yetus-3f4279a/precommit/personality/hadoop.sh |
+| git revision | branch-2.7 / 82de3e1 |
+| findbugs | v3.0.0 |
+| findbugs | https://builds.apache.org/job/PreCommit-YARN-Build/9726/artifact/patchprocess/branch-findbugs-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-warnings.html |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/9726/artifact/patchprocess/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/9726/artifact/patchprocess/whitespace-eol.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/9726/artifact/patchprocess/whitespace-tabs.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/9726/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_66.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/9726/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_85.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-YARN-Build/9726/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_66.txt https://builds.apache.org/job/PreCommit-YARN-Build/9726/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_85.txt |
+| JDK v1.7.0_85  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/9726/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-YARN-Build/9726/artifact/patchprocess/patch-asflicense-problems.txt |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Max memory used | 68MB |
+| Powered by | Apache Yetus   http://yetus.apache.org |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/9726/console |
+
+
+This message was automatically generated.
+
+, [~eepayne], thanks for update, could you check test failures of latest patch? It seems TestLeafQueue is still failing., Thanks, [~leftnoteasy], but I'm not seeing failures in {{TestLeafQueue}}:
+-----
+-----
+[hadoop-yarn-server-resourcemanager-jdk1.8.0_66.txt|https://builds.apache.org/job/PreCommit-YARN-Build/9726/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.8.0_66.txt]
+{noformat}
+Running org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.TestLeafQueue
+Tests run: 26, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 26.435 sec - in org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.TestLeafQueue
+{noformat}
+-----
+-----
+[hadoop-yarn-server-resourcemanager-jdk1.7.0_85.txt|https://builds.apache.org/job/PreCommit-YARN-Build/9726/artifact/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-jdk1.7.0_85.txt]
+{noformat}
+Running org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.TestLeafQueue
+Tests run: 26, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 22.957 sec - in org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.TestLeafQueue
+{noformat}, Thanks [~eepayne], committing.., SUCCESS: Integrated in Hadoop-trunk-Commit #8834 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/8834/])
+YARN-3769. Consider user limit when calculating total pending resource (wangda: rev 2346fa3141bf28f25a90b6a426a1d3a3982e464f)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/ProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicyForNodePartitions.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicy.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #1427 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/1427/])
+YARN-3769. Consider user limit when calculating total pending resource (wangda: rev 2346fa3141bf28f25a90b6a426a1d3a3982e464f)
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicyForNodePartitions.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/ProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicy.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #690 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/690/])
+YARN-3769. Consider user limit when calculating total pending resource (wangda: rev 2346fa3141bf28f25a90b6a426a1d3a3982e464f)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/ProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicyForNodePartitions.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #702 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/702/])
+YARN-3769. Consider user limit when calculating total pending resource (wangda: rev 2346fa3141bf28f25a90b6a426a1d3a3982e464f)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/ProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicyForNodePartitions.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+, Committed to branch-2.7/branch-2/trunk, thanks [~eepayne] and review from [~mding]!, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2631 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2631/])
+YARN-3769. Consider user limit when calculating total pending resource (wangda: rev 2346fa3141bf28f25a90b6a426a1d3a3982e464f)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/ProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicyForNodePartitions.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #2562 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2562/])
+YARN-3769. Consider user limit when calculating total pending resource (wangda: rev 2346fa3141bf28f25a90b6a426a1d3a3982e464f)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicyForNodePartitions.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/ProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #624 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/624/])
+YARN-3769. Consider user limit when calculating total pending resource (wangda: rev 2346fa3141bf28f25a90b6a426a1d3a3982e464f)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/TestLeafQueue.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/LeafQueue.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/ProportionalCapacityPreemptionPolicy.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicyForNodePartitions.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/monitor/capacity/TestProportionalCapacityPreemptionPolicy.java
+, [~leftnoteasy], Thank you very much!, [~eepayne], [~leftnoteasy], should this be backported to 2.6.x?, bq. should this be backported to 2.6.x?
+[~sjlee0], I would recommend it. We were seeing a lot of unnecessary preempting without this fix. , Could you check if the 2.7 commit applies cleanly to branch-2.6? If not, it would be great if you could post a 2.6 patch. Thanks., bq. Could you check if the 2.7 commit applies cleanly to branch-2.6? If not, it would be great if you could post a 2.6 patch. Thanks.
+[~sjlee0], Sure. I can do that.
+, [~sjlee0], Backport is in progress. Manual tests on 3-node cluster work well, but running into problems backporting the unit tests., Thanks! cc [~djp], Attaching {{YARN-3769-branch-2.6.001.patch}} for backport to branch-2.6.
+
+TestLeafQueue unit test for multiple apps by multiple users had to be modified specifically to allow for all apps to be active at the same time since the way active apps is calculated is different between 2.6 and 2.7., I'll yield to [~djp] on which version this should make (2.6.3 v. 2.6.4)., Hi [~sjlee0], given this is non-critical/non-blocker, can we make it to 2.6.4? Thanks!, I'm fine with 2.6.4., Hi [~eepayne], it looks like the patch for branch-2.6 has some problem:
+{code}
++        Resource headroom = Resources.subtract(
++            computeUserLimit(app, resources, minimumAllocation, user, null),
++            user.getConsumedResourceByLabel(CommonNodeLabelsManager.NO_LABEL));
+{code}
+{{user.getConsumedResourceByLabel()}} is not defined in branch-2.6. Shall we use {{user.getUsed()}} instead as patch for branch-2.7? Also, there are test code conflict with branch-2.6., Move it out of 2.6.4 to 2.6.5 given 2.6.4-rc0 is almost out., Thanks [~djp]] I will look into it., bq. Hi Eric Payne, it looks like the patch for branch-2.6 has some problem:
+Sorry about that, [~djp]. I built and tested against a stale branch-2.6 branch.
+
+This new patch ({{YARN-3769-branch-2.6.002.patch}}) should apply cleanly and works well for me., Closing the JIRA as part of 2.7.3 release.]

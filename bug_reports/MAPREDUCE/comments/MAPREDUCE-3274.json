@@ -1,0 +1,296 @@
+[From what I can see in the code.  The simplest thing to do appears to be inside AssignedRequests.add check preemptionWaitingReduces, when assigning the container, and then if it is there, re-issue the TA_KILL event.
+
+I am not sure that this is the correct thing to do, as a TA_KILL has already been issued.  I will try to trace down the events associated with these., No that doesn't make any since.  Because the reduce cannot be added in until it has a container.  I will need to look at this further., OK so it is a race condition.  
+
+{noformat}
+attempt_1319242394842_0065_m_000000_0 is Launched (STATE RUNNING)
+Many other reducers are launched filling up the queues capacity
+attempt_1319242394842_0065_r_000008_0 is in the UNASSIGNED state waiting to be scheduled
+attempt_1319242394842_0065_m_000000_0 is killed for going over its memory limit
+attempt_1319242394842_0065_m_000000_0 is cleaned up and a replacement attempt_1319242394842_0065_m_000000_1 is added to be scheduled
+attempt_1319242394842_0065_r_000008_0 gets a container and goes to the ASSIGNED state.
+Preemption is triggered. attempt_1319242394842_0065_r_000008_0 is selected and is sent a TA_KILL event
+(the History Log ignores the event because it has not written out a START event for attempt_1319242394842_0065_r_000008_0 yet)
+attempt_1319242394842_0065_r_000008_0 transitions to KILLED, going through several other states
+attempt_1319242394842_0065_r_000008_1 is created to replace attempt_1319242394842_0065_r_000008_0 and moves to UNASSIGNED state
+Processing attempt_1319242394842_0065_r_000008_0 of type TA_CONTAINER_LAUNCHED (The container for the killed task is now launched)
+JVM with ID : jvm_1319242394842_0065_r_000008 asked for a task
+JVM with ID: jvm_1319242394842_0065_r_000008 given task: attempt_1319242394842_0065_r_000004_0
+{noformat}
+
+So even though attempt_1319242394842_0065_r_000008_0 was killed, its container when it finally showed up was given to a different reduce attempt, and did not end up freeing up any resources at all.
+
+, >> JVM with ID: jvm_1319242394842_0065_r_000008 given task: attempt_1319242394842_0065_r_000004_0
+
+there seems something wrong here. jvm with particular id should always be given the corresponding task., You are correct, I got confused by the JVM ID not lining up with the attempt/task ID.  The r_000008 is confusing.  I will keep digging.  The deadlock has been fairly reproducible, but I end up with about 20GB of logs to go through afterwards so it has taken me a while to get through them all., Yes the JVM thing was a red herring.
+
+The issue is that on the AM.  The events were processed in the following order
+CONTINER_REMOTE_LAUNCH
+TA_KILL
+
+But on the NM they were processed in reverse.
+Stop Container Request (Error)
+Start Container Request (Success)
+
+The Stop Request was processed 4 ms before the Start Request was.
+
+
+I need to read through the code some more to try to understand how to handle this.  Just my gut feeling would be that we need a way to handle an error in a Stop Container Request.  We may need an event back indicating that the TA_KILL failed. Perhaps we could retry it a few times before giving up instead of the event back.
+
+Also the container launched and started talking to the App Master requesting something to do.  The App Master always responded with I have nothing for you to do.  It might be good if the code that informs the Container what to do could know about killed attempts and if for some reason they ask for something to do they are told to die.  This seems like a good way to prevent this type of error in the future., bq. But on the NM they were processed in reverse.
+That seems weird, one that shouldn't have happened.
+
+Can you please upload snippets of the event order in the AM and the NM like you did in your first comment? Thanks., Of Course.
+
+From the AM Logs
+{noformat}
+m_0 NEW -> SCHEDULED
+r_8 NEW -> SCHEDULED
+m_0_0 NEW -> UNASSIGNED
+r_8_0 NEW -> UNASSIGNED
+cont_1_2 = m_0_0
+m_0_0 UNASSIGNED -> ASSIGNED
+CONTAINER_REMOTE_LAUNCH for m_0_0
+TA_CONTAINER_LAUNCHED for m_0_0
+m_0_0 ASSIGNED -> RUNNING
+m_0 SCHEDULED -> RUNNING
+jvm_m_2 = m_0_0
+m_0_0 RUNNING -> FAIL_CONTAINER_CLEANUP
+m_0_0 FAILED_CONTAINER_CLEANUP -> FAILED_TASK_CLEANUP
+m_0_0 FAILED_TASK_CLEANUP -> FAILED
+m_0_1 NEW -> UNASSIGNED
+cont_1_11 = r_8_0
+r_8_0 UNASSIGNED -> ASSIGNED
+CONTAINER_REMOTE_LAUNCH for r_8_0
+preempting r_8_0
+TA_KILL for r_8_0
+r_8_0 ASSIGNED -> KILL_CONTAINER_CLEANUP
+CONTAINER_REMOTE_CLEANUP for r_8_0
+TA_CONTAINER_CLEANED for r_8_0
+r_8_0 KILL_CONTAINER_CLEANUP -> KILL_TASK_CLEANUP
+r_8_0 KILL_TASK_CLEANUP -> KILLED
+r_8_1 NEW -> UNASSIGNED
+****** r_8_0 TA_CONTAINER_LAUNCHED ******
+{noformat}
+
+Inside the job logs for cont_1_11, it constantly calls getTask and has null returned for it.
+
+NM Logs for cont_1_11 (Scrubbed a bit)
+{noformat}
+2011-10-22 09:38:06,137 WARN org.apache.hadoop.yarn.server.nodemanager.containermanager.ContainerManagerImpl: Trying to stop unknown container container_1319242394842_0065_01_000011
+2011-10-22 09:38:06,138 WARN org.apache.hadoop.yarn.server.nodemanager.NMAuditLogger: USER=container_1319242394842_0065_01_000008      OPERATION=Stop Container Request        TARGET=ContainerManagerImpl     RESULT=FAILURE  DESCRIPTION=Trying to stop unknown container! APPID=application_1319242394842_0065    CONTAINERID=container_1319242394842_0065_01_000011
+2011-10-22 09:38:06,142 INFO org.apache.hadoop.yarn.server.nodemanager.NMAuditLogger: USER=hadoop     OPERATION=Start Container Request       TARGET=ContainerManageImpl    RESULT=SUCCESS  APPID=application_1319242394842_0065    CONTAINERID=container_1319242394842_0065_01_000011
+2011-10-22 09:38:06,142 INFO org.apache.hadoop.yarn.server.nodemanager.containermanager.application.Application: Adding container_1319242394842_0065_01_000011 to application application_1319242394842_0065
+2011-10-22 09:38:06,142 INFO org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container: Processing container_1319242394842_0065_01_000011 of type INIT_CONTAINER
+2011-10-22 09:38:06,143 INFO org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container: Container container_1319242394842_0065_01_000011 transitioned from NEW to LOCALIZING
+2011-10-22 09:38:06,143 INFO org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container: Processing container_1319242394842_0065_01_000011 of type RESOURCE_LOCALIZED
+2011-10-22 09:38:06,143 INFO org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container: Processing container_1319242394842_0065_01_000011 of type RESOURCE_LOCALIZED
+2011-10-22 09:38:06,143 INFO org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container: Container container_1319242394842_0065_01_000011 transitioned from LOCALIZING to LOCALIZED
+2011-10-22 09:38:06,273 INFO org.apache.hadoop.yarn.server.nodemanager.LinuxContainerExecutor: launchContainer: [container-executor, hadoop, 1, application_1319242394842_0065, container_1319242394842_0065_01_000011, application_1319242394842_0065/container_1319242394842_0065_01_000011, application_1319242394842_0065/container_1319242394842_0065_01_000011/task.sh, container_1319242394842_0065_01_000011/container_1319242394842_0065_01_000011.tokens]
+2011-10-22 09:38:06,305 INFO org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container: Processing container_1319242394842_0065_01_000011 of type CONTAINER_LAUNCHED
+2011-10-22 09:38:06,305 INFO org.apache.hadoop.yarn.server.nodemanager.containermanager.container.Container: Container container_1319242394842_0065_01_000011 transitioned from LOCALIZED to RUNNING
+2011-10-22 09:38:07,613 INFO org.apache.hadoop.yarn.server.nodemanager.containermanager.monitor.ContainersMonitorImpl: Starting resource-monitoring for container_1319242394842_0065_01_000011
+2011-10-22 09:38:07,658 INFO org.apache.hadoop.yarn.server.nodemanager.containermanager.monitor.ContainersMonitorImpl: Memory usage of ProcessTree 5856 for container-id container_1319242394842_0065_01_000011 : Virtual 1246031872 bytes, limit : 2147483648 bytes; Physical 50659328 bytes, limit -1 bytes
+{noformat}
+
+The last like just repeats until the JOB is killed, That is one monster of a race!
+
+I think the problem is this: Today we treat REMOTE_LAUNCH and REMOTE_CLEANUP events for the same container as distinct unrelated events in ContainerLauncherImpl. We need to handle them as related, and take action depending on whether container is launched or not. Code fixes in MAPREDUCE-3240 for the NodeManager immediately come to my mind which are similar but for cleaning up container processes on NM.
+
+bq. It might be good if the code that informs the Container what to do could know about killed attempts and if for some reason they ask for something to do they are told to die.
+The infrastructure is already there for doing this. It is supposed to work if not for bugs :) See TaskAttempListenerImpl (+411) which dishes out tasks, it is supposed to ask them to die if it doesn't know them. Two things we can do for this:
+ - TaskAttempt should register with TaskAttemptListener even *before* the container is launched. Today the registration happens only after the container launches.
+ - It should register with TaskAttemptListener.taskHeartBeatHandler *after* the container is launched so that heartBeatHandler doesn't start counting down even before the container is launched.
+ - And of course, fix the obvious bug, that is send a DIE to the task, if it is not registered with TaskAttemptListener., I agree that is the way to go.  I will start working on a patch.  FYI TaskAttempListenerImpl.getTaskJVM has 3 TODOs in it.
+
+{code}
+    // TODO: Is it an authorised container to get a task? Otherwise return null.
+
+    // TODO: Is the request for task-launch still valid?
+
+    // TODO: Child.java's firstTaskID isn't really firstTaskID. Ask for update
+    // to jobId and task-type.
+{code}
+
+None of them really seem that related to this, but it will never return a JvmTask with shouldDie set to true.  It just returns null if it does not have anything for the task to do.  Should I change it so that if there is nothing for the task to do then it should kill the task?, Yes, the current code doesn't do what we want. Like I said above, if the task is not registered, we should send a DIE via the flag in JvmTask constructor. But for doing that, you need to separate registering from TaskAttemptListenerImpl from TaskHeartBeatHandler as their scopes are different. TaskAttemptListenerImpl needs to be registered even before the container started whereas the later needs registration only after the container has started., I have an initial patch for asking containers to die if the AM doesn't expect them to be alive.  I am going to try and do some more extensive testing on it to be sure it fixes the deadlock before I declare victory and submit it.
+
+I am also trying to understand how or even if to handle CONTAINER_REMOTE_LAUNCH and CONTAINER_REMOTE_CLEANUP as related in ContainerLauncherImpl.  I am not even sure that it would make a difference.  In the logs for the AM I can see that CONTAINER_REMOTE_LAUNCH for the errant attempt has returned successful before CONTAINER_REMOTE_CLEANUP is sent.  The race appears to not be in the AM as much as it is in the NM.  The NM will respond back that the container has been launched but it will not launch it yet.  Launching appears to be something that can take quite a while to finish.  If the CLEANUP arrives while that is happening the internal state of the NM does not know that the launch is in progress, and as such it fails.  I think for us to tie the two together in the AM would also require us to tie the two even closer together in the NM as well.  MAPREDUCE-3240 marks the process as launched by having it write out a PID file from the process itself.  But that does not guarantee that once NM.startContainer has returned that NM.stopContainer will stop that container.  It would require the NM to mark a container as being launched before the startContainer completes and it would require stopContainer to mark the container as needs to be stopped if it is in progress.
+
+All of this sounds like more work then can get done today.  So I will try to test my patch without the changes.  If everything seems to work then I will files a separate JIRA to address the atomicity issues with startContainer/stopContainer in the NM., I am wrong.  After looking at the code in the NM that it is keeping track of containers that have launched inside start/stop Container.  So they are tied together already., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12501357/MR-3274.txt
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1199//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1199//console
+
+This message is automatically generated., Looked at the patch. Couple of comments:
+ - Need to properly synchronize access to _pendingJvms_ and _jvmIDToActiveAttemptMap_
+ - Rename _registerJvm()_ to _registerPendingTask()_ and _registerAttemptToJVM()_ to _registerLaunchedTask()_ ?
+ - Cute little test case :)
+ - Like I said before, these changes are necessary but not sufficient. We also need to make ContainerLauncher to not send a _stopContainer_ for a container that isn't launched. Want to do that here or separately? I am fine either ways., I filed MAPREDUCE-3312 for the follow on work.  I just don't think I can get it done before Monday.  I did not make it synchronized because even though they are related the order in which they are used makes it unnecessary.  But if someone else makes changes to it that ordering might not stay consistent so I will synchronize it., Addressed the comments., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12501485/MR-3274.txt
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 6 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1205//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1205//console
+
+This message is automatically generated., Latest patch looks good. +1.
+
+I just committed this to trunk and branch-0.23. Thanks Robert!, Integrated in Hadoop-Hdfs-trunk-Commit #1274 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/1274/])
+    MAPREDUCE-3274. Fixed a race condition in MRAppMaster that was causing a task-scheduling deadlock. Contributed by Robert Joseph Evans.
+
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1195145
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/TaskAttemptListener.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+, Integrated in Hadoop-Common-trunk-Commit #1198 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/1198/])
+    MAPREDUCE-3274. Fixed a race condition in MRAppMaster that was causing a task-scheduling deadlock. Contributed by Robert Joseph Evans.
+
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1195145
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/TaskAttemptListener.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+, Integrated in Hadoop-Hdfs-0.23-Commit #104 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Commit/104/])
+    MAPREDUCE-3274. Fixed a race condition in MRAppMaster that was causing a task-scheduling deadlock. Contributed by Robert Joseph Evans.
+svn merge -c r1195145 --ignore-ancestry ../../trunk/
+
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1195146
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/TaskAttemptListener.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+, Integrated in Hadoop-Common-0.23-Commit #104 (See [https://builds.apache.org/job/Hadoop-Common-0.23-Commit/104/])
+    MAPREDUCE-3274. Fixed a race condition in MRAppMaster that was causing a task-scheduling deadlock. Contributed by Robert Joseph Evans.
+svn merge -c r1195145 --ignore-ancestry ../../trunk/
+
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1195146
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/TaskAttemptListener.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+, Integrated in Hadoop-Mapreduce-trunk-Commit #1224 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Commit/1224/])
+    MAPREDUCE-3274. Fixed a race condition in MRAppMaster that was causing a task-scheduling deadlock. Contributed by Robert Joseph Evans.
+
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1195145
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/TaskAttemptListener.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+, Integrated in Hadoop-Mapreduce-0.23-Commit #113 (See [https://builds.apache.org/job/Hadoop-Mapreduce-0.23-Commit/113/])
+    MAPREDUCE-3274. Fixed a race condition in MRAppMaster that was causing a task-scheduling deadlock. Contributed by Robert Joseph Evans.
+svn merge -c r1195145 --ignore-ancestry ../../trunk/
+
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1195146
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/TaskAttemptListener.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+, Integrated in Hadoop-Hdfs-trunk #848 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/848/])
+    MAPREDUCE-3274. Fixed a race condition in MRAppMaster that was causing a task-scheduling deadlock. Contributed by Robert Joseph Evans.
+
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1195145
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/TaskAttemptListener.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+, Integrated in Hadoop-Mapreduce-0.23-Build #75 (See [https://builds.apache.org/job/Hadoop-Mapreduce-0.23-Build/75/])
+    MAPREDUCE-3274. Fixed a race condition in MRAppMaster that was causing a task-scheduling deadlock. Contributed by Robert Joseph Evans.
+svn merge -c r1195145 --ignore-ancestry ../../trunk/
+
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1195146
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/TaskAttemptListener.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+, Integrated in Hadoop-Mapreduce-trunk #882 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/882/])
+    MAPREDUCE-3274. Fixed a race condition in MRAppMaster that was causing a task-scheduling deadlock. Contributed by Robert Joseph Evans.
+
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1195145
+Files : 
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/TaskAttemptListener.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+, Integrated in Hadoop-Hdfs-0.23-Build #56 (See [https://builds.apache.org/job/Hadoop-Hdfs-0.23-Build/56/])
+    MAPREDUCE-3274. Fixed a race condition in MRAppMaster that was causing a task-scheduling deadlock. Contributed by Robert Joseph Evans.
+svn merge -c r1195145 --ignore-ancestry ../../trunk/
+
+vinodkv : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1195146
+Files : 
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapred/TaskAttemptListenerImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/TaskAttemptListener.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/job/impl/TaskAttemptImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapred/TestTaskAttemptListenerImpl.java
+* /hadoop/common/branches/branch-0.23/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/test/java/org/apache/hadoop/mapreduce/v2/app/MRApp.java
+]

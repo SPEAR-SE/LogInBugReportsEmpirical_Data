@@ -1,0 +1,152 @@
+[Looking at the 1.x code, it appears it will also add directories to the results but somewhat inconsistently.  It will only add them if they are not immediately under the initial input path.  From the FileInputFormat.listStatus() code:
+
+{code}
+      FileStatus[] matches = fs.globStatus(p, inputFilter);
+      if (matches == null) {
+        errors.add(new IOException("Input path does not exist: " + p));
+      } else if (matches.length == 0) {
+        errors.add(new IOException("Input Pattern " + p + " matches 0 files"));
+      } else {
+        for (FileStatus globStat: matches) {
+          if (globStat.isDir()) {
+            for(FileStatus stat: fs.listStatus(globStat.getPath(),
+                inputFilter)) {
+              result.add(stat);
+            }          
+          } else {
+            result.add(globStat);
+          }
+{code}
+
+Note how it blindly just adds all the results of the second-level directory listing to the results rather than recursing the directory handling logic.  That inconsistent directory handling in 1.x seems like a bug to me.  However note that it does not skip any directories -- it either adds the contents of the directory or the directory itself.  I don't think it's OK to skip the directory entirely when gathering the input or we could easily, silently drop input data for the job., In the 2.x code, isn't that what the recursive flag is there for (mapreduce.input.fileinputformat.input.dir.recursive), to recurse into directories if needed?
+If the generated input splits include a directory, it looks like this causes the job to fail because it's expecting a file as opposed to a directory.  Is the onus then on the caller of listStatus() to go through the file list and remove any directories that were included?
+
+Looks like the recursive stuff (with lots of discussion) was added in MAPREDUCE-3193., Yes, the recursive stuff was added later.
+
+I can't speak for what downstream consumers of FileInputFormat are expecting.  Some may expect and handle directories while others do not.  The difficult part is we don't want to break the former to fix the latter, as that leads to the worst of all outcomes: silent data loss.
+, To clarify the origins of the recursion feature, it was added to mapred.FileInputFormat in MAPREDUCE-1501 and later MAPREDUCE-3193 added feature parity to mapreduce.lib.input.FileInputFormat for those migrating from mapred.FileInputFormat.
+
+From the code I'd expect branch-1 and branch-2 should act similarly here when in non-recursive mode.  They both list the contents of the top-level input path, and if any child is a directory they list that second-level directory and return the directory directly if it's not recursive.  I don't see anywhere in branch-1 code where it's completely ignoring directories, but maybe I'm missing something., Ok, looking a little more at this .. so FileInputFormat.listStatus() is returning the same results on hadoop-1 and hadoop-2, and it includes the directories, so I guess listStatus() is not the issue. It looks like what CombineFileInputFormat.getSplits() does with the file list after getting it is different between hadoop-1 and hadoop-2, where hadoop-2 includes those directories in the list of InputSplits:
+
+(Hadoop 20S means hadoop 1.x)
+{noformat}
+2014-02-13 13:35:32,492 ERROR shims.HadoopShimsSecure (HadoopShimsSecure.java:getSplits(345)) - ** Hadoop version: 0.20S
+2014-02-13 13:35:32,492 ERROR shims.HadoopShimsSecure (HadoopShimsSecure.java:getSplits(349)) - ** called super.getSplits(): [Paths:/000000_0:0+50 Locations:127.0.0.1:; ]
+{noformat}
+
+(Hadoop 23 means hadoop 2.x)
+{noformat}
+2014-02-13 13:38:12,425 ERROR shims.HadoopShimsSecure (HadoopShimsSecure.java:getSplits(345)) - ** Hadoop version: 0.23
+2014-02-13 13:38:12,425 ERROR shims.HadoopShimsSecure (HadoopShimsSecure.java:getSplits(349)) - ** called super.getSplits(): [Paths:/000000_0:0+50 Locations:127.0.0.1:; , Paths:/Users:0+0,/build:0+0,/tmp:0+0,/user:0+0 Locations:; ]
+{noformat}
+, Looks like the changes in MAPREDUCE-4470 may be causing the difference in the 1.x vs 2.x behavior. Should CombineFileInputFormat be filtering out any locations which turn out to be directories here?, I'm not sure if the filtering of directories in the 1.x version of CombineFileInputFormat was intentional.  Seems like it's an easy way to silently drop data if the user assumed everything under the specified directory would be part of the input.  However if it's always worked like that in 1.x and people are expecting that behavior then arguably 2.x needs to match it for backwards compatibility or risk breaking things (like Hive in this case)., "git blame" tells me this is introduced by MAPREDUCE-1981 which was committed to 0.23.10 and 2.1.1-beta. This is the interesting bit of that patch:
+{code}
+@@ -169,13 +171,17 @@ public static PathFilter getInputPathFilter(JobConf conf) {
+   protected void addInputPathRecursively(List<FileStatus> result,
+       FileSystem fs, Path path, PathFilter inputFilter)
+       throws IOException {
+-    for(FileStatus stat: fs.listStatus(path, inputFilter)) {
+-      if (stat.isDirectory()) {
+-        addInputPathRecursively(result, fs, stat.getPath(), inputFilter);
+-      } else {
+-        result.add(stat);
++    RemoteIterator<LocatedFileStatus> iter = fs.listLocatedStatus(path);
++    while (iter.hasNext()) {
++      LocatedFileStatus stat = iter.next();
++      if (inputFilter.accept(stat.getPath())) {
++        if (stat.isDirectory()) {
++          addInputPathRecursively(result, fs, stat.getPath(), inputFilter);
++        } else {
++          result.add(stat);
++        }
+       }
+-    }
++    }
+   }
+{code}
+
+Clearly, before 0.23.10 and 2.1.1-beta, the behavior was to exclude directories. So should we treat it as incorrect behavior and fix it?, Are you sure that's the relevant code change?  Looking at the patch above, both before and after the change it will recursively process directories.  Am I missing something?  Also [~jdere] verified in [a comment|https://issues.apache.org/jira/browse/MAPREDUCE-5756?focusedCommentId=13900772&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-13900772] that the FileInputFormat.listStatus behavior didn't change between 1.x and 2.x with respect to directories.
+
+Instead it appears to be caused by MAPREDUCE-4470 which changed the way CombineFileInputFormat treats files without any blocks.  Before it was failing to generate any splits for empty files, and afterwards it looks like it generates a degenerate split for them.  Since directories also have no blocks, I'm wondering if that change caused it to also generate a degenerate split for directories as well as empty files., Whats the decision on this one? Is it expected to make it in 2.5 timeframe?, Sorry for the delay.  As [~jdere] and I mentioned above we think the problem is caused by MAPREDUCE-4470 generating degenerate splits for directories within the input directory.  I haven't verified yet that reverting that patch changes CombineFileInputFormat to its original behavior of silently skipping directories in the input directory, but if it does then I think we should tweak that fix to distinguish directories from files without blocks.  From a quick perusal of that patch it doesn't appear to do so, and that's why I think it could have introduced the behavior change.
+
+[~jdere], have you already verified that reverting MAPREDUCE-4470 fixes the Hive test issue?, Just tried reverting MAPREDUCE-4470, and yes the test case does pass now., ping. Any plan to fix backward incompatible change here ?, Patch to skip the fix from MAPREDUCE-4470, if the file is a directory.  I've tried this with the failing testcase from HIVE-6401 and this allows the test to pass., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12651801/MAPREDUCE-5756.1.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4678//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4678//console
+
+This message is automatically generated., Patch v2 adds unit test, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12652004/MAPREDUCE-5756.2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The following test timeouts occurred in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient:
+
+org.apache.hadoop.mapred.pipes.TestPipeApplication
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4679//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4679//console
+
+This message is automatically generated., Did a recent commit break TestPipeApplication? I ran that test locally on trunk, and it still fails without my patch., The TestPipeApplication failure was unrelated and fixed in MAPREDUCE-5868.
+
++1 lgtm.  Committing this., Thanks, [~jdere]!  I committed this to trunk and branch-2., SUCCESS: Integrated in Hadoop-trunk-Commit #5926 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/5926/])
+MAPREDUCE-5756. CombineFileInputFormat.getSplits() including directories in its results. Contributed by Jason Dere (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1612400)
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/CombineFileInputFormat.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapreduce/lib/input/TestCombineFileInputFormat.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #620 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/620/])
+MAPREDUCE-5756. CombineFileInputFormat.getSplits() including directories in its results. Contributed by Jason Dere (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1612400)
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/CombineFileInputFormat.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapreduce/lib/input/TestCombineFileInputFormat.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #1812 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1812/])
+MAPREDUCE-5756. CombineFileInputFormat.getSplits() including directories in its results. Contributed by Jason Dere (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1612400)
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/CombineFileInputFormat.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapreduce/lib/input/TestCombineFileInputFormat.java
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk #1839 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1839/])
+MAPREDUCE-5756. CombineFileInputFormat.getSplits() including directories in its results. Contributed by Jason Dere (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1612400)
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core/src/main/java/org/apache/hadoop/mapreduce/lib/input/CombineFileInputFormat.java
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/mapreduce/lib/input/TestCombineFileInputFormat.java
+, The same problem does also exist in MRv1. I added the test case in  MAPREDUCE-5756.2.patch to MRv1's TestCombineFileInputFormat and the test failed with java.io.FileNotFoundException: Path is not a file: /dir1/dir2.
+
+bq. Note how it blindly just adds all the results of the second-level directory listing to the results rather than recursing the directory handling logic.
+
+Looking at that block of code, looks like it's adding the results for first-level directory listing rather than the second-level. The _globStat_ in the code block corresponds to the _fs.globStatus(p, inputFilter)_ call on _p_, which is one of the first-level input directories. The list of paths from the MRv1's mapreduce.lib.input FileInputFormat#listStatus call does include the second-level directories, hence the problem also exists in MRv1.]

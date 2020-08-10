@@ -1,0 +1,142 @@
+[Settings: 
+Cluster is of 107 nodes out which 106 runs tasktrackers
+Configured 4 qeueues -:
+
+default gc_percent=10
+test_q1 gc_percent=20
+test_q2	gc_precent=30
+test_q3 gc_percent=40
+
+After starting  mapred cluster.  
+JobTracker UI shows -:
+Nodes=106, Map Task Capacity=212, Reduce Task Capacity=212	Avg. Tasks/Node=4.00
+
+Queue Information shows -:
+Queue Name Scheduling Information
+default    Guaranteed Capacity Maps (%) :10.0, Guaranteed Capacity Reduces (%) :10.0, Current Capacity Maps : 0, Current Capacity Reduces : 0
+test_q1    Guaranteed Capacity Maps (%) :20.0, Guaranteed Capacity Reduces (%) :20.0, Current Capacity Maps : 0, Current Capacity Reduces : 0
+test_q2    Guaranteed Capacity Maps (%) :30.0, Guaranteed Capacity Reduces (%) :30.0, Current Capacity Maps : 0, Current Capacity Reduces : 0
+test_q3    Guaranteed Capacity Maps (%) :40.0, Guaranteed Capacity Reduces (%) :40.0, Current Capacity Maps : 0, Current Capacity Reduces : 0
+
+
+And Job track log shows -:
+2008-10-08 09:46:48,053 DEBUG org.apache.hadoop.mapred.CapacityTaskScheduler: After updating QSI objects:
+2008-10-08 09:46:48,053 DEBUG org.apache.hadoop.mapred.CapacityTaskScheduler:  Queue 'default'(map): run=0, gc=0, wait=0, run jobs=0, wait jobs=0***  Queue 'test_q1'(map): run=0, gc=0, wait=0, run jobs=0, wait jobs=0***  Queue 'test_q2'(map): run=0, gc=0, wait=0, run jobs=0, wait jobs=0***  Queue 'test_q3'(map): run=0, gc=0, wait=0, run jobs=0, wait jobs=0***
+2008-10-08 09:46:48,053 DEBUG org.apache.hadoop.mapred.CapacityTaskScheduler: After updating QSI objects:
+2008-10-08 09:46:48,053 DEBUG org.apache.hadoop.mapred.CapacityTaskScheduler:  Queue 'default'(reduce): run=0, gc=0, wait=0, run jobs=0, wait jobs=0***  Queue 'test_q1'(reduce): run=0, gc=0, wait=0, run jobs=0, wait jobs=0***  Queue 'test_q2'(reduce): run=0, gc=0, wait=0, run jobs=0, wait jobs=0***  Queue 'test_q3'(reduce): run=0, gc=0, wait=0, run jobs=0, wait jobs=0***
+
+Ran running  about 15 jobs. 
+gc for all 4 queues remained 0 all the time.
+
+, The observed behavior is because we compute the guaranteed capacity as follows:
+{code}
+private synchronized void updateQSIObjects() {
+      int slotsDiff = getClusterCapacity()- numSlots;
+      numSlots += slotsDiff;
+      for (QueueSchedulingInfo qsi: queueInfoMap.values()) {
+        // compute new GCs and ACs, if TT slots have changed
+        if (slotsDiff != 0) {
+          qsi.guaranteedCapacity +=
+            (qsi.guaranteedCapacityPercent*slotsDiff/100);
+        }
+     //...
+}
+{code}
+
+The intent, it appears, is that after a certain steady state is reached, i.e. after the time the guaranteed capacities for queues reaches some % of the total capacity, guaranteed capacities are updated by a differential based on the difference in slots. While this seems right, the problem is that the pre-condition never occurs.
+
+{{getClusterCapacity()}} gets the number of map/reduce slots currently known. When the cluster is starting up, this value gradually increases. Typically, {{slotsDiff}} will be equal to the number of slots on a TT, as each TT joins in. This, in turn, is typically much less than 100 (say 2, or 4, or some such). So, if the {{guaranteedCapacityPercent}} is a small value as well, something like 10% or so, the product is < 100, and so the capacity is always 0.
+
+Trying out a patch which modifies the computation as follows:
+{code}
+if (slotsDiff != 0) {
+  qsi.guaranteedCapacity =
+       (int)(qsi.guaranteedCapacityPercent*numSlots/100);
+}
+{code}
+i.e. if there is a difference in slots, we don't compute the differential, but rather the actual capacity. Does this seem right ?
+, BTW, I observed some odd behavior of java with the current code. I am sure there are good explanations, but it was just counter intuitive.
+
+For e.g.
+{code}
+if (slotsDiff != 0) {
+  qsi.guaranteedCapacity +=
+    qsi.guaranteedCapacityPercent*slotsDiff/100;
+}
+{code}
+has the following type of expression: {{int += float*int/100}}. I expected this to actually be a compile time error, because of the loss in precision. Indeed, {{int = float*int/100}} does give a compile time error.
+
+Also, in the {{QueueComparator}} class, we have the following expression:
+{code}
+double r1 = (double)q1.numRunningTasks/(double)q1.guaranteedCapacity;
+double r2 = (double)q2.numRunningTasks/(double)q2.guaranteedCapacity;
+{code}
+
+I thought this would give a divide by zero somewhere. However, because of the cast to double, this works fine, and the result is two NaN or Infinite numbers, which when compared returned -1.
+
+Because it is not fully explained, the simple fix I've proposed above may not be complete. I will continue to see if there are more gotchas involving guaranteed capacity., Simple patch that implements the proposed change to guaranteed capacity computation. With this, Karam verified that the capacities are shown properly now. Attaching this patch, just to enable QA to move forward., bq. f there is a difference in slots, we don't compute the differential, but rather the actual capacity. Does this seem right ?
+
+This seems right. Recompute the GC for each queue, if the total cluster capacity has changed. 
+
+bq. I thought this would give a divide by zero somewhere.
+
+GC for a queue really houldn't be zero. Maybe we should ensure that in _CapacityTaskScheduler.start()_. , The new patch preserves the change done in the first one, and makes two additional changes:
+
+- It modifies the queue comparator so that queues which do not have a Guaranteed capacity come to the end of the list of queues
+- No jobs are picked from a queue that does not have a guaranteed capacity.
+
+It adds a test case that tests that GC is correctly computed, and jobs are not assigned if GCs are zero for a queue.
+
+Vivek, when the cluster is starting up and TTs are reporting in, based on the percentage, GC for a queue could be zero. This is a transient condition, and we can just make sure that we don't consider such a queue for assignment of tasks. My rationale is if a queue doesn't have capacities, it cannot get tasks.
+
+Let me know if this makes sense., Few comments. We can
+ - stop looking at more queues once we spot a queue with zero guaranteed capacity, in TaskSchedulingMgr.assignTasks. This works because of the ordering of queues.
+ - also skip queues with on zero capacities in TaskSchedulingMgr.reclaimCapacity. This can avoid some unnecessary comparisons.
+ - have a check for queues with zero capacity *percentages*. This is perhaps what Vivek intended., I incorporated the first two comments. 
+
+The last one I've not done. One reason is that a check for capacity percentages is already done in HADOOP-4178 which is committed to trunk. Unfortunately, it does not check for zero capacities. Hence two patches will need to be generated to handle this - one for Hadoop 0.19, and one for trunk. Since it is only error handling, I am thinking it is not worth that much effort.
+
+The second is, specifying a value of zero for guaranteed capacity, along with this patch, I think makes a nice way to disable a queue. Arguably, this is better done by explicitly having a configuration parameter for enabling / disabling a queue. But until that comes, I am thinking this is a nice side effect to have., Zero percentages can be handled later. +1 for the patch., Results of test-patch:
+
+     [exec] +1 overall.
+
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+
+     [exec]     +1 tests included.  The patch appears to include 3 new or modified tests.
+
+     [exec]     +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+     [exec]     +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+     [exec]     +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+, Since this patch touches only capacity scheduler, I ran contrib tests, and all of them have passed., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12392023/HADOOP-4373.patch
+  against trunk revision 704818.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3466/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3466/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3466/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/3466/console
+
+This message is automatically generated., I just committed this. Thanks, Hemanth!, Integrated in Hadoop-trunk #635 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/635/])
+    HADOOP-4426. TestCapacityScheduler broke due to the two commits HADOOP-4053 and . This patch fixes that. Contributed by Hemanth Yamijala.
+. Fix calculation of Guaranteed Capacity for the capacity-scheduler. Contributed by Hemanth Yamijala.
+]

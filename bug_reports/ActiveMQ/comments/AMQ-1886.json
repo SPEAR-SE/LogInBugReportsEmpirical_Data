@@ -1,0 +1,81 @@
+[Fixed in rev 685966, I don't think AMQ-1886 is entirely fixed yet. The error handling still needs improvements. 
+
+Assuming the MySQLJDBCAdapter class uses batchStatements (which seems the default for MySQL and Oracle and surely others), the call to MySQLJDBCAdapter.doAddMessage() only adds the SQL statements to the batch, it does not execute the statements:
+
+{code:title=DefaultJDBCAdapter.doAddMessage()}
+if (batchStatments) {
+   s.addBatch();
+} 
+{code}
+
+At the end of MemoryTransactionStore.commit() we call persistenceAdapter.commitTransaction(ctx), which calls into TransactionContext.commit() and this is where we execute the SQL statements in executeBatch(). 
+{code:title=TransactionContext.commit()}
+public void commit() throws IOException {
+        if (!inTx) {
+            throw new IOException("Not started.");
+        }
+        try {
+            executeBatch();
+            if (!connection.getAutoCommit()) {
+                connection.commit();
+            }
+        } catch (SQLException e) {
+            JDBCPersistenceAdapter.log("Commit failed: ", e);
+            throw IOExceptionSupport.create(e);
+        } finally {
+            inTx = false;
+            close();
+        }
+    }
+{code}
+So far all is fine.
+
+Now, lets assume an sql exception is caught during the call to executeBatch(). Before re-raising the ex, we run the finally clause in TransactionContext.commit(), which currently sets inTx=false prior to calling close().
+
+Inside close() we again check for inTx and since it was set to false already (in finally clause), we run executeBatch() again, this time without a transaction. This will result in some message being written directly to the db until we hit another sql exception.
+
+IMHO, the finally clause in TransactionContext.commit() should swap the order and call close() first before setting inTx=false.
+
+{code:title=TransactionContext.commit()}
+...
+finally {
+  close();
+  inTx = false;
+}
+{code}
+
+What do you think?
+
+Then there is a second problem. When I swapped the order of close() and inTx=false there were no messages written to the db in case of hitting an exception during the call to executeBatch(). However, if the sql exception was raised after message 49 out of 50 msgs to be written, we should somehow call a rollback on the jdbc connection. With the change above, these msgs won't get written to the db as we do not commit the sql insert but we also don't rollback explicitly in our error handling. I presume the db itself will run a rollback at some stage (timeout or whatsoever) but to have a clean implementation, we will need to rollback in our exception handling.
+
+Here is a proposed implementation of TransactionStore.commit():
+
+{code:title=TransactionContext.commit()}
+public void commit() throws IOException {
+        if (!inTx) {
+            throw new IOException("Not started.");
+        }
+        try {
+            executeBatch();
+            if (!connection.getAutoCommit()) {
+                connection.commit();
+            }
+        } catch (SQLException e) {
+            JDBCPersistenceAdapter.log("Commit failed: ", e);
+
+  	  //we need to rollback before the finally clause, 
+	  //either by calling 
+          this.rollback(); 
+          //or connection.rollback();
+
+        throw IOExceptionSupport.create(e);
+        } finally {
+            close();
+            inTx = false;
+        }
+    }
+{code}
+What do you think about this change? I have not tested the explicit call to rollback() and don't claim to understand the source well enough to understand possible side effects of this change. 
+, Reopening this issue based on previous comment., good catch.. I think the root cause is that the close() call in the finally method is not really closing out the jdbc connection.  On a transacted connection if the connection is actually closed before a commit(), it should automatically cause a transaction rollback.
+
+Will work on a patch for this., Applied proposed change and added a JDBCStoreBrokerTest test case to verify everything works fine (revision 801612). All other jdbc-related test cases pass as well.]

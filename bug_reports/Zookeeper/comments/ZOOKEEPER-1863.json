@@ -1,0 +1,629 @@
+[Good catch. Do you want to attempt a patch?, I'd be happy to, but it may take me quite some time to get to it - I have many commitments right now.
+
+I think I'd first look at whether that second block can be protected with a short circuit check on isWaitingForCommit().  If that's not true then I don't think we can grab a sync off the committedRequests before it has been pulled off queuedRequests, which seems to be the core problem.  We should probably think about whether there are any other orderings that would get you to a similar state though., I couldn't repro this but we might have actually seen this in prod. I'll try some more but if you get some time would you mind running jstack on a ZK server with a wedged CommitProcessor and pasting that here? Thanks!, I will try, I'm not sure how difficult it is to reproduce the wedge with the sleep-instrumented server, and I haven't tried to determine the precise ordering that gets you there.  I have seen it happen on a live server once, but couldn't get a thread dump before some automation reset the cluster.  In every case of this lockup, a client saw the xid error (which is itself quite rare) immediately before the server it was talking to wedged, so I'm confident these issues are related., I will take a look at this the week of the 26th if no one has time to look into it before that., Here is a trace of a server following a force of this bug using an instrumented server.
+
+Requests made to this server timeout.
+, [~dutch]: I can't see the SessionTracker thread. In a healthy Follower I have this thread
+
+{noformat}
+"SessionTracker" prio=10 tid=0x00007f93fc3b2800 nid=0xb1f8 waiting on condition [0x00000000446d2000]
+   java.lang.Thread.State: TIMED_WAITING (sleeping)
+        at java.lang.Thread.sleep(Native Method)
+        at org.apache.zookeeper.server.SessionTrackerImpl.run(SessionTrackerImpl.java:124)
+
+   Locked ownable synchronizers:
+        - None
+{noformat}
+
+Can you grep /var/log/zookeeper/zookeeper.log for SessionTracker?, Sorry about that.  It's because I didn't have the changes associated with local sessions incorporated in that trace.  My build is just a bit older, but I think I can repro from trunk, as the bug appears to still be there.
+
+I will update it with a fresh build from trunk, and ensure that nothing weird is blocking my ability to reproduce the error there.
+, You should still have a SessionTracker thread, regardless of having or not local sessions enabled. If you still have your previous logs handy, would you mind grepping for SessionTracker? I wonder if the SessionTracker thread exited... I saw this once or twice before. It's very sporadic and rare. , Oh, sorry about that you are right — there shouldn't be a SessionTracker in your case. Ignore my previous comment. Still a repro from trunk would be nice. , Also, to clarify, the stack trace you attached is for a wedged follower or just for the case in which you triggered the XIDs mismatch? Nothing looks, immediately, locked-up in that stack trace. , I think the server is wedged in that trace - all requests to the server (the follower that originally showed the xid mismatch) timeout.  Even though the commit thread does look okay, I think it probably has a commit stuck in nextPending, such that isWaitingForCommit() would return true.  Effectively the lost sync has plugged the pipeline at the commit processor.
+
+If I "echo stat | nc localhost 2181" I see the outstanding request count increase at each request, but never decrease., I have seen a Commit Processor getting stuck in our prod (which run our internal branch) I spent a few days digging into the problem but couldn't locate the root cause.  
+
+The sequence of action that you put in description is very unlikely to occur in quorum mode.  First, the Follower/ObserverReuestProcessor which is in the front of the CommitProcessor put a request into queuedRequests even before sending it out to the leader.   It need at least a network round trip ( or a full quorum vote) before the same request will comeback from a leader and get put into commitRequest.  This is the assumption that even the original CommitProcessor (prior to ZOOKEEPER-1505) rely on. However, a combination of bad thread scheduling and long GC pause might break this assumption.
+
+Sync request is special unlike other write request because it doesn't require quorum voting, but I still don't think it matter in this case. 
+
+Again, since I saw this in prod but I am unable to repro it. I did add a background thread to detect a request stuck in nextPending for extended period of time and kill the server if it is the case.  I can post the patch if we are able unable find the root cause. 
+
+You can also capture a heap dump of server to inspect which request get stuck (at nextPending) and correlated the possible event.  
+
+
+, So, it seems like if this happens it must happen due to the fact that we have two paths in CommitProcessor, one on line 203, where we set the nextPending to null, and one where we never set it to null, the else case below on lines 205-210.
+Thawan, has your background thread ever done that in prod?
+I am curious as to why we have that case where we get a commit with no corresponding pending request waiting for it. The comment " // this request came from someone else so just
+                        // send the commit packet"
+Doesn't really make much sense to me, does anyone have an explanation? If this is the only way we think this could happen, maybe we check the queuedRequest queue at the time we get the unmatched request, and try to match it then., OK Apologies, I (somewhat) understand why we don't care when nextPending doesn't match.
+
+So, I've played around with reproducing this. When I change the FollowerRequestProcessor to do this:
+  case OpCode.sync:
+                    zks.pendingSyncs.add(request);
+                    zks.getFollower().request(request);
+                    zks.sync(); //this is what the leader will eventually cause us to call
+                    break;
+ , randomly sleep the commit processor, and run the async hammer test with some extra reads and sleeps (just trying to force a reproduction), I can get the xid out of sync exception:
+java.io.IOException: Xid out of order. Got Xid 5 with err 0 expected Xid 1 for a packet with details: clientPath:/test- serverPath:/test- finished:false header:: 1,1  replyHeader:: 0,0,-4  request:: '/test-,,v{s{31,s{'world,'anyone}}},2  response::  
+	at org.apache.zookeeper.ClientCnxn$SendThread.readResponse(ClientCnxn.java:914)
+	at org.apache.zookeeper.ClientCnxnSocketNIO.doIO(ClientCnxnSocketNIO.java:99)
+	at org.apache.zookeeper.ClientCnxnSocketNIO.doTransport(ClientCnxnSocketNIO.java:362)
+	at org.apache.zookeeper.ClientCnxn$SendThread.run(ClientCnxn.java:1193)
+
+Note that this fails in the same way with the same changes in 3.4, so I don't think this is a new thing.
+Have yet to get it to hang or any other behavior except for the xid out of order.
+Feels like we may need to do some additional tracking of syncs inside the commit processor...
+, Commit processor is critical to the perf of ZK so additional synchronization must be done very carefully. I agree that correctness is definitely more important. The commit processor main's loop is the bottleneck since it is executed by a single thread. So it would be best to avoid expensive locking there. 
+
+I will see log from my prod if the background thread that abort the server had done its job or not., Here is a sketch at one approach.  I'd appreciate feedback on this - I don't consider it particularly elegant, and I hope there's a better way.
+
+The idea is straightforward - we check queuedRequests prior to the dequeue of committedRequests to ensure that the head of commitedRequests has not raced.  Since I'd rather not take a full traversal for every sync request, I've further optimized this by wrapping the whole block in a check on isWaitingForCommit.  If nextPending is not NULL I don't believe the syncs can jump ordering.  So we should only pay the cost of checking if we receive a commit we weren't already waiting on, and if I'm not mistake that requires that the block above exited with:
+
+{noformat}
+queuedRequests.poll() == null
+{noformat}
+
+So the queue probably hasn't grown so deep in the interim that the traversal is particularly expensive.
+
+Still - The dependencies between the blocks of in this loop are pretty subtle and hard to understand.  If someone can safely refactor it I think that would be much preferred.  It might also be better to tag commit/sync requests such that this check for identity:
+
+{noformat}
+pending.sessionId == request.sessionId &&
+                        pending.cxid == request.cxid
+{noformat}
+
+is a bit stronger.  If we knew in this commit processor where the request came from (i.e. was it processed by our parent FollowerRequestProcessor?) then the above test would be cleaner and this race would be easy to avoid., Thanks for proposing a fix.  Here is my understanding of your proposed solution. (Assuming that the race is based on Camille's repro) 
+
+1. It is only safe to pop {{committedRequests}} and pass it down to next process when there is an outstanding write request (nextPending != null). Since we get to compare it with the outstanding write request. 
+
+2. When nextPending == null,   a request can be in {{commitedRequests}} only when it is already added to {{queuedRequests}}. If there is a request in {{commitedRequests}} it just need to check {{queuedRequests}} again to check for potential matching request.
+
+I believe traversing over {{queuedRequests}} is expensive and not needed. So I am thinking of doing this instead of that loop
+{code}
+if ( ! isWaitingForCommit() and ! queuedRequests.isEmpty()) { 
+  continue;
+} 
+{code}
+
+The idea is that we abort the current attempt of trying to process the current committed request. Then repeat the loop of processing {{queuedRequests}}. Eventually, if there is a matching request (or other write request) it will be assigned to {{nextPending}} which allow us to process {{committedRequests}} correctly
+
+
+, Thawan - I considered that and still prefer, but I had trouble convincing myself that it is safe:
+
+The block we're trying to fix is:
+{noformat}
+                    Request pending = nextPending.get();
+                    if (pending != null &&
+                        pending.sessionId == request.sessionId &&
+                        pending.cxid == request.cxid) {
+                           ...
+                    } else {
+                        // this request came from someone else so just                                                   
+                        // send the commit packet                                                                        
+                        currentlyCommitting.set(request);
+                        sendToNextProcessor(request);
+                    }
+{noformat}
+
+In that else block we would seem to be handing the case where nextPending is null but committedRequests isn't by sending the commit to the next processor.  Your solution would change that, by instead retrying the loop.  Is it possible that nothing would be placed on queuedRequests for a long time and we could starve committedRequests?
+
+I don't understand ramifications of that else clause well enough to say.  What do you think?
+, This is how that how the patch may looks like.  Some of the if statement can be merge but this is easier to understand for now
+{code}
+                /*
+                 * Processing committedRequests: check and see if the commit
+                 * came in for the pending request. We can only commit a
+                 * request when there is no other request being processed.
+                 */
+                if (!stopped && !isProcessingRequest() &&
+                    (request = committedRequests.peak()) != null) {
+                    
+                    // Abort the loop if there a new request waiting in queuedRequests
+                    if ( ! isWaitingForCommit() and ! queuedRequests.isEmpty()) { 
+                       continue;
+                    }       
+
+                    request = committedRequests.poll();
+
+                    /*
+                     * We match with nextPending so that we can move to the
+                     * next request when it is committed. We also want to
+                     * use nextPending because it has the cnxn member set
+                     * properly.
+                     */
+                     .....
+{code}
+
+Regarding your concern about this block.  There is not change to it, we still execute this one.  However, it will only get executed when queuedRequests is empty.  
+{code}
+                        // this request came from someone else so just                                                   
+                        // send the commit packet                                                                        
+                        currentlyCommitting.set(request);
+                        sendToNextProcessor(request);
+{code}
+This means that there is a potential starvation for committedRequests queue instead. Since we give a higher priority for queuedRequests  but the existing code already do that. My understanding is that ZK is supposed to be notification driven system. If there is no update (committedRequest) going through client would stop issuing read request and queuedRequests will be empty eventually and allow committed requests to go through.     
+, I think agree with you.  There is a limited potential for starvation, but that issue aside, this should perform better.  Either way, there should only be a performance impact in exceptional cases, but your simplification certainly makes the code easier to understand and maintain.  I'd recommend using your approach., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12625985/ZOOKEEPER-1863.patch
+  against trunk revision 1561672.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1913//console
+
+This message is automatically generated., Yeah, we still need to think about test case (if it is possible to test) 
+
+Also, I will try to allocate sometime to do perf test using my test cases that we don't see significant perf regression with this change. , Any update on this?, ping, Here's a patch that reflects Thawan's improvements over my original patch.  I've had this running in production for some months now with no problems.
+
+There is no test included, as this race condition is rare enough that I don't believe it can be reliably reproduced without instrumenting the code to intentionally stall at key locations.  I have performed that test manually and verified that this patch fixes the issue.  We could add the necessary instrumentation to stall and control it with a flag that would be only useful to test, but I don't believe regressions are likely enough to justify a unit test that is so specific and complex., +1 I'll run zk-smoketest before checking this in to make sure there is no significant performance hit., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12644667/ZOOKEEPER-1863.patch
+  against trunk revision 1595273.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2099//console
+
+This message is automatically generated., Updating to something that should apply to trunk, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12653011/ZOOKEEPER-1863.patch
+  against trunk revision 1606254.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2163//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2163//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2163//console
+
+This message is automatically generated., @michim any concerns with the perf impact here? Otherwise I'm gonna check it in., I was thinking that with the changes I'm proposing here, we should be able to write a test case by populating committedRequests and queuedRequests accordingly. What do you think?, Thanks for the updated patch [~fpj]. Small readability nit, I think it reads better (and with less indentation) if you exit as early as you see an unmet condition:
+
+{noformat}
+    if (stopped || isProcessingRequest() || committedRequests.peek() == null) {
+        return;
+    }
+
+    /*
+     * ZOOKEEPER-1863: Abort the loop if there is a new request
+     * waiting in queuedRequests or it is waiting for a
+     * commit. 
+     */
+    if ( !isWaitingForCommit() && !queuedRequests.isEmpty()) {
+        return;
+    }
+
+    /* do it.... */
+
+{noformat}
+, Oh, the comment here has some issues too:
+
+{noformat}
++            /*
++             * ZOOKEEPER-1863: Abort the loop if there is a new request
++             * waiting in queuedRequests or it is waiting for a
++             * commit. 
++             */
++            if ( !isWaitingForCommit() && !queuedRequests.isEmpty()) {
++                return;
++            }
+{noformat}
+
+Abort the loop is not correct.. you'll keep looping from the calling method... abort processing the commit perhaps? Also, it says "abort ... if it is waiting for a commit", whereas it's actually the contrary... right (!isWaitingForCommit)?, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12655221/ZOOKEEPER-1863.patch
+  against trunk revision 1609730.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2186//console
+
+This message is automatically generated., I shouldn't have submitted the patch. I was proposing changes that allow us to write a test case by implementing a mock CommitProcessor and instantiating it independently. I haven't tried to write the test yet, but it sounds like it is doable this way. The comments are still valid, though, thanks for checking., I have separated a part of the run loop in CommitProcessor so that I could reproduce the issue in a simple way, without using brute force to trigger the race. This patch adds the test case I mentioned before., This indeed makes the CommitProcessor more readable (besides making it testable). Some nits though, take them or leave them as you wish:
+
+extra spaces around req:
+{noformat}
++            this.committedRequests.add( req );
+{noformat}
+
+ditto:
+{noformat}
++       processor.addToCommittedRequests( writeReq );
+{noformat}
+
+debugging leftover?
+{noformat}
++       //processor.addToNextPending( writeReq );
+{noformat}
+, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12655418/ZOOKEEPER-1863.patch
+  against trunk revision 1609730.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 5 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    -1 findbugs.  The patch appears to introduce 87 new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2188//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2188//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2188//console
+
+This message is automatically generated., Thanks for the review, [~rgs]! I think this addresses your nits. I don't think this patch is related to the NioNettySuiteHammerTest test failure, but we will need to have a look at it separately., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12655442/ZOOKEEPER-1863.patch
+  against trunk revision 1609730.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 5 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    -1 findbugs.  The patch appears to introduce 87 new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2189//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2189//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2189//console
+
+This message is automatically generated., I checked the findbugs warnings, and I don't think there is anything in there due to this patch. Also, the nio hammer test seems to be crashing and I can't actually see the cause. The latest changes to jenkins seem to have made the pre-commit build unstable., fwiw, +1. thanks for the patch [~fpj]., Just to clarify [~fpj] this is just a patch so we can write a test, not a fix for the issue?, [~fournc], it is a patch that fixes the issue. I made a modification to the original patch to be able to test it and added a test case., Awesome. Checked this in to trunk. Thanks [~fpj] and [~dutch] and [~rgs] and everyone else who helped!, FAILURE: Integrated in ZooKeeper-trunk #2373 (See [https://builds.apache.org/job/ZooKeeper-trunk/2373/])
+ZOOKEEPER-1863. Race condition in commit processor leading to out of order request completion, xid mismatch on client. (fpj and Dutch T Meyer via camille) (camille: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1610861)
+* /zookeeper/trunk/CHANGES.txt
+* /zookeeper/trunk/src/java/main/org/apache/zookeeper/server/quorum/CommitProcessor.java
+* /zookeeper/trunk/src/java/test/org/apache/zookeeper/server/quorum/CommitProcessorConcurrencyTest.java
+, [~fournc]: hi - were you able to repro this in 3.4 consistently? Should we backport this patch then? I'll try your repro on top of the 3.4 branch later today. , Hi! I was able to reproduce the same issue as mentioned in [ZOOKEEPER-2151|https://issues.apache.org/jira/browse/ZOOKEEPER-2151]. Here is the output from the stat command: 
+{noformat}
+Zookeeper version: 3.5.1-alpha--1, built on 07/08/2016 17:08 GMT
+Clients:
+ /0:0:0:0:0:0:0:1:59312[0](queued=0,recved=1,sent=0)
+ /10.2.29.7:34266[0](queued=0,recved=1,sent=0)
+ /10.2.29.7:55996[0](queued=0,recved=1,sent=0)
+ /10.2.81.3:48640[0](queued=0,recved=1,sent=0)
+
+Latency min/avg/max: 0/1/826
+Received: 2199007
+Sent: 935511
+Connections: 4
+Outstanding: 48112
+Zxid: 0x100011d4e
+Mode: leader
+Node count: 171
+{noformat}
+
+Notice the number of outstanding connections.... 
+After examining the code I found that the patch that have been submitted with this issue was applied to the code. With my limited experience I do not believe that I will be able to reproduce the issue, but I am saving the full stdout zookeeper output and can provide it if needed. 
+
+Here's jstack dump:
+{noformat}
+Full thread dump OpenJDK 64-Bit Server VM (24.95-b01 mixed mode):
+
+"NIOWorkerThread-4" daemon prio=10 tid=0x00007fbb9c007000 nid=0x1a7 waiting on condition [0x00007fbbd84ce000]
+   java.lang.Thread.State: WAITING (parking)
+	at sun.misc.Unsafe.park(Native Method)
+	- parking to wait for  <0x00000000c18ed460> (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)
+	at java.util.concurrent.locks.LockSupport.park(LockSupport.java:186)
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await(AbstractQueuedSynchronizer.java:2043)
+	at java.util.concurrent.LinkedBlockingQueue.take(LinkedBlockingQueue.java:442)
+	at java.util.concurrent.ThreadPoolExecutor.getTask(ThreadPoolExecutor.java:1068)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1130)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:615)
+	at java.lang.Thread.run(Thread.java:745)
+
+"NIOWorkerThread-3" daemon prio=10 tid=0x00007fbb9c005000 nid=0x1a6 waiting on condition [0x00007fbbd85cf000]
+   java.lang.Thread.State: WAITING (parking)
+	at sun.misc.Unsafe.park(Native Method)
+	- parking to wait for  <0x00000000c18ed460> (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)
+	at java.util.concurrent.locks.LockSupport.park(LockSupport.java:186)
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await(AbstractQueuedSynchronizer.java:2043)
+	at java.util.concurrent.LinkedBlockingQueue.take(LinkedBlockingQueue.java:442)
+	at java.util.concurrent.ThreadPoolExecutor.getTask(ThreadPoolExecutor.java:1068)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1130)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:615)
+	at java.lang.Thread.run(Thread.java:745)
+
+"NIOWorkerThread-2" daemon prio=10 tid=0x00007fbb9c003800 nid=0x1a4 waiting on condition [0x00007fbbd87d1000]
+   java.lang.Thread.State: WAITING (parking)
+	at sun.misc.Unsafe.park(Native Method)
+	- parking to wait for  <0x00000000c18ed460> (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)
+	at java.util.concurrent.locks.LockSupport.park(LockSupport.java:186)
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await(AbstractQueuedSynchronizer.java:2043)
+	at java.util.concurrent.LinkedBlockingQueue.take(LinkedBlockingQueue.java:442)
+	at java.util.concurrent.ThreadPoolExecutor.getTask(ThreadPoolExecutor.java:1068)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1130)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:615)
+	at java.lang.Thread.run(Thread.java:745)
+
+"ContainerManagerTask" daemon prio=10 tid=0x00007fbbb801b800 nid=0x1a3 in Object.wait() [0x00007fbbd88d2000]
+   java.lang.Thread.State: WAITING (on object monitor)
+	at java.lang.Object.wait(Native Method)
+	at java.lang.Object.wait(Object.java:503)
+	at java.util.TimerThread.mainLoop(Timer.java:526)
+	- locked <0x00000000c190fa68> (a java.util.TaskQueue)
+	at java.util.TimerThread.run(Timer.java:505)
+
+"SyncThread:1" prio=10 tid=0x00007fbbb8016000 nid=0x1a1 in Object.wait() [0x00007fbbd8ad4000]
+   java.lang.Thread.State: WAITING (on object monitor)
+	at java.lang.Object.wait(Native Method)
+	at java.lang.Thread.join(Thread.java:1281)
+	- locked <0x00000000c195c128> (a org.apache.zookeeper.server.SyncRequestProcessor)
+	at java.lang.Thread.join(Thread.java:1355)
+	at org.apache.zookeeper.server.SyncRequestProcessor.shutdown(SyncRequestProcessor.java:195)
+	at org.apache.zookeeper.server.quorum.ProposalRequestProcessor.shutdown(ProposalRequestProcessor.java:90)
+	at org.apache.zookeeper.server.PrepRequestProcessor.shutdown(PrepRequestProcessor.java:954)
+	at org.apache.zookeeper.server.quorum.LeaderRequestProcessor.shutdown(LeaderRequestProcessor.java:78)
+	at org.apache.zookeeper.server.ZooKeeperServer.shutdown(ZooKeeperServer.java:476)
+	- locked <0x00000000c18ebd28> (a org.apache.zookeeper.server.quorum.LeaderZooKeeperServer)
+	at org.apache.zookeeper.server.quorum.LeaderZooKeeperServer.shutdown(LeaderZooKeeperServer.java:102)
+	- locked <0x00000000c18ebd28> (a org.apache.zookeeper.server.quorum.LeaderZooKeeperServer)
+	at org.apache.zookeeper.server.ZooKeeperServer$ZooKeeperServerListenerImpl.notifyStopping(ZooKeeperServer.java:443)
+	at org.apache.zookeeper.server.ZooKeeperCriticalThread.handleException(ZooKeeperCriticalThread.java:49)
+	at org.apache.zookeeper.server.SyncRequestProcessor.run(SyncRequestProcessor.java:165)
+
+"NIOWorkerThread-1" daemon prio=10 tid=0x00007fbb9c002000 nid=0x1a0 waiting on condition [0x00007fbbd8bd5000]
+   java.lang.Thread.State: WAITING (parking)
+	at sun.misc.Unsafe.park(Native Method)
+	- parking to wait for  <0x00000000c18ed460> (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)
+	at java.util.concurrent.locks.LockSupport.park(LockSupport.java:186)
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await(AbstractQueuedSynchronizer.java:2043)
+	at java.util.concurrent.LinkedBlockingQueue.take(LinkedBlockingQueue.java:442)
+	at java.util.concurrent.ThreadPoolExecutor.getTask(ThreadPoolExecutor.java:1068)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1130)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:615)
+	at java.lang.Thread.run(Thread.java:745)
+
+"LearnerCnxAcceptor-/10.2.88.8:2888" prio=10 tid=0x00007fbbb8007000 nid=0x19d runnable [0x00007fbbd8ed8000]
+   java.lang.Thread.State: RUNNABLE
+	at java.net.PlainSocketImpl.socketAccept(Native Method)
+	at java.net.AbstractPlainSocketImpl.accept(AbstractPlainSocketImpl.java:398)
+	at java.net.ServerSocket.implAccept(ServerSocket.java:530)
+	at java.net.ServerSocket.accept(ServerSocket.java:498)
+	at org.apache.zookeeper.server.quorum.Leader$LearnerCnxAcceptor.run(Leader.java:364)
+
+"QuorumPeer[myid=1](plain=/0:0:0:0:0:0:0:0:2181)(secure=disabled)" prio=10 tid=0x00007fbbe02fd800 nid=0x19c in Object.wait() [0x00007fbbd8fd9000]
+   java.lang.Thread.State: TIMED_WAITING (on object monitor)
+	at java.lang.Object.wait(Native Method)
+	at org.apache.zookeeper.server.quorum.Leader.lead(Leader.java:559)
+	- locked <0x00000000c18ebe20> (a org.apache.zookeeper.server.quorum.Leader)
+	at org.apache.zookeeper.server.quorum.QuorumPeer.run(QuorumPeer.java:1036)
+
+"WorkerReceiver[myid=1]" daemon prio=10 tid=0x00007fbbe02fb800 nid=0x19b waiting on condition [0x00007fbbd90da000]
+   java.lang.Thread.State: TIMED_WAITING (parking)
+	at sun.misc.Unsafe.park(Native Method)
+	- parking to wait for  <0x00000000c1820688> (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)
+	at java.util.concurrent.locks.LockSupport.parkNanos(LockSupport.java:226)
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.awaitNanos(AbstractQueuedSynchronizer.java:2082)
+	at java.util.concurrent.ArrayBlockingQueue.poll(ArrayBlockingQueue.java:389)
+	at org.apache.zookeeper.server.quorum.QuorumCnxManager.pollRecvQueue(QuorumCnxManager.java:1038)
+	at org.apache.zookeeper.server.quorum.FastLeaderElection$Messenger$WorkerReceiver.run(FastLeaderElection.java:235)
+	at java.lang.Thread.run(Thread.java:745)
+
+"WorkerSender[myid=1]" daemon prio=10 tid=0x00007fbbe02fa800 nid=0x19a waiting on condition [0x00007fbbd91db000]
+   java.lang.Thread.State: TIMED_WAITING (parking)
+	at sun.misc.Unsafe.park(Native Method)
+	- parking to wait for  <0x00000000c1820e98> (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)
+	at java.util.concurrent.locks.LockSupport.parkNanos(LockSupport.java:226)
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.awaitNanos(AbstractQueuedSynchronizer.java:2082)
+	at java.util.concurrent.LinkedBlockingQueue.poll(LinkedBlockingQueue.java:467)
+	at org.apache.zookeeper.server.quorum.FastLeaderElection$Messenger$WorkerSender.run(FastLeaderElection.java:457)
+	at java.lang.Thread.run(Thread.java:745)
+
+"/10.2.88.8:3888" prio=10 tid=0x00007fbbe02e9000 nid=0x199 runnable [0x00007fbbd92dc000]
+   java.lang.Thread.State: RUNNABLE
+	at java.net.PlainSocketImpl.socketAccept(Native Method)
+	at java.net.AbstractPlainSocketImpl.accept(AbstractPlainSocketImpl.java:398)
+	at java.net.ServerSocket.implAccept(ServerSocket.java:530)
+	at java.net.ServerSocket.accept(ServerSocket.java:498)
+	at org.apache.zookeeper.server.quorum.QuorumCnxManager$Listener.run(QuorumCnxManager.java:635)
+
+"2029193347@qtp-381175311-1 - Acceptor0 SocketConnector@0.0.0.0:8080" prio=10 tid=0x00007fbbe02d9000 nid=0x198 runnable [0x00007fbbd93dd000]
+   java.lang.Thread.State: RUNNABLE
+	at java.net.PlainSocketImpl.socketAccept(Native Method)
+	at java.net.AbstractPlainSocketImpl.accept(AbstractPlainSocketImpl.java:398)
+	at java.net.ServerSocket.implAccept(ServerSocket.java:530)
+	at java.net.ServerSocket.accept(ServerSocket.java:498)
+	at org.mortbay.jetty.bio.SocketConnector.accept(SocketConnector.java:99)
+	at org.mortbay.jetty.AbstractConnector$Acceptor.run(AbstractConnector.java:708)
+	at org.mortbay.thread.QueuedThreadPool$PoolThread.run(QueuedThreadPool.java:582)
+
+"1451939056@qtp-381175311-0" prio=10 tid=0x00007fbbe02dd800 nid=0x197 in Object.wait() [0x00007fbbd94de000]
+   java.lang.Thread.State: TIMED_WAITING (on object monitor)
+	at java.lang.Object.wait(Native Method)
+	at org.mortbay.thread.QueuedThreadPool$PoolThread.run(QueuedThreadPool.java:626)
+	- locked <0x00000000c1821e40> (a org.mortbay.thread.QueuedThreadPool$PoolThread)
+
+"ConnnectionExpirer" prio=10 tid=0x00007fbbe02d7800 nid=0x196 waiting on condition [0x00007fbbd95df000]
+   java.lang.Thread.State: TIMED_WAITING (sleeping)
+	at java.lang.Thread.sleep(Native Method)
+	at org.apache.zookeeper.server.NIOServerCnxnFactory$ConnectionExpirerThread.run(NIOServerCnxnFactory.java:574)
+
+"NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181" daemon prio=10 tid=0x00007fbbe02d6000 nid=0x195 runnable [0x00007fbbd96e0000]
+   java.lang.Thread.State: RUNNABLE
+	at sun.nio.ch.EPollArrayWrapper.epollWait(Native Method)
+	at sun.nio.ch.EPollArrayWrapper.poll(EPollArrayWrapper.java:269)
+	at sun.nio.ch.EPollSelectorImpl.doSelect(EPollSelectorImpl.java:79)
+	at sun.nio.ch.SelectorImpl.lockAndDoSelect(SelectorImpl.java:87)
+	- locked <0x00000000c19609b0> (a sun.nio.ch.Util$2)
+	- locked <0x00000000c19609a0> (a java.util.Collections$UnmodifiableSet)
+	- locked <0x00000000c19607a8> (a sun.nio.ch.EPollSelectorImpl)
+	at sun.nio.ch.SelectorImpl.select(SelectorImpl.java:98)
+	at sun.nio.ch.SelectorImpl.select(SelectorImpl.java:102)
+	at org.apache.zookeeper.server.NIOServerCnxnFactory$AcceptThread.select(NIOServerCnxnFactory.java:229)
+	at org.apache.zookeeper.server.NIOServerCnxnFactory$AcceptThread.run(NIOServerCnxnFactory.java:205)
+
+"NIOServerCxnFactory.SelectorThread-0" daemon prio=10 tid=0x00007fbbe02d5800 nid=0x194 runnable [0x00007fbbd97e1000]
+   java.lang.Thread.State: RUNNABLE
+	at sun.nio.ch.EPollArrayWrapper.epollWait(Native Method)
+	at sun.nio.ch.EPollArrayWrapper.poll(EPollArrayWrapper.java:269)
+	at sun.nio.ch.EPollSelectorImpl.doSelect(EPollSelectorImpl.java:79)
+	at sun.nio.ch.SelectorImpl.lockAndDoSelect(SelectorImpl.java:87)
+	- locked <0x00000000c19479e8> (a sun.nio.ch.Util$2)
+	- locked <0x00000000c19479d8> (a java.util.Collections$UnmodifiableSet)
+	- locked <0x00000000c1947350> (a sun.nio.ch.EPollSelectorImpl)
+	at sun.nio.ch.SelectorImpl.select(SelectorImpl.java:98)
+	at sun.nio.ch.SelectorImpl.select(SelectorImpl.java:102)
+	at org.apache.zookeeper.server.NIOServerCnxnFactory$SelectorThread.select(NIOServerCnxnFactory.java:426)
+	at org.apache.zookeeper.server.NIOServerCnxnFactory$SelectorThread.run(NIOServerCnxnFactory.java:391)
+
+"PurgeTask" daemon prio=10 tid=0x00007fbbe024d000 nid=0x193 in Object.wait() [0x00007fbbd98e2000]
+   java.lang.Thread.State: TIMED_WAITING (on object monitor)
+	at java.lang.Object.wait(Native Method)
+	at java.util.TimerThread.mainLoop(Timer.java:552)
+	- locked <0x00000000c1822748> (a java.util.TaskQueue)
+	at java.util.TimerThread.run(Timer.java:505)
+
+"RMI TCP Accept-0" daemon prio=10 tid=0x00007fbbe01ed000 nid=0x191 runnable [0x00007fbbe4168000]
+   java.lang.Thread.State: RUNNABLE
+	at java.net.PlainSocketImpl.socketAccept(Native Method)
+	at java.net.AbstractPlainSocketImpl.accept(AbstractPlainSocketImpl.java:398)
+	at java.net.ServerSocket.implAccept(ServerSocket.java:530)
+	at java.net.ServerSocket.accept(ServerSocket.java:498)
+	at sun.rmi.transport.tcp.TCPTransport$AcceptLoop.executeAcceptLoop(TCPTransport.java:399)
+	at sun.rmi.transport.tcp.TCPTransport$AcceptLoop.run(TCPTransport.java:371)
+	at java.lang.Thread.run(Thread.java:745)
+
+"Service Thread" daemon prio=10 tid=0x00007fbbe00ab000 nid=0x190 runnable [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+
+"C2 CompilerThread1" daemon prio=10 tid=0x00007fbbe00a9000 nid=0x18f waiting on condition [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+
+"C2 CompilerThread0" daemon prio=10 tid=0x00007fbbe00a6000 nid=0x18e waiting on condition [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+
+"Signal Dispatcher" daemon prio=10 tid=0x00007fbbe00a3800 nid=0x18d waiting on condition [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+
+"Finalizer" daemon prio=10 tid=0x00007fbbe0078000 nid=0x18c in Object.wait() [0x00007fbbe4ea8000]
+   java.lang.Thread.State: WAITING (on object monitor)
+	at java.lang.Object.wait(Native Method)
+	at java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:135)
+	- locked <0x00000000c1861290> (a java.lang.ref.ReferenceQueue$Lock)
+	at java.lang.ref.ReferenceQueue.remove(ReferenceQueue.java:151)
+	at java.lang.ref.Finalizer$FinalizerThread.run(Finalizer.java:209)
+
+"Reference Handler" daemon prio=10 tid=0x00007fbbe0076000 nid=0x18b in Object.wait() [0x00007fbbe4fa9000]
+   java.lang.Thread.State: WAITING (on object monitor)
+	at java.lang.Object.wait(Native Method)
+	at java.lang.Object.wait(Object.java:503)
+	at java.lang.ref.Reference$ReferenceHandler.run(Reference.java:133)
+	- locked <0x00000000c1860ec0> (a java.lang.ref.Reference$Lock)
+
+"main" prio=10 tid=0x00007fbbe000a800 nid=0x187 in Object.wait() [0x00007fbbe9a1a000]
+   java.lang.Thread.State: WAITING (on object monitor)
+	at java.lang.Object.wait(Native Method)
+	- waiting on <0x00000000c18ebec0> (a org.apache.zookeeper.server.quorum.QuorumPeer)
+	at java.lang.Thread.join(Thread.java:1281)
+	- locked <0x00000000c18ebec0> (a org.apache.zookeeper.server.quorum.QuorumPeer)
+	at java.lang.Thread.join(Thread.java:1355)
+	at org.apache.zookeeper.server.quorum.QuorumPeerMain.runFromConfig(QuorumPeerMain.java:184)
+	at org.apache.zookeeper.server.quorum.QuorumPeerMain.initializeAndRun(QuorumPeerMain.java:120)
+	at org.apache.zookeeper.server.quorum.QuorumPeerMain.main(QuorumPeerMain.java:79)
+
+"VM Thread" prio=10 tid=0x00007fbbe0071800 nid=0x18a runnable 
+
+"GC task thread#0 (ParallelGC)" prio=10 tid=0x00007fbbe0020800 nid=0x188 runnable 
+
+"GC task thread#1 (ParallelGC)" prio=10 tid=0x00007fbbe0022800 nid=0x189 runnable 
+
+"VM Periodic Task Thread" prio=10 tid=0x00007fbbe01fa800 nid=0x192 waiting on condition 
+
+JNI global references: 149
+
+Heap
+ PSYoungGen      total 26112K, used 8888K [0x00000000eb280000, 0x00000000ed880000, 0x0000000100000000)
+  eden space 13312K, 45% used [0x00000000eb280000,0x00000000eb86e050,0x00000000ebf80000)
+  from space 12800K, 22% used [0x00000000ecc00000,0x00000000ecec0000,0x00000000ed880000)
+  to   space 12800K, 0% used [0x00000000ebf80000,0x00000000ebf80000,0x00000000ecc00000)
+ ParOldGen       total 278528K, used 266898K [0x00000000c1800000, 0x00000000d2800000, 0x00000000eb280000)
+  object space 278528K, 95% used [0x00000000c1800000,0x00000000d1ca48e8,0x00000000d2800000)
+ PSPermGen       total 21504K, used 14831K [0x00000000b7200000, 0x00000000b8700000, 0x00000000c1800000)
+  object space 21504K, 68% used [0x00000000b7200000,0x00000000b807bd50,0x00000000b8700000)
+{noformat}
+
+Unfortunately, the issue seems to have happened on Sunday when I was not able to check the health of my cluster or perform any immediate fixes. I do have several Kazoo clients + Kafka + Secor that are using zookeeper, and as all those are failing now with zookeeper outputting the following logs:
+
+{noformat}
+2016-08-01 20:45:51,828 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.81.3:50656
+2016-08-01 20:45:51,829 - INFO  [NIOWorkerThread-4:ZooKeeperServer@931] - Client attempting to establish new session at /10.2.81.3:50656
+2016-08-01 20:45:53,723 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.29.7:35862
+2016-08-01 20:45:53,725 - INFO  [NIOWorkerThread-3:ZooKeeperServer@931] - Client attempting to establish new session at /10.2.29.7:35862
+2016-08-01 20:45:59,171 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.81.3:50658
+2016-08-01 20:45:59,172 - INFO  [NIOWorkerThread-1:ZooKeeperServer@931] - Client attempting to establish new session at /10.2.81.3:50658
+2016-08-01 20:46:00,223 - INFO  [ConnnectionExpirer:NIOServerCnxn@1007] - Closed socket connection for client /10.2.29.7:35828 which had sessionid 0x10044f682c45bdd
+2016-08-01 20:46:00,223 - INFO  [ConnnectionExpirer:NIOServerCnxn@1007] - Closed socket connection for client /10.2.81.3:50656 which had sessionid 0x10044f682c45bdf
+2016-08-01 20:46:05,013 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.29.7:35898
+2016-08-01 20:46:05,028 - INFO  [NIOWorkerThread-2:NIOServerCnxn@836] - Processing ruok command from /10.2.29.7:35898
+2016-08-01 20:46:05,029 - INFO  [NIOWorkerThread-2:NIOServerCnxn@1007] - Closed socket connection for client /10.2.29.7:35898 (no session established for client)
+2016-08-01 20:46:05,146 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.29.7:35900
+2016-08-01 20:46:05,153 - INFO  [NIOWorkerThread-4:NIOServerCnxn@836] - Processing srvr command from /10.2.29.7:35900
+2016-08-01 20:46:05,153 - INFO  [NIOWorkerThread-4:NIOServerCnxn@1007] - Closed socket connection for client /10.2.29.7:35900 (no session established for client)
+2016-08-01 20:46:05,617 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.29.7:35904
+2016-08-01 20:46:05,617 - INFO  [NIOWorkerThread-3:NIOServerCnxn@836] - Processing ruok command from /10.2.29.7:35904
+2016-08-01 20:46:05,618 - INFO  [NIOWorkerThread-3:NIOServerCnxn@1007] - Closed socket connection for client /10.2.29.7:35904 (no session established for client)
+2016-08-01 20:46:05,634 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.29.7:35906
+2016-08-01 20:46:05,634 - INFO  [NIOWorkerThread-1:NIOServerCnxn@836] - Processing srvr command from /10.2.29.7:35906
+2016-08-01 20:46:05,636 - INFO  [NIOWorkerThread-1:NIOServerCnxn@1007] - Closed socket connection for client /10.2.29.7:35906 (no session established for client)
+2016-08-01 20:46:05,644 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.29.7:35908
+2016-08-01 20:46:05,644 - INFO  [NIOWorkerThread-2:ZooKeeperServer@931] - Client attempting to establish new session at /10.2.29.7:35908
+2016-08-01 20:46:06,718 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.81.3:50660
+2016-08-01 20:46:06,719 - INFO  [NIOWorkerThread-4:ZooKeeperServer@931] - Client attempting to establish new session at /10.2.81.3:50660
+2016-08-01 20:46:10,224 - INFO  [ConnnectionExpirer:NIOServerCnxn@1007] - Closed socket connection for client /10.2.81.3:50658 which had sessionid 0x10044f682c45be1
+2016-08-01 20:46:10,225 - INFO  [ConnnectionExpirer:NIOServerCnxn@1007] - Closed socket connection for client /10.2.29.7:35862 which had sessionid 0x10044f682c45be0
+2016-08-01 20:46:13,933 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.81.3:50662
+2016-08-01 20:46:13,933 - INFO  [NIOWorkerThread-3:ZooKeeperServer@931] - Client attempting to establish new session at /10.2.81.3:50662
+2016-08-01 20:46:16,030 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.29.7:35942
+2016-08-01 20:46:16,032 - INFO  [NIOWorkerThread-1:ZooKeeperServer@931] - Client attempting to establish new session at /10.2.29.7:35942
+2016-08-01 20:46:18,646 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.29.7:57696
+2016-08-01 20:46:18,647 - INFO  [NIOWorkerThread-2:ZooKeeperServer@931] - Client attempting to establish new session at /10.2.29.7:57696
+2016-08-01 20:46:20,223 - INFO  [ConnnectionExpirer:NIOServerCnxn@1007] - Closed socket connection for client /10.2.29.7:35908 which had sessionid 0x10044f682c45be2
+2016-08-01 20:46:20,224 - INFO  [ConnnectionExpirer:NIOServerCnxn@1007] - Closed socket connection for client /10.2.81.3:50662 which had sessionid 0x10044f682c45be4
+2016-08-01 20:46:20,225 - INFO  [ConnnectionExpirer:NIOServerCnxn@1007] - Closed socket connection for client /10.2.81.3:50660 which had sessionid 0x10044f682c45be3
+2016-08-01 20:46:21,255 - INFO  [NIOServerCxnFactory.AcceptThread:/0.0.0.0:2181:NIOServerCnxnFactory$AcceptThread@296] - Accepted socket connection from /10.2.81.3:50664
+2016-08-01 20:46:21,256 - INFO  [NIOWorkerThread-4:ZooKeeperServer@931] - Client attempting to establish new session at /10.2.81.3:50664
+{noformat}
+
+Also, I would like to point out that I am running zookeeper as a part of kubernetes cluster, and not as a kubernetes petset, but as a generic service with a replication controller]

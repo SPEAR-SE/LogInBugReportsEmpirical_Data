@@ -1,0 +1,283 @@
+[The simpler fix might be to do all server-side checks in a synchronous manner and throw an exception back to the client from the RM itself when an invalid app is submitted. 
+
+Examples of invalid app submissions: 
+   - invalid queue
+   - resource specifications for the AM are invalid
+   - other fields/values out of range or not set. 
+
+, The issue with blocking until submission is complete has to do with holding the IPC server thread hostage, waiting for the scheduler to get around to processing the submission request.  The concern is if the scheduler is running behind or takes a long time to process the submit request then we can starve the RM of IPC handler threads and end up blocking other clients.  That's why currently the YARN application submission process is a two-phase process, first submit then followed by a polling loop where the client checks if the app ended up in the right state.  If we want to make these potentially long-running calls synchronous then we should prioritize server-side asynchronous processing such as proposed by HADOOP-11552.
+
+YarnRunner "works" because it bothers to do one extra appreport after the app submission completes to verify the app is still in a non-failed/killed state.  YarnClient doesn't do this check, hence why callers don't see a failure but the MapReduce client does.
+, [~jlowe] Referring to my earlier comment, does it make more sense to do the simple checks inline instead of doing them as part of the app state machine? The issue mainly stems from the fact that in Tez, we start an AM and then submit work to it directly. In such cases, where the AM is never launched, the underlying issue of why it was never launched gets hidden at times. 
+
+bq. YarnRunner "works" because it bothers to do one extra appreport after the app submission completes to verify the app is still in a non-failed/killed state.
+
+We added a unit test for this and have seen it failing randomly on a minicluster as catching the failure on the first getAppReport() call is not reliable. Ref: TEZ-2058
+
+
+
+, bq. Referring to my earlier comment, does it make more sense to do the simple checks inline instead of doing them as part of the app state machine?
+
+I believe the main issue is that when an app is submitted it must first persist the app to the state store which could take some time.  There was some concern originally that this would be too expensive to process inline.  This design came from YARN-549, maybe [~zjshen] has some additional input as to whether it would be reasonable to do more of the app submission processing inline.
+
+bq. We added a unit test for this and have seen it failing randomly on a minicluster as catching the failure on the first getAppReport() call is not reliable.
+
+Ah, the state machine transitions for an app rejected by the scheduler look like this:
+
+NEW -> NEW_SAVING -> SUBMITTED -> FINAL_SAVING (still seen as SUBMITTED in an AppReport) -> FAILED
+
+So if we look at the first app report that isn't NEW/NEW_SAVING we might still see SUBMITTED just before FAILED.  We'd have to also continue polling during the SUBMITTED state to verify it wasn't rejected.  When things are running normally the SUBMITTED state is usually very short-lived, which would explain the flaky test.
+
+bq. The issue mainly stems from the fact that in Tez, we start an AM and then submit work to it directly.
+
+So is it important to know the AM is actually running?  An AM could take an indeterminate amount of time to eventually launch if submitted to a crowded queue, and the AM could fail to run in a number of ways before that (e.g.: killed by user, fail to launch due to JVM or container launch context issues, etc.).  Seems like there would need to be other failsafes in place besides just the fact that the scheduler accepted the job., bq. So is it important to know the AM is actually running?
+
+Not really. I think it goes back to my original question. Should an app with invalid configs be accepted in the first place? There is overhead in terms of saving the app submission context etc - should some of the checks be done before this step so as to not incur the overhead of storing the app data as well as moving it through the app state machine? 
+
+ , Have written a patch which provides a short term solution: AM will keep polling from RM until it's running. It also prevent the flaky behavior as detected in YarnRunner by not treating SUBMITTED state as absolute sign of application will run. [~hitesh] I have asked Jason about solution of this problem and he suggested me to do this short term solution first. [~jlowe]Could you reply to Hitesh about your concerns of his suggestions? Thanks., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12699763/yarn_3131_v1.patch
+  against trunk revision d49ae72.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client:
+
+                  org.apache.hadoop.yarn.client.TestApplicationClientProtocolOnHA
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6676//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6676//console
+
+This message is automatically generated., [~lichangleo] I do not think that continuously polling until RUNNING is a good idea. The most common case on a busy cluster is that an app can be submitted at time X but not start running until a long time later. Making client code block until then is not a good idea especially for cases where jobs are submitted in a fire-n-forget manner. 
+
+I think for now, we should probably not address this jira in this manner. As it stands today, it might be better to live with these issues in the short term ( so as to not break current expected behavior ).
+
+As I mentioned earlier, I still believe that doing some basic checks in-line in ClientRMService itself and throwing an exception back straight away is probably a better idea than polling for any RUNNING/FAILED state. 
+, bq. I do not think that continuously polling until RUNNING is a good idea. The most common case on a busy cluster is that an app can be submitted at time X but not start running until a long time later.
+
+The patch does not cause the client to poll until the job is RUNNING.  It polls until the job has progressed past the SUBMITTED state.  The SUBMITTED state is a brief transient state before the ACCEPTED state.  So the client will wait approximately as long as it does today, and it fixes that flaky submit unit test in Tez.  It will not block until the AM is actually running.
+
+bq. As I mentioned earlier, I still believe that doing some basic checks in-line in ClientRMService itself and throwing an exception back straight away is probably a better idea than polling for any RUNNING/FAILED state. 
+
+I agree that a blocking method is much easier on the client, but I don't think this is an easy change to make in the short term.  Again I think it requires a major change to the RPC layer and the RM to support server-side asynchronous call handling, otherwise we have to throw an army of threads at the client service to avoid blocking other clients and that has scaling issues.  We could probably add an API to the scheduler to do an in-line sanity check on the requested queue (which is a backwards-incompatible change for schedulers not in the Hadoop repo).  However there are many other things that could go wrong during submission that take a long time to perform, such as saving the application state and renewing delegation tokens.  I'm not sure it's a win if we check for one thing in-line that could go wrong but still have to poll for all the other things that could go wrong.  In the end, Tez and other YARN clients need to know if the app was accepted or not.  The queue being wrong is just one of the ways the submit could fail.
+
+Continuing to poll in the SUBMITTED state also meshes with the thoughts on the SUBMITTED state being something the client probably shouldn't see anyway.  See the discussion about NEW_SAVING and SUBMITTED in YARN-3230.
+
+Thanks, Chang, for updating the patch.  Please investigate the unit test failure, as it looks like it could be related.  My only nit on the patch is it would be a bit clearer and more efficient if we used EnumSet constants to capture the set of states we're waiting the app to leave and the set of states that are failed-to-submit states.
+
+I suppose another way to solve this problem is to take the approach discussed in YARN-3230 and have the RM not expose the NEW_SAVING and SUBMITTED states to the client -- they would just see NEW.  We'd have to leave the states in the enumeration for backwards compatibility, but we'd stop exposing them in app reports.  Any thoughts on that [~zjshen] or [~jianhe]?, Actually just saw YARN-3232 was filed which proposes to stop exposing the NEW_SAVING and SUBMITTED states to clients.  If we do that then all we need to do in YarnClientImpl is have it throw when the non-NEW state is FAILED or KILLED to indicate the submit failed., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12699905/yarn_3131_v2.patch
+  against trunk revision c33ae27.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6683//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6683//console
+
+This message is automatically generated., Updated patch, fixed unit test and improved the code style. Thanks both [~jlowe] and [~hitesh] for providing valuable opinions. 
+[~hitesh]We could open new jira(s) to address the issue of confirming AM gets launched. The current fix could be a short term solution because transition from submit state to accept state won't take too long as explained by Jason. We are not polling for Running/Failed state. It's not optimized but the situations of submitting work to a incorrect queue aren't common either.
+[~zjshen][~jianhe]Could you please kindly also comment on this problem? Thanks. , Hi [~lichangleo],
+Thanks for working on this, some (minor) comments:
+1) There're several duplicated calls of {{getApplicationReport}} in YarnClientImpl, you can merge them you a single one.
+2) Changes of TestApplicationClientProtocolOnHA actually changed behavior of the test, it's better to fix the test.
+3) Code style, I noticed tabs/spaces mixed using in the patch.
+
+Wangda, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12700207/yarn_3131_v3.patch
+  against trunk revision fe7a302.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6699//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/6699//artifact/patchprocess/newPatchFindbugsWarningshadoop-yarn-client.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6699//console
+
+This message is automatically generated., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12700224/yarn_3131_v4.patch
+  against trunk revision fe7a302.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6702//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6702//console
+
+This message is automatically generated., [~wangda]Thanks for reviewing my work! I have updated my patch according to your suggestion. Could you please kindly review it again? Thanks, [~leftnoteasy], Thanks for update, LGTM, +1., looks good overall, some minor comments on my side
+- the enum sets are exceeding 80 column limit
+- Instead of throwing IOException, we may throw YarnException., "Failed to submit application to YARN : " - we may mention the appId to be more clear. "Failed to submit " + appId  + "to YARN", {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12700573/yarn_3131_v5.patch
+  against trunk revision 9a37247.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client:
+
+                  org.apache.hadoop.yarn.client.api.impl.TestYarnClient
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6712//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6712//console
+
+This message is automatically generated., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12700584/yarn_3131_v6.patch
+  against trunk revision 9a37247.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6713//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6713//console
+
+This message is automatically generated., [~jianhe] Thanks for review! I have updated my patch. Could you please kindly review it again. If all is good, please kindly help commit this. Thanks., Nits:
+{code}
++            throw new YarnException("Failed to submit " + applicationId +
++                "to YARN : " + appReport.getDiagnostics());
+{code}
+You will see the output to be something like "application_123456_0001to YARN" - a missing space
+
+We can just simply check for failToSubmitStates? Why do we also need to check for waitingStates?, Cancelling the patch in light of the comments., bq. We can just simply check for failToSubmitStates? Why do we also need to check for waitingStates?
+
+If we only check for failToSubmitStates then we'll continue to loop waiting for those failed states.  We need to check for waitingStates because that's the typical looping condition.  We need to keep polling for a new application report as long as the app is in the NEW, NEW_SAVING, or SUBMITTED state since those states indicate the RM hasn't finished accepting the app yet.  When it's not in one of the waiting states, we need to check if its one of the failed states to decide to throw rather than just return indicating it was successful., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12700886/yarn_3131_v7.patch
+  against trunk revision caa42ad.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/6747//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/6747//console
+
+This message is automatically generated., Thanks [~jlowe] for commenting. [~vinodkv] I have fixed the space issue. Jason's explanation is reasonable and I also agree that the check for waitingStates is logical and necessary. Do you have any other concern? Thanks., Yeah, I missed the larger context in which this code works i.e. app submissions. Tx for the confirmation [~jlowe].
+
+[~lichangleo], I am good. I'll let either [~jlowe] or other committers commit it as they spent more time on the patch., [~jlowe] [~jianhe] [~leftnoteasy] Could any of you help commit this if it looks good for you now? Thanks, +1 lgtm.  Will commit this tomorrow if there are no objections or further comments that need to be addressed., Thanks to Chang for the contribution and to Hitesh, Wangda, Jian, and Vinod for additional review!  I committed this to trunk and branch-2., FAILURE: Integrated in Hadoop-trunk-Commit #7255 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/7255/])
+YARN-3131. YarnClientImpl should check FAILED and KILLED state in submitApplication. Contributed by Chang Li (jlowe: rev 03cc22945e5d4e953c06a313b8158389554a6aa7)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/ProtocolHATestBase.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/YarnClientImpl.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestYarnClient.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #123 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/123/])
+YARN-3131. YarnClientImpl should check FAILED and KILLED state in submitApplication. Contributed by Chang Li (jlowe: rev 03cc22945e5d4e953c06a313b8158389554a6aa7)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/YarnClientImpl.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/ProtocolHATestBase.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestYarnClient.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #857 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/857/])
+YARN-3131. YarnClientImpl should check FAILED and KILLED state in submitApplication. Contributed by Chang Li (jlowe: rev 03cc22945e5d4e953c06a313b8158389554a6aa7)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/ProtocolHATestBase.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/YarnClientImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestYarnClient.java
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #2055 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2055/])
+YARN-3131. YarnClientImpl should check FAILED and KILLED state in submitApplication. Contributed by Chang Li (jlowe: rev 03cc22945e5d4e953c06a313b8158389554a6aa7)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/YarnClientImpl.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestYarnClient.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/ProtocolHATestBase.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #114 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/114/])
+YARN-3131. YarnClientImpl should check FAILED and KILLED state in submitApplication. Contributed by Chang Li (jlowe: rev 03cc22945e5d4e953c06a313b8158389554a6aa7)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/ProtocolHATestBase.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestYarnClient.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/YarnClientImpl.java
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #123 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/123/])
+YARN-3131. YarnClientImpl should check FAILED and KILLED state in submitApplication. Contributed by Chang Li (jlowe: rev 03cc22945e5d4e953c06a313b8158389554a6aa7)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/YarnClientImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/ProtocolHATestBase.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestYarnClient.java
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2073 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2073/])
+YARN-3131. YarnClientImpl should check FAILED and KILLED state in submitApplication. Contributed by Chang Li (jlowe: rev 03cc22945e5d4e953c06a313b8158389554a6aa7)
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/main/java/org/apache/hadoop/yarn/client/api/impl/YarnClientImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/ProtocolHATestBase.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/api/impl/TestYarnClient.java
+]

@@ -1,0 +1,135 @@
+[[~aw], does the problem in the JIRA description make sense to you? If so, I can try a simple patch., The log directory may still get used, depending upon the log4j settings.
+
+(An example would be the HDFS audit log.), For a bit more context, we have some code that starts the balancer in the foreground, without a log4j.properties file or setting $HADOOP_LOG_DIR. verify_logdir then checks the default location ($HADOOP_HOME/logs), which is not writable, and fails.
+
+Other commands that do not support daemonization skip all these checks. In this case, I'm not  trying to run the balancer as a daemon. Is it reasonable to also skip these checks in this situation? Looking more at the code, I think what I want is to go directly to hadoop_java_exec rather than the daemon logic., Ah, OK. 
+
+bq. Is it reasonable to also skip these checks in this situation?
+
+In the general daemon case we definitely need to leave the hadoop_verify_logdir in place.  This will get followed up with verifying the pid dir as well.  This is needed because many folks run the daemon commands "interactively" from a shell code perspective but do their own daemonization from init.  There's also the docker case where individual daemons are in their own containers.   etc, etc. We're almost always better checking for the existence of this dirs rather than letting Java go haywire.
+
+But balancer (and mover and probably a handful of others) are, in many ways, special.
+
+We effectively have a problem of history. sbin/start-balancer.sh was added way back when as a convenience  to background the balancer.  When the rewrite happened, balancer was added to the commands that could be daemonized as a result.   
+
+There might also be a privilege problem here too.  I don't think balancer can be run as by a non-privileged user, usually making the log and pid dir verification (usually) safe and somewhat required if we want all of our daemons to function in the same way (consistency!).  The pid check at the UNIX level definitely helps prevent multiple instances running on the same host way faster (and somewhat more reliably!) than the Java checks. 
+
+To me, the questions become:
+
+a) should balancer stay as a daemon? what about the other not-really-daemons-but-can-run-in-daemon-mode subcommands?
+b) should instead there be logic to say that failing logdir and piddir are optionally fatal?
+c) should a local override be used instead? (e.g., define a shell profile that replaces the hdfs balancer command)
+
+, Besides the Mover, I'd also include the new intra-DN balancer in the collection of special commands. It's currently not daemon-enabled.
+
+I don't have strong opinions here, but it seems like if someone is not specifying the "--daemon" flag, then they don't care about daemon things like pid files and log dirs for stdout/stderr. The audit log is an interesting case, but I think app-specific logging should be checked in the app, not the shell scripts (which are generic).
+
+I think some combination of a) and b) is appropriate.
+
+Regarding a), I don't think the balancer is commonly run in the background; Bigtop and CDH don't have balancer init scripts for instance. So can remove daemonization, also for Mover if it has it.
+
+Regarding b), I'd prefer to short-circuit to hadoop_java_exec, but b) is alright too. I think there should be some generic fix for when "--daemon" isn't specified, because of user expectations.
+
+Happy to try a patch if you agree., bq.  it seems like if someone is not specifying the "--daemon" flag, then they don't care about daemon things like pid files and log dirs for stdout/stderr.
+
+They do, actually.  The inconsistent behavior of the hadoop daemons was a big sticking point amongst quite a few admins I had talked to.  
+
+bq. The audit log is an interesting case, but I think app-specific logging should be checked in the app, not the shell scripts (which are generic).
+
+I'd love to see pid and log dir handling out of the scripts.  It greatly over-complicates them. One thing to keep in mind that doing it prior to Java launch means that we get extremely fast fail: there's no Java classpath work and no Java initialization costs.
+
+bq.  Bigtop and CDH don't have balancer init scripts for instance.
+
+Sorry, I think I may have miscommunicated this point.  start-balancer is geared towards manual usage but running it in the background and catching it's IO as it can run for very long times on large and/or extremely misbalanced clusters.  It's not a daemon in the traditional sense.   It really is a convience script so that those that aren't familiar with bash don't have to remember how to catch stdout/stderr, or use disown or whatever.   I'd be very surprised if there actually was an init script.
+
+It's fun to note that the start-balancer script only appears to be documented in the Balancer javadoc and the only place that Javadoc is really exposed is on Cloudera's website. ;)
+
+bq. I think there should be some generic fix for when "--daemon" isn't specified, because of user expectations.
+
+As stated above, user expectation is consistency.  No consistency will mean we'll also need to remove the --daemon status capability since it will be unreliable.
+
+, I think it's important to point out that this ...
+
+bq. For a bit more context, we have some code that starts the balancer in the foreground, without a log4j.properties file or setting $HADOOP_LOG_DIR. verify_logdir then checks the default location ($HADOOP_HOME/logs), which is not writable, and fails.
+
+... is an edge case.
+
+Most users of hadoop almost certainly have a log4j.properties file and HADOOP_LOG_DIR is set somewhere writable at installation time., Man, the balancer is a can of worms. Not a daemon, but runs awkwardly longer than other normal commands. This is the root of potential differences in expectations.
+
+What do you propose we do? Minimally, we should make sure all the members of the balancer family have the same daemonization behavior, which is currently untrue.
+
+If part of the answer is that the balancer family are daemons and need a HADOOP_LOG_DIR and a log4j.properties, that's fine with me. Not a hard change on our side., bq. Man, the balancer is a can of worms. Not a daemon, but runs awkwardly longer than other normal commands. This is the root of potential differences in expectations.
+
+Yup. Completely agree. :)
+
+bq. What do you propose we do? Minimally, we should make sure all the members of the balancer family have the same daemonization behavior, which is currently untrue.
+
+Yes, we probably should make sure they are treated the same in the hdfs script if they aren't.  We should definitely avoid adding more sbin scripts.  My hope is that in 4.x we can wipe out most of sbin and reduce our code footprint.
+
+bq. If part of the answer is that the balancer family are daemons and need a HADOOP_LOG_DIR and a log4j.properties, that's fine with me. Not a hard change on our side.
+
+I was thinking about what kind of interfaces/guarantees we provide 3rd parties. We make no promises about the content of log4j that I could find, so that's an easy one. But if a non-ASF jar gets added to the classpath via shellprofile what would the expectations on HADOOP_LOG_DIR and -Dhadoop.log.dir be?  The key might be hadoop-env.sh:
+
+{code}
+# Where (primarily) daemon log files are stored.
+# ${HADOOP_HOME}/logs by default.
+# Java property: hadoop.log.dir
+# export HADOOP_LOG_DIR=${HADOOP_HOME}/logs
+{code}
+
+It's pretty clear that HADOOP_LOG_DIR is expected to point somewhere valid when we run as a daemon. HADOOP_LOG_DIR needs to work then on daemons. That leads me to we basically have three choices:
+
+1. If there is a general agreement amongst the community that balancer and friends should run with HADOOP_SUBCMD_SUPPORTDAEMONIZATION=true, then HADOOP_LOG_DIR should be set to something writable (e.g., /tmp) when it is being executed.
+
+2. If balancer should be run with HADOOP_SUBCMD_SUPPORTDAEMONIZATION=false, it now becomes a normal client command and sbin/start-balancer goes away.  HADOOP_LOG_DIR, etc, now become irrelevant.
+
+3. Some third state needs to get introduced and all of the accompanying support code added so that we can support it in all of the user-executable scripts.
+
+At this point, yes, I think the easiest path forward really is #1: HADOOP_LOG_DIR must point somewhere writable.  All of the other options have a lot more pain involved, for us and/or the end users., Sounds good. Attaching a trivial patch which makes the intra-DN balancer also support daemonization., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 17s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red}  0m  0s{color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 11s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} shellcheck {color} | {color:green}  0m 12s{color} | {color:green} The patch generated 0 new + 74 unchanged - 1 fixed = 74 total (was 75) {color} |
+| {color:green}+1{color} | {color:green} shelldocs {color} | {color:green}  0m 11s{color} | {color:green} There were no new shelldocs issues. {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 46s{color} | {color:green} hadoop-hdfs in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 11m 39s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HADOOP-13717 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12833812/HADOOP-13717.001.patch |
+| Optional Tests |  asflicense  mvnsite  unit  shellcheck  shelldocs  |
+| uname | Linux de1528f26471 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / f5d9235 |
+| shellcheck | v0.4.4 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/10815/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/10815/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Hi [~aw] could I get a review? Trivial one., +1, Thanks Allen for discussion and review, I've committed this to trunk., SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #10749 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/10749/])
+HADOOP-13717. Normalize daemonization behavior of the diskbalancer with (wang: rev bd7f5911c726c505a654d5d30b7dc5a92dca05bd)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/bin/hdfs
+, [~andrew.wang]  [~aw] Sorry to comment on this late.  Just saw it when I was looking at the git log. The DiskBalancerCLI runs but for a brief moment when planning and writes a plan file out. Then when you submit plan it reads the plan file and sends it datanode via RPC. Both of those AFAIK does not qualify as a daemon behaviour. So why classify this as a daemon ?  
+
+I agree with the balancer comments, it does run for a long time. All long running activity for diskbalancer is confined within the datanode, Perhaps I am missing something here ? 
+, Thanks for the info Anu, I wrongly assumed the diskbalancer CLI worked like the balancer. I'll revert this change and close as WONTFIX., Reverted and reclosing, thanks again Anu for catching this., [~andrew.wang]Thanks for reverting it. 
+[~aw] Would this be a good time for us to see if we should fix how to discover which commands are daemons and which are normal commands in hdfs command set ? 
+, SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #10755 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/10755/])
+Revert "HADOOP-13717. Normalize daemonization behavior of the (wang: rev f2800f523d4a4f9ff9c3286f9a839d081dcb5b96)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/bin/hdfs
+]

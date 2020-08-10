@@ -1,0 +1,270 @@
+[
+To quote an example, TT cannot properly cleanup the following dirs.
+{code}
+$mapred.local.dir
+   `-- taskTracker
+         `-- jobcache
+               `--- $jobid
+                     `--- work
+                           `-- unwritable-dir dr--r--r--  <created by user's task>
+                                 `---- user-file -r--r--r-- <created by user's task>
+{code}, This problem gets aggravated when LinuxTaskController is in use. User can simply set group ownership of files that he/she creates to himself thereby preventing TaskTracker to clean up those files. By default, all directories have setgid bit set and so files/dirs are cleanable by the TT., Why aren't we using TaskController to actually delete the files too?, With LinuxTaskController in use, we have seen instances of this on some clusters. This effectively rendered some of the TTs useless for lack of disk space. Need in this 0.21., Attaching patch with the fix. Please review and provide your comments.
+
+Patch does the following:
+
+(1) When deleting $jobId/$attemptId/work or when deleting $jobId/$attemptId, TT uses task-controller to enable the path for deletion(by changing permissions). (a) LinuxTaskController sets 770 as permissions for all the files/directories within this dir recursively and then TT will delete the dir. (b) DefaultTaskController sets rwx for user(same as TT) for this dir recursively and then TT deletes the dir.
+
+(2) Deletion of $jobId is done as earlier because user can't create any files in this dir.
+
+(3) Deletion of work dir in TaskRunner(useful with jvm reuse) is also done by changing the permissions first(no taskcontroller is needed in this case).
+
+(4) With jvm reuse, after final task of a Jvm is finished, workDir is deleted using procedure mentioned in (1) above by task-controller.
+
+(5) Modified TestTaskTrackerLocalization and TestLocalizationWithLinuxTaskController to have directories/files created in $attemptId and set nonwritable permissions which tests whether (a) DefaultTaskController and (b) LinuxTaskController would be able to remove these new files from $attemptId., sigh! the patch has got stale. Can you pl update it ?, Updated the patch so that it appies to current trunk.
+
+Please review and provide your comments., Started looking at this patch. I need to still see the C changes, but have the following comments so far:
+
+- I think we should not pass the full path for deletion to the task-controller for security purposes. We should use the pattern we have used for other commands like this:
+ task-controller user-name cmd mapred-local-dir job-id task-id is-work-dir
+- PathDeletionContext can have APIs like jobId, taskId, isWorkDir, which it can construct based on the path passed to it.
+- Can we call the API and commands in TaskController as cleanupTask, just so the names are consistent like initializeTask, etc.
+- The new addToQueue API can be package private.
+- We should probably take care that if user or taskController is not null, the other is non-null as well and throw an IllegalArgumentException if it is not.
+- After enabling path for deletion using taskcontroller, we should probably use context.fs.delete(context.path, true). This way the deletion logic remains same. Also, the deletePath implementation can be simplified as follows:
+{code}
+  if (context.taskController != null) {
+    context.taskController.cleanupTask(context); 
+  }
+  return context.fs.delete(context.path, true);
+{code}
+- I don't think LinuxTaskController must do context.fs.delete in case arguments in pathdeletioncontext are incorrect. This can hide errors and result in the undeleted directories.
+- There is a change in JVMManager where the workdir for the last task was being deleted inline, but now we delete it asynchronously. Is this OK ? It seems like it should be because there is no reuse of directories after this point and hence, a little delay in cleaning up the workdir shouldn't have any effect.
+- The change in setupWorkDir does not seem to be creating a workDir after deletion., Some comments on the C code and testcases:
+
+- I feel secure_path is a better API name than change_permissions - any specific reason for the change ?
+- The parameter 'secure' can be renamed 'check_ownership' to better reflect its intent.
+- Why do we need check_group ?
+- Please document the permissions being set in the comments describing enable_path_for_deletion, like is done for other methods like initialize_user.
+- Typo in test case createFileAndSetPermissions ? a=rw should be a-rw  
+- The error in TestLocalizationWithLinuxTaskController.testUserLocalization could be better fixed by refactoring the test cases in TestLocalizationWithLinuxTaskController and TestTaskTrackerLocalization as follows:
+  Define a method canRun() in TestTaskTrackerLocalization and call it as the first statement in every test in TestTaskTrackerLocalization. Override this method in TestLocalizationWithLinuxTaskController to return ClusterWithLinuxTaskController.shouldRun(). Then we can stop overriding every test case in TestTaskTrackerLocalization
+- It seems like we can write a test case for TaskRunner.setupWorkDir, if we ignore distributed cache files for now., The new TaskController command is ENABLE_TASK_FOR_CLEANUP.
+
+There is a change in JVMManager where the workdir for the last task was being deleted inline, but now we delete it asynchronously. This should be fine.
+
+The change in setupWorkDir fixes the issue of trying to delete workDir, which is the current working dir. Only contents of workDir are deleted, leaving the workDir as empty. A testcase is added to validate this cleanup of workDir.
+
+Removing check_group as this wouldn't work if user changes the group of workDir.
+
+createFileAndSetPermissions sets a=rx for subDir and file in subDir sothat no one can delete them without doing chmod.
+
+Am fine with the other comments.
+
+, Attaching Y! 20 patch(review comments incorporated). Making changes to the trunk's patch.
+
+Please review Y! 20 patch and provide your comments., I looked at the Y! 20 patch. Some comments:
+
+- TaskTracker.buildPathForDeletion need not be public.
+- Was there a need to change CleanupQueue.addToQueue to take a FileSystem as argument instead of Configuration ? It has caused more changes than required by this patch - like in JobTracker and JobInProgress. Can we retain the original API and pass in a Configuration as before ? 
+- When adding a task directory to delete, we are adding paths from all the local directories instead of just the one where files for the task are actually created. At a minimum, this is more work being done than necessary. More importantly, I don't know if there are any side effects this will cause. We can check which among the local directories the path belongs to (by doing a startsWith on the path) and all only that I think.
+- Shouldn't getLocalDirs take the tasktracker's configuration always ? In which case, it doesn't need to take the JobConf as a parameter, but can use fConf.
+- The log statements in CleanupQueue.PathCleanupThread.run are printing context.path which will only be the mapred local dir. We actually need the full path, otherwise the log statements could be confusing. Indeed, I would suggest a slight refactoring of the PathDeletionContext class, because as it exists currently we have one mode or the other that works - either a fullPath is provided or the path is built from other bits of data - like jobId, taskId etc. So, I would suggest something along the following lines:
+{code}
+class PathDeletionContext {
+  String fullPath;
+  FileSystem fs;
+
+  protected String getPathForDeletion() {
+    return fullPath;
+  }
+
+  protected void enablePathForCleanup() {
+    // do nothing
+  }
+}
+
+class TaskControllerPathDeletionContext extends PathDeletionContext {
+  String user;
+  String jobId;
+  String taskId;
+  boolean isCleanupTask;
+  boolean isWorkDir;
+  TaskController taskController;
+  Path p;
+
+  @Override
+  protected String getPathForDeletion() {
+    TaskTracker.buildPathForDeletion(this);
+  }
+
+  @Override
+  protected void enablePathForCleanup() {
+    taskController.enablePathForCleanup(this);
+  }
+}
+{code}
+
+Then we can use PathDeletionContext in all cases where we don't need to use the taskController and the sub-class in other cases. CleanupQueue will naturally take and store PathDeletionContext objects. getPathForDeletion can be called to get the final path for deletion. I feel this design is cleaner. Thoughts ?
+- DefaultTaskController.enableTaskForCleanup should be package private.
+- In other APIs of LinuxTaskController - like buildLaunchTaskArgs, we find out if the task is a cleanup task and adjust paths directly. I think we can do the same thing for the new command also. This is not less secure, because we are still constructing the full path from the command args, but we abstract the task-controller from details like cleanup task. It is less clear whether the same thing should be done for workDir (i.e. should we append that to taskid in LinuxTaskController itself.) For that we may need a flag still, but I am OK if that is also resolved in LinuxTaskController itself and we completely eliminate flags to pass to task-controller.
+- The List of args in buildChangePathPermissionsArgs should be of the right size. (It's not 5). Also, I think it is useful to retain the order of commands the same. i.e. Let the mapred local dir be the first argument, then job-id, then task-id.
+- I think we must allocate the exact amount of memory required in build_dir_path. This can be done by defining a format string like TT_LOCAL_TASK_SCRIPT_PATTERN and then summing the lengths of this string, and the arguments like jobid, taskid, mapred local dir etc. Then we can use snprintf to build the path instead of multiple (unsafe) strcat and strcpy calls. Again, please look at get_task_file_path for an example.
+- Return values of calls like malloc should all be checked. When this is done, calls to build_dir_path can fail, which must also be checked.
+- In TaskRunner.deleteDirContents, I think if we get an InterruptedException, we should return immediately. Because otherwise, the operation is not really interrupted and it can get stuck permanently.
+- The intent of the testcase in TestChildTaskDirs is nice. But I am worried that since directory cleanup happens asynchronously, this might fail due to timing issues (like the TODO in the comment says). One option could be to use an inline directory cleaner. Can we try that ? 
+- Should we also verify that the taskattemptdir is also cleaned up ?
+- There are some TODOs in the tests, can you please remove them after addressing the concerns ?
+, > Was there a need to change CleanupQueue.addToQueue to take a FileSystem as argument instead of Configuration ? It has caused more changes than required by this patch - like in JobTracker and JobInProgress. Can we retain the original API and pass in a Configuration as before ?
+
+With the new code you suggested, those changes are anyway needed in JobTracker and JobInProgress and also it will be consistent with trunk's code. So sending FileSystem instead of Configuration.
+
+> When adding a task directory to delete, we are adding paths from all the local directories instead of just the one where files for the task are actually created. At a minimum, this is more work being done than necessary. More importantly, I don't know if there are any side effects this will cause. We can check which among the local directories the path belongs to (by doing a startsWith on the path) and all only that I think.
+
+As some of the files under workDir can be on different local directories, deletion of all the paths is to be done.
+
+
+Incorporated all other review comments. Also changed the permissions being set recursively on the path to be deleted is changed to 777 as that is the default permission setting done by TaskTracker when taskDir and workDir are created(just to be consistent with that).
+
+A testcase of this patch depends on HADOOP-5771. So this patch needs to be applied on top of HADOOP-5771.
+
+Attaching new patch for Y! 20.
+Please review and provide your comments., This is getting close. I have a few minor comments:
+
+- get_task_dir_path does not use mapred_local_dir. It can be removed.
+- We should also be calling check_tt_root before we start the operation of cleanup.
+- Documentation of PathDeletionContext and its subclasses would be nice. You can also document methods like enablePathForDeletion.
+- TaskTracker.localFs can be private and given by an accessor instead of being package private and exposed.
+- buildPathDeletionContexts and buildTaskControllerPathDeletionContexts can be private.
+- buildPathDeletionContexts is checking for paths being null in one place, but not everywhere. For e.g. for (Path p : paths) will throw an NPE if paths is null. I think it is not expected to be null, no ? In which case, we shouldn't be checking for it.
+- I would suggest instead of sending multiple parameters related to Task to TaskControllerPathDeletionContext, we can send the Task itself. Also, I would suggest using JobID instead of the value as string.
+
+Other than these, the other changes I verified seem fine., Attaching patch for Y! 20 with the review comments incorporated., TestPermission and TestDFSPermission failed in unit tests. The failures are not related to this patch., ant test-patch passed on my local machine for this Y! 20 patch., Attaching patch for trunk with review comments incorporated., The trunk patch is looking close. Have a few minor comments:
+
+- Seems like getLocalDirs() can be implemented in terms of getLocalFiles() by calling getLocalFiles(fConf, "") and adjusting getLocalFiles to handle the case where if the 'subDir' is empty, it works by returning just the local files.
+- Use TaskTracker.getTaskWorkDir in TaskControllerPathDeletionContext.buildPathForDeletion(). Same for LinuxTaskController.buildTaskCleanupArgs.
+- Remove the TODO in testSetupWorkDir. Instead we could file a new JIRA to track the additional test cases.
+- Couple of more test cases I can think of:
+-- Call removeTaskFiles with needCleanup set to false, and verify the entire task directory is cleaned up.
+-- Call removeTaskFiles with jobconf enabling JVM reuse and verify the work directory is cleaned up.
+-- Do we need to ensure changes in JobTracker and JobInProgress are tested too ? Or are they already covered elsewhere ?, Latest Y! 20 patch generates unnecessary log messages because of trying to delete taskWorkDir on all disks(where as it would only be on one disk).
+Attaching a fix on top of that patch now. Modified TestSetupWorkDir also.
+
+Please review and provide your comments., ant test and ant test-patch passed on my local machine for this fix of Y! 20., There are few comments:
+- I would suggest we don't check only for existence of workDirs. We should not be calling the task-controller if a path doesn't exist.
+- I would also think that if the task-controller fails to set permissions for some components, we can still try and delete the rest of the components. So, I would suggest we catch exceptions from runCommand in LinuxTaskController.
+- The modified test case has a comment saying 555 permissions are being set on files, which is not true. Please adjust that., Attaching new Y! 20 fix patch with review comments incorporated., Attaching new patch removing an unnecessary log message., Changes look fine to me. +1, unit tests passed on my local machine for this Y! 20 patch., Attaching patch for trunk.
+Incorporated review comments. Fixed the issue of launching task-controller in case of path not existing, similar to y896.2.1.fix.v2.patch. Added more testcases for cases of (a) needCleanup is false and (b) jvmReuse., The last patch from Ravi looks good. I just made one small change. In CleanupQueue.java, I changed the method PathDeletionContext.enablePathForCleanup to not do any checks for arguments or print LOG statements. Essentially, the default implementation of this method does nothing. Hence, I felt the checks we were doing were of no useful purpose and could fill logs with spurious messages. Ravi, hopefully this is fine with you., Running this through Hudson., Am fine with removing those condition checks., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12428596/MR-896.v4.patch
+  against trunk revision 892479.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 9 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/230/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/230/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/230/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/230/console
+
+This message is automatically generated., Canceling patch to take care of test failures., The new patch fixes test failures in TestLocalizationWithLinuxTaskController. The bug was setUp() was calling super.setUp() which detected that the tests shouldn't run given the non-setuid environment, but after the call to supet.setUp() returned, the rest of the setup method continued to run. The fix was to explicitly call canRun() and return appropriately., Retrying hudson., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12428609/MR-896.v5.patch
+  against trunk revision 892479.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 9 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/231/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/231/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/231/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h3.grid.sp2.yahoo.net/231/console
+
+This message is automatically generated., Streaming test failures are unrelated to this JIRA (as the age on the test report shows). Hence, I will commit this patch., The patch does not apply any more, most likely due to changes in MAPREDUCE-181. Cancelling to upload a new patch., In MAPREDUCE-181, the job submission mechanism was changed to transfer job info via a staging directory and the jobtracker completely owns creation of the job directory under the mapreduce system directory. As a result, the code in Jobtracker to do with cleaning up the mapred system directory using the cleanup queue when job submission fails, is no longer needed. Note that the staging directory is cleaned up on client in a finally block, so the functionality is still available, though not in Jobtracker.
+
+The new patch removes changes in Jobtracker.java and adjusts a merge conflict in JobInProgress.java. Other things are the same., Try Hudson again., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12428696/MR-896.v6.patch
+  against trunk revision 893055.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 9 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/331/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/331/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/331/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/331/console
+
+This message is automatically generated., TestMapReduceJobControl failure is a known issue MAPREDUCE-441. Other 4 tests failures are also seen in earlier Hudson runs of other patches., TestMapReduceJobControl failed with a timeout. Locally, I ran this several times and every time it passed. Without logs it is difficult to debug this issue. And as Ravi pointed out, it appears it has been observed previously.
+
+The failure in TestServiceLevelAuthorization could be explained though. Essentially, the test case is failing at a place where it assumes that the localized job directories are cleaned up. However, this cleanup is asynchronous in nature and hence, because of timing issues it can fail. However, it is also true that this patch could make the failure situation a little more probable as it does more work in the asynchronous cleanup code. Since the issue is inherently present in the test case even without this patch, we can fix it in a follow-up JIRA. The advantage we get is that we merge this reasonably complex patch on trunk, thereby avoiding more merge conflicts, like I discovered today. Thoughts ?, Some more details on the test failure in TestServiceLevelAuthorization:
+
+The problem is with TestMiniMRWithDFS.checkTaskDirectories. As explained above, this method verifies an exact list of localized directories on a tasktracker. To do so, it seems to wait until the TTs become idle. But idleness is only a function of the number of active tasks. When tasks complete, the TT adds directories to be deleted to the CleanupQueue, which by default, asynchronously deletes them. Clearly that means that waiting for the TTs to become idle is not a sufficient pre-condition for the testing of localized directory contents.
+
+Like I explained, this problem exists on trunk as well. But this patch can increase the chances of hitting it more often, because it does more work in the asynchronous portion. Given that, I am not comfortable committing it, particularly as there's no blazing hurry for this patch right now. We do run a risk of the patch going stale, but I am relying on the holiday season to slow people down (*smile*). More importantly, we'll not make the test scene worse than it already is.
+
+As regards the fix, a simple solution may be to configure the MiniMRCluster with an inline cleanup queue whenever we want to check the deletion of localized files and directories - essentially in all test cases that use TestMiniMRWithDFS.checkTaskDirectories. Fortunately, there are only four of them right now. Another option could be to wait until the cleanup queue is empty. The disadvantage with this approach is that it uses the much maligned "sleep(100) until some condition is satisfied" pattern. I would use the former approach instead, which has worked well elsewhere. It may slow the tests down a tad bit, but hopefully not too badly., I could reproduce the failure of TestServiceLevelAuthorization consistently by adding a sleep in CleanupQueue.deletePath() before actual deletion and making the cleanup queue inline solved the issue.
+Modified the tests that use MiniMRCluster and validate deletion of files/dirs through CleanupQueue to use inline cleanup queue. Inline cleanup queue is moved to UtilsForTests.
+
+Attaching new patch for trunk. Please review and provide your comments., I reviewed the latest patch from Ravi and am fine with the changes except that there was no need for the accessors for cleanup queue in tasktracker to be public. The new patch makes them package private. I ran tests locally and they passed. So, trying hudson., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12428976/MR-896.v8.patch
+  against trunk revision 893828.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 30 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/345/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/345/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/345/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Mapreduce-Patch-h6.grid.sp2.yahoo.net/345/console
+
+This message is automatically generated., The test failures are unrelated to this patch, as the age shows. This is good to commit., I committed this to trunk. Thanks, Ravi !, Integrated in Hadoop-Mapreduce-trunk #196 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-Mapreduce-trunk/196/])
+    , More updated patch for earlier version of Hadoop. Not for commit here.]

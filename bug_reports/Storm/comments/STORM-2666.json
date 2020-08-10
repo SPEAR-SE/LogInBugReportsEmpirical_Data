@@ -1,0 +1,169 @@
+[hi [~Srdo] I'm at-ing you  as this could be a specific issue for your per-partition offset manager max-uncommit tracking solution., Hi [~GuangDu], thanks for your report. Can you verify if you have STORM-2544 fixed in your checkout of 1.1.1? It sounds a lot like what you describe., Hi [~Srdo], thanks for reply. I checked and the STORM-2544 is included in my code. The issue is different from STORM-2544. 
+
+STORM-2544 is missing to ack offset, causing dis-continuous offsets in OffsetManager, as a result unable to commit the missing ones. 
+My observation is Spout is emitting already committed offsets again, and the newly acked duplicated ones will be added in OffsetManager. This is confusing Spout for the 'uncommitted count', as a result could block poll(), as well as blocking OffsetManager to find next feasible commitable offset in org.apache.storm.kafka.spout.internal.OffsetManager#findNextCommitOffset.
+
+Currently I have no idea where these duplicated offsets come from, my guess is they're from the 'on the way' failed ones, which eventually will be acked by retry service.
+
+I'm making a temporary fix by removing offsets before committedOffset in org.apache.storm.kafka.spout.internal.OffsetManager#findNextCommitOffset, but I think probably this is not the best solution, and you could have better ideas., [~GuangDu] I've been looking at this for a while now, and I'm kind of stumped.
+
+Some things I've looked at:
+* Storm won't ack or fail multiple times for the same tuple. Once the spout executor receives either an ack or a fail for a tuple, any further acks or fails are discarded.
+* The spout disregards acks or fails for messages that are not in the emitted list. We remove message ids from emitted whenever we ack or fail a tuple, so we're effectively ensuring the same thing as the executor in the spout code as well. If partitions get reassigned, the emitted list for revoked partitions is emptied out, so we won't care about acks/fails for partitions that are not assigned to this spout. 
+* We don't remove pending retries for messages when that message id is acked. I can't come up with a way for a tuple to be acked while the same message id is in the retry service though.
+* The spout won't emit a tuple for a message id that is already emitted, or is currently in the set of acked tuples. It is possible the spout will emit a tuple for a committed offset, since we don't check for that. This requires the tuple to somehow be in RetryService while it is also acked.
+* The default RetryService won't duplicate retry schedules, so an offset can't have multiple retries scheduled at the same time. We remove the scheduled retry before emitting a message, so I don't see how it is possible to have a pending tuple while the same message is scheduled on the retry service.
+
+So as far as I can tell, it should not be possible that RetryService replays tuples that are already acked, and if a tuple gets acked, any subsequent ack/fail calls should not have any effect, unless the spout emits the tuple again after this happens.
+
+I agree that the spout code can't currently handle a tuple being acked and then replayed later, but I'm having trouble understanding how we can get into that situation. We could maybe get rid of some assumptions by making the spout remove scheduled retries once an ack is received, or dropping tuples if we're trying to emit something lower than the committed offset, but I can't really spout the faulty assumption I must be making, because in my mind those changes should not be necessary.
+
+Can you share the storm-kafka-client forked code you're running on?
+Are you using the default retry service?
+Can you share your Kafka spout configuration?, Thank you very much [~Srdo] for your time investigating into this. My folk is https://github.com/WolfeeTJ/storm.git in case this will help.
+I'm using the exponential retry service, also the kafka config is as below FYI if this helps.
+
+{code:java}
+        KafkaSpoutRetryExponentialBackoff kafkaSpoutRetryExponentialBackoff =
+            new KafkaSpoutRetryExponentialBackoff(
+                KafkaSpoutRetryExponentialBackoff.TimeInterval.seconds(5),
+                KafkaSpoutRetryExponentialBackoff.TimeInterval.seconds(5),
+                2,
+                KafkaSpoutRetryExponentialBackoff.TimeInterval.seconds(30));
+        KafkaSpoutConfig kafkaSpoutConfig = KafkaSpoutConfig.builder(configParameterMap.get(KAFKA_BROKER_LIST), configParameterMap.get(KAFKA_ACTION_TOPIC))
+            .setGroupId(configParameterMap.get(CONSUMER_GROUP))
+            .setMaxPollRecords(4)
+            .setMaxUncommittedOffsets(20)
+            .setOffsetCommitPeriodMs(2_000)
+            .setProp("session.timeout.ms", "120000")
+            .setProp("request.timeout.ms", "180000")
+            .setRetry(kafkaSpoutRetryExponentialBackoff)
+            .setFirstPollOffsetStrategy(KafkaSpoutConfig.FirstPollOffsetStrategy.UNCOMMITTED_LATEST)
+            .build();
+        KafkaSpout kafkaSpout = new KafkaSpout<>(kafkaSpoutConfig);
+
+{code}
+
+Please kindly be noticed I've applied a simple fix to remove offsets before committed in my folk branch to make my production work.
+
+I'm not familiar about the core component code of storm, so I'm not sure if my assumption is correct:
+In my scenario, my Python Shell Bolt will execute quite a long time (like 8 seconds) for each record, so it could be true to have a lot of tuples waiting in the Shell Bolt incoming queue. Under heavy loads, some tuples could timeout before they're able to be processed. In my opinion the fail() of Spout will be executed, thus the retry service will be involved at this time, ack & commit might happen at this time. 
+However the tuples in the waiting queue could be processed again, and fail again, and enter the retry service again, resulting a resend after commit, causing this tuple to appear again in Spout's emitted list.
+Please kindly help to review if my assumption could be valid.
+
+Again thank you very much for your time, appreciate that very much., [~GuangDu] Am I right that the branch you're using is 1.1.x-branch in your fork? Just to be sure I'm looking at the right thing.
+
+Are you using Kafka's topic compaction, and do you ever see this log https://github.com/apache/storm/blob/v1.1.1/external/storm-kafka-client/src/main/java/org/apache/storm/kafka/spout/internal/OffsetManager.java#L94
+
+Just to explain why I think Storm doesn't ack/fail the same tuple more than once:
+When the spout emits a tuple, it is assigned a random id used for tracking whether the tuple tree has completed. This happens here https://github.com/apache/storm/blob/v1.1.1/storm-core/src/clj/org/apache/storm/daemon/executor.clj#L565, and is stored in a map id -> tuple info called "pending", where tuple info includes the msg id used by the spout internally. The store into the map is here https://github.com/apache/storm/blob/v1.1.1/storm-core/src/clj/org/apache/storm/daemon/executor.clj#L582. 
+When the spout receives an ack or fail from the acker bolt, it removes the id -> tuple info mapping from the pending map. It checks that there was such a mapping, and if there were it will call either ack or fail on the spout instance. If the mapping isn't there, the message is ignored. This happens here https://github.com/apache/storm/blob/v1.1.1/storm-core/src/clj/org/apache/storm/daemon/executor.clj#L528 and in the line below that.
+
+Given this mechanism, I think it isn't possible for Storm to call ack or fail multiple times for the same tuple, because any ack or fail after the first one is ignored. The reason we do a similar check in the Kafka spout code has to do with partition reassignment. If the spout emits msgId 0 on partition 0 and partition 0 gets assigned to some other spout instance, the spout will throw away its internal state relating to partition 0, including which message ids it thinks it emitted on that partition. If partition 0 then gets assigned back to this spout instance, it might receive the ack or fail for the tuple that was emitted before partitions were reassigned. Since the pending map in the generic Storm code still contains tracking information for that tuple, the spout must be able to handle this ack or fail. We do this by keeping the list of msg ids the spout has emitted, and if we receive an ack or fail for a tuple the spout doesn't think it emitted, we just ignore it. 
+
+This should be enough to ensure that we can't receive double acks or fails. The generic mechanism in Storm ensures that we can't get duplicates for the same tuple, while the mechanism in the Kafka spout ensures that if we receive an ack or fail for a message id (which can be duplicated when partition reassignment occurs), we ignore everything except the first one.
+
+Taking a look at the scenario you describe, I agree that some tuples may time out in the shell bolt queue. They will then fail on the spout, and be added to the retry service. Once this happens the tuple ids generated by Storm for those tuples have been removed from the pending map. So if an ack/fail for the same tuple tree is received, it should be dropped before even reaching the spout. If partition reassignment happens, you could get some message id duplication, but when the message id was failed and added to the retry service, it was removed from the emitted set inside the spout. This means any more acks/fails are ignored., By the way when you saw logs like 
+{code}
+2017-07-27 22:23:49.203 o.a.s.k.s.i.OffsetManager Thread-23-spout-executor[248 248] [WARN] topic-partition [kafka_bd_trigger_action-18] has unexpected offset [16002]. Current committed Offset [16003]
+{code}
+was it always off by one or was it random?, Thank you [~Srdo] for your detailed explanation.
+
+First to answer your questions: 
+Yes it's the 1.1.x branch;
+No I'm not using Kafka's topic compaction, and didn't see the log;
+
+Given your explanation for storm's underlying mechanism, I agree my assumption might not be valid. I think a better option would be add some more log information to find the underlying root cause. I'll try in our environment later, and get back with logs FYI later.
+
+Regarding the unexpected offset, I can't remember clearly if it was always off by one. I'll add logs to check again, and get back to you later.
+
+Your explanation about storm msg processing was great, thank you very much and I'll take time looking a little deeper into the clojure codes to get some better understanding. Thank you very much. :)
+
+Get back to you with more logs later., First a quick check from previous logs, no it's not only offset off by one. It could be many unexpected offsets.
+{code:java}
+2017-07-28 07:43:00.506 o.a.s.k.s.i.OffsetManager Thread-72 [WARN] topic-partition [kafka_bd_trigger_action-1] has unexpected offset [17387]. Current committed Offset [17390]
+2017-07-28 07:43:00.506 o.a.s.k.s.i.OffsetManager Thread-72 [WARN] topic-partition [kafka_bd_trigger_action-1] has unexpected offset [17388]. Current committed Offset [17390]
+2017-07-28 07:43:00.506 o.a.s.k.s.i.OffsetManager Thread-72 [WARN] topic-partition [kafka_bd_trigger_action-1] has unexpected offset [17389]. Current committed Offset [17390]
+2017-07-28 07:43:00.506 o.a.s.k.s.i.OffsetManager Thread-72 [WARN] topic-partition [kafka_bd_trigger_action-1] has unexpected offset [17390]. Current committed Offset [17390]
+{code}
+, I grepped more logs below. To me seems Spout is resending after commit.
+
+{code:java}
+2017-07-27 23:55:41.100 o.a.s.k.s.i.OffsetManager Thread-59-spout-executor[128 128] [INFO] Instantiated OffsetManager{topic-partition=kafka_bd_trigger_action-1, fetchOffset=17387, committedOffset=17386, emittedOffsets=[], ackedMsgs=[]}
+2017-07-27 23:55:41.107 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] No offsets to commit. KafkaSpout{offsetManagers ={kafka_bd_trigger_action-5=OffsetManager{topic-partition=kafka_bd_trigger_action-5, fetchOffset=17518, committedOffset=17517, emittedOffsets=[], ackedMsgs=[]}, kafka_bd_trigger_action-4=OffsetManager{topic-partition=kafka_bd_trigger_action-4, fetchOffset=15235, committedOffset=15234, emittedOffsets=[], ackedMsgs=[]}, kafka_bd_trigger_action-3=OffsetManager{topic-partition=kafka_bd_trigger_action-3, fetchOffset=16656, committedOffset=16655, emittedOffsets=[], ackedMsgs=[]}, kafka_bd_trigger_action-2=OffsetManager{topic-partition=kafka_bd_trigger_action-2, fetchOffset=17074, committedOffset=17073, emittedOffsets=[], ackedMsgs=[]}, kafka_bd_trigger_action-1=OffsetManager{topic-partition=kafka_bd_trigger_action-1, fetchOffset=17387, committedOffset=17386, emittedOffsets=[], ackedMsgs=[]}, kafka_bd_trigger_action-0=OffsetManager{topic-partition=kafka_bd_trigger_action-0, fetchOffset=14494, committedOffset=14493, emittedOffsets=[], ackedMsgs=[]}}, emitted=[]}
+2017-07-27 23:55:42.078 c.q.d.s.h.HBaseDataLookupBolt Thread-53-pdl_lookup_hbase_bolt-executor[60 60] [INFO] Topic: kafka_bd_trigger_action, Partition: 1, Offset: 17388, Key: null, Value: {"appId":"A20170727200514663","policyId":"PDL_BLACKLIST2","transactionId":"150116558246620452","timestamp":"20170727222705953","dataKey":"['nuanxindai', 'BR_antifraudVerify|PULL', 'ZM_creditScore|PULL']"}
+2017-07-27 23:55:42.132 c.q.d.s.h.HBaseDataLookupBolt Thread-23-pdl_lookup_hbase_bolt-executor[72 72] [INFO] Topic: kafka_bd_trigger_action, Partition: 1, Offset: 17387, Key: null, Value: {"appId":"A20170727200514803","policyId":"PDL_TP","transactionId":"150116300744862685","timestamp":"20170727222427452","dataKey":"['nuanxindai', 'HULU_tsp|DETAIL_PULL', 'HULU_tsp|SUMMARY_PUSH', 'ZM_creditScore|PULL', 'QF_history|PULL', 'TD_creditReport|PULL']"}
+2017-07-27 23:55:42.182 c.q.d.s.h.HBaseDataLookupBolt Thread-23-pdl_lookup_hbase_bolt-executor[72 72] [INFO] Topic: kafka_bd_trigger_action, Partition: 1, Offset: 17390, Key: null, Value: {"appId":"A20170727200514953","policyId":"PDL_TP","transactionId":"150116342612677949","timestamp":"20170727222759470","dataKey":"['nuanxindai', 'HULU_tsp|DETAIL_PULL', 'HULU_tsp|SUMMARY_PUSH', 'ZM_creditScore|PULL', 'QF_history|PULL', 'TD_creditReport|PULL']"}
+2017-07-27 23:55:42.233 c.q.d.s.h.HBaseDataLookupBolt Thread-9-pdl_lookup_hbase_bolt-executor[68 68] [INFO] Topic: kafka_bd_trigger_action, Partition: 1, Offset: 17389, Key: null, Value: {"appId":"A20170727200514823","policyId":"PDL_TP","transactionId":"150116328342980579","timestamp":"20170727222715948","dataKey":"['nuanxindai', 'HULU_tsp|DETAIL_PULL', 'HULU_tsp|SUMMARY_PUSH', 'ZM_creditScore|PULL', 'QF_history|PULL', 'TD_creditReport|PULL']"}
+2017-07-27 23:57:41.105 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Received ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17388, numFails=0}].
+2017-07-27 23:57:41.105 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Successful ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17388, numFails=0}].
+2017-07-27 23:57:41.105 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Received ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17387, numFails=0}].
+2017-07-27 23:57:41.105 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Successful ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17387, numFails=0}].
+2017-07-27 23:57:41.106 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Received ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17389, numFails=0}].
+2017-07-27 23:57:41.106 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Successful ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17389, numFails=0}].
+2017-07-27 23:57:41.107 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Received ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17390, numFails=0}].
+2017-07-27 23:57:41.107 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Successful ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17390, numFails=0}].
+2017-07-27 23:57:41.112 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Offsets successfully committed to Kafka [{kafka_bd_trigger_action-3=OffsetAndMetadata{offset=16656, metadata='{topic-partition=kafka_bd_trigger_action-3, offset=16656, numFails=0, hostname=IDC-HADOOPSH-01, thread='Thread-59-spout-executor[128 128]', timestamp=20170727235741}'}, kafka_bd_trigger_action-1=OffsetAndMetadata{offset=17390, metadata='{topic-partition=kafka_bd_trigger_action-1, offset=17390, numFails=0, hostname=IDC-HADOOPSH-01, thread='Thread-59-spout-executor[128 128]', timestamp=20170727235741}'}}]
+2017-07-27 23:57:41.113 o.a.s.k.s.i.OffsetManager Thread-59-spout-executor[128 128] [INFO] committing to offset 17390
+2017-07-27 23:57:41.113 o.a.s.k.s.i.OffsetManager Thread-59-spout-executor[128 128] [INFO] Committed offsets [17387-17390 = 4] for topic-partition [kafka_bd_trigger_action-1].
+2017-07-27 23:57:41.125 c.q.d.s.h.HBaseDataLookupBolt Thread-25-pdl_lookup_hbase_bolt-executor[56 56] [INFO] Topic: kafka_bd_trigger_action, Partition: 1, Offset: 17387, Key: null, Value: {"appId":"A20170727200514803","policyId":"PDL_TP","transactionId":"150116300744862685","timestamp":"20170727222427452","dataKey":"['nuanxindai', 'HULU_tsp|DETAIL_PULL', 'HULU_tsp|SUMMARY_PUSH', 'ZM_creditScore|PULL', 'QF_history|PULL', 'TD_creditReport|PULL']"}
+2017-07-27 23:57:41.125 c.q.d.s.h.HBaseDataLookupBolt Thread-23-pdl_lookup_hbase_bolt-executor[72 72] [INFO] Topic: kafka_bd_trigger_action, Partition: 1, Offset: 17388, Key: null, Value: {"appId":"A20170727200514663","policyId":"PDL_BLACKLIST2","transactionId":"150116558246620452","timestamp":"20170727222705953","dataKey":"['nuanxindai', 'BR_antifraudVerify|PULL', 'ZM_creditScore|PULL']"}
+2017-07-27 23:57:41.195 c.q.d.s.h.HBaseDataLookupBolt Thread-53-pdl_lookup_hbase_bolt-executor[60 60] [INFO] Topic: kafka_bd_trigger_action, Partition: 1, Offset: 17390, Key: null, Value: {"appId":"A20170727200514953","policyId":"PDL_TP","transactionId":"150116342612677949","timestamp":"20170727222759470","dataKey":"['nuanxindai', 'HULU_tsp|DETAIL_PULL', 'HULU_tsp|SUMMARY_PUSH', 'ZM_creditScore|PULL', 'QF_history|PULL', 'TD_creditReport|PULL']"}
+2017-07-27 23:57:41.219 c.q.d.s.h.HBaseDataLookupBolt Thread-9-pdl_lookup_hbase_bolt-executor[68 68] [INFO] Topic: kafka_bd_trigger_action, Partition: 1, Offset: 17389, Key: null, Value: {"appId":"A20170727200514823","policyId":"PDL_TP","transactionId":"150116328342980579","timestamp":"20170727222715948","dataKey":"['nuanxindai', 'HULU_tsp|DETAIL_PULL', 'HULU_tsp|SUMMARY_PUSH', 'ZM_creditScore|PULL', 'QF_history|PULL', 'TD_creditReport|PULL']"}
+2017-07-27 23:57:41.328 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Received ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17388, numFails=0}].
+2017-07-27 23:57:41.328 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Successful ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17388, numFails=0}].
+2017-07-27 23:57:42.135 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Received ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17387, numFails=0}].
+2017-07-27 23:57:42.135 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Successful ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17387, numFails=0}].
+2017-07-27 23:57:44.150 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Received ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17390, numFails=0}].
+2017-07-27 23:57:44.150 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Successful ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17390, numFails=0}].
+2017-07-27 23:57:50.200 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Received ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17389, numFails=0}].
+2017-07-27 23:57:50.200 o.a.s.k.s.KafkaSpout Thread-59-spout-executor[128 128] [INFO] Successful ack for tuple message [{topic-partition=kafka_bd_trigger_action-1, offset=17389, numFails=0}].
+2017-07-27 23:57:53.103 o.a.s.k.s.i.OffsetManager Thread-59-spout-executor[128 128] [WARN] topic-partition [kafka_bd_trigger_action-1] has unexpected offset [17387]. Current committed Offset [17390]
+2017-07-27 23:57:53.103 o.a.s.k.s.i.OffsetManager Thread-59-spout-executor[128 128] [WARN] topic-partition [kafka_bd_trigger_action-1] has unexpected offset [17388]. Current committed Offset [17390]
+2017-07-27 23:57:53.103 o.a.s.k.s.i.OffsetManager Thread-59-spout-executor[128 128] [WARN] topic-partition [kafka_bd_trigger_action-1] has unexpected offset [17389]. Current committed Offset [17390]
+2017-07-27 23:57:53.103 o.a.s.k.s.i.OffsetManager Thread-59-spout-executor[128 128] [WARN] topic-partition [kafka_bd_trigger_action-1] has unexpected offset [17390]. Current committed Offset [17390]
+
+{code}
+, You are right, those logs indicate that committed offsets are being emitted again. I think I've figured out what's happening. The consumer position can sometimes fall behind the committed offsets.
+
+Say there are partition 0 - 10, and this spout is assigned partition 0, and has currently committed up to offset 0.
+Emit offset 0-100
+Ack offset 0-100, except offset 50
+Reassign partitions before commit happens. Keep partition 0 assigned to this spout.
+Reassignment logic does not remove the offset manager for partition 0, so 0-49 and 51-100 are still acked.
+Reassignment logic seeks the consumer back to the committed offset for all assigned partitions, including partition 0. The consumer position for partition 0 is now 0.
+Ack offset 50
+NextTuple is called, and commit of offset 0-100 happens.
+Offsets 0 - 100 are emitted again, because the consumer position was 0. The spout is now in a bad state, and when 0-100 are acked, the offset manager will complain in the log.
+
+A similar scenario can be constructed without partition reassignment
+
+Say max poll records is 10
+Emit offset 0-100 over 10 polls
+Ack 1-100
+Fail 0 and retry
+Ack 0
+When nextTuple is called, 0-100 will be acked, but the consumer position will be at most 10 due to max.poll.records. Once the offsets are committed, the spout is again in a state where the consumer position is behind the committed offset, and the same problem occurs.
+
+I think the following changes will fix it:
+Don't seek to committed offsets for partitions during reassignment if they were assigned to the spout previously. This fix isn't strictly necessary, but I don't think it makes sense to seek when we keep the rest of the state.
+When committing offsets, we should check the consumer position. If the position is behind the committed offset, seek up to the committed offset.
+
+Your configuration sets max.poll.records to 4, so I suspect this might be the case you're seeing.
+
+I've put up a branch with proposed fixes here https://github.com/srdo/storm/tree/STORM-2666 (the last commit only, the others are from STORM-2549 which you should already have). I'd appreciate if you would try them out. , 1.x version. You should be able to check this one out and use it directly. https://github.com/srdo/storm/tree/STORM-2666-1.x, Thank you [~Srdo]. Sorry I missed your comment last month, I was busy fixing our own issues. As also discussed in STORM-2549/PR-2156, I'll use 1.x-branch and merge all these in to give it a try. (I think srdo/STORM-2666-1.x will do, plus the last commit in STORM-2549. I'll do that locally.) 
+Appreciate your help very much. (y), Thanks [~Srdo], I also merged it into 1.x and 1.1.x branches., [~Srdo] [~GuangDu] Can you please clarify the comment made at 14/Aug/17 16:10. I think I have found another bug related to this.
+
+In the presence of this [piece of code|https://github.com/apache/storm/blob/1.x-branch/external/storm-kafka-client/src/main/java/org/apache/storm/kafka/spout/KafkaSpout.java#L158], how is it possible this to happen "_Reassign partitions before commit happens. Keep partition 0 assigned to this spout._" ?
+
+, [~hmclouro] I think you are right and the example is wrong. It can't happen that partitions are reassigned before committing. It was still possible to produce the bad state though. Here's a modified sequence without the _Reassign partitions before commit happens. Keep partition 0 assigned to this spout._ part.
+
+Say there are partition 0 - 10, and this spout is assigned partition 0, and has currently committed up to offset 0.
+Emit offset 0-100
+Ack offset 0-100, except offset 50
+Commit and reassign partitions. Keep partition 0 assigned to this spout. Offsets 0-49 are committed (i.e. we call commitSync with offset 50 so the consumer will restart there).
+Reassignment logic does not remove the offset manager for partition 0, so 51-100 are still acked.
+Reassignment logic seeks the consumer back to the committed offset for all assigned partitions, including partition 0. The consumer position for partition 0 is now 50.
+Ack offset 50
+NextTuple is called, and commit of offset 50-100 happens.
+Offsets 50 - 100 are emitted again, because the consumer position was 50. Since 50-100 were committed, they're no longer considered emitted/acked, so the spout will emit them. The spout is now in a bad state, and when 50-100 are acked, the offset manager will complain in the log.]

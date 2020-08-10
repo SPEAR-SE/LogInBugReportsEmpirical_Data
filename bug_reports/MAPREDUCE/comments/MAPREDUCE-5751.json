@@ -1,0 +1,98 @@
+[Currently we're working around this issue by adding the jetty classes (org.mortbay.) to mapreduce.job.classloader.system.classes. And I think an argument can be made that it is perhaps the right fix. Jetty is provided primarily by hadoop, and clients should use those jetty classes.
+
+Thoughts?, Another option may be to delay setting the classloader as much as possible in MRAppMaster. Currently it's being set before calling initAndStartAppMaster(). We could delay it until after super.start() in MRAppMaster.start(), assuming no user code runs until that point. We could set the classloader just before startJobs()., > And I think an argument can be made that it is perhaps the right fix. Jetty is provided primarily by hadoop, and clients should use those jetty classes.
+
+I agree. How about adding it to the system classes by default?, Yes, I think org.mortbay. should be added to the system classes by default. In fact, I think I'll do both changes: (1) adding org.mortbay. to the system classes, and (2) delay setting the classloaders until just before startJobs(). I think (2) still has value in case any other library that comes between these points happens to use the thread context classloader.
+
+I'll submit a patch shortly., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12628397/mapreduce-5751.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-core.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4351//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/4351//console
+
+This message is automatically generated., It is not straightforward to write a unit test for this due to the way the MRAppMaster code is structured. I confirm with either of these changes (system classes or delaying the call) the specific problem is fixed., Meant to add that it was tested with a pseudo-cluster mode (single node), and with or without uberization., I think you can easily add a test case to TestMRAppMaster, Hmm, the condition we want to check as part of a unit test would be whether the context classloader is already set to the job classloader when the parent (CompositeService) service start is called. However, it doesn't seem trivial to mock/spy it so that we intercept the timing of the CompositeService.serviceStart() in a manner that's not too sensitive to the implementation of MRAppMaster.serviceStart(). Any tips are welcome..., Revisiting this topic.
+
+Stepping back, if the job is not uberized (i.e. !job.isUber()), then no user code runs in the MR app master, correct? Then, we should be able to set the job classloader only if the job is uberized.
+
+Thoughts?, There is user code that runs in the ApplicationMaster, namely the OutputCommitter code.  It's responsible for setup, output commit, output cleanup upon job failure, and task recovery if recovery is supported., That had skipped my mind. We do need the job classloader for that...
+
+Let me know if you have any feedback on the patch. Thanks!, I think moving the app classloader setup to just before we start the job makes a lot of sense.  There should be no user code invoked up to that point, and it's close to where user code will be called as part of the job setup.
+
+As for the org.mortbay. addition to the system classes list, I'm not enough of a jetty expert to know if this is really necessary.  Does jetty do things that prevent multiple jetty versions from co-existing if the app classloader is doing its job?  It sounds like it worked when you tried leaving it out but still moving the app classloader init.  If multiple jetty versions can really coexist in this setup then I think we shouldn't preclude it by default.  But again I might be missing something jetty does that would break if we allow multiple versions even with the app classloader in place., I think it may be prudent to keep the jetty classes in the system classes. The problem pattern was jetty trying to load a configuration class using the thread context classloader as part of initialization.
+
+If some jetty classes are loaded through the normal JVM app classloader, but the configuration class is loaded through the hadoop's job classloader, it would cause the ClassCastException, just like the one that's mentioned in the description. It doesn't even need multiple jetty versions to have this issue.
+
+Making jetty part of the system classes solves this issue if it should happen later on as part of user code., My apologies, I still don't see why jetty needs to be part of the system classes.  If that's true then one could argue guava, jackson, jersey, avro, etc. could also have the same issue.  Couldn't those classes do some initialization in the hadoop classloader context then later some user code triggers some other internal classes of those dependencies to be loaded and we end up mixing and matching as we did with jetty?  Or am I misunderstanding the issue and jetty is doing something none of our other dependencies will do?
+
+I want to make sure I understand the criteria for what should be put in the system classes.  If I'm understanding the issue properly, it seems like a slippery slope from adding jetty to adding a large chunk of our dependencies which would effectively undermine the whole point of the app classloader., IMHO, making classloader isolation work at all times without fail is unfortunately pretty difficult, most because Java allows leaky ways of loading classes and it's difficult to always enforce the rules without breaking user code.
+
+One concrete scenario where the problem I mentioned above could happen without making jetty system classes is as follows. You're probably familiar with how it can happen (if so I apologize), but let me put it down still.
+
+Suppose we set the job classloader just prior to starting jobs. And suppose the app master decides to start a new jetty-based server *after* that point in time. Normally all the jetty classes would have been loaded (including the configuration class). But suppose it triggers a code path that wasn't exercised yet which uses the *context classloader* (getContextClassLoader()). This would now return the job classloader. If that class calls code like this, you would get a ClassCastException:
+
+{code}
+ClassLoader cl = Thread.currentThread().getContextClassLoader();
+// Foo was loaded by the app classloader previously
+// FooImpl will be loaded by a different classloader
+// this line will throw a ClassCastException
+Foo foo = (Foo)Class.forName("org.jetty.foo.impl.FooImpl", cl); // or (Foo)cl.loadClass("org.jetty.foo.impl.FooImpl")
+{code}
+
+For the problem to surface, it would need to meet all of the following conditions:
+- its classes are loaded through the app classloader (i.e. the code path is outside the user task code path)
+- it uses the context classloader *after* it has been set to the job classloader
+- it tries to load another class (of its own) using that context classloader
+- it tries to cast it to its own type (interface or base class) that's already been loaded by the app classloader
+
+It is pretty hard to get into all of these. But it does happen, and the above code pattern for jetty was one. Another library that I know of that uses the context classloader is jaxb (already included in the system classes). So by including jetty in the system classes we gain just a bit more safety.
+
+This is bit of trial and error. But we do know what hadoop may do outside the user code, and hopefully this list does not need to grow.
+
+My 2 cents..., Yeah, that makes sense.  I know we can't make this bulletproof, rather I am thinking along the lines of which default is more likely to work for users.  If a user-provided jetty is not likely to break then I'm thinking we shouldn't preclude it by default as that means the user doesn't get the jetty they expect.
+
+I thought by initializing the job classloader after we've started services that we should have avoided our jetty instance from trying to load the user-provided jetty classes.  Since we are going to start the jetty services before setting the job classloader, I thought those jetty threads won't have the job classloader as their context classloader and therefore not be affected by any user-provided jetty jars.  The AM is the only MR framework piece that uses jetty within a job, and we should know exactly what it will do and when it will init relative to user code. 
+
+I doubt many users will be starting jetty in their OutputCommitter code that runs in the AM, and therefore it seemed likely that mixing the two jetty versions and using the job classloader feature would work as intended.  The AM would get Hadoop's jetty version and tasks would get the user's version.  If it's likely to work then I don't see a need to preclude it by default and make most users discover and change the system classes property to get what they want in the majority of the cases.
+
+Now if the user code starts up jetty inside the AM (i.e.: within their OutputCommitter which seems weird but who knows) or if it's an uber job then we probably have issues there.
+
+Anyway I'm far from a classloader or jetty expert.  If you guys agree that jetty should be in the system classes by default for MR jobs then that's probably a good thing.  It's definitely the safer thing from the framework perspective since we know we'll get what the framework wants (barring user.classpath.first shenanigans).  I just didn't want to preclude by default users from using a different jetty version than Hadoop's dependency if it is likely to work for most cases., You have convinced me on this. :) Yes, I agree there is value in allowing users to run their own jetty version (as that is one of the very values that the isolated classloader provides) if they choose to do so. And that probably outweighs proofing against the possible additional action by the app master.
+
+I'll remove the changes for the system classes and submit the patch again. Thanks for the discussion., +1, lgtm.  Will wait a few days before committing to give [~tomwhite] a chance to comment., Thanks, Sangjin!  I committed this to trunk, branch-2, and branch-2.4., SUCCESS: Integrated in Hadoop-trunk-Commit #5328 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/5328/])
+MAPREDUCE-5751. MR app master fails to start in some cases if mapreduce.job.classloader is true. Contributed by Sangjin Lee (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1577554)
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+, Thanks Jason! Much appreciated., FAILURE: Integrated in Hadoop-Yarn-trunk #510 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/510/])
+MAPREDUCE-5751. MR app master fails to start in some cases if mapreduce.job.classloader is true. Contributed by Sangjin Lee (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1577554)
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #1702 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1702/])
+MAPREDUCE-5751. MR app master fails to start in some cases if mapreduce.job.classloader is true. Contributed by Sangjin Lee (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1577554)
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk #1727 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1727/])
+MAPREDUCE-5751. MR app master fails to start in some cases if mapreduce.job.classloader is true. Contributed by Sangjin Lee (jlowe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1577554)
+* /hadoop/common/trunk/hadoop-mapreduce-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-app/src/main/java/org/apache/hadoop/mapreduce/v2/app/MRAppMaster.java
+]

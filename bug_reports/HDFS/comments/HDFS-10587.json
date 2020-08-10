@@ -1,0 +1,672 @@
+[Hi [~jojochuang],
+
+Thanks a lot for the investigation/findings and the jira!
+
+I did some study and below is what I found:
+
+The acknowledged length is what has been acknowledged to the client (the writer). The client will continue to write data from there on after a new pipeline is constructed.
+
+{quote}
+(5) The last chunk (512 bytes) was not a full chunk, but the destination still reserved the whole chunk in its buffer, and wrote the entire buffer to disk, therefore some written data is garbage.
+{quote}
+
+To do the block transfer during the pipeline recovery process, the code that does the padding is in BlockSender's constructor:
+{code}
+      // end is either last byte on disk or the length for which we have a 
+      // checksum
+      long end = chunkChecksum != null ? chunkChecksum.getDataLength()
+          : replica.getBytesOnDisk();
+      if (startOffset < 0 || startOffset > end
+          || (length + startOffset) > end) {
+        String msg = " Offset " + startOffset + " and length " + length
+        + " don't match block " + block + " ( blockLen " + end + " )";
+        LOG.warn(datanode.getDNRegistrationForBP(block.getBlockPoolId()) +
+            ":sendBlock() : " + msg);
+        throw new IOException(msg);
+      } 
+     
+      // Ensure read offset is position at the beginning of chunk
+      offset = startOffset - (startOffset % chunkSize);
+      if (length >= 0) {
+        // Ensure endOffset points to end of chunk.
+        long tmpLen = startOffset + length;
+        if (tmpLen % chunkSize != 0) {
+          tmpLen += (chunkSize - tmpLen % chunkSize); <=====================include data to end of chunk
+        }
+        if (tmpLen < end) {
+          // will use on-disk checksum here since the end is a stable chunk
+          end = tmpLen;
+        } else if (chunkChecksum != null) {
+          // last chunk is changing. flag that we need to use in-memory checksum 
+          this.lastChunkChecksum = chunkChecksum;
+        }
+      }
+      endOffset = end;
+{code}
+
+{{endOffset}} is overwriten with {{end}},  which is only overwritten by {{tmpLen}} when {{tmpLen < end}}.
+
+Notice that {{end}} is
+      // end is either last byte on disk or the length for which we have a 
+      // checksum
+
+So in theory, the data sent from BlockSender is still valid data. Thus  the following statement is not true:
+{quote}
+(5) The last chunk (512 bytes) was not a full chunk, but the destination still reserved the whole chunk in its buffer, and wrote the entire buffer to disk, therefore some written data is garbage.
+{quote}
+
+That said, it's important for the receiving DN to have the accurate visibleLength. That's the key issue here. Because the receiving DN got the wrong visibleLength.
+
+The way receiver got visible length is:
+{code}
+  @Override // FsDatasetSpi
+  public synchronized ReplicaInPipeline convertTemporaryToRbw(
+      final ExtendedBlock b) throws IOException {
+    final long blockId = b.getBlockId();
+    final long expectedGs = b.getGenerationStamp();
+    final long visible = b.getNumBytes();  <=================================This is how the receiving DN got visible length
+    LOG.info("Convert " + b + " from Temporary to RBW, visible length="
+        + visible);
+{code}
+
+So I think the solution is for the sender to send only visibleLength worth amount of data, instead of including data toward chunk end.
+
+Quoted below is part of the above quoted code,  
+{code}
+        // Ensure endOffset points to end of chunk.
+        long tmpLen = startOffset + length;
+        if (tmpLen % chunkSize != 0) {
+          tmpLen += (chunkSize - tmpLen % chunkSize); <=====================include data to end of chunk
+        }
+{code}
+Though the comment here says {{// Ensure endOffset points to end of chunk.}}, I don't see why we need to do that. If we ensure the endOffset is equal to startOffset + visibleLength (the {{length}} here is the visible length), then we should solve the incorrect visibleLength issue at the receiver side, thus the corruption issue.
+
+I think this seems to be the solution, unless there is some real subtle reason that we have to {{Ensure endOffset points to end of chunk.}}.
+
+I hope some folks who are more familiar with this code can comment.
+
+Thanks.
+
+, I see some subtlety here, if the sending DN does have data up to the chunk end, and the checksum was computed accordingly. Per my proposed solution, now we are sending part of the data that the sender DN has, so we need to recalculate the checksum for this "truncated: data.
+
+The problem with existing implementation is, the receiving DN treats the received size as visibleLength, which is not correct here. If we can find a way to pass the visibleLength to the receiving DN, then the sender DN can still send data up to the chunk end.
+
+ , I did a quick change
+
+{code}
+diff --git hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java hadoop-hdfs-project/hadoop-hdfs/src/main/ja
+va/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+index 398935d..188768b 100644
+--- hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
++++ hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+@@ -363,6 +363,7 @@
+       
+       // Ensure read offset is position at the beginning of chunk
+       offset = startOffset - (startOffset % chunkSize);
++      /*
+       if (length >= 0) {
+         // Ensure endOffset points to end of chunk.
+         long tmpLen = startOffset + length;
+@@ -378,7 +379,8 @@
+         }
+       }
+       endOffset = end;
+-
++      */
++      endOffset = length > 0? startOffset + length : end;
+       // seek to the right offsets
+       if (offset > 0 && checksumIn != null) {
+         long checksumSkip = (offset / chunkSize) * checksumSize;
+{code}
+and run all HDFS/common unit tests, they passed fine.
+
+Either we don't have a test to enforce {{// Ensure endOffset points to end of chunk.}} or it's ok not to have this enforcement.
+
+If we don't need the enforcement, then the solution I would propose is to send {{length}} worth of data (where {{length}} is the visibleLength in this context) in BlockSender, as the quick change above illustrated.
+
+So I'd suggest that we look more into whether we really need the above mentioned enforcement.
+
+Thanks.
+, HI [~jojochuang],
+
+I think it'd be nice to work out a unit test that demonstrates the block corruption, for example, to create a block with visibleLength X, and a replica with data X+delta written to disk,  then use the involved code to copy the replica to a different one, to see if  the corruption happens. If so, then we can see my above proposed change can address the issue. 
+
+Of course, we still need to understand better the "chunk end enforcement" mentioned in my earlier comment. 
+ 
+What do you think?
+
+Thanks.
+, HI [~szetszwo] and [~kihwal],
+
+I would like to bring this jira to your attention. Would you please help review the report and the comments I made?
+
+Especially, I wonder why we have to enforce the size of data sent from BlockSender to the end of a chunk (Please see my comments above for details).
+
+The problem here is, the receiving DN would treat the size of the sent data as visibleLength, which is wrong.
+
+Thanks a lot.
+
+
+, Hi [~kihwal] and [~szetszwo], 
+
+Upload a naive patch (001) to illustrate how to possibly only send {{length}} (visibleLength) amount of data, so the receiving DN will not get wrong visibleLength.
+
+The questions are:
+
+1. when do we have to send more than {{length}} amount of data? Seems that's true for a currently being written replica, which seems a special case, such as when we increase replication factor. 
+
+2. Any issue about checksum calculation with this change? 
+
+Thanks a lot.
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 24s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red}  0m  0s{color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 26s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 26s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 53s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 56s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 24s{color} | {color:orange} hadoop-hdfs-project/hadoop-hdfs: The patch generated 1 new + 41 unchanged - 2 fixed = 42 total (was 43) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 54s{color} | {color:red} hadoop-hdfs-project/hadoop-hdfs generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 79m 15s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 20s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 99m 30s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-hdfs-project/hadoop-hdfs |
+|  |  Field only ever set to null:null: org.apache.hadoop.hdfs.server.datanode.BlockSender.lastChunkChecksum  In BlockSender.java |
+| Failed junit tests | hadoop.hdfs.TestAppendSnapshotTruncate |
+|   | hadoop.hdfs.TestParallelRead |
+|   | hadoop.hdfs.TestHFlush |
+|   | hadoop.hdfs.server.namenode.snapshot.TestSnapshotFileLength |
+|   | hadoop.hdfs.server.datanode.TestCachingStrategy |
+|   | hadoop.hdfs.client.impl.TestClientBlockVerification |
+|   | hadoop.hdfs.TestFileConcurrentReader |
+|   | hadoop.hdfs.TestParallelUnixDomainRead |
+|   | hadoop.hdfs.TestFileCreationClient |
+|   | hadoop.fs.contract.hdfs.TestHDFSContractSeek |
+|   | hadoop.hdfs.server.datanode.fsdataset.impl.TestDatanodeRestart |
+| Timed out junit tests | org.apache.hadoop.hdfs.TestPread |
+|   | org.apache.hadoop.hdfs.TestClientReportBadBlock |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12817362/HDFS-10587.001.patch |
+| JIRA Issue | HDFS-10587 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 51da0651a7cc 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 819224d |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/16024/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-HDFS-Build/16024/artifact/patchprocess/new-findbugs-hadoop-hdfs-project_hadoop-hdfs.html |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/16024/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16024/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16024/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, The failed tests do indicate some issue with this naive change.
+, Thanks [~jojochuang] for bringing HDFS-4660 to my attention, which seems to have similar symptom.
+
+HDFS-4660 talked about and fixed BlockReceiver side issue. Per the analysis I put above, in the HDFS-10587 case, the issue here is that BlockSender adjusted the data to chunk end, thus making the data larger than the real visibleLength ({{length}}. And the receiver side treats the received size as the new visibleLength, which seems incorrect to me and is the key issue here.
+
+HI [~kihwal], [~vinayrpet] and [~peng.zhang], you guys worked on HDFS-4660, would you please help sharing some insight here for HDFS-10587?
+
+Thanks a lot.
+, Thanks [~jojochuang] for adding the log to the jira description.
+
+{code}
+The sender has the replica as follows:
+2016-04-15 22:03:05,066 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Recovering ReplicaBeingWritten, blk_1556997324_1100153495099, RBW
+getNumBytes() = 41381376
+getBytesOnDisk() = 41381376
+getVisibleLength()= 41186444
+getVolume() = /hadoop-i/data/current
+getBlockFile() = /hadoop-i/data/current/BP-1043567091-10.1.1.1-1343682168507/current/rbw/blk_1556997324
+bytesAcked=41186444
+bytesOnDisk=41381376
+
+while the receiver has the replica as follows:
+2016-04-15 22:03:05,068 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Recovering ReplicaBeingWritten, blk_1556997324_1100153495099, RBW
+getNumBytes() = 41186816
+getBytesOnDisk() = 41186816
+getVisibleLength()= 41186816
+getVolume() = /hadoop-g/data/current
+getBlockFile() = /hadoop-g/data/current/BP-1043567091-10.1.1.1-1343682168507/current/rbw/blk_1556997324
+bytesAcked=41186816
+bytesOnDisk=41186816
+{code}
+
+The sender's visibleLength is 41186444, which is not a multiple of chunks (it's 80442 * 512 + 140), then BlockSender "marks it up" to 41186816 (or 80443 * 512), because there is enough data on the BlockSender DN's disk.
+
+It would be ok for The BlockReceiver DN to receive 41186816 data, as long as it can skip the already-received data when receiving more data from the client. But it appears that the BlockReceiver DN is not doing that correctly. If we can fix that behavior, it  would be a good fix for this issue here.
+ , About the visibleLength, I saw 
+{code}
+In ReplicaBeingWritten.java
+  @Override
+  public long getVisibleLength() {
+    return getBytesAcked(); // all acked bytes are visible
+  }
+{code}
+which means different replicas may have different visibleLength, because BytesAcked at different DataNodes maybe different.
+
+My earlier effort was to claim that using different visibleLength at the BlockReceiver than the BlockSender side is wrong. Based on the above code, it might be ok to claim the visibleLength as the received data length at the destination side of blockTransfer (better to get confirmation though).
+
+So, we need to understand, how the corruption really happened, and where in the block data: Did it happen when we receive this chunk of data, or when we receive new data after reconstructing the pipeline? Because based on my analysis so far, the skipping of the bytes on disk (mentioned in the following statement) is necessary since the data is not garbage (assuming the data at the Sender side is good).
+{quote}
+(8) When new data was appended to the destination, it skipped the bytes already on disk. Therefore, whatever was written as garbage was not replaced.
+{quote}
+
+One possibility is that the checksum handling there is not correct in a corner situation. 
+
+If we have a testcase to replicate the issue, we need to look at both the source side data and destination side data, to see whether it's real data corruption, or checksum miscalculation. If there is corruption, where exactly the corruption is.
+
+
+, The block corruption appears to be corrupted at the very beginning of the chunk right after the block transfer (that copy data up to the previous chunk end).
+
+The looks similar to HDFS-4660. Unfortunately we don't have the exact block file and checksum file on the source and the destination to compare. Otherwise, it would be easier to tell what might have happened.
+
+
+ , bq. (5) The last chunk (512 bytes) was not a full chunk, but the destination still reserved the whole chunk in its buffer, and wrote the entire buffer to disk, therefore some written data is garbage.
+Since the sender have more onDisk data than ack'ed, it can send extra bytes during transfer. That doesnt mean that extra data sent is garbage. Its valid data, but not sent the ack upstream, possibly due to waiting for the ack from downstream.
+
+So in current case, extra bytes sent to make up to chunk end, should be valid data, along with the checksum available at the sender.
+
+Client, anyway will send the unack'ed packets again. These packets should recalculate the checksum if these are appending data to same chunk.
+If the onDisk data is at the chunk boundary, that chunk will be skipped and next chunk will be written for the packet.
+If the packet starting in between the chunk, then it should contain only data to fill up the chunk.
+So in this case, since the ondisk length is at the chunk boundary, then next packet(which is starting in middle of the chunk) will be skipped.
+
+Another question is, whats the exact sequence of events? VolumeScanner can scan only completed blocks. Whether this block was closed and re-opened for append?
+
+Whether client reading the data found any corruption later?
+
+It would be helpful, if more logs are shared for both datanodes.
+, Hi [~vinayrpet],
+
+Thanks a lot for your comment!
+
+I also have found that item (5) in the description is incorrect.  In addition, I observed that the data corruption happened at the next chunk. As my last comment stated, unfortunately we don't have the BlockSender DN's replica data to compare, to see if it's real data corruption, or incorrect checksum. I think it's more likely the checksum calculation issue.
+
+VolumeScanner is just a later protection, when volumeScanner detects the corruption, the replica is already much larger than right after the block transfer.
+
+Thanks.
+
+
+
+
+
+, bq.  In addition, I observed that the data corruption happened at the next chunk.
+Can you give some more details about this. How you found that it happened at next chunk?, Thanks [~vinayrpet].
+
+I used "hdfs debug verify" on the replica files at the destination. I wish I have the source replica files, but I don't.
+, bq. Another question is, whats the exact sequence of events? VolumeScanner can scan only completed blocks. Whether this block was closed and re-opened for append?
+I meant, whether any {{DFS.append()}} was involved or Just continous write for {{create()}} with pipeline recoveries.?, Thanks [~vinayrpet] for the discussion.
+For a while when I filed this jira, I thought I found the smoking gun, but it turned out it was my misunderstanding of the code. However, other than step (5) and (8), other steps were evident in the log.
+
+From what I understand so far, the corruption was detected in the first chunk appended after the pipeline recovery. Incidentally, the corruption initially was only found on the datanode added into pipeline after recovery, and it did not affect other datanodes in the pipeline., bq. From what I understand so far, the corruption was detected in the first chunk appended after the pipeline recovery. Incidentally, the corruption initially was only found on the datanode added into pipeline after recovery, and it did not affect other datanodes in the pipeline.
+You mean for other replicas "hdfs debug verify" didnt show any corruption?, I didn't run hdfs debug verify for other replicas. Maybe I jumped to conclusion too soon, but the VolumeScanner on those DNs in the original pipeline never detected checksum error. Those replicas however became stale because the DataNodes were restarted., Out of curiosity, Mechanically, what's the difference between these two? I know for a fact the client is a flume application, so it's mostly append operation., Hi [~vinayrpet],
+
+Thanks for looking into. Some info to share:
+
+The blockTransfer only transferred data of of size 41186816 in the above example, and the corruption is found to be at the right next chunk starting at 41186816.  
+
+It's a bit interesting here: it's observed that much ore data is written to this same replica. However, the client keeps getting the following msg and the DFSOutputStream was not created successfully after block transfer (because of the corrupted data, any newly added downstream DN always detect the checksum error and disconnect it from the pipeline, thus the client keeps trying to replace the downstream DN, as reported in HDFS-6937). 
+
+Question is, If the DFSOutputStream is not created successfully, supposedly the client wouldn't send new data, where is the new data beyond 41186816 from? 
+
+{code}
+INFO org.apache.hadoop.hdfs.DFSClient: Exception in createBlockOutputStream
+java.io.IOException: Bad connect ack with firstBadLink as 10.1.1.1:1110
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.createBlockOutputStream(DFSOutputStream.java:1472)
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.setupPipelineForAppendOrRecovery(DFSOutputStream.java:1293)
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.processDatanodeError(DFSOutputStream.java:1016)
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.run(DFSOutputStream.java:560)
+{code}
+
+Thanks.
+, From this, I can see that, truncate happens even in Sender's Block, but not for the receivers block.
+Need to analyze more in this area., I don't see truncate on Sender's, Sender actually reports {{getVisibleLength()= 41186444}}. 
+
+Would you please elaborate 
+{quote}
+truncate happens even in Sender's Block, but not for the receivers block.
+{quote}
+
+Thanks a lot.
+, bq. I don't see truncate on Sender's, Sender actually reports getVisibleLength()= 41186444.
+Yes, thats correct. Thats while transferring the block, it displays 41186444 as visibleLength and 41381376 as onDisk. Because of this, during trasnsfer it sends extra bytes to make up the full chunk.
+
+But once the transfer is complete, during pipeline recovery in {{recoverRbw()}} since the bytesOnDisk > visibleLength, on disk bytes will be truncated to visibleLength. This will happen in almost all Datanodes except the new DN added. So extra bytes sent to new DN will not be overwritter, whereas in old DNs it will be written from packets.
+{code}     // Truncate the potentially corrupt portion.
+      // If the source was client and the last node in the pipeline was lost,
+      // any corrupt data written after the acked length can go unnoticed.
+      if (numBytes > bytesAcked) {
+        final File replicafile = rbw.getBlockFile();
+        truncateBlock(replicafile, rbw.getMetaFile(), numBytes, bytesAcked);
+        rbw.setNumBytes(bytesAcked);
+        rbw.setLastChecksumAndDataLen(bytesAcked, null);
+      }{code}
+But this step will be skipped in new DN as it has both visible and ondisk bytes as same due to transfer., For End-user both should result in same data. 
+but recovery flows involved are different in append, as pipeline reconstruction happens for the original nodes itself. Why I asked is, before append() block would be in Finalized state, which VolumeScanner would have started scanning.
+If its only pipeline recoveries with one create(), block will not be Finalized state anytime, and VolumeScanner will not scan the block., Hi all :
+
+I encountered the same issue, here is the scenario : 
+
+- hbase writing block to pipeline 10.6.134.228 , 10.6.128.215, 10.6.128.208
+-  dn - 10.6.128.208 restarted
+-  pipeline recovery, add new datanode - 10.6.134.229 to pipeline.
+-  client send transfer_block command , and 10.6.134.228 copy the block file to new data node 10.6.134.229  
+-  client writing data
+-   datanode 10.6.128.215 restarted
+-  pipeline recovery, add new datanode - 10.6.129.77 to pipeline.
+-  client send transfer_block command , and 10.6.134.229 copy the block file to new data node 10.6.129.77
+-  129.77 throws "error.java.io.IOException: Unexpected checksum mismatch", Hi [~xupeng], Can you add 229 and 77 logs as well for this block? Including transfer related logs., hi [~vinayrpet] :
+
+logs related are listed below
+
+134.228
+{noformat}
+2016-07-13 11:48:29,528 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: DataTransfer: Transmitted blk_1116167880_42905642 (numBytes=9911790) to /10.6.134.229:5080
+2016-07-13 11:48:29,552 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: Receiving blk_1116167880_42905642 src: /10.6.130.44:26319 dest: /10.6.134.228:5080
+2016-07-13 11:48:29,552 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Recover RBW replicablk_1116167880_42905642
+2016-07-13 11:48:29,552 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Recovering ReplicaBeingWritten, blk_1116167880_42905642, RBW
+  getNumBytes()     = 9912487
+  getBytesOnDisk()  = 9912487
+  getVisibleLength()= 9911790
+  getVolume()       = /current
+  getBlockFile()    = /current/current/rbw/blk_1116167880
+  bytesAcked=9911790
+  bytesOnDisk=9912487
+2016-07-13 11:48:29,552 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: truncateBlock: blockFile=/current/current/rbw/blk_1116167880, metaFile=/current/current/rbw/blk_1116167880_42905642.meta, oldlen=9912487, newlen=9911790
+016-07-13 11:49:01,566 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: Receiving blk_1116167880_42906656 src: /10.6.130.44:26617 dest: /10.6.134.228:5080
+2016-07-13 11:49:01,566 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Recover RBW replica blk_1116167880_42906656
+2016-07-13 11:49:01,566 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Recovering ReplicaBeingWritten, blk_1116167880_42906656, RBW
+  getNumBytes()     = 15104963
+  getBytesOnDisk()  = 15104963
+  getVisibleLength()= 15102415
+  getVolume()       = /current
+  getBlockFile()    = /current/current/rbw/blk_1116167880
+  bytesAcked=15102415
+  bytesOnDisk=15104963
+2016-07-13 11:49:01,566 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: truncateBlock: blockFile=/current/rbw/blk_1116167880, metaFile=/current/rbw/blk_1116167880_42906656.meta, oldlen=15104963, newlen=15102415
+2016-07-13 11:49:01,569 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: Datanode 2 got response for connect ack  from downstream datanode with firstbadlink as 10.6.129.77:5080
+2016-07-13 11:49:01,569 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: Datanode 2 forwarding connect ack to upstream firstbadlink is 10.6.129.77:5080
+2016-07-13 11:49:01,570 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: PacketResponder: blk_1116167880_42907145, type=HAS_DOWNSTREAM_IN_PIPELINE
+java.io.EOFException: Premature EOF: no length prefix available
+        at org.apache.hadoop.hdfs.protocolPB.PBHelper.vintPrefixed(PBHelper.java:2225)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.PipelineAck.readFields(PipelineAck.java:176)
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver$PacketResponder.run(BlockReceiver.java:1179)
+        at java.lang.Thread.run(Thread.java:745)
+2016-07-13 11:49:01,570 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: Exception for blk_1116167880_42907145
+java.io.IOException: Premature EOF from inputStream
+        at org.apache.hadoop.io.IOUtils.readFully(IOUtils.java:201)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.PacketReceiver.doReadFully(PacketReceiver.java:213)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.PacketReceiver.doRead(PacketReceiver.java:134)
+{noformat}
+
+
+134.229
+{noformat}
+2016-07-13 11:48:29,488 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: Receiving blk_1116167880_42905642 src: /10.6.134.228:24286 dest: /10.6.134.229:5080
+2016-07-13 11:48:29,516 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Convert blk_1116167880_42905642 from Temporary to RBW, visible length=9912320
+2016-07-13 11:48:29,552 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: Receiving blk_1116167880_42905642 src: /10.6.134.228:24321 dest: /10.6.134.229:5080
+2016-07-13 11:48:29,552 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Recover RBW replica blk_1116167880_42905642
+2016-07-13 11:48:29,552 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Recovering ReplicaBeingWritten, blk_1116167880_42905642, RBW
+  getNumBytes()     = 9912320
+  getBytesOnDisk()  = 9912320
+  getVisibleLength()= 9912320
+  getVolume()       = /current
+  getBlockFile()    = /current/rbw/blk_1116167880
+  bytesAcked=9912320
+  bytesOnDisk=9912320
+
+2016-07-13 11:49:01,501 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: PacketResponder: blk_1116167880_42906656, type=HAS_DOWNSTREAM_IN_PIPELINE
+java.io.IOException: Connection reset by peer
+016-07-13 11:49:01,505 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: PacketResponder: blk_1116167880_42906656, type=HAS_DOWNSTREAM_IN_PIPELINE terminating
+2016-07-13 11:49:01,505 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: opWriteBlock blk_1116167880_42906656 received exception java.io.IOException: Premature EOF from inputStream
+2016-07-13 11:49:01,506 ERROR org.apache.hadoop.hdfs.server.datanode.DataNode: DataXceiver error processing WRITE_BLOCK operation  src: /10.6.134.228:24321 dst: /10.6.134.229:5080
+java.io.IOException: Premature EOF from inputStream
+        at org.apache.hadoop.io.IOUtils.readFully(IOUtils.java:201)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.PacketReceiver.doReadFully(PacketReceiver.java:213)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.PacketReceiver.doRead(PacketReceiver.java:134)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.PacketReceiver.receiveNextPacket(PacketReceiver.java:109)
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receivePacket(BlockReceiver.java:472)
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receiveBlock(BlockReceiver.java:789)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.writeBlock(DataXceiver.java:917)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opWriteBlock(Receiver.java:174)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:80)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:244)
+        at java.lang.Thread.run(Thread.java:745)
+2016-07-13 11:49:01,541 INFO org.apache.hadoop.hdfs.server.datanode.BlockScanner: Not scanning suspicious block blk_1116167880_42906656 on DS-8c209fca-9b34-4a6b-919b-6b4d24a3e13a, because the block scanner is disabled.
+2016-07-13 11:49:01,542 WARN org.apache.hadoop.hdfs.server.datanode.DataNode: :Failed to transfer blk_1116167880_42906656 to 10.6.129.77:5080 got
+java.net.SocketException: Original Exception : java.io.IOException: Connection reset by peer
+        at sun.nio.ch.FileChannelImpl.transferTo0(Native Method)
+        at sun.nio.ch.FileChannelImpl.transferToDirectlyInternal(FileChannelImpl.java:428)
+        at sun.nio.ch.FileChannelImpl.transferToDirectly(FileChannelImpl.java:493)
+        at sun.nio.ch.FileChannelImpl.transferTo(FileChannelImpl.java:608)
+        at org.apache.hadoop.net.SocketOutputStream.transferToFully(SocketOutputStream.java:223)
+        at org.apache.hadoop.hdfs.server.datanode.BlockSender.sendPacket(BlockSender.java:576)
+        at org.apache.hadoop.hdfs.server.datanode.BlockSender.sendBlock(BlockSender.java:745)
+        at org.apache.hadoop.hdfs.server.datanode.DataNode$DataTransfer.run(DataNode.java:2166)
+        at org.apache.hadoop.hdfs.server.datanode.DataNode.transferReplicaForPipelineRecovery(DataNode.java:2895)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.transferBlock(DataXceiver.java:980)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opTransferBlock(Receiver.java:203)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:92)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:244)
+        at java.lang.Thread.run(Thread.java:745)
+Caused by: java.io.IOException: Connection reset by peer
+        ... 14 more
+2016-07-13 11:49:01,567 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: blk_1116167880_42906656 src: /10.6.134.228:46441 dest: /10.6.134.229:5080
+2016-07-13 11:49:01,567 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Recover RBW replica blk_1116167880_42906656
+2016-07-13 11:49:01,567 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Recovering ReplicaBeingWritten, blk_1116167880_42906656, RBW
+  getNumBytes()     = 15104963
+  getBytesOnDisk()  = 15104963
+  getVisibleLength()= 15102415
+  getVolume()       = /current
+  getBlockFile()    = /current/rbw/blk_1116167880
+  bytesAcked=15102415
+  bytesOnDisk=15104963
+2016-07-13 11:49:01,567 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: truncateBlock: blockFile=/current/rbw/blk_1116167880, metaFile=current/rbw/blk_1116167880_42906656.meta, oldlen=15104963, newlen=15102415
+2016-07-13 11:49:01,569 ERROR org.apache.hadoop.hdfs.server.datanode.DataNode: :Exception transfering block blk_1116167880_42907145 to mirror 10.6.129.77:5080: java.io.EOFException: Premature EOF: no length prefix available
+2016-07-13 11:49:01,569 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: opWriteBlock blk_1116167880_42907145 received exception java.io.EOFException: Premature EOF: no length prefix available
+2016-07-13 11:49:01,569 ERROR org.apache.hadoop.hdfs.server.datanode.DataNode: DataXceiver error processing WRITE_BLOCK operation  src: /10.6.134.228:46441 dst: /10.6.134.229:5080
+java.io.EOFException: Premature EOF: no length prefix available
+        at org.apache.hadoop.hdfs.protocolPB.PBHelper.vintPrefixed(PBHelper.java:2225)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.writeBlock(DataXceiver.java:858)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opWriteBlock(Receiver.java:174)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:80)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:244)
+        at java.lang.Thread.run(Thread.java:745)
+{noformat}
+
+129.77
+{noformat}
+2016-07-13 11:49:01,512 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: Receiving blk_1116167880_42906656 src: /10.6.134.229:43844 dest: /10.6.129.77:5080
+2016-07-13 11:49:01,543 WARN org.apache.hadoop.hdfs.server.datanode.DataNode: Checksum error in block blk_1116167880_42906656 from /10.6.134.229:43844
+org.apache.hadoop.fs.ChecksumException: Checksum error: DFSClient_NONMAPREDUCE_2019484565_1 at 81920 exp: 1352119728 got: -1012279895
+        at org.apache.hadoop.util.NativeCrc32.nativeComputeChunkedSumsByteArray(Native Method)
+        at org.apache.hadoop.util.NativeCrc32.verifyChunkedSumsByteArray(NativeCrc32.java:69)
+        at org.apache.hadoop.util.DataChecksum.verifyChunkedSums(DataChecksum.java:347)
+        at org.apache.hadoop.util.DataChecksum.verifyChunkedSums(DataChecksum.java:294)
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.verifyChunks(BlockReceiver.java:421)
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receivePacket(BlockReceiver.java:558)
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receiveBlock(BlockReceiver.java:789)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.writeBlock(DataXceiver.java:917)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opWriteBlock(Receiver.java:174)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:80)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:244)
+        at java.lang.Thread.run(Thread.java:745)
+2016-07-13 11:49:01,543 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: Exception for blk_1116167880_42906656
+java.io.IOException: Terminating due to a checksum error.java.io.IOException: Unexpected checksum mismatch while writing blk_1116167880_42906656 from /10.6.134.229:43844
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receivePacket(BlockReceiver.java:571)
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receiveBlock(BlockReceiver.java:789)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.writeBlock(DataXceiver.java:917)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opWriteBlock(Receiver.java:174)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:80)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:244)
+        at java.lang.Thread.run(Thread.java:745)
+2016-07-13 11:49:01,543 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: opWriteBlock blk_1116167880_42906656 received exception java.io.IOException: Terminating due to a checksum error.java.io.IOException: Unexpected checksum mismatch while writing blk_1116167880_42906656 from /10.6.134.229:43844
+2016-07-13 11:49:01,543 ERROR org.apache.hadoop.hdfs.server.datanode.DataNode:  error processing WRITE_BLOCK operation  src: /10.6.134.229:43844 dst: /10.6.129.77:5080
+java.io.IOException: Terminating due to a checksum error.java.io.IOException: Unexpected checksum mismatch while writing blk_1116167880_42906656 from /10.6.134.229:43844
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receivePacket(BlockReceiver.java:571)
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.receiveBlock(BlockReceiver.java:789)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.writeBlock(DataXceiver.java:917)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opWriteBlock(Receiver.java:174)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:80)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:244)
+        at java.lang.Thread.run(Thread.java:745)
+2016-07-13 11:49:01,570 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: Receiving blk_1116167880_42906656 src: /10.6.134.229:43878 dest: /10.6.129.77:5080
+2016-07-13 11:49:01,570 INFO org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl: Recover RBW replica BP-448958278-10.6.130.96-1457941856632:blk_1116167880_42906656
+2016-07-13 11:49:01,570 INFO org.apache.hadoop.hdfs.server.datanode.DataNode: opWriteBlock blk_1116167880_42906656 received exception org.apache.hadoop.hdfs.server.datanode.ReplicaNotFoundException: Cannot recover a non-RBW replica ReplicaInPipeline, blk_1116167880_42906656, TEMPORARY
+  getNumBytes()     = 9961472
+  getBytesOnDisk()  = 9830400
+  getVisibleLength()= -1
+  getVolume()       = /current
+  getBlockFile()    = /current/tmp/blk_1116167880
+  bytesAcked=0
+  bytesOnDisk=9830400
+2016-07-13 11:49:01,571 ERROR org.apache.hadoop.hdfs.server.datanode.DataNode: DataXceiver error processing WRITE_BLOCK operation  src: /10.6.134.229:43878 dst: /10.6.129.77:5080
+org.apache.hadoop.hdfs.server.datanode.ReplicaNotFoundException: Cannot recover a non-RBW replica ReplicaInPipeline, blk_1116167880_42906656, TEMPORARY
+  getNumBytes()     = 9961472
+  getBytesOnDisk()  = 9830400
+  getVisibleLength()= -1
+  getVolume()       = /current
+  getBlockFile()    =/current/tmp/blk_1116167880
+  bytesAcked=0
+  bytesOnDisk=9830400
+        at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl.recoverRbw(FsDatasetImpl.java:1273)
+        at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.<init>(BlockReceiver.java:190)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.writeBlock(DataXceiver.java:799)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opWriteBlock(Receiver.java:174)
+        at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:80)
+        at org.apache.hadoop.hdfs.server.datanode.DataXceiver.run(DataXceiver.java:244)
+        at java.lang.Thread.run(Thread.java:745)
+{noformat}, bq. org.apache.hadoop.fs.ChecksumException: Checksum error: DFSClient_NONMAPREDUCE_2019484565_1 at 81920 exp: 1352119728 got: -1012279895
+Here it says checksum error at 81920, which is at the very beginning itself. May be 229 disk have some problem, or during transfer to 77 some corruption due to network card would have happened. 
+Is not exactly same as current case., Thanks a lot [~vinayrpet] and [~xupener]!
+
+As Vinay pointed, the case Xupeng described looks alike but the corruption position is not like this case. I think HDFS-6937 will help on Xupeng's case.
+
+Vinay: About {{recoverRbw}},  since the data the destination DN (the new DN) received is valid data, does not truncating at the new DN hurt? 
+
+We actually allow different visibleLength at different replica, see 
+https://issues.apache.org/jira/browse/HDFS-10587?focusedCommentId=15374480&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15374480
+
+Though I originally hopeed that the block transfer preserve the visibleLength, so that in the block transfer, the target DN can have the same visibleLength as the source DN.
+
+Assuming it's ok to have the different visibleLength at the new DN, the block transfer seems to have side effect, such that the new chunk after the block transfer at the new DN appears corrupted.
+
+Another thing is, if the pipeline recovery is failing, see
+
+https://issues.apache.org/jira/browse/HDFS-10587?focusedCommentId=15376467&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15376467
+
+ why we have more data reaching the new DN (I meant the chunk after block transfer) ?
+
+Thanks.
+
+
+ 
+, I think this looks why we had new data reaching the new DN after the init block transfer:  after adding the new DN to the pipeline, doing the block transfer to this new DN, the client resumed writing data. Then in the process, corruption is detected again, thus repeating the pipeline recovery process. Even though from client side point of view, it keeps getting the following exception
+
+{code}
+INFO org.apache.hadoop.hdfs.DFSClient: Exception in createBlockOutputStream
+java.io.IOException: Bad connect ack with firstBadLink as 10.1.1.1:1110
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.createBlockOutputStream(DFSOutputStream.java:1472)
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.setupPipelineForAppendOrRecovery(DFSOutputStream.java:1293)
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.processDatanodeError(DFSOutputStream.java:1016)
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.run(DFSOutputStream.java:560)
+{code}
+
+Wei-Chiu and I discussed, and we think here is a more complete picture:
+
+* 1. pipeline going on DN1 -> DN2 -> DN3
+* 2. trouble at DN3, it's gone
+* 3. pipeline recovery, new DN DN4 added
+* 4. block transfer from DN1 to DN4, DN4's data is now a multiple of chunks.
+* 5. DataStreamer resumed writing data to DN1 -> DN4 -> DN3 (this is where new data gets in), the first chunk DN4 got is corrupt for some reason that we are searching for
+* 6. DN3 detects corruption, quit; while new data has been written to DN1 and DN4
+* 7. goes back to step 3, new pipeline recovery starts
+DN1 ->DN4 -> DN5
+DN1 -> DN4 -> DN6
+......
+
+At a corner case, Step 3 could be replaced with "DN3 restarted", in which case, another block transfer would happen, and may cause corruption.
+
+Since DN1's visibleLength in step 4 is not a multiple of chunks, this fact might be somehow related to the corruption in step 5., I see. So for the logs I saw, there's no "Appending to " messages. I think the replica was created without being in FINALIZED state., bq. Here it says checksum error at 81920, which is at the very beginning itself. May be 229 disk have some problem, or during transfer to 77 some corruption due to network card would have happened. Is not exactly same as current case.
+I was wrong. [~xupeng] case is also exactly same as this Jira.
+Here is how, 
+# 77 is throwing exception while verifying the received packet during transfer from 229(which got the block transfered earlier from 228)
+# While verifying only packet, the position mentioned in the checksum exception, is relative to packet buffer offset, not the block offset. So 81920 is the offset in the exception.
+# Blocks already written to disk in 77 during transfer before checksum exception : 9830400
+# Total : 9830400 + 81920 == 9912320, which is same as bytes received by 229 from 228 when it was added to pipeline.
+, I have written some test to reproduce the flow as mentioned in the description. 
+But could not find the corruption when ran.
+Check whether this could help any of you., Thank you so much [~vinayrpet]! We are looking further!
+
+
+, Hi [~vinayrpet],
+
+Thanks much again for creating the testcase! Upon further investigation, we found that our branch initially had HDFS-4660, then it was reverted because of an issue, which was later identified as HDFS-9220. We had a tool to query jiras in a given branch, and it failed to tell us the jira was reverted, so we thought we already had HDFS-4660, and we kept thinking it's something else, though we saw the symptom here is really same as HDFS-4660. Sorry for the overlook there.
+
+I did an experiment by reverting HDFS-4660 etc, and found your test failed as expected. I created HDFS-10652 for adding this test as a unit test for HDFS-4660. if you don't mind, would you please assign it to yourself, craft it and add comments as needed, and attach new versions there?
+
+Thanks a lot!
+, bq. I did an experiment by reverting HDFS-4660 etc, and found your test failed as expected. 
+That means, this Jira is no longer required investigation right?
+May be [~xupeng] also can confirm, if his installation had HDFS-4660 then issue might exist. If not, then we can close this Jira as well.
+
+bq.  I created HDFS-10652 for adding this test as a unit test for HDFS-4660. if you don't mind, would you please assign it to yourself, craft it and add comments as needed, and attach new versions there?
+Sure. thank you., Hi [~xupener],
+
+Per [~vinayrpet]'s comment here:
+
+https://issues.apache.org/jira/browse/HDFS-10587?focusedCommentId=15378879&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15378879
+
+and my comment above, would you please check whether your release has HDFS-4660, HDFS-9220?
+
+Thanks.
+, Thanks [~vinayrpet], you are really fast responding! and our comments collided:-)
+
+let's wait for [~xupener]'s reply about whether he has HDFS-4660. But can we move ahead with HDFS-10652 asap? 
+
+Thanks.
+
+, Hi [~yzhangal],  [~vinayrpet]:
+
+Sorry for the late reply， I checked my installation（hadoop-2.6.0-cdh5.4.4） that I don't have HDFS-4660. 
+
+So this means HDFS-4660 can solve these problem discussed above ? , Thanks for your reply [~xupener]. 
+
+Yes, HDFS-4660 + HDFS-9220 would solve these problem, because HDFS-9220 fixed a bug in the HDFS-4660 fix. 
+
+I think we should fix the following report
+{quote}
+While verifying only packet, the position mentioned in the checksum exception, is relative to packet buffer offset, not the block offset. So 81920 is the offset in the exception.
+{quote}
+to also report the offset in the file, offset in block, and offset in packet.
+
+
+, Closing this jira as duplicate of HDFS-4660.
+]

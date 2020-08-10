@@ -1,0 +1,228 @@
+[This has the unpleasant side-effect of causing the job to hang., Resource Manager exception is:
+{noformat}
+java.lang.IllegalArgumentException: Converting 9223372036854775807 from '' to 'm' will result in an overflow of Long
+        at org.apache.hadoop.yarn.util.UnitsConversionUtil.convert(UnitsConversionUtil.java:160)
+        at org.apache.hadoop.yarn.util.resource.DominantResourceCalculator.normalize(DominantResourceCalculator.java:444)
+        at org.apache.hadoop.yarn.util.resource.Resources.normalize(Resources.java:392)
+        at org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerUtils.getNormalizedResource(SchedulerUtils.java:177)
+        at org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler.getNormalizedResource(FairScheduler.java:782)
+        at org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler.normalizeRequests(AbstractYarnScheduler.java:1137)
+        at org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler.allocate(FairScheduler.java:828)
+        at org.apache.hadoop.yarn.server.resourcemanager.DefaultAMSProcessor.allocate(DefaultAMSProcessor.java:265)
+        at org.apache.hadoop.yarn.server.resourcemanager.AMSProcessingChain.allocate(AMSProcessingChain.java:92)
+        at org.apache.hadoop.yarn.server.resourcemanager.ApplicationMasterService.allocate(ApplicationMasterService.java:388)
+        at org.apache.hadoop.yarn.api.impl.pb.service.ApplicationMasterProtocolPBServiceImpl.allocate(ApplicationMasterProtocolPBServiceImpl.java:60)
+        at org.apache.hadoop.yarn.proto.ApplicationMasterProtocol$ApplicationMasterProtocolService$2.callBlockingMethod(ApplicationMasterProtocol.java:99)
+        at org.apache.hadoop.ipc.ProtobufRpcEngine$Server$ProtoBufRpcInvoker.call(ProtobufRpcEngine.java:523)
+        at org.apache.hadoop.ipc.RPC$Server.call(RPC.java:991)
+        at org.apache.hadoop.ipc.Server$RpcCall.run(Server.java:869)
+        at org.apache.hadoop.ipc.Server$RpcCall.run(Server.java:815)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:422)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1962)
+{noformat}, [~templedf] If you don't mind I would take this task to work on it., Fine with me., Tried several things to reproduce this issue without success, please see the summary of my findings below.
+ *Actually the only way I was able to reproduce is to put a custom resource type with a value equals to {{Long.MAX_VALUE}} to the node-resources.xml, but it does not seem a valid configuration for me, moreover it is different what this issue describes so that the default configuration causes the overflow.*
+
+Based on the exception message and the method signature of
+
+{{org.apache.hadoop.yarn.util.UnitsConversionUtil.convert}}, {{fromUnit}} should be empty, {{toUnit}} should be "m" and {{fromValue}} should equal to {{Long.MAX_VALUE}}.
+
+Based on the stacktrace, the call to {{UnitsConversionUtil.convert}} comes from {{DominantResourceCalculator.normalize:444}}, this is the call:
+{code:java}
+long maximumValue = UnitsConversionUtil.convert(
+          maximumResourceInformation.getUnits(),
+          rResourceInformation.getUnits(),
+          maximumResourceInformation.getValue());
+{code}
+From these, I tried to track down how the call to {{maximumResourceInformation.getValue()}} could return {{Long.MAX_VALUE}}.
+
+Please see the steps I took by checking the original stack trace and the call hierarchy:
+ 1. {{FairScheduler.getNormalizedResource()}}: the 3rd parameter here is the {{getMaximumResourceCapability()}} call.
+
+2. {{org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler#getMaximumResourceCapability()}} that calls to 
+ {{org.apache.hadoop.yarn.server.resourcemanager.scheduler.ClusterNodeTracker#getMaxAllowedAllocation}}
+
+3. In the {{ClusterNodeTracker#getMaxAllowedAllocation}} method, with the default configuration, the {{Resource}} being returned contains {{ResourceInformations}} where their value is maximized by the {{maxAllocation}} field, so in theory, one element of this array (a value of a resource) should be {{Long.MAX_VALUE}}.
+
+4. The {{ClusterNodeTracker.maxAllocation}} field is updated in: {{org.apache.hadoop.yarn.server.resourcemanager.scheduler.ClusterNodeTracker#updateMaxResources}}.
+ Looking at the source of this method, the {{maxAllocation}} array takes its values from the {{node.getTotalResource()}}, so I tried to track down how the {{SchedulerNode}}'s {{totalResource}} could take this high value.
+ Since all the implementation classes just calling the constructor of the abstract class, I started to investigate towards this direction.
+
+5. {{SchedulerNode}}'s constructor, relevant line:
+{code:java}
+this.totalResource = Resources.clone(node.getTotalCapability());
+{code}
+{{Node}} is an instance of {{RMNode}}, looking how {{RMNodeImpl.getTotalCapability()}} works, checked where {{RMNodeImpl}} is created.
+
+6. {{RMNodeImpl}} is created in: {{org.apache.hadoop.yarn.server.resourcemanager.ResourceTrackerService#registerNodeManager}}
+ Since the {{totalCapability}} field of {{RMNodeImpl}} is updated in many places, I tried to filter the most relevant one, so just checked the constructor. 
+ It would have been very hard to check every scenario where this field could be updated.
+ Still in {{registerNodeManager}}, I saw that the {{totalCapability}} is set from the {{RegisterNodeManagerRequest}} at the beginning of the method:
+{code:java}
+Resource capability = request.getResource();
+{code}
+This is the boundary of the {{ResourceManager}} because the {{RegisterNodeManagerRequest}} is sent from NM to RM.
+
+7. Checked where the {{RegisterNodeManagerRequest}} is created, found only one occurence: 
+ {{org.apache.hadoop.yarn.server.nodemanager.NodeStatusUpdaterImpl#registerWithRM}} creates the request.
+ This is the call:
+{code:java}
+RegisterNodeManagerRequest.newInstance(nodeId, httpPort, totalResource,
+              nodeManagerVersionId, containerReports, getRunningApplications(),
+              nodeLabels, physicalResource);
+{code}
+The relevant field is the {{totalResource}}, so checked where this field is updated.
+
+8. In {{org.apache.hadoop.yarn.server.nodemanager.NodeStatusUpdaterImpl#serviceInit}}, {{totalResource}} is updated with:
+{code:java}
+this.totalResource = NodeManagerHardwareUtils.getNodeResources(conf);
+{code}
+9. Looking at the implementation of {{NodeManagerHardwareUtils.getNodeResources()}}: 
+ This is the method that reads from node-resources.xml and sets the node's total resources.
+ I could not find a scenario where a value of any custom resource is set to {{Long.MAX_VALUE}}.
+----
+To be able to reproduce, I tried several combinations of resource settings with node-resources.xml, I have always started the pi job via console.
+ Example parameters:
+{code:java}
+ "pi -Dmapreduce.framework.name=yarn -Dmapreduce.map.resource.gpu=5000m 10 100".
+{code}
+Please note that sometimes I used different values for the -Dmapreduce.map.resource parameter.
+ In all cases I used this resource-types.xml file:
+{code:xml}
+<configuration>
+	<property>
+	   <name>yarn.resource-types</name>
+	   <value>gpu,fpga</value>
+	</property>
+</configuration>
+{code}
+The scenarios I tried:
+
+*1. node-resources.xml: gpu defined as Long.MAX_VALUE --> exception same as in issue, hangs*
+{code:xml}
+<property>
+   <name>yarn.nodemanager.resource-type.gpu</name>
+   <value>9223372036854775807</value>
+</property>
+{code}
+jobs parameter:
+ A.) -Dmapreduce.map.resource.gpu=5000m --> hangs
+ B.) -Dmapreduce.map.resource.fpga=5000m --> does not hang
+
+2. node-resources.xml: no custom types defined --> no exception, does not hang
+
+3. node-resources.xml: fpga defined with value 1
+{code:xml}
+<property>
+   <name>yarn.nodemanager.resource-type.fpga</name>
+   <value>1</value>
+</property>
+{code}
+jobs parameter:
+ A.) -Dmapreduce.map.resource.gpu=5000m --> does not hang
+ B.) -Dmapreduce.map.resource.fpga=5000m --> does not hang
+
+4. node-resources.xml: gpu defined with value 1
+{code:xml}
+<property>
+   <name>yarn.nodemanager.resource-type.gpu</name>
+   <value>1</value>
+</property>
+{code}
+jobs parameter:
+ A.) -Dmapreduce.map.resource.gpu=5000m --> does not hang
+ B.) -Dmapreduce.map.resource.fpga=5000m --> does not hang
+
+5. node-resources.xml: gpu defined without value
+{code:xml}
+<property>
+   <name>yarn.nodemanager.resource-type.gpu</name>
+</property>
+{code}
+jobs parameter:
+ A.) -Dmapreduce.map.resource.gpu=5000m --> does not hang
+ B.) -Dmapreduce.map.resource.fpga=5000m --> does not hang, [~gsohn] Do you remember how the configuration files (node-resources.xml / resource-types.xml) looked like to reproduce this issue with the default value for the resource?
+Thanks!, I believe when the resource type unit is `m` you use a value without units to trigger overflow., [~grant.sohn] Do you mean to define a resource with the unit of "m" in the resource-types.xml and request the resource with a job without units? Thanks!, Yes., [~gsohn] No luck. 
+I tried with this resource-types.xml: 
+
+
+{code:java}
+<configuration>
+<property>
+   <name>yarn.resource-types</name>
+   <value>gpu,fpga</value>
+ </property>
+ 
+ <property>
+   <name>yarn.resource-types.gpu.units</name>
+   <value>m</value>
+ </property>
+</configuration>
+{code}
+
+I ran the job with these parameters: "pi -Dmapreduce.framework.name=yarn -Dmapreduce.map.resource.gpu=5000 10 100"
+The exception does not come up and the job does not hang.
+
+If you have time, you can check what scenarios I have tried so far on my longer comment.
+Do you agree to close this as non-reproducible?, You might want to check with [~templedf] on this.  He might recall the specific instance better., Hey [~gsohn]! 
+
+Sure, I will discuss this one with Daniel.
+
+Thanks for your help so far!, I discussed this with [~vijaykalluru], we came to the conclusion that we cannot reproduce this issue, so I will close this as non-reproducible., Sorry it took me a while to respond.  Did you try requesting {{-Dmapreduce.map.resource.gpu=5k}} with that setup?  I don't remember the details, but I think that if you now ask for a quantity without a unit, it will assume the resource's default unit.  If you force the unit to something larger than millis, it should expose the issue.  As far as I know, the issue should still exist., Hey [~templedf]!
+
+No problem.
+ I tried to reproduce again with the following config: 
+ node-resources.xml:
+{code:java}
+<configuration>
+ <property>
+   <name>yarn.nodemanager.resource-type.gpu</name>
+   <value>100</value>
+ </property> 
+</configuration>
+{code}
+resource-types.xml:
+{code:java}
+<configuration>
+ <property>
+   <name>yarn.resource-types</name>
+   <value>gpu</value>
+</property>
+<property>
+   <name>yarn.resource-types.gpu.units</name>
+   <value>m</value>
+ </property>
+</configuration>
+{code}
+and the command I ran was:
+{code:java}
+/Users/szilardnemeth/development/apache/hadoop-maven//hadoop-dist//target/hadoop-3.1.0-SNAPSHOT/bin/hadoop jar /Users/szilardnemeth/development/apache/hadoop-maven//hadoop-dist//target/hadoop-3.1.0-SNAPSHOT/share/hadoop/mapreduce/hadoop-mapreduce-examples-3.1.0-SNAPSHOT.jar pi -Dmapreduce.framework.name=yarn -Dmapreduce.map.resource.gpu=5k 10 100
+{code}
+I also tried with the same configuration, except I removed the gpu.units from resource-types.xml and the result is the same, does not reproducible.
+
+ 
+
+I have a log statement in place in the code for every conversion, so I grepped to those conversions in the log:
+
+{{grep converting -i /tmp/rm.log | grep "''"}}
+
+results (just the largest converted numbers since there are a lot of matches lines):
+{code:java}
+2018-01-30 11:51:01,317 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'm'
+2018-01-30 11:51:43,610 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'm'
+2018-01-30 11:51:54,681 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'k'
+2018-01-30 11:51:55,685 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'k'
+2018-01-30 11:51:56,691 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'k'
+2018-01-30 11:51:57,698 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'k'
+2018-01-30 11:51:58,707 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'k'
+2018-01-30 11:51:59,709 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'k'
+2018-01-30 11:52:04,471 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'k'
+2018-01-30 11:52:07,780 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'm'
+2018-01-30 11:52:11,560 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'k'
+2018-01-30 11:52:15,688 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'k'
+2018-01-30 11:52:17,847 INFO  [SchedulerEventDispatcher:Event Processor] util.UnitsConversionUtil (UnitsConversionUtil.java:convert(134)) - ***Converting 100 from '' to 'k'
+{code}
+So given these outputs, I could only imagine this exception comes up when the value is somehow Long.MAX_VALUE for a custom resource type.
+ Can you think of a scenario when a custom resource type's value is set to it's default (Long.MAX_VALUE)?
+
+Thanks!, If you do not specify a maximum value for a resource, it's set internally to {{Long.MAX_VALUE}}.  When a job is submitted, we check the resource request against the maximum for the resource, which will require a units conversion.  Hmmm...  Now that I write that out loud, it occurs to me that we should be converting the requested value into the default units, not the other way around, which would be why you're not seeing an issue.  I'll need to look at the code again.  Even if that's the case, you should still be able to cause the failure by requesting -Dmapreduce.map.resource.gpu=92233720368547k with your setup above.]

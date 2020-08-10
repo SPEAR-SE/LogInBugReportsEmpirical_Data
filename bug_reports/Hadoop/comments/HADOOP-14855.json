@@ -1,0 +1,189 @@
+[[~aw] - does this ring any bells for you? Any thoughts on how to make this check more robust?, This is a dupe of HADOOP-9085 (and it's buddy HADOOP-9086).
+
+[~stevel@apache.org]'s comments are spot on, with this being the key one:
+
+bq. What we need to do is move away from pid-file-liveness tests altogether.
+
+Unfortunately, we're using Java.   Doing liveliness checks anywhere but in bash is either extremely expensive due to the massive classpath or non-portable/introduces more environmental dependencies.
+
+Other thoughts:
+
+1) These types of pid clashes are more on the edge case/rare side.  They just generally aren't worth spending the effort on.
+
+2) Given user-functions and shell profiles, it's possible for end users (or vendors) to replace the pid checking/handling on their own. I'm expecting experienced admins to replace it with daemontools and the like., Gotcha, all makes sense. I figured I wasn't the first person to encounter this, but couldn't find the JIRA. I'll go ahead and close this one as a dupe of HADOOP-9085., Actually, [~aw], here's a lightweight suggestion to make this check at least much more robust, if not quite foolproof. The current code that does this just checks to see if a process is running with the pid in question. But we also know the name of the daemon we're checking on, so couldn't we pretty easily make this check more robust by also grepping for the name of the daemon in the {{`ps'}} output for the pid in question? That would take an already rare issue and make it _exceptionally_ unlikely to result in a false positive, and without adding any additional dependencies beyond grep. 
+
+Specifically, I'm thinking replace this line:
+
+{code}
+if ps -p "${pid}" > /dev/null 2>&1; then
+{code}
+
+With something like this:
+
+{code}
+if ps -fp "${pid}" | grep "${daemonname}" > /dev/null 2>&1; then
+{code}
+
+Total shell scripting newbie here, so please feel free to tell me that this is way off base., (I'm having a total deja vu moment right now.  I wish I could remember who else I discussed this issue with a few years ago. haha.)
+
+It reduces the size of the edge case from 0.5% to 0.1% (or whatever). It'll still match things like 'cat datanode.txt'.  Execution speed wise, though, it's pretty expensive when one considers that we've doubled the # of forks for every start/status/stop request.  That'll have an impact esp in places like QA.
+
+But giving some further thought to it... I think you're on to something that might work pretty well... hmm...
+
+off the top:
+{code}
+pspid=$(ps -fp "${pid}" 2>/dev/null)
+
+if [[ $? -ne 0]]; then
+  if [[ ${pspid} =~ Dproc_${daemonname} ]]; then
+{code}
+
+or whatever.  [e.g., that $? construction has issues.]
+
+I think that'd be nearly the same cost as we have now and doesn't make the edge-case situation more expensive.  It also avoids the IO that's very tempting by writing the ps output to a temp file. The 'grep' is replaced by an internal regex check and lsince 3.x consistently defines proc_ for jps usage we can bounce off of that to reduce the search space even more.
+
+It's still not foolproof, but it does cut down the chances of false positives.  It's just a matter of if it's worth it or not.
+
+BTW, there are some other patches out there regarding this code but I haven't had a chance to really play with the edge cases. (and there are a lot.), You could always check to see if its a java process, which is resilient to any issues about process name. How do you check that? jstack will do it, though its exit code 1 means both "no process" and "process not listening"
+{code}
+bash-3.2$ time jstack 470
+470: Unable to open socket file: target process not responding or HotSpot VM not loaded
+The -F option can be used when the target process is not responding
+
+real	0m5.439s
+user	0m0.127s
+sys	0m0.038s
+bash-3.2$ echo $?
+1
+{code}
+
+if the process is a java one, you get the stack trace and the exit code == 0
+
+I could imagine a sequence of file -> pid -> kill -0 -> jstack, so the jstack check is only done if the process is known to be running. , note that the solution of HADOOP-9086, daemons to hold exclusive locks, is the way to guarantee that a named service is running/not running, as the moment a process dies its locks are released. If the lock can't be acquried then the process is running, (live or zombie)., jstack (and it's buddy, jps) are problematic.
+
+* jstack can crash/break processes because it uses things like SIGSTOP
+* jstack is non-standard 
+-- To my knowledge, it is NOT part of the JRE spec.
+-- Oracle: "This utility is unsupported and may or may not be available in future versions of the JDK."
+-- IBM: no such command
+
+I think everyone needs to take a step back and look at this situation in a more complete light.  The main problem here is pid cycling.  This is caused by starting and stopping a lot of processes.  For things like the NN, RM, etc, this just doesn't happen in production.  It does (very rarely) happen on the worker nodes (DN, NM), but most experienced operations people know exactly how to handle it.  Developers and QA, however, hit this problem a lot.... because they're also always cycling processes.  I really don't want this to turn into the equivalent of the metrics mess we have in Hadoop.  ("We should expose system metric X in the YARN UI!".   Who is actually looking at those values?  It isn't ops folks--we've got other tools to tell us those things.)
+
+I think it's important for folks to go look at HADOOP-13225.  It really sort of exemplifies the power that we've given users over the shell scripts in 3.x.  Yes, we could require daemontools' setlock.  But then we look like morons on operating systems that have other tools (SMF, launchd, systemd, etc.).  If we want to get fancy, then we should providing examples of using alternate daemon control tools.  
+
+We haven't even covered what happens to the process space in containerized systems:
+
+{code}
+    root     1     0   0   Aug 25 ?           0:01 /sbin/init
+    root  1740  1450   0   Aug 25 ?           0:01 /sbin/init -m verbose
+    root  1738  1449   0   Aug 25 ?           0:01 /sbin/init
+{code}
+
+Yes, those are separate init processes. Something that shouldn't happen.  Except they are running in different Illumos zones and this is the view from the global zone, which can see (but not touch) all processes from all zones.  I've never tried it, but I wouldn't be too surprised if lxc's (docker, rkt, etc) processes can be seen and touched from the parent since the boundaries are much less defined.
+
+...
+
+There is a lot of nuance involved in this problem.  Again, I'm going to double down on this is less of an issue for other apps because they don't have our Java-induced startup time.  If we weren't using Java (at least with this massive classpath), we'd just fire the daemon up and let it sort it out on it's own.  But we're not.  So we can't.
+
+That's why this is exactly the space where vendors who support specific operating systems should be providing value add by making such controls part of their offering.  We should probably add a hadoop-vendor-functions.sh or something to make it easier for vendors to override things.
+
+FWIW, I figure for those not using systemd and the like, we'll likely see user functions that turn off pid handling and simple init scripts that use  [daemon|http://libslack.org/daemon/manpages/daemon.1.html] appear relatively quickly.  There's the potential for a whole ecosystem of home grown mods like this waiting to happen with 3.x., FYI JDK 9 includes JEP 102, Process API Updates, will provide a much more sane way for the JDK to find it's pid., I think we should try to lower the chances of doing this.  If a user runs into this issue, they're going to be very confused and won't know how to fix it without looking into our shell scripts (if they even figure out that they should look there).  While it's not 100% perfect, I think we should do something along the lines of what [~aw] suggested in [this earlier comment|https://issues.apache.org/jira/browse/HADOOP-14855?focusedCommentId=16159435&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-16159435]:
+{code}
+pspid=$(ps -fp "${pid}" 2>/dev/null)
+
+if [[ $? -ne 0]]; then
+  if [[ ${pspid} =~ Dproc_${daemonname} ]]; then
+{code}
+This should significantly cut down the likelihood of running into this issue and seems pretty easy to do with little cost.  I'll try to come up with a patch soon., I've attached a patch that adds the checking for the {{-Dproc_$\{daemonname\}}}.  I played around with it and it seems to behave correctly., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 35s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red}  0m  0s{color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 15m 24s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 58s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  8m 29s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} shellcheck {color} | {color:red}  0m  3s{color} | {color:red} The patch generated 2 new + 20 unchanged - 0 fixed = 22 total (was 20) {color} |
+| {color:green}+1{color} | {color:green} shelldocs {color} | {color:green}  0m  9s{color} | {color:green} There were no new shelldocs issues. {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 47s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m 47s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 20s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 38m 46s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:d4cc50f |
+| JIRA Issue | HADOOP-14855 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12915408/HADOOP-14855.001.patch |
+| Optional Tests |  asflicense  mvnsite  unit  shellcheck  shelldocs  |
+| uname | Linux dd298d128d59 4.4.0-64-generic #85-Ubuntu SMP Mon Feb 20 11:50:30 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 138c1ed |
+| maven | version: Apache Maven 3.3.9 |
+| shellcheck | v0.4.6 |
+| shellcheck | https://builds.apache.org/job/PreCommit-HADOOP-Build/14359/artifact/out/diff-patch-shellcheck.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/14359/testReport/ |
+| Max. process+thread count | 397 (vs. ulimit of 10000) |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/14359/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, The 002 patch fixes the new shellcheck issues (I had an old version installed before)., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 26s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red}  0m  0s{color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 15m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 59s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 11s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} shellcheck {color} | {color:green}  0m  3s{color} | {color:green} There were no new shellcheck issues. {color} |
+| {color:green}+1{color} | {color:green} shelldocs {color} | {color:green}  0m 10s{color} | {color:green} There were no new shelldocs issues. {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 21s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m 40s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 38m 45s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:d4cc50f |
+| JIRA Issue | HADOOP-14855 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12915526/HADOOP-14855.002.patch |
+| Optional Tests |  asflicense  mvnsite  unit  shellcheck  shelldocs  |
+| uname | Linux bfafd6281812 4.4.0-64-generic #85-Ubuntu SMP Mon Feb 20 11:50:30 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 6c63cc7 |
+| maven | version: Apache Maven 3.3.9 |
+| shellcheck | v0.4.6 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/14365/testReport/ |
+| Max. process+thread count | 447 (vs. ulimit of 10000) |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/14365/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, +1 LGTM. I will commit this shortly., Committed to trunk. Thank you for the patch [~rkanter] and for the reviews [~aw], [~atm] and [~stevel@apache.org]., SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #13927 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/13927/])
+HADOOP-14855. Hadoop scripts may errantly believe a daemon is still (szegedim: rev e52539b46fb13db423490fe02d46e9fae72d72fe)
+* (edit) hadoop-common-project/hadoop-common/src/main/bin/hadoop-functions.sh
+]

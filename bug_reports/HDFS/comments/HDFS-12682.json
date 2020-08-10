@@ -1,0 +1,602 @@
+[Looking at the history of HDFS-11565, I understand this is done to save the redundant object constructions in NN.
+
+I'm thinking we should keep the same for the NN, but construct every time for the client. 
+Don't think this overhead will matter for a downstream long-running dfsclient that calls {{DFS#getAllErasureCodingPolicies}} repeatedly, since there will be numerous other objects created during the RPC. There will also be the headache to update these objects without the FSN lock.
+
+Would this be okay with the intent of HDFS-11565, [~andrew.wang]?, My concern was actually for the clients, since there are apps (Hive, Impala) that do listing of thousands or millions of files.
+
+I assume we can do a hybrid approach, where we get most of the fields from the static class, but get the enabled/disabled state from the PB?, Had a quick discussion with Andrew, here's the outcome:
+ErasureCodingPolicyState should not be part of the ErasureCodingPolicy, since ECP should be immutable. This was added recently from HDFS-12258.
+
+The concern is that ECP in part of HdfsFileStatus, so pretty impactful to clients doing listing. Although apps like hive and impala probably doesn't care about the ECP, returning a wrong ECPS will just be a bug.
+
+I'll look at whether we can do HDFS-12258 in another way, so we HdfsFileStatus only contains immutable ECP, and -listPolices would get the ECPS with ECP.
+
+Thanks Andrew for the discussion!, Familiarized myself with the code more, and investigated further. Also including [~zhouwei] [~Sammi] and [~rakeshr] since this is related to the initial work of HDFS-12258, and kind of related to HDFS-7337.
+
+HDFS-12258 adds good functionalities.
+Before HDFS-12258, the information "what policies are enabled" is not persisted to NN metadata, so {{-listPolicies}} always return the default {{RS-6-3-1024k}}. Even if there are some files/dirs already under a different policy, after NN restart {{-listPolicies}} still returns RS-6-3 only. This feels definitely wrong and I believe is the motivation of HDFS-12558.
+
+The problem I see from HDFS-12258's implementation though, is the mutable ECPS is saved on the immutable ECP, breaking assumptions such as shared single instance policy. At the same time the policy is still not persisted independently. I think ECPS is highly dependent on the missing piece from HDFS-7337: policies are not persisted to NN metadata. The state of whether a policy is enabled could be persisted together with the policy, without impacting HDFSFileStatus.
+
+I think this bug (HDFS-12682) and HDFS-12258 would make more sense if we could first persist policies to NN metadata. Would also be helpful to separate out something like {{ErasureCodingPolicyAndState}} for the policy-specific APIs, so the state isn't deserialized onto {{HDFSFileStatus}}.
+
+Please let me know what you think. Thanks!, Hi [~xiaochen],  thanks for reporting this issue. Inspired by your discovery, I found the same issue exists in system EC persist into and load from fsImage (HFDS-12686).  The current convertErasureCodingPolicy function is perfect in most cases. For special cases, like get all erasure coding policy and persist policy into fsImage, I think we need a new edition for full convert. 
+
+{quote}
+The problem I see from HDFS-12258's implementation though, is the mutable ECPS is saved on the immutable ECP, breaking assumptions such as shared single instance policy. At the same time the policy is still not persisted independently. I think ECPS is highly dependent on the missing piece from HDFS-7337: policies are not persisted to NN metadata. The state of whether a policy is enabled could be persisted together with the policy, without impacting HDFSFileStatus.
+{quote}
+Persist ec policies is implemented in HDFS-7337. 
+
+{quote}
+I think this bug (HDFS-12682) and HDFS-12258 would make more sense if we could first persist policies to NN metadata. Would also be helpful to separate out something like ErasureCodingPolicyAndState for the policy-specific APIs, so the state isn't deserialized onto HDFSFileStatus.
+{quote}
+For HDFS-12258, [~zhouwei],  [~drankye] and I, we discussed and do have two different approaches when we first think about how to implement it. One is the current implemented approach, which add one extra "state" field in the existing ECP definition. Another is define a new class, something like {{ErasureCodingPolicyWithState}} to hold the EPC and new policy state field.  They are almost equally good.  The only concern is if we introduce the new {{ErasureCodingPolicyWithState}}, it may introduce complexity to API interfaces, and to end users. There are multiple EC related APIs.  If we return  {{ErasureCodingPolicyWithState}} for {{getAllErasureCodingPolicies}} , should we return {{ErasureCodingPolicyWithState}} or {{ErasureCodingPolicy}} for {{getErasureCodingPolicy}}? something like that. Also is it worth to introduce a new class definition in Hadoop which only has 1 extra new field?   After all the considerations, the current approach is chosen to leverage the existing ECP. 
+
+Please let me know if you have other concerns.  Thanks!, Thanks for the response Sammi, good find on HDFS-12686! 
+
+I propose we fix the problem by:
+- Remove the state from {{ErasureCodingPolicy}}. The motivation is, {{ErasureCodingPolicy}} is returned with {{HdfsFileStatus}}, which impacts all clients listing hdfs. We want to make it as lightweight as possible, and keep Andrew's work on HDFS-11565 for performance.
+- Add a new class {{ErasureCodingPolicyInfo}} (or whatever name people feel intuitive), that contains the policy and its state. This will be used by the ECAdmin-purpose APIs, as well as internally HDFS persistency.
+
+Will prepare a patch toward this direction for demonstration. If you or any watchers have concerns, please feel free to speak up., Uploading patch 1 to show the idea. It's not easy to split the metadata part to HDFS-12686, because the protobuf definition is changed.
+
+Some considerations in this patch:
+- Modifying protobuf definition and Public class {{ErasureCodingPolicy}} are not compatible. But this is fixing the previous bug, so I think the right thing to do here.
+- For the get {{ErasureCodingPolicy}} methods, I went without state for all. File attributes only care about policy, not its state; file system level (e.g. {{hdfs ec -getPolicy -path <path>}}) I think since we always require -path, it's also focusing on the policy rather than its state. If there is requirement to get the state of a policy without using {{-listPolices}} in the future, we could add new APIs for that.
+
+Will check tests and think about coverage. Appreciate early reviews / feedback on the patch., Patch 2 ready for review:
+Add basic unit test for the new {{ErasureCodingPolicyInfo}} class. A few cosmetic updates., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  9m 45s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 58s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 15m 10s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 15m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m 25s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 43s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m  0s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 17s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 14m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green} 14m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 14m 12s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  2m 26s{color} | {color:orange} root: The patch generated 4 new + 557 unchanged - 2 fixed = 561 total (was 559) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 23s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 12s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m 36s{color} | {color:green} hadoop-hdfs-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 84m 19s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}119m 18s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 38s{color} | {color:red} The patch generated 1 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}310m 20s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+| Timed out junit tests | org.apache.hadoop.mapred.pipes.TestPipeApplication |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:ca8ddc6 |
+| JIRA Issue | HDFS-12682 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12893487/HDFS-12682.02.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux e44d5b7f938d 3.13.0-123-generic #172-Ubuntu SMP Mon Jun 26 18:04:35 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 248d9b6 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_131 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/21779/artifact/patchprocess/diff-checkstyle-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21779/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21779/artifact/patchprocess/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/21779/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/21779/artifact/patchprocess/patch-asflicense-problems.txt |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/21779/console |
+| Powered by | Apache Yetus 0.6.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks for reporting this and working on this, [~xiaochen]
+
+* I think we should keep {{ErasureCodingPolicyInfo}} as {{@InterfaceAudience.Private}}, also 
+ private for {{ErasureCodingPolicy}}. These classes should not be used outside of HDFS.  Lessons from HADOOP-14957 :) 
+* Wondering whether it is possible that always set {{state}} in {{PBHelperClient#convertErasureCodingPolicy}} 
+
+{code}
+public static convertErasureCodingPolicy() {
+   ...
+   if (proto.hasState()) {
+     policy.setState(proto.getState());
+   }
+   return policy;
+}
+{code}, Thanks for the review Eddy!
+
+Had some offline discussions with Eddy to clarify his second point. His proposal is we do not change the protobuf, but handles it carefully so the state is only exposed to the -listPolicies.
+
+Attached patch 3 which implements this idea. The advantage of this is:
+- compatible, so less intrusive
+- less code change
+- no ECPInfo class/proto, which just contain the same information of the current ECP.
+
+The drawback is:
+- Converting to protobuf need to be overloaded to handle with state, and without state. Added some javadoc to hopefully make it clear.
+- since the ECP object will always have the state, so for calls other than -listPolicies, the object will have a state to DISABLED (the default). Considering we make the ECP class {{InterfaceAudience.Private}}, this is within HDFS and should be okay., [~xiaochen] Good catch! Thanks for the quick updates.
+
+IIUC, the problem occurs only to the SystemErasureCodingPolicies. In that case, can we change the jira subjectline reflecting the same - {{ECAdmin -listPolicies will always show SystemErasureCodingPolicies state as DISABLED}}
+
+bq. since the ECP object will always have the state, so for calls other than -listPolicies, the object will have a state to DISABLED (the default).
+Instead of separately handling the state value for {{-listPolicies}} and other function calls. Can we keep the state field value consistent for all the calls for better code maintenance ?
+, Thanks [~rakeshr] for the review and comment. Updated the jira title as suggested.
+
+bq. Can we keep the state field value consistent for all the calls for better code maintenance ?
+I think the patch 2 approach maybe better to maintain. Always populating the object will undo HDFS-11565. I checked with Andrew about this too [above|https://issues.apache.org/jira/browse/HDFS-12682?focusedCommentId=16210230&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-16210230] :), Thanks for the work and discussions here. I thought the smell of this issue indicated we should unify all the EC policies for better and easier maintenance. Is it possible or doable? Not sure about its impact though. Thanks., Attaching patch 4 which is a hybrid solution between the approaches in patch 2 and patch 3.
+
+To summarize the concerns, they're mostly:
+# ECP should be immutable
+# Compatibility
+# Code easy to maintain / read
+
+In patch 4, protobuf is untouched, and the Java class {{ErasureCodingPolicy}} is modified to represent the immutable version of a policy. A new Java class {{ErasureCodingPoilcyInfo}} is added, containing the ECP and its state.
+
+When serializing and deserializing the protobuf, we conditionally convert it to a ECP or ECPI, based on necessity. The ECPs are still cached by {{SystemErasureCodingPolicies}} regardlessly.
+
+There is a slight incompatibility of {{LimitedPrivate}} {{DistributedFileSystem}} and {{Public}} {{Evolving}} {{HdfsAdmin}}, but this feels to be best solution to me.
+
+Also addressed Eddy's comment about making the ECP classes private, and Rakesh's comment about removing the setters of id/name from ECP.
+
+Regarding Kai's comment of {{we should unify all the EC policies}}, I think we can do a separate jira to basically change {{SystemErasureCodingPolicies}} to be {{ErasureCodingPoliciesCache}} or the like. IIUC this can be a separate improvement jira.
+
+Thanks all for the reviews!, Hi, [~xiaochen]
+Thanks for the updates. Overall LGTM.
+
+Minor nits:
+
+{code}
+final ErasureCodingPolicyInfo info = policiesByName.get(defaultPolicyName);
+{code}
+
+It should use {{defaultPolicyName.trim()}} as well.
+
+{code}
+public void setState(final ErasureCodingPolicyState newState) {
+  state = newState;
+}
+{code}
+
+Maybe do a precondition check not null here. 
+
+{code}
+ private ErasureCodingPolicyState getPolicyState(
+802	      final ErasureCodingPolicy policy) {
+803	    ErasureCodingPolicyInfo[] policyInfos =
+804	        ErasureCodingPolicyManager.getInstance().getPolicies();
+805	    for (ErasureCodingPolicyInfo pi : policyInfos) {
+806	      if (pi.getPolicy().equals(policy)) {
+807	        return pi.getState();
+808	      }
+809	    }
+810	    throw new IllegalArgumentException("Policy <" + policy + "> is not in"
+811	        + " system policies:" + Arrays.toString(policyInfos));
+812	  }
+{code}
+
+The above code is duplicated in multiple tests, could you consolidate them?
+
++1 pending the changes.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 18s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 37s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 16m 30s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 41s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m  8s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 21s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 15m 39s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 16s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 42s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 22m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 22m 12s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  3m 27s{color} | {color:orange} root: The patch generated 6 new + 557 unchanged - 2 fixed = 563 total (was 559) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  5m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 15m 25s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  8m 58s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javadoc {color} | {color:red}  0m 25s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m  1s{color} | {color:red} hadoop-hdfs-client in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m  3s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m  4s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:blue}0{color} | {color:blue} asflicense {color} | {color:blue}  0m  1s{color} | {color:blue} ASF License check generated no output? {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}118m  1s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | HDFS-12682 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12894848/HDFS-12682.04.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 5dc2c84d1726 3.13.0-119-generic #166-Ubuntu SMP Wed May 3 12:18:55 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / a8083aa |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_131 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/21883/artifact/out/diff-checkstyle-root.txt |
+| javadoc | https://builds.apache.org/job/PreCommit-HDFS-Build/21883/artifact/out/patch-javadoc-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21883/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs-client.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21883/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21883/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/21883/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/21883/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks for the review Eddy!
+
+Patch 5 addressed all comments. Also fixed checkstyle warnings. Other failures looks to be HDFS-12711....
+
+I tiny difference is the trimming is already done when reading from config, so I just removed the redundant {{trim()}} in the if condition.
+{code}
+final String defaultPolicyName = conf.getTrimmed(
+{code}, HI [~xiaochen], thanks for the update. The patch looks overall good.  
+
+Minor nits:
+
+ {{toStringWithState}} in {{ErasureCodingPolicy}} is duplicate with {{toString}} and is not used. 
+
+
+
+I'm thinking besides {{getErasureCodingPolicies}},  do we also need to return {{ErasureCodingPolicyInfo}} in the response of {{addErasureCodingPolicies}}?  From API's semantics, return {{ErasureCodingPolicyInfo}} seems more fit.  But I'm wonder would that provide more benefit to end users for this API, maybe current {{ErasureCodingPolicy}} is already enough. 
+
+, Thanks for the review Sammi.
+
+I also thought about whether we need to provide state for add / get too. :) I'm not sure whether the ec admin would need to see the state from those APIs either, m2c is it should be fine as long as they can get from -listPolicies, and the add / get doesn't return wrong state (as before the patch).
+
+If [~drankye], [~eddyxu] or anyone else have a strong opinion, I'm happy to coordinate in this patch., Patch 6 to address Sammi's comment about toStringWithState, good catch!
+
+Please let me know how you feel about the addPolicies, thanks., +1. Thanks Xiao., Thanks Eddy! If there is no objections I'd like to commit this in 24 hours.
+
+[~Sammi] [~drankye] [~rakeshr] [~andrew.wang] FYI, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  9m 22s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 6 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 35s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 16m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 11s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 19s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m 42s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m  8s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 41s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 15s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 11m 17s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  2m  6s{color} | {color:orange} root: The patch generated 4 new + 647 unchanged - 2 fixed = 651 total (was 649) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 19s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 45s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 40s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m 21s{color} | {color:green} hadoop-hdfs-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 84m  9s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}113m 32s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 38s{color} | {color:red} The patch generated 1 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}296m 17s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.blockmanagement.TestUnderReplicatedBlocks |
+|   | hadoop.hdfs.server.federation.router.TestRouterRpcMultiDestination |
+| Timed out junit tests | org.apache.hadoop.mapred.pipes.TestPipeApplication |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | HDFS-12682 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12895063/HDFS-12682.06.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 82230abc7fa2 3.13.0-129-generic #178-Ubuntu SMP Fri Aug 11 12:48:20 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / ed24da3 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_131 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/21906/artifact/out/diff-checkstyle-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21906/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21906/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/21906/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/21906/artifact/out/patch-asflicense-problems.txt |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/21906/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Patch 7 to fix checkstyle. Test failures look unrelated., Good work! [~xiaochen]. Apart from the below comments, overall patch looks good to me.
+# Please make ErasureCodingPolicyInfo {{implements Serializable}}
+# Could you rename {{DFSTestUtil#getPolicyState}} method to {{DFSTestUtil#getECPolicyState}}
+# It returns both system and user defined policies, so please change message to 
+{{ErasureCodingPolicy <" + policy + "> doesn't exist in the policies:" + Arrays.toString(policyInfos)}}
+{code}
+DFSTestUtil#getPolicyState(policy)
+
+throw new IllegalArgumentException("Policy <" + policy + "> is not in"
+        + " system policies:" + Arrays.toString(policyInfos));
+{code}
+# Considering we make the ECP class {{InterfaceAudience.Private}}, can we also make ECPS to {{@InterfaceAudience.Private}} ?
+{code}
+@InterfaceAudience.Public
+@InterfaceStability.Evolving
+public enum ErasureCodingPolicyState {
+{code}, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 39s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 6 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 51s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 16m 14s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 13m 23s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 15m 28s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 42s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m  4s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 12m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 16s{color} | {color:green} root: The patch generated 0 new + 647 unchanged - 2 fixed = 647 total (was 649) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  1s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m 39s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 42s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m 20s{color} | {color:green} hadoop-hdfs-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}123m 30s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}120m 20s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 43s{color} | {color:red} The patch generated 1 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}338m 25s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+|   | hadoop.hdfs.TestEncryptionZones |
+|   | hadoop.hdfs.server.blockmanagement.TestReconstructStripedBlocksWithRackAwareness |
+|   | hadoop.hdfs.server.datanode.TestDataNodeUUID |
+| Timed out junit tests | org.apache.hadoop.mapred.pipes.TestPipeApplication |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | HDFS-12682 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12895124/HDFS-12682.07.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 136ea7704bb6 3.13.0-116-generic #163-Ubuntu SMP Fri Mar 31 14:13:22 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / b8c8b5b |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_131 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21909/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21909/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/21909/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/21909/artifact/out/patch-asflicense-problems.txt |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/21909/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks for the review Rakesh! Patch 8 to address all the comments., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 15m 56s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 6 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 36s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 16m 59s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 14s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 20s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 15m 29s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 16s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 49s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m  6s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 12m 24s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  2m 11s{color} | {color:orange} root: The patch generated 1 new + 647 unchanged - 2 fixed = 648 total (was 649) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 35s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m 18s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 38s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 47s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m 28s{color} | {color:green} hadoop-hdfs-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}117m 56s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}125m 26s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  1m  1s{color} | {color:red} The patch generated 1 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}353m 55s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailure |
+| Timed out junit tests | org.apache.hadoop.mapred.pipes.TestPipeApplication |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | HDFS-12682 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12895226/HDFS-12682.08.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 2c8d0b595d67 3.13.0-129-generic #178-Ubuntu SMP Fri Aug 11 12:48:20 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 56b88b0 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_131 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/21916/artifact/out/diff-checkstyle-root.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21916/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21916/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/21916/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/21916/artifact/out/patch-asflicense-problems.txt |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/21916/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Fixing checkstyle..., Precommit https://builds.apache.org/job/PreCommit-HDFS-Build/21923/ seems to have run out of resources. Kicked a new one at https://builds.apache.org/job/PreCommit-HDFS-Build/21931., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  9m 15s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 6 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 15m 59s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 50s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m  6s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 19s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m 54s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 42s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 11m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 59s{color} | {color:green} root: The patch generated 0 new + 648 unchanged - 2 fixed = 648 total (was 650) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m  1s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 32s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m 16s{color} | {color:green} hadoop-hdfs-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 91m 19s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}113m 37s{color} | {color:red} hadoop-mapreduce-client-jobclient in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 38s{color} | {color:red} The patch generated 1 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}300m 22s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.blockmanagement.TestBlockStatsMXBean |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailure |
+|   | hadoop.hdfs.server.blockmanagement.TestBlockTokenWithDFSStriped |
+|   | hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting |
+| Timed out junit tests | org.apache.hadoop.mapred.pipes.TestPipeApplication |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | HDFS-12682 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12895305/HDFS-12682.08.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 897f0448f5f0 3.13.0-117-generic #164-Ubuntu SMP Fri Apr 7 11:05:26 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / e6ec020 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_131 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21931/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/21931/artifact/out/patch-unit-hadoop-mapreduce-project_hadoop-mapreduce-client_hadoop-mapreduce-client-jobclient.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/21931/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/21931/artifact/out/patch-asflicense-problems.txt |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs-client hadoop-hdfs-project/hadoop-hdfs hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/21931/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Test failures look unrelated. Specifically ran {{TestDataNodeVolumeFailure}} and {{TestPipeApplication}} locally, both passed.
+
+Any further comments from all reviewers / watchers? Hoping to resolve this 3.0 blocker soon. Thanks., The new approach using {{ErasureCodingPolicyInfo}} looks great!! I liked the patch and another +1. Thanks [~xiaochen] and all for working this out!, Thanks [~xiaochen]. +1 latest patch looks good to me., Based on Kai and Rakesh's +1's and Eddy's earlier +1, I'm committing this. Thanks!, Committed this to trunk and branch-3.0.
+
+Added the incompatible flag since {{DistributedFileSystem.java}} and {{HdfsAdmin.java}} are non private.
+
+Thanks for all your reviews and discussions [~eddyxu] [~andrew.wang] [~drankye] [~Sammi] [~rakeshr]!, SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #13182 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/13182/])
+HDFS-12682. ECAdmin -listPolicies will always show (xiao: rev e565b5277d5b890dad107fe85e295a3907e4bfc1)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSImage.java
+* (add) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/ErasureCodingPolicyInfo.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestErasureCodingPolicies.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSEditLogLoader.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/ErasureCodingPolicy.java
+* (add) hadoop-hdfs-project/hadoop-hdfs-client/src/test/java/org/apache/hadoop/hdfs/protocol/TestErasureCodingPolicyInfo.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolServerSideTranslatorPB.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DistributedFileSystem.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/ClientProtocol.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelperClient.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ErasureCodingPolicyManager.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSClient.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSDirErasureCodingOp.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/federation/router/RouterRpcServer.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocol/ErasureCodingPolicyState.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/client/HdfsAdmin.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/protocolPB/ClientNamenodeProtocolTranslatorPB.java
+* (edit) hadoop-mapreduce-project/hadoop-mapreduce-client/hadoop-mapreduce-client-jobclient/src/test/java/org/apache/hadoop/fs/TestDFSIO.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageFormatProtobuf.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/ECAdmin.java
+]

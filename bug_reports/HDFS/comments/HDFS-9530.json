@@ -1,0 +1,404 @@
+[i want to add logs to monitor DataNode DFS Used, Non DFS Used,and so on.
+how can i do that ?which files  i need to modify?, [~ferhui] thanks for reporting this. Can you please check {{reservedSpace}} and {{reservedSpaceForReplicas}} values in JMX ( you can check through http:<datanodeip>:<httpport>/jmx)., This looks like the symptom of HDFS-8072, where RBW reserved space is not released when Datanode BlockReceiver encounters an IOException. The space won't be releases until DN restart. 
+
+The fix should be included in hadoop 2.6.2 and 2.7.1. Can you post the "hadoop version" command output?
+, Additionally, Apache Hadoop 2.7.1 has a bug that configured {{dfs.datanode.du.reserved}} space gets counted towards non-DFS used.  The work of fixing this is tracked in HDFS-9038., [hdfs@worker-1 ~]$ hadoop version
+Hadoop 2.6.2
+
+and i am sure it also appears in 2.7.1
+
+,   <property>
+    <name>dfs.namenode.resource.du.reserved</name>
+    <value>1073741824</value>
+  </property>, useful information， jmx result conflicts with df
+"VolumeInfo" : "{\"/mnt/disk4/current\":{\"freeSpace\":7721571505,\"usedSpace\":2648002383,\"reservedSpace\":1073741824},\"/mnt/disk1/current\":{\"freeSpace\":8503652886,\"usedSpace\":2248676842,\"reservedSpace\":1073741824},\"/mnt/disk2/current\":{\"freeSpace\":8194545617,\"usedSpace\":2173402671,\"reservedSpace\":1073741824},\"/mnt/disk3/current\":{\"freeSpace\":8316634525,\"usedSpace\":2177793635,\"reservedSpace\":1073741824}}"
+
+[hadoop@worker-1 ~]$ df
+Filesystem     1K-blocks    Used Available Use% Mounted on
+/dev/xvda1      20641404 3647828  15945052  19% /
+tmpfs            8165456       0   8165456   0% /dev/shm
+/dev/xvdc       20642428 2254196  17339656  12% /mnt/disk3
+/dev/xvdb       20642428 2721092  16872760  14% /mnt/disk4
+/dev/xvdd       20642428 2274172  17319680  12% /mnt/disk2
+/dev/xvde       20642428 2316260  17277592  12% /mnt/disk1, freeSpace conflicts with df putputs
+where is freeSpace code? maybe there is a bug!, freeSpace conflicts with df putputs
+where is freeSpace code? maybe there is a bug!, we see this problem too in hadoop 2.6.2. The dfs non used is inconsistent with du command. , [~Qiuzhuang] this issue is tracked in HDFS-9038.., @Brahma Reddy Battula, thanks. For now we restart all datanodes to release dfs non used as a temp fix., (Removing the hive stack trace from the Description.)
+
+Should we resolve this as a duplicate of HDFS-9038?
+, bq. Should we resolve this as a duplicate of HDFS-9038?
+Agree. Closing this., maybe it's different from HDFS-9038.
+
+the example in description, dfs.datanode.du.reserved is 1G. dfs reports Non DFS Used: 40303602176 (37.54 GB), DFS Remaining: 29943965184 (27.89 GB) on worker-1. but df output is below on worker-1 
+/dev/xvdc 20642428 2254196 17339656 12% /mnt/disk3 
+/dev/xvdb 20642428 2721092 16872760 14% /mnt/disk4
+/dev/xvdd 20642428 2274172 17319680 12% /mnt/disk2
+/dev/xvde 20642428 2316260 17277592 12% /mnt/disk1
+
+total 80G use 9.4G, free 68G. 
+
+dfs report non dfs 37.54GB is inconsistent with df command, Reopen this. I'll dig into this issue., Hi [~ferhui], did you execute df command when running the job? I suppose your hive job write a lot of temporary data in the local directories of the slave servers, and the temporary files are cleaned up after the job., execute df & dfs report in order
+after the job finished， non dfs usage is also large, is this will be there after hive job is completed(while running it might writing so many files)..? I mean, non-dfs used..? , while job running, the df output is above.there is no non-dfs used, that is why i am confused, Thanks for reporting Fei Hui. I can confirm that we are seeing this in our 2.7.1 clusters too. I'll dig. It is *not* explained by HDFS-9038. e.g.
+{code}
+$ grep dfs.datanode.du.reserved -r .  -A 1
+./hdfs-site.xml:            <name>dfs.datanode.du.reserved</name>
+./hdfs-site.xml-            <value>107374182400</value>
+{code}
+We are seeing a deficit of way more than this 100Gb * number of disks., I took a heap dump of the Datanode process. I see the value of {{FsVolumeImpl.reservedForRbw}} is really large (> 1Tb) . This matches with the kind of discrepancy we are seeing on our cluster., HDFS-8072 has not fixed this for us. [~arpitagarwal] know anything about this?, I think there was a related fix to HDFS-8072. I can't recall the Jira right now, will comment here later if I find it., [~arpitagarwal] are you referring HDFS-8626..? This also present in 2.7.1..Let me investigate on this.., Upon my investigation came to know that abandon blocks are not getting release the space even blocks got deleted.
+
+Fix can be done two ways. Release reserved bytes when
+1) block got deleted.
+2 ) the mirror connection fails, immediately reserved bytes can be released in case of PIPELINE_SETUP_CREATE
+
+Attaching the patch, with both approaches, 2nd one is commented., Hi [~brahmareddy], yes I meant HDFS-8626 thanks for finding it.
+
+I'll take a look at your patch., Linking these two JIRAs together. Maybe they are related? , Hi [~brahmareddy], I didn't quite understand the patch. Could you please describe the problem?
+
+There is some dead code in the patch., If any of the datanode other than 1st DN is down for the first time pipeline creation,then Block will be abandoned and write will continue with new block.
+In this case, the DN previous to bad link, will get IOE while connecting to mirror and in that case, reservedBytes will not be released for that DN.
+bq.There is some dead code in the patch.
+I mentioned two approaches, one is commented,, Just for reference now. , FWIW, there is only a trivial amount of data in the RBW directory on the DN. So if we only released the reservation whenever we delete / move an RBW file, we would be fine.
+
+Here's my analysis based on Hadoop-2.7.1 code. I'll see what makes sense in trunk shortly.
+It seems to me that in addition to the places that we already do, we should be modifying the reserved space in these places too:
+# {{BlockPoolSlice.resolveDuplicateReplicas}} (or perhaps {{deleteReplica}}) predicated on the replica being RBW
+# {{FsDatasetImpl.convertTemporaryToRbw}} (after {{moveBlockFiles}})
+# {{FsDatasetImpl.recoverRbw}} after {{truncateBlock}}
+# {FsDatasetImpl.updateReplicaUnderRecovery}} after {{newReplicaInfo.setNumBytes(newlength);}}
+
+I'd be interested in seeing if you all can find other places too. 
+
+I wonder if the current implementation is too brittle and if there isn't a different place we can keep track of the required reservation? There may well not be. I'm surprised the feature itself was added without even a configuration to disable it. , Thanks for your attention and patch Brahma!
+On a brief glance, your change to {{FsDatasetImpl}} seems to make sense. I'll dig in deeper.
+I suspect {{releaseAllBytesReserved}} in DataXceiver (the approach you commented out in your patch) may remove more reservation than ideal because inside {{blockReceiver = new BlockReceiver(block, storageType, in,}} the code is a lot more nuanced. There are different contingencies based on whether its a new block / a block to be recovered / duplicate block etc. Please correct me if I am wrong.
+, To Make it simple for analysis,
+
+1. Reservation happens only when the block is being received using BlockReceiver. No other places reservation happens, so no need to release as well.
+2. BlockReceiver constructor have a try-catch block where it will release all the bytes reserved, if there is any exceptions after reserving.
+3. BlockReceiver#receiveBlock() have the try-catch block where it will release all the bytes reserved if there is any exceptions during the receiving process.
+4. During successful receiving of packets, {{ReplicaInPipeline#setBytesAcked(..)}} will be called by {{PacketResponder}}
+5. Once the block is completely received, {{FsDataSetImpl#finalizeReplica(..)} will release all the remaining reserved bytes.
+
+Only place left is in {{DataXceiver#writeBlock()}}, exception can happen after creation of {{BlockReceiver}} and before calling {{BlockReceiver#receiveBlock()}}, if failed to connect to Mirror nodes.
+Only in this case, bytes will not be released. But a ReplicaInfo instance will be already created in ReplicaMap.
+
+Here, if the client re-creates the pipeline with same blockId, then same ReplicaInfo instance will be used, So no extra reservation happens. This can be verified using the same testcase as patch, but failing the pipeline for append, where abandonBlock will not be called, and pipeline will be recovered for same block.
+
+But in case of fresh block creation, block will be abandoned and fresh block with new pipeline will be requested.
+The old block created at Datanode will be eventually be deleted, BUT reserved space was never released. That's why you are not seeing many RBW blocks in RBW directory, but reserved space went on to accumulate > 1TB.
+
+Though I have given two approaches, #1, releasing reserved bytes while deletion of ReplicaInPipeline instances, will cover all hidden cases, if any, as well.
+
+Hope this helps., anybody can review the attached patch..?, bq. 1. Reservation happens only when the block is being received using BlockReceiver. No other places reservation happens, so no need to release as well.
+Thanks for reminding me Brahma! Do you think we should change {{reservedForReplicas}} when a datanode is started up and an older RBW replica is recovered? Specifically [BlockPoolSlice.getVolumeMap|https://github.com/apache/hadoop/blob/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/BlockPoolSlice.java#L361] {{addToReplicasMap(volumeMap, rbwDir, lazyWriteReplicaMap, false);}} . Also it seems to me, since we aren't calling {{reserveSpaceForReplica}} in BlockReceiver but instead at a lower level, we will have to worry about calling {{releaseReservedSpace}} at that lower level.
+{quote}2. BlockReceiver constructor have a try-catch block where it will release all the bytes reserved, if there is any exceptions after reserving.
+3. BlockReceiver#receiveBlock() have the try-catch block where it will release all the bytes reserved if there is any exceptions during the receiving process.{quote}
+Could you please point me to the code where you see this happening? I mean specific instances of {{FsVolumeImpl.releaseReservedSpace}} being called with the stack trace.
+
+bq. Only place left is in DataXceiver#writeBlock(), exception can happen after creation of BlockReceiver and before calling BlockReceiver#receiveBlock(), if failed to connect to Mirror nodes.
+Do you mean to imply that the places I found in [this comment|https://issues.apache.org/jira/browse/HDFS-9530?focusedCommentId=15231164&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15231164] need not call {{reserveSpaceForReplica}} / {{releaseReservedSpace}} ?
+, To answer one of my own questions: "Could you please point me to the code where you see this happening?"
+In 2, Brahma is likely referring to [BlockReceiver:283|https://github.com/apache/hadoop/blob/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java#L283] -> [ReplicaInPipeline:163|https://github.com/apache/hadoop/blob/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaInPipeline.java#L163] -> [FsVolumeImpl:480|https://github.com/apache/hadoop/blob/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java#L480]
+In 3, Brahma is likely referring to [BlockReceiver:956|https://github.com/apache/hadoop/blob/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java#L956] -> [ReplicaInPipeline:163|https://github.com/apache/hadoop/blob/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaInPipeline.java#L163] -> [FsVolumeImpl:480|https://github.com/apache/hadoop/blob/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java#L480], bq. Do you think we should change reservedForReplicas when a datanode is started up and an older RBW replica is recovered? Specifically BlockPoolSlice.getVolumeMap addToReplicasMap(volumeMap, rbwDir, lazyWriteReplicaMap, false); 
+Please Note that, "reservation" happens for Replicas which are instances of {{ReplicaInPipelineInterface}}. i.e. Only for ReplicaBeingWritten(RBW) and ReplicaInPipeline(TMP) blocks, both these will go through BlockReceiver. No reservation required during recovery (RWR/RUR) as no other data will be written to this, except recovery with DN restart case for upgrade in which expected block size is not tracked, no reservation happens.
+
+bq. also it seems to me, since we aren't calling reserveSpaceForReplica in BlockReceiver but instead at a lower level, we will have to worry about calling releaseReservedSpace at that lower level.
+Ideally thats correct. But reservation happens once, but release happens gradually for every packet. So ReplicaInPipeline instance will keep track of how much bytes released, and how much yet to release. Finally, during close/exception all remaining bytes will be released.
+
+bq. Do you mean to imply that the places I found in this comment need not call reserveSpaceForReplica / releaseReservedSpace ?
+Yes, IMO those places need not require to release any reserved space. As already mentioned above, only {{ReplicaInPipeline}} instances need to release, if reserved.
+, Thanks for continuing to work on this [~brahmareddy] and your detailed analyses. Your reasoning sounds correct but I'd need more time to check this thoroughly.
+
+I agree that this is complex so if I am also open to the option of removing the reservation if there is a simpler alternative., Perhaps we can postpone the question of whether RBW blocks which are recovered during a DN start / refresh of storages should have space reserved to another JIRA (since that is not causing the symptoms mentioned in this JIRA)
+
+Thanks for the explanations Brahma! They are very helpful for me to understand the code.
+
+Should we also reduce the reservation in {{FsDatasetImpl.removeVolumes}} after {{it.remove();}}? How about {{checkAndUpdate}}?
+
+I'm trying to figure out why we missed releasing the space during {{invalidate}} as you found out. As you correctly point out, we reserve space only when a BlockReceiver is created. , Good analysis [~brahmareddy]. 
+Your analysis makes sense.
+
+IMO Releasing the remaining reserved bytes during invalidation is the better approach to deal with this issue.
+As per my understanding and analysis, currently there is no other place where reserve/release is not consistent. But even if it comes in future, this change will avoid growing reserved space.
+
+IMO, Even though there is workaround to overcome this, restarting datanodes everytime will be hard for clusters.
+So this should be pushed before 2.8 comes out., I took a deeper look at the reservation code. It was painful to see my own lack of thoroughness.
+
+I mostly agree with Brahma's analysis. Since reservation is done only for replicas created via BlockReceiver, there are a couple of potential culprits where the reservation could be leaked:
+* Failure in {{DataXceiver#writeBlock}} after creating the BlockReceiver.
+* BlockReceiver receives an unchecked exception after reserving.
+
+Also agree with [~vinayrpet] that releasing via invalidate is the safer option although it can lead to the reserved space hanging around longer. 
+
+Do we agree on the following summary of the contract for when space should be reserved and released?
+# Space is reserved only when the on-disk block file is successfully created for an rbw/temporary replica. This is verifiably true in FsDatasetImpl#createTemporary and FsDatasetImpl#createRbw barring OOM when the ReplicaInPipeline/ReplicaBeingWritten is allocated.
+# Space continues to be reserved as long as there is an rbw/temporary in the volumeMap.
+# Space must be released either when the replica is finalized or it is invalidated. FsDatasetImpl#finalizeReplica handles the finalize case. Fixing invalidate would close the remaining gap.
+## Space may be released earlier if a failure is detected earlier e.g. exception in BlockReceiver which we handle today.
+## Space may also be released incrementally when some bytes are written to disk which is handled via ReplicaInPipeline#setBytesAcked.
+
+Thanks again for the detailed analysis on this one Brahma, [~raviprak] and Vinay. Nice work., bq. Do we agree on the following summary of the contract for when space should be reserved and released?
+Yes, that was a perfect summary., bq. Also agree with Vinayakumar B that releasing via invalidate is the safer option although it can lead to the reserved space hanging around longer.
+Yes, I agree that it will hang around longer. But I think, that's fine as long as the block file is present on disk., This has been a long standing and complicated problem and your effort was laudable Arpit! It'd be great if we can tie this all down. Even if we can't write a comprehensive unit test to ensure all this byte accounting stays correct despite changes in the future, we should go ahead and fix the release of bytes on invalidate., Thanks to all.Uploaded patch..
+
+Attached test case targeted current problem,  Tests available in {{TestSpaceReservation}} covers many other cases. 
+IMO, If any more tests required, can be added as follow-up jira. Right?
+
+I am thinking, this should go with 2.7.3 release., Thanks [~brahmareddy], the core change looks fine to me. The test case needs some more work. The {{failMirrorConnection}} hook looks unused. Also the DN should be updated to call the hook.
+
+Using close will not exercise the changed code path since the block is finalized and not invalidated. We probably need to trigger the abandon block path in DataStreamer to trigger this invalidation as you correctly diagnosed earlier.
+{quote}
+If any of the datanode other than 1st DN is down for the first time pipeline creation,then Block will be abandoned and write will continue with new block.
+In this case, the DN previous to bad link, will get IOE while connecting to mirror and in that case, reservedBytes will not be released for that DN.
+{quote}
+
+Thanks again for sticking with this difficult issue!, [~arpitagarwal] thanks for catch.
+
+bq.The failMirrorConnection hook looks unused. Also the DN should be updated to call the hook.
+
+Yes, missed this from HDFS-9530-01 to HDFS-9530-02.. Now I uploaded.., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 21s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 10m 20s {color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 37s {color} | {color:green} branch-2.7 passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 27s {color} | {color:green} branch-2.7 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 36s {color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 26s {color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 23s {color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 14s {color} | {color:green} branch-2.7 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 46s {color} | {color:green} branch-2.7 passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 55s {color} | {color:green} branch-2.7 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 10s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 35s {color} | {color:green} the patch passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 20s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 20s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 30s {color} | {color:red} hadoop-hdfs-project/hadoop-hdfs: The patch generated 2 new + 188 unchanged - 2 fixed = 190 total (was 190) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 1m 15s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 15s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 1967 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 59s {color} | {color:red} The patch 99 line(s) with tabs. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 3s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 45s {color} | {color:green} the patch passed with JDK v1.8.0_91 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 43s {color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 50m 49s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_91. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 45m 10s {color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_101. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red} 0m 22s {color} | {color:red} The patch generated 3 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 140m 28s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| JDK v1.8.0_91 Failed junit tests | hadoop.hdfs.server.namenode.snapshot.TestRenameWithSnapshots |
+|   | hadoop.hdfs.server.namenode.TestNNThroughputBenchmark |
+|   | hadoop.hdfs.TestPread |
+|   | hadoop.hdfs.web.TestWebHdfsTokens |
+|   | hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+| JDK v1.7.0_101 Failed junit tests | hadoop.hdfs.server.namenode.snapshot.TestRenameWithSnapshots |
+|   | hadoop.tools.TestJMXGet |
+|   | hadoop.hdfs.server.namenode.TestNNThroughputBenchmark |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:c420dfe |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12811370/HDFS-9530-branch-2.7-002.patch |
+| JIRA Issue | HDFS-9530 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux cfc564b2dc2e 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.7 / 138d0f0 |
+| Default Java | 1.7.0_101 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_91 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/15808/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/15808/artifact/patchprocess/whitespace-eol.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/15808/artifact/patchprocess/whitespace-tabs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/15808/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_91.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/15808/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_101.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/15808/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_91.txt https://builds.apache.org/job/PreCommit-HDFS-Build/15808/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_101.txt |
+| JDK v1.7.0_101  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/15808/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/15808/artifact/patchprocess/patch-asflicense-problems.txt |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/15808/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, {{Test failures}},{{checkstyle}} and {{ASF License warnings}} are unrelated to this patch..
+
+Re-uploaded the trunk patch, as jenkins did run on trunk patch., Latest patch looks good. +1.
+Checkstyle and whitespace comments for branch-2.7 patch can be ignored. Not related.
+
+Waiting for QA report for trunk., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 26s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 31s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 51s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 31s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 58s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 43s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 57s {color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 58s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 44s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 44s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red} 0m 26s {color} | {color:red} hadoop-hdfs-project/hadoop-hdfs: The patch generated 2 new + 189 unchanged - 1 fixed = 191 total (was 190) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green} 0m 51s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 10s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 3 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 48s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 58s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 73m 26s {color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 17s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 93m 18s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestDecommissionWithStriped |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:e2f6409 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12811784/HDFS-9530-03.patch |
+| JIRA Issue | HDFS-9530 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 2b5ed2beb667 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / fc6b50c |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/15831/artifact/patchprocess/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/15831/artifact/patchprocess/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/15831/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HDFS-Build/15831/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/15831/testReport/ |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/15831/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thanks [~vinayrpet] for your review. I will wait for commit till [~arpiagariu] reviews., Hi [~brahmareddy], the test case is still not exercising the changed code path. If you revert the change to FsDatasetImpl.java the test case still passes because closing the file finalizes the block., I take that back. I tested this again and verified the invalidate path is exercised with the failMirrorConnection hook in place. Also confirmed the new test times out without the fix.
+
++1 thanks [~brahmareddy]., Thanks for reconfirming Arpit. I too had tested it earlier before giving +1
+for 2.7 patch. After seeing your earlier comment  I was confused. :)
+
+, One of the checkstyle comments can be fixed before final commit. Its in
+test though.
+
+, Sorry about that. I will hold off committing this in case [~brahmareddy] wants to try out his new commit bit. :), Thats good to start commit with his one of the long waited issue. Its
+skipped from almost 3 releases I think.
+On 20 Jun 2016 22:42, "Arpit Agarwal (JIRA)" <jira@apache.org> wrote:
+
+Arpit Agarwal
+<https://issues.apache.org/jira/secure/ViewProfile.jspa?name=arpitagarwal>
+*commented* on [image: Bug] HDFS-9530
+<https://issues.apache.org/jira/browse/HDFS-9530>
+
+Re: huge Non-DFS Used in hadoop 2.6.2 & 2.7.1
+<https://issues.apache.org/jira/browse/HDFS-9530>
+
+Sorry about that. I will hold off committing this in case Brahma Reddy
+Battula
+<https://issues.apache.org/jira/secure/ViewProfile.jspa?name=brahmareddy>
+wants to try out his new commit bit.
+[image: Add Comment]
+<https://issues.apache.org/jira/browse/HDFS-9530#add-comment> Add Comment
+<https://issues.apache.org/jira/browse/HDFS-9530#add-comment>
+
+This message was sent by Atlassian JIRA (v6.3.4#6332-sha1:51bc225)
+[image: Atlassian logo]
+, SUCCESS: Integrated in Hadoop-trunk-Commit #9993 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/9993/])
+HDFS-9530. ReservedSpace is not cleared for abandoned Blocks (brahma: rev f2ac132d6a21c215093b7f87acf2843ac8123716)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataXceiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestSpaceReservation.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/DataNodeFaultInjector.java
+, Committed to trunk,branch-2,branch-2.8,branch-2.7 and branch-2.7.3.                                                                                                                    
+
+Thanks a lot [~arpitagarwal] and [~vinayrpet] for your reviews.. And thanks to [~ferhui] for reporting this issue and others.., We are facing issues that may be resolved with this fix.  Will this be ported to 2.6.x?  Thanks much in advance., Hi [~srikanth.sampath], thanks for the report.
+
+I just did a dry run cherry-pick to branch-2.6 and there was a single conflict that looks straightforward to resolve. [~brahmareddy], do you want to take a crack at backporting this to branch-2.6? If not I can I do so., [~srikanth.sampath] thanks for report..
+
+[~arpitagarwal] Uploaded the branch-2.6 patch..Kindly review.., Reopening the issue to attach the branch-2.6 patch and run jenkins against this.., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 15m 43s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 14m 28s{color} | {color:green} branch-2.6 passed {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  0m 50s{color} | {color:red} hadoop-hdfs in branch-2.6 failed with JDK v1.8.0_101. {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  0m 50s{color} | {color:red} hadoop-hdfs in branch-2.6 failed with JDK v1.7.0_101. {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 27s{color} | {color:green} branch-2.6 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  0s{color} | {color:green} branch-2.6 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 18s{color} | {color:green} branch-2.6 passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  3m  1s{color} | {color:red} hadoop-hdfs-project/hadoop-hdfs in branch-2.6 has 273 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  8s{color} | {color:green} branch-2.6 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 52s{color} | {color:green} branch-2.6 passed with JDK v1.7.0_101 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  0m 42s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_101. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  0m 42s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_101. {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  0m 44s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_101. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  0m 44s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_101. {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 19s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 14s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  0m  0s{color} | {color:red} The patch has 2722 line(s) that end in whitespace. Use git apply --whitespace=fix <<patch_file>>. Refer https://git-scm.com/docs/git-apply {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  1m  2s{color} | {color:red} The patch 107 line(s) with tabs. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m  2s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  7s{color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m  4s{color} | {color:green} the patch passed with JDK v1.7.0_101 {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m 49s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_101. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 39s{color} | {color:red} The patch generated 75 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 55m 49s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:44eef0e |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12822981/HDFS-9530-branch-2.6.patch |
+| JIRA Issue | HDFS-9530 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 9ed7f3a773d9 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2.6 / 2dc43a2 |
+| Default Java | 1.7.0_101 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_101 |
+| compile | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/artifact/patchprocess/branch-compile-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_101.txt |
+| compile | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/artifact/patchprocess/branch-compile-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_101.txt |
+| findbugs | v1.3.9 |
+| findbugs | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/artifact/patchprocess/branch-findbugs-hadoop-hdfs-project_hadoop-hdfs-warnings.html |
+| compile | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/artifact/patchprocess/patch-compile-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_101.txt |
+| javac | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/artifact/patchprocess/patch-compile-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_101.txt |
+| compile | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/artifact/patchprocess/patch-compile-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_101.txt |
+| javac | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/artifact/patchprocess/patch-compile-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_101.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/artifact/patchprocess/whitespace-eol.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/artifact/patchprocess/whitespace-tabs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/artifact/patchprocess/patch-unit-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_101.txt |
+| JDK v1.7.0_101  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/artifact/patchprocess/patch-asflicense-problems.txt |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/16376/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Looks some problem in compiling libwebhdfs in 2.6. 
+Some docker dependencies needs to be updated?, yes,Seems to be some docker dependcies missed..pinging [~aw].., It's branch-2.6.  You'll need to ping someone who cares about that branch., Thanks for posting the patch [~brahmareddy]. I am out this rest of this week but will review it next week.
+
+Also I'd just ignore Jenkins and run HDFS unit tests locally to check the patch didn't regress any tests.
+
+, Ok.. thanks arpit.. Even I ran before uploading the patch,did not induced any test failure., Ok.thanks for feedback allen., bq. Reopening the issue to attach the branch-2.6 patch and run jenkins against this..
+Closing this again for the 2.7.3 release process. If you just want to use Jenkins for 2.6 patch, you can create a clone and use that., I've pushed this to branch-2.6 after verifying the affected unit test., Closing the JIRA as part of 2.7.3 release., [~arpiagariu] thanks for committing to branch-2.6.I think , we need update Change.txt in branch-2.7, They are independent release lines so iiuc the branch-2.7 CHANGES.txt needs no update.]

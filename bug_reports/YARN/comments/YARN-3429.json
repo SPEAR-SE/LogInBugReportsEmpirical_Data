@@ -1,0 +1,129 @@
+[I find out the test failure reason is because the configuration RM_AMRM_TOKEN_MASTER_KEY_ROLLING_INTERVAL_SECS and RM_AM_EXPIRY_INTERVAL_MS is changed to a smaller value at testMasterKeyRollOver. And the same configuration is used by testTokenExpiry, if launching AM container takes  more time than  19 seconds = RM_AMRM_TOKEN_MASTER_KEY_ROLLING_INTERVAL_SECS(13) + RM_AM_EXPIRY_INTERVAL_MS(4) *1.5.
+This failure will happen.
+
+The following logs can prove it:
+{code}
+2015-03-31 12:25:56,869 DEBUG [AsyncDispatcher event handler] event.AsyncDispatcher (AsyncDispatcher.java:dispatch(166)) - Dispatching the event org.apache.hadoop.yarn.server.resourcemanager.amlauncher.AMLauncherEvent.EventType: LAUNCH
+2015-03-31 12:25:56,871 INFO  [pool-20-thread-1] security.AMRMTokenSecretManager (AMRMTokenSecretManager.java:createAndGetAMRMToken(195)) - Create AMRMToken for ApplicationAttempt: appattempt_1427804754787_0001_000001
+2015-03-31 12:25:56,871 INFO  [pool-20-thread-1] security.AMRMTokenSecretManager (AMRMTokenSecretManager.java:createPassword(307)) - Creating password for appattempt_1427804754787_0001_000001
+2015-03-31 12:26:06,859 INFO  [main] security.TestAMRMTokens (TestAMRMTokens.java:testTokenExpiry(129)) - Waiting for AM Launch to happen..
+2015-03-31 12:26:07,788 INFO  [Timer-24] security.AMRMTokenSecretManager (AMRMTokenSecretManager.java:rollMasterKey(142)) - Rolling master-key for amrm-tokens
+2015-03-31 12:26:12,861 INFO  [main] security.TestAMRMTokens (TestAMRMTokens.java:testTokenExpiry(129)) - Waiting for AM Launch to happen..
+2015-03-31 12:26:13,790 INFO  [Timer-24] security.AMRMTokenSecretManager (AMRMTokenSecretManager.java:activateNextMasterKey(166)) - Activating next master key with id: 391474792
+2015-03-31 12:26:15,931 DEBUG [pool-20-thread-1] security.SecurityUtil (SecurityUtil.java:setTokenService(360)) - Acquired token Kind: YARN_AM_RM_TOKEN, Service: asf902.gq1.ygridcore.net:8030, Ident: (appAttemptId { application_id { id: 1 cluster_timestamp: 1427804754787 } attemptId: 1 } keyId: 391474791)
+2015-03-31 12:26:15,932 INFO  [pool-20-thread-1] amlauncher.AMLauncher (AMLauncher.java:launch(127)) - Done launching container Container: [ContainerId: container_1427804754787_0001_01_000001, NodeId: localhost:1234, NodeHttpAddress: localhost:2, Resource: <memory:1024, vCores:1>, Priority: 0, Token: Token { kind: ContainerToken, service: localhost:1234 }, ] for AM appattempt_1427804754787_0001_000001
+{code}
+
+The above log show:
+Rolling master-key for amrm-tokens happened at 2015-03-31 12:26:07
+after 6 seconds(2015-03-31 12:26:13),  Activating next master key with id: 391474792(activateNextMasterKey) happened,
+the keyId for the token used is 391474791, You can see the used keyId 391474791 is just rolled over.
+The following is the code of activateNextMasterKey:
+You can see nextMasterKey is set null and  currentMasterKey is changed to 391474792
+{code}
+  public void activateNextMasterKey() {
+    this.writeLock.lock();
+    try {
+      LOG.info("Activating next master key with id: "
+          + this.nextMasterKey.getMasterKey().getKeyId());
+      this.currentMasterKey = this.nextMasterKey;
+      this.nextMasterKey = null;
+      AMRMTokenSecretManagerState state =
+          AMRMTokenSecretManagerState.newInstance(
+            this.currentMasterKey.getMasterKey(), null);
+      rmContext.getStateStore()
+          .storeOrUpdateAMRMTokenSecretManager(state, true);
+    } finally {
+      this.writeLock.unlock();
+    }
+  }
+{code} 
+
+The master key roll over cause the following InvalidToken exception from retrievePassword.
+{code}
+Caused by: org.apache.hadoop.security.token.SecretManager$InvalidToken: Invalid AMRMToken from appattempt_1427804754787_0001_000001
+	at org.apache.hadoop.yarn.server.resourcemanager.security.AMRMTokenSecretManager.retrievePassword(AMRMTokenSecretManager.java:263)
+	at org.apache.hadoop.yarn.server.resourcemanager.security.AMRMTokenSecretManager.retrievePassword(AMRMTokenSecretManager.java:56)
+	at org.apache.hadoop.security.token.SecretManager.retriableRetrievePassword(SecretManager.java:91)
+	at org.apache.hadoop.security.SaslRpcServer$SaslDigestCallbackHandler.getPassword(SaslRpcServer.java:277)
+	at org.apache.hadoop.security.SaslRpcServer$SaslDigestCallbackHandler.handle(SaslRpcServer.java:304)
+	at com.sun.security.sasl.digest.DigestMD5Server.validateClientResponse(DigestMD5Server.java:585)
+{code}
+
+Based on the code of retrievePassword, 
+the used keyId 391474791 doesn't match currentMasterKey which has keyId 391474792 and also nextMasterKey is null,
+so InvalidToken("Invalid AMRMToken from " + applicationAttemptId) is thrown.
+{code}
+  public byte[] retrievePassword(AMRMTokenIdentifier identifier)
+      throws InvalidToken {
+    this.readLock.lock();
+    try {
+      ApplicationAttemptId applicationAttemptId =
+          identifier.getApplicationAttemptId();
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Trying to retrieve password for " + applicationAttemptId);
+      }
+      if (!appAttemptSet.contains(applicationAttemptId)) {
+        throw new InvalidToken(applicationAttemptId
+            + " not found in AMRMTokenSecretManager.");
+      }
+      if (identifier.getKeyId() == this.currentMasterKey.getMasterKey()
+        .getKeyId()) {
+        return createPassword(identifier.getBytes(),
+          this.currentMasterKey.getSecretKey());
+      } else if (nextMasterKey != null
+          && identifier.getKeyId() == this.nextMasterKey.getMasterKey()
+            .getKeyId()) {
+        return createPassword(identifier.getBytes(),
+          this.nextMasterKey.getSecretKey());
+      }
+      throw new InvalidToken("Invalid AMRMToken from " + applicationAttemptId);
+    } finally {
+      this.readLock.unlock();
+    }
+  }
+{code}, To fix this issue, we can set RM_AMRM_TOKEN_MASTER_KEY_ROLLING_INTERVAL_SECS and RM_AM_EXPIRY_INTERVAL_MS to default value in testTokenExpiry., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12708614/YARN-3429.000.patch
+  against trunk revision 2daa478.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/7187//testReport/
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/7187//console
+
+This message is automatically generated., +1, Thanks Zhihai.  Committed to trunk and branch-2!, thanks [~rkanter] for reviewing and committing the patch., FAILURE: Integrated in Hadoop-trunk-Commit #7525 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/7525/])
+YARN-3429. Fix incorrect CHANGES.txt (rkanter: rev 5b8a3ae366294aec492f69f1a429aa7fce5d13be)
+* hadoop-yarn-project/CHANGES.txt
+, You may have inadvertantly used the wrong JIRA number in your commit [~rkanter] Ought to be YARN-3429 (instead of YARN-2429) I see comments on YARN-2429., FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #157 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/157/])
+YARN-3429. Fix incorrect CHANGES.txt (rkanter: rev 5b8a3ae366294aec492f69f1a429aa7fce5d13be)
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #2089 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2089/])
+YARN-3429. Fix incorrect CHANGES.txt (rkanter: rev 5b8a3ae366294aec492f69f1a429aa7fce5d13be)
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #148 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/148/])
+YARN-3429. Fix incorrect CHANGES.txt (rkanter: rev 5b8a3ae366294aec492f69f1a429aa7fce5d13be)
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Yarn-trunk #891 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/891/])
+YARN-3429. Fix incorrect CHANGES.txt (rkanter: rev 5b8a3ae366294aec492f69f1a429aa7fce5d13be)
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #158 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/158/])
+YARN-3429. Fix incorrect CHANGES.txt (rkanter: rev 5b8a3ae366294aec492f69f1a429aa7fce5d13be)
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2107 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2107/])
+YARN-3429. Fix incorrect CHANGES.txt (rkanter: rev 5b8a3ae366294aec492f69f1a429aa7fce5d13be)
+* hadoop-yarn-project/CHANGES.txt
+, Ya, sorry about that; I only noticed yesterday, and so I fixed CHANGES.txt to say YARN-3429.  Unfortunately, I can't fix the git message or the Hudson comments in YARN-2429.]

@@ -1,0 +1,208 @@
+[Test case is as follows:
+
+CREATE TABLE implicit_test1(a BIGINT, b STRING) ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.dynamic_type.DynamicSerDe' WITH SERDEPROPERTIES('serialization.format'= 'org.apache.hadoop.hive.serde2.thrift.TCTLSeparatedProtocol') STORED AS TEXTFILE;
+
+
+SELECT implicit_test1.*
+FROM implicit_test1
+WHERE implicit_test1.a <> 0;
+
+
+Fails to do implicit conversion in the predicate implicit_test1.a <> 0 , Zheng, I was actually fixing this. I have a partial fix ready for this. One major problem with this is the fact that the implict conversion stuff is broken because of circular dependencies in the implict conversion graph (this should be a tree) when string to number types are involved.., Yep. The problem with this test case is an ambiguous call: evaluate(String, Number), evaluate(Number, String), and evaluate(Long, Long) all fit with one implicit conversion.
+
+I think we have to disallow the circular conversion.
+
+This is what we discussed on the mailing list long time ago (This disallows number -> string implicit conversion)
+String -> byte -> int -> long -> double
+int -> float -> double
+
+Is this your plan for the fix?
+, yes.
+
+basically what I have done is move string to be at the bottom of the hierarchy and disallow the implicit conversion from number to string and some of the tests fail because of that as we need to change them to do explicit conversion now.
+
+On looking at some of the test cases that fail, I think it would make sense to convert from various types to strings as well, though I had thought otherwise in the discussion that we had originally on the email thread. We have actually some queries in our tests that do that .e.g
+
+concat('My total: ', sum(t.c))
+
+A user could do that very easily to generate reporting strings with that kind of a sql. Without implict conversion, they would have to write a cast operator.
+
+In light of that, I think we should revisit the decisions that we made.
+
+Thoughts?, if u can go both ways (string -> number and number -> string) - which way would u go? any rules we would come up with (perhaps based on context etc.) would become complicated. mysql does something even simpler than we proposed and people seem ok with that ..
+
+regarding the concat example - can't we make the function polymorphic? concat can take responsibilty for converting everything to string. , Actually mysql supports implicit conversions in both directions and that is what got me thinking that perhaps we should also be supporting both.
+
+http://dev.mysql.com/doc/refman/5.0/en/type-conversion.html
+
+If we go the polymorphism route we would have to be very careful while adding UDFs. The UDF writers will have to really understand how for implicit conversion they have to implement functions with different signatures and that would just make it that much harder for them to write UDFs that can take advantage of implicit conversion. In fact polymorphism in the comparison function is the reason why we are hitting this problem in the
+first place. 
+
+
+The problem with going both ways is truly the one that caused us a lot of pain initially. However, that does not get solved by restricting the conversion possibilities. If for example we have a udf that takes two forms:
+
+a) evaluate(string, string, int)
+b) evaluate(int, string, string)
+
+then even if we only allow string to be converted to int and not vice versa we have an ambiguous match for
+
+evaluate(1, 'abc', 2)
+
+and we would not know which one to pick. This is what I mean by polymorphism causing these issues. The comparison functions are
+polymorphic and they are the ones that lead to the problem of ambiguity.
+, > a) evaluate(string, string, int)
+> b) evaluate(int, string, string)
+
+This problem even happens for strict-typed languages (replace string with double). So I don't think this is something we need to fix.
+
+
+If we agree in most cases people convert string -> numeric, then all numeric->string can be done by udf itself through polymorphism.
+I think this is much cleaner than circular conversion.
+
+I am +1 to stick to the original solution (and leave the author of concat to implement Number->String conversion).
+, I am not sure what you mean by saying that the problem also happens with strict-typed languages. Can you elaborate?, I mean, strict-typed languages will have ambiguity if the user calls evaluate(int, double, int), while there are 2 overloaded implementations: evaluate(double, double, int) and evaluate(int, double, double).
+, Namit's experiment with Oracle shows Oracle outputs ambiguity if UDF has both evaluate(double, double) and evaluate(string,string), and users calls udf(double, string).
+
+Let's stick with the following implicit conversion hierarchy and special-case comparison operators (they will prefer evaluate(double, double) to evaluate(string,string)):
+byte -> short -> int -> long -> float -> double -> string, string -> double
+
+In order to allow the special case, we can add a tag to the methods. If there are multiple methods with the same number of implicit conversions, then we choose the one with the maximum tag (if there are still many then we say ambiguity).
+
+The reason that I think long -> float should be allowed is http://java.sun.com/docs/books/jls/third_edition/html/conversions.html#25214 This of course also simplify the code since it's a single line instead of a DAG.
+, By using tag, we can get rid of the current hack (the evaluate(String, Number) and evaluate(Number, String) methods in the parent class) which caused the problem in this issue.
+, I guess the following outlines how conversions are done for comparison operators for mysql
+
+http://dev.mysql.com/doc/refman/5.0/en/type-conversion.html
+
+I think we should just follow that for comparisons.
+, @Zheng - i don't follow. i thought we discussed a while back that double->string conversion is non-intuitive in a comparison between double and string. it's almost always the case that the user in such a case would like the string to be treated as a double and hence we had talked about putting string at the base of the partial order. mysql type conversion agrees with this approach.
+
+i am ok with using mysql type conversion semantics as well - but i think what we had agreed was better (in terms of partial order and finding least common super-type to convert to). this actually has space consequences - for example in mysql string + int will produce double. which consumes double the space of int (which is the least common super-type).
+
+i still don't see the problem with this approach (and letting udf polymorphism take care of ambiguities), @joydeep: There are 2 drawbacks:
+
+1. Authors of udf need to be aware of that.  In oracle, the system does take care of double -> string in udf so authors don't have to do it.
+2. string -> int is lossy. The result of '1.1' = 1 will be true under our agreed conversion partial order (string -> byte -> short -> int -> ... -> double). But both mysql and oracle output that as FALSE.
+
+, Description of implicit conversions in PL/SQL
+
+http://www-camden.rutgers.edu/HELP/Documentation/Oracle/server.815/a67842/02_funds.htm#3435
+
+Description of implicit conversion in Postgres
+
+http://www.postgresql.org/docs/7.3/static/typeconv.html
+
+In light of this and the mysql implicit conversion for comparison types
+
+I think fundamentally the model is as follows:
+
+1. For overloaded comparison operators (>,<, >=, <=, <>, =):
+      If both the operands have the same type, then we have an exact match
+      otherwise, If one of the operands is a date and the other is not, then convert the other to a date.
+      otherwise, If the two arguments are not of the same type, convert them both to double and do the comparison.
+      Note that we do not do this for LIKE, RLIKE and REGEXP as those operators are not overloaded and every type is convertible to string
+
+2. For overloaded arithmetic operators (+, -, *, /, %, &, |, ^):
+      If both the operands have the same types then we have an exact match
+      otherwise we convert everything to double
+      In this case the logical operators will just work as is as they are not overloaded in the sense that they do not have multiple evaluate functions.
+
+We allow seemless conversions within numbers, from string to numbers and vice versa as well as from date to string and vice versa. We may allow seemless conversion between date and int at some point (once we support date more formally)
+
+When looking for a match in a generic overloaded function (which is user defined and not one of the cases enumerated above as we have already addressed those), we use the current mechanism of picking up an evaluate function that needs
+least number of conversions, otherwise we throw an ambiguity.
+
+So instead of encoding hierarchies, in the UDFTo... classes we will encode the conversion rules and then use the above to figure out the matches.
+
+I think this will give us the same results as mysql and other DBs as well.
+
+One thing that is still not very clean in this is the bit operators...
+
+I think this somewhat addresses all the concerns except the storage one which Joy raised, but even Oracle there warns about the same issue and asks the user to casting properly. These set of rules are also hopefully much simpler to code and to explain to the users.
+
+Thoughts? , The expression node generation code needs changes to fix this bug and that in turn depends on the unified graph traversal and rules framework., Uploading the patch for refactoing typechecking and fixing implict conversion problems. This is a rather big patch with a number of changes relating to:
+1. How we resolve udf and udaf evaluation functions or evaluators given the argument types.
+2. Changes to how we implement UDAFs to support overloaded UDAFs.
+3. Tree walker, dispatcher and processor code to make it more amenable to expression creation.
+etc...
+
+Will update with a more detailed description of the changes after lunch.
+, The patch contains the following changes: 
+
+1. Interfaces to be able to plugin your own resolvers for UDFs and UDAFs. These are: 
+ - UDFMethodResolver for udfs -> Given the types of the arguments, this interface allows the compiler to retrieve which evaluate function to use. 
+ - UDAFEvaluatorResolver for udafs -> Given the types of the arguments, this interface allows the compiler to retrieve which UDAFEvaluator to use. 
+
+What was UDAF previously in now the UDAFEvaluator interface. The function names have been changed somewhat. These are: 
+1. init which was also init in the UDAF abstract class - for initializaing the state 
+2. iterate which was aggregate in the UDAF abstract class - for updating the state for each passed in value of the arguments 
+3. terminatePartial which was evaluatePartial in the UDAF abstract class - for returning the state after the partial aggregation has been done 
+4. merge which was aggregatePartial in the UDAF abstract class - for merging the results of the terminatePartial while doing the final aggregation 
+5. terminate which was evaluate in the UDAF abstract class - for retruning the final result of the aggregation. 
+
+The UDF and UDAF classes now encapsulate a resolver which is used for resolution for that particular class. 
+The different types of resolver implementation for UDFMethodResolver are: 
+1. DefaultUDFMethodResolver - This is the default resolver and it uses the old rule of finding the evaluate function in the UDF that needs least number of 
+    argument conversions. 
+2. NumericOpMethodResolver - This is the resolver used by overloaded numeric operators (+, -, %, /, *). This implements the following resolution logic: 
+  - If any of the arguments is Void (null) or String, then the evaluate(Double, Double) method is used. 
+  - otherwise, if both the arguments are of the same type, then the evaluate(<arg Type>, <arg Type>) method is used. 
+  - otherwise, evaluate(Double, Double) method is used. 
+3. ComparisonOpMethodResolver - This is the resolver used by oveloaded comparison operators (>, <. >=. <=. =. <>). This implements the following resolution logic: 
+  - If any of the arguments in Void (null), then the evaluate(Double, Double) method is used. 
+  - otherwise, if both the arguments are of the same type, then the evaluate(<arg Type>, <arg Type>) method is used. 
+  - otherwise, if one of the arguments is a Date, then evaluate(Date, Date) method is used. 
+  - otherwise, evaluate(Double, Double) method is used. 
+
+Abstract base classes for UDFs that use each of these resolvers are provided. These are: 
+1. UDF has been modified to use DefaultUDFMethodResolver. 
+2. UDFNumericOp is a new class which uses NumericOpMethodResolver. 
+3. UDFBaseCompare has been modified to use ComparisonOpMethodResolver. 
+
+Similar to the UDFMethodResolvers decribed above, there are 2 implementation available for the UDAFEvaluatorResolvers. These are: 
+1. DefaultUDAFEvaluatorResolver - on similar lines as DefaultUDFMethodResolver. 
+2. NumericUDAFEvaluatorResolver - on similar lines as NumericOpMethodResolver. 
+
+The UDAF resolution logic is in getUDAF where as the UDF resolution logic is in getExprNodeDesc. This logic is the same as previously, though 
+I think we should change this to allow conversions from any thing to any thing. I have change the UDF conversion operators to reflect that. In both 
+these locations, conversion operators are appropriately added for the arguments that need conversion. 
+
+I have also moved the code to create exprNodeDesc to start using the tree walker infrastructure. Note the code in SemanticAnalyzer still remains 
+because PartitionPruner depends on it and we can get rid of that only after we have refactored partition pruning which iteself depends on predicate 
+push down - I will file a separate JIRA for this work. 
+In the Tree Walker framework, I have added the ability for the processor to return objects and I have also added the ability for the walker to pass 
+what was returned for objects walked so far to the processor. This is usefull while creating expression node descriptors for a node from the 
+expression node descriptors of the children that have been visited preorder. Also I have removed the NodeProcessorCtx (this was Joy's comment 
+in the previous review), it was anyway an empty abstract class and having that around was making it more involved to write the type checker 
+because of Java's lack of support for multiple class inheritance. 
+Accordingly, the type check processor and factory are implemented in: 
+1. TypeCheckProcFactory 
+2. TypeCheckCtx 
+
+I have so far added 1 test relating to this JIRA. I am also going to add more tests for this. 
+
+As a result of the UDAFEvaluator framework, we are now able to support overloaded aggregate functions like max and min for strings as well. 
+One of the existing tests which was returning null previously (a wrong result!!) now outputs the correct result.
+, haven't finished looking at all of them
+ql/src/java/org/apache/hadoop/hive/ql/exec/UDAFEvaluator.java:21	nit: that encapsulates?
+ql/src/java/org/apache/hadoop/hive/ql/parse/TypeCheckProcFactory.java:128	can you put a comment explaining what is going on here
+ql/src/java/org/apache/hadoop/hive/ql/parse/TypeCheckProcFactory.java:255	does this work for complex columns? i think this should use getColAlias or some such function
+ql/src/java/org/apache/hadoop/hive/ql/parse/TypeCheckProcFactory.java:393	how do UDFs read struct object? how does it know the class?
+ql/src/java/org/apache/hadoop/hive/ql/lib/NodeProcessorCtx.java:23	why is this removed? wouldn't it be useful so that arbitrary context objects are not passed around. or is that a requirement?, I did not get the first comment. Can you elaborate on UDAFEvaluator.java:21?
+
+I removed NodeProcessorCtx.java because this was initially an abstract class with nothing inside it, so it was not serving any purpose as such (Joy had pointed that out in the previous JIRA code review)...
+
+Looking at other comments...
+, For TypeCheckProcFactory.java:255 - This is the same code as the one that appears in genExprNodeDescFromColRef today. Don;t completely understand how getColAlias helps here?
+
+For 393: structs are just read to be of type Object. The only UDAF that I know of that does this is count.
+, Resolved conflicts with latest changes from Prasad's checkin and cleaned out more stuff from SemanticAnalyzer
+
+There was one comment in the code review of converting the MethodResolver into a static variable in the UDF class. Can someone refresh my memory as to what was needed there. I tried doing that but it seems that there is not much benefit there.
+
+Another comment during the code review was with respect to the date type in the NumericOpMethodResolver. That code was actually in CompareOpMethodResolver and not in NumericOpMethodResolver as I had originally stated in the code review. So I did not have to change anything there..
+
+, Added NodeProcessorCtx back due to popular demand :)
+
+Also addressed other review comments from Prasad and Zheng..
+, +1, Fixed long time ago. Thanks Ashish!]

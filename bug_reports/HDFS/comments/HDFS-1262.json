@@ -1,0 +1,220 @@
+[Solving this is a bit tricky... brainstorming a couple options, not sure what's best, or if I'm missing a simpler one:
+
+Option 1) change renewLease function to pass a list of all open files. In LeaseManager maintain each lease with a separate timestamp. Thus if we end up with an inconsistency like this, it will get resolved since the lease on just that file will get expired. This is somewhat complicated, breaks RPC compatibility, etc. Not so great...
+
+Option 2) add a finally clause to the pipeline setup in DFSClient.append() such that if the pipeline can't get set up, we re-close the file before throwing an exception. I don't think we can use completeFile() to do this, since the blocks aren't in blocksMap right after append() - so completeFile would loop forever. We could overload abandonBlock() for this purpose, perhaps. Alternatively maybe it's not right that appendFile() removes from blocks map, but rather the initial commitBlockSynchronization should be the thing that does it?, i think something along the lines of option 2 sounds cleaner imo.
+
+but i have another question, does the error you see have
+"because current leaseholder is trying to recreate file"
+
+it sounds like this code is executing:
+
+{code}
+        //
+        // We found the lease for this file. And surprisingly the original
+        // holder is trying to recreate this file. This should never occur.
+        //
+        if (lease != null) {
+          Lease leaseFile = leaseManager.getLeaseByPath(src);
+          if (leaseFile != null && leaseFile.equals(lease)) { 
+            throw new AlreadyBeingCreatedException(
+                                                 "failed to create file " + src + " for " + holder +
+                                                 " on client " + clientMachine + 
+                                                 " because current leaseholder is trying to recreate file.");
+          }
+        }
+{code}
+
+and anytime I see a comment "this should never happen" it sounds to me like the handling of that might be suboptimal.  is there any reason that a client shouldn't be able to open a file in the same mode it already has it open?  NN-side, it's a basically a no-op, or a explicit lease renewal.
+
+any reason we can't make the above code do that?  (log something and return)
+, in looking at client code, my suggestion above probably isn't a good idea.  it would allow concurrent writes.
+
+i think the simplest solution is this:
+
+add a finally block that removes the path from the LeaseChecker in DFSClient.  Then the lease will expire in 60s.
+, provided there is agreement on the last suggestion, i'm happy to take care of it btw
+, oop, nevermind--forgot that lease renewal is by client name *only* (hence your option 1)
+
+still pondering this a bit, but ~option 2 sounds most appealing.  a client should have a way to release the lease it has on a file without necessarily doing a normal close (and hence completeFile)
+, actually, here's another idea:
+
+3) the NN thinks the client has a lease.  it's right.  the client just didn't save enough information to handle the failure.
+namenode.append() just returns the last block.  The code in DFSClient:
+
+{code}
+    OutputStream result = new DFSOutputStream(src, buffersize, progress,
+        lastBlock, stat, conf.getInt("io.bytes.per.checksum", 512));
+    leasechecker.put(src, result);
+    return result;
+{code}
+
+if in leasechecker we stored a pair, lastBlock and result (and did so in a finally block):
+
+{code}
+    OutputStream result = null;
+    try {
+      result = new DFSOutputStream(src, buffersize, progress,
+        lastBlock, stat, conf.getInt("io.bytes.per.checksum", 512));
+    } finally {
+      Pair<LocatedBlock, OutputStream> pair = new Pair(lastBlock, result);
+      leasechecker.put(src, pair);
+      return result;
+    }
+{code}
+
+and above, we only call namenode.append() if we don't have a lease already.
+
+again, if we do find a solution, i'm happy to help out on this one
+, I don't think that solution #3 works - it's only in HBase's case that we stubbornly keep trying to call append() forever. The assumption should be that if we get an IOException out of append() then we don't hold the lease on the file., i see, it only solves the re-open by the same client problem, but not the blocking of other clients.
+
+the fact is the client does have the lease and currently the only way to release it is via close.  
+
+in looking at DFSClient.create(), the same problem can occur there.  we make a NN rpc call to get a block and acquire a lease.  we then create the DFSOutputStream (which could fail)
+
+i think that comes back to the need to be able to release a lease without calling namenode.completeFile().
+
+i guess there's not a clever way to do this with existing namenode RPC and/or client initiated lease recovery?, I am still thinking about this one and I agree that we should try to solve the general case too, but how about a workaround for HBase
+
+4) change org.apache.hadoop.hbase.util.FSUtils.recoverFileLease() to create a new FileSystem object via FileSystem.newInstance() every time in the while loop. Use this newly created FileSystem object to issue the appendFile() call. The downside is that this API is available only in 0.21 and above (but we could backport it), Oof, what a hack that would be :) Not to say we shouldn't do that over in HBase in the short term, but I agree let's treat this as a serious bug in 0.20-append and try to fix it on the HDFS side unless we really can't think of any implementable solutions.
+
+Can you think of a problem with the abandonBlock() solution? My thinking is that we'd check if the block is the last block of a file under construction by the abandoning client, and if so, reassign lease to NN_Recovery and initiate block synchronization from the NN as if the lease were lost. It may not be necessary to go through the whole recovery process, but it will be safer in case the client half set up a pipeline before failing, or somesuch., we actually use a new FileSystem instance per file in scribe.  see
+http://hadoopblog.blogspot.com/2009/06/hdfs-scribe-integration.html
+
+there are some downsides to this (creating a new FileSystem instance can be expensive, issuing fork & exec calls for 'whoami' and 'groups', but we have patches to minimize this)
+
+, i am also wondering why this hasn't shown up in regular create calls sometime.  both DFSClient.append() and DFSClient.create() are susceptible to the same problem (client has lease, then throws exception setting up pipeline), It probably has shown up before :) I think most people just don't care, since for things like MR tasks that are short-lived, they'll die and retry on their own. Most people probably bail on IOE instead of retrying is my guess., todd: can you confirm if the exception was from the namenode.append() call or creating the output stream?  (sounds like the latter, in the lease recovery it initiates)
+
+{code}
+  OutputStream append(String src, int buffersize, Progressable progress
+      ) throws IOException {
+    checkOpen();
+    FileStatus stat = null;
+    LocatedBlock lastBlock = null;
+    try {
+      stat = getFileInfo(src);
+      lastBlock = namenode.append(src, clientName);
+    } catch(RemoteException re) {
+      throw re.unwrapRemoteException(FileNotFoundException.class,
+                                     AccessControlException.class,
+                                     NSQuotaExceededException.class,
+                                     DSQuotaExceededException.class);
+    }
+    OutputStream result = new DFSOutputStream(src, buffersize, progress,
+        lastBlock, stat, conf.getInt("io.bytes.per.checksum", 512));
+    leasechecker.put(src, result);
+    return result;
+  }
+{code}
+
+
+either way, i think the right way to do this is add back an abandonFile RPC call in the NN.   Even if we don't change function call signatures for abandonBlock, we will break client/server compatibility.
+
+thoughts?, Yea, the exception in this case was during the "new DFSOutputStream" - specifically the block recovery part as you mentioned. I think the actual cause of that failure was HDFS-1260 but we should still address this issue too.
+
+You're right, we should add a new RPC rather than overloading abandonBlock. abandonFile makes sense, or abandonAppendBlock, or something like that. Do you want to take a crack at implementing it or should I?, i'd appreciate the chance to implement it, actually.  Thanks
+
+re: the name, according to Dhruba, there used to be one called "abandonFile" which had the semantics we need.  Also, a similar error can occur on non-append creates, so probably having append in the name doesn't make sense.  abandonFile or another idea?, Ah, the abandonFile RPC must have been before my time. Looks like it got deleted in 0.18. Go for it! :), hey, so what should the precise semantics of abandonFile(String src, String holder) be?  I have a quick impl now (+ test case) that does this:
+
+1. check that holder owns the lease for src
+2. call internalReleaseLeaseOne
+
+so it really is a glorified 'cleanup and close' which has the same behavior as if the lease expired--nice and tidy imo.  It does have the slight delay of lease recovery, though.
+
+
+an alternative option:
+
+for the specific case we are fixing here, we could do something simpler such as just putting the targets in the blockMap and call completeFile (basically what commitBlockSynchronization would do).  However, this doesn't handle the general case if we expose abandonFile at any other time and a client has actually written data to last block.  
+
+I think the first option is safer, but maybe I'm too cautious
+
+
+if the way I've implemented it seems ok, I can post he patch for review asap, also, in writing up the test case, i realized DFSClient.create() is not susceptible to the same scenario.  While in theory it could happen on the NN side, right now, the namenode RPC for create happens and then all we do is start the streamer (hence i don't have a test case for it yet).
+
+I still think having a finally block that calls abandonFile() for create is prudent--if we get any exception in the process client side, abandon the file to be safe
+, bq. so it really is a glorified 'cleanup and close' which has the same behavior as if the lease expired--nice and tidy imo. It does have the slight delay of lease recovery, though.
+
+I think that makes sense - best to do recovery since we might have gotten halfway through creating the pipeline, for example, and this will move the blocks back to finalized state on the DNs. Performance shouldn't be a concern, since this is such a rare case.
+
+bq. While in theory it could happen on the NN side, right now, the namenode RPC for create happens and then all we do is start the streamer (hence i don't have a test case for it yet).
+
+What happens if we have a transient network error? For example, let's say the client is on the same machine as the NN, but it got partitioned from the network for a bit. When we call create(), it succeeds, but then when we actually try to write the blocks, it fails temporarily. This currently leaves a 0-length file, but does it also orphan the lease for that file?, in the 2nd case, can't the client still call close?  or will it hang forever waiting for blocks?
+
+either way, i've got test cases for create() + append() and the fix.  took a little longer to clean up today, but will post the patch by end of day
+
+, -test case for append and create failures.
+-tried to get it so both cases fail fast, but create will hit the test timeout (default for create that gets AlreadyBeingCreatedException is 5 retries with 60s sleep)
+-append case fails in 30s w/o the fix worst case
+, one note:
+
+{code}
+ public void updateRegInfo(DatanodeID nodeReg) {
+   name = nodeReg.getName();
+   infoPort = nodeReg.getInfoPort();
+   // update any more fields added in future.
+ }
+{code}
+
+should be:
+{code}
+public void updateRegInfo(DatanodeID nodeReg) {
+   name = nodeReg.getName();
+   infoPort = nodeReg.getInfoPort();
+   ipcPort = nodeReg.getIpcPort();
+   // update any more fields added in future.
+ }
+{code}
+
+it wasn't copying the ipcPort for some reason.
+
+My patch includes this fix
+
+trunk doesn't have this bug, above is from DatanodeId.java, The bug mentioned above is HDFS-894 - we just didn't commit it to 20 branch. Maybe best to commit that one under the aegis of that issue rather than here?, that's probably better.  this was dependent on it as i was killing the datanodes to simulate the pipeline failure.  i ended up tuning the test case to use mockito to throw exceptions at the end of a NN rpc call for both append() and create(), so I think that dependency is gone. 
+
+can we mark this as dependent on that if it turns out to be needed?
+, verified test case passes w/o that patch.  we should commit hdfs-894 to 20-append for sure, though.  that seems like a potentially gnarly bug in tests to track down (took me a short spell)
+
+i can upload the patch w/o the DatanodeID, removed hdfs-894 change from patch (commit this to 0.20-append separately), removed empty file MockitoUtil, fixed bug where calling append() to trigger lease recovery resulted in a client-side exception (trying to abandon a file that you don't own lease on).
+
+DFSClient now catches this exception and logs it, Hey Sam, finally got a chance to look at this. A few notes:
+
+- why does abandonFile return boolean? looks like right now it can only return true or throw, may as well make it void, no?
+- in the log message in FSN.abandonFile it looks like there's a missing '+ src +' in the second log message
+- in the log messages, also log the "holder" argument perhaps
+- in previous append-branch patches we've been trying to keep RPC compatibility with unpatched 0.20 - ie you can run an updated client against an old NN, with the provision that it might not fix all the bugs. Given that, maybe we should catch the exception we get if we call abandonFile() and get back an exception indicating the method doesn't exist? Check out what we did for HDFS-630 backport for example.
+- looks like there are some other patches that got conflated into this one - eg testSimultaneousRecoveries is part of another patch on the append branch.
+- missing Apache license on new test file
+- typo: Excection instead of Exception
+- "(PermissionStatus) anyObject()," might generated an unchecked cast warning - I think you can do Matchers.<PermissionStatus>anyObject() or some such to avoid the unchecked cast
+- given the complexity of the unit test, would be good to add some comments for the general flow of what all the mocks/spys are achieving. I found myself a bit lost in the abstractions, my apologies for the delay.  I've been caught up in some hi-pri bits at work.
+
+thanks for the comments.  inlined responses
+
+#why does abandonFile return boolean? looks like right now it can only return true or throw, may as well make it void, no?
+good question: I stole abandonBlock() which has the same behavior.  It returns true or throws an exception.  I was trying to keep it consistent (rather than logical per se).
+I do prefer the void option as it makes the method more clear.
+
+#in the log message in FSN.abandonFile it looks like there's a missing '+ src +' in the second log message
+#in the log messages, also log the "holder" argument perhaps
+will fix
+
+#in previous append-branch patches we've been trying to keep RPC compatibility with unpatched 0.20 - ie you can run an updated client against an old NN, with the provision #that it might not fix all the bugs. Given that, maybe we should catch the exception we get if we call abandonFile() and get back an exception indicating the method doesn't #exist? Check out what we did for HDFS-630 backport for example.
+nice idea, I will check this out
+
+#looks like there are some other patches that got conflated into this one - eg testSimultaneousRecoveries is part of another patch on the append branch.
+hmm, yea, not sure what happened here...weird, I think I applied one of your patches.  Which patch is that test from?
+
+#missing Apache license on new test file
+will fix
+#typo: Excection instead of Exception
+will fix
+#"(PermissionStatus) anyObject()," might generated an unchecked cast warning - I think you can do Matchers.<PermissionStatus>anyObject() or some such to avoid the unchecked #cast
+ah, nice catch, will fix also
+
+#given the complexity of the unit test, would be good to add some comments for the general flow of what all the mocks/spys are achieving. I found myself a bit lost in the #abstractions
+
+yea, sry, was in a rush b4 vacation to get some test + patch up.  It was a bit tricky to get this case going for both create + append;  I'll document the case better (at all), re: RPC compatibility.  I'm not 100% sure this is a good idea.  If we start to enumerate the cases of how a client can interact with the server, bugs seem more likely.  It makes sense with a single method, but if RPC changes become interdependent...
+
+what's the case that mandates using a new client against an old namenode?  is it not possible to use the appropriately versioned client?  or is it the case of heterogeneous sets of clusters and simplicity of management with a single client code base?
+
+any other thoughts on this?, I agree with sam that we we can safely introduce a new RPC without worrying about back compatibility with 0.20 or 0.21. As of now, new versions of hadoop are not compatible with older versions., address todd's comments (except for RPC compatibility--pending discussion), re RPC compatibility - I agree it's not a requirement on trunk, but so far we've kept branch-20-append compatible with a "your mileage may vary since we haven't tested the compatibility matrix". If it's too complicated to do a fallback code path that maintains the current buggy behavior, that's OK., Note this patch is not necessary for HBase since HBase does not use append() any longer on restart or failover of region server. Instead it revokes the lease and starts a new journal file rather than appending to the old one.]

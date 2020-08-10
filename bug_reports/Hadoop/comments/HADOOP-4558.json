@@ -1,0 +1,107 @@
+[Submitted sleep Job J1 to Q1 with maps and reduces tasks = 210 each.
+Sleep time per map =10 mins and reduces = 20 mins.
+When all maps and reduces of J1 starts running, submitted sleep Job J2 to Q2 with maps and reduces tasks = 210 each. 
+
+J2  started only after 10 mins when maps of J1 starts finishing up. 
+J2 should get its slots after 2 mins (i.e after its reclaim time limit).
+
+, The Capacity Scheduler updates its queue-based data structures on every heartbeat, when a task needs to be assigned. What happened here was that a job was submitted, but all TTs were running long-running maps and no call to assignTasks() was made. Hence the Scheduler never updated its structures and was unaware of the 2nd job being added. It's a fairly simple fix - update the data structure when a job is added/removed. , Attached patch (4558.1.patch) has a fairly simple fix. We update the # of pending for the queue when a job is added. Also made jobAdded() and jobRemoved() synchronized, as we're updating common data structures. , Repeated the same test case mentioned above with same environment after applying 4558.1.patch
+
+Following is the observation -:
+1. With speculative execution = true.
+   Job J2 starts running after 2 mins of submission.
+   Now both jobs start running with -:
+     J1 maps = 96 and reduces = 85
+     J2 maps = 114 and reduces = 125
+     Here J1 is still using 12 extra map and 1 extra reduce slots 
+     It took nearly two more minutes to when j1 and j2 both starts using MR slots equal to their GCs.
+
+2. With speculative execution = false.
+   J2 starts running only when maps of J1 starts finishing.
+, Looks like the structure for running tasks is maintained only if speculation is _ON_. Hence with speculation turned off we dont see any tasks getting killed. We have 3 options here
+1. Maintain a list of running tasks per job in capacity scheduler and use that to kill tasks instead. The drawback of this approach is 
+   - Scheduler will do the same book keeping as done by JIP
+   - Scheduler now needs to know about task completions.
+
+2. Maintain the list of running tasks irrespective of speculation. The only drawback of this approach is that this will modify the (framework) code path for jobs with speculation turned _OFF_ and hence will require benchmarking
+
+3. For jobs with speculation turned _OFF_, we walk over the map structure, find out the least progressed maps and kill them. The benefit of this approach is that the framework code remains unchanged and there is no code duplication. The drawback is that this approach does a linear scan everytime.
+
+Thoughts?
+
+I am still investigating why the reclaim didnt happen as expected., I'd go with #2 (yes, you need to make sure that no code is relying on the fact that the data structures for running tasks are empty if speculative execution is turned off). Granted, you're keeping extra state for jobs with spec execution turned off, but the number of running tasks cannot exceed the cluster capacity, so you're bounded. option #1 duplicates code between the Capacity Scheduler & JobInProgress, and Option #3 is expensive, though we do a linear scan only when killing tasks, which shouldn't happen very often. , +1 on #2, Splitting this issue. This jira will deal with _capacity-scheduler_ side problems on reclaim while HADOOP-4623 will deal with the framework bug on speculation., {quote}
+Here J1 is still using 12 extra map and 1 extra reduce slots
+It took nearly two more minutes to when j1 and j2 both starts using MR slots equal to their GCs.
+{quote}
+The reason is as follows :
+When job2 gets added, a {{ReclaimedResource}} object is added to the reclaim queue. After _whenToKill_ units of time, tasks from job1 are killed. But at this point of time job2 is not set up and hence is not able to schedule tasks. So again job1 is selected for scheduling tasks. Now once job2 finishes setup, the reclaim request is added for the (extra) scheduled tasks. Hence the observation that there is some extra killings and the guaranteed capacity is allocated after few mins.
+
+I think the issue is more involved. Here are the choices
+1) Let it be : Since the setup task took time to schedule and finish, its ok to keep it as it is. What we guarantee here is that the slots will be allocated to the queue as soon as a request is made
+2) Delay : One way to avoid the _thrashing_ is to delay the reclaim until the job/queue which wants it, actually needs it. The obvious problem with this is that it will take sometime to kill the tasks and hence there will a little delay in reclaim. Also the _sla_ needs to be redefined.
+
+Note that this issue also depends on how set-up tasks are handled in future and when the job actually becomes _RUNNING_., We should leave this as is. The right solution depends on how we handle HADOOP-4421. If the schedulers are aware of setup tasks and handle them directly, then the solution is different from if setup tasks are handled outside of the Scheduler. , Attaching a patch that changes the following
+- {{jobAdded()}} now changes the _pendingTasks_ count
+- {{reclaimCapacity()}} now uses the updated QSI info
+- _reclaimTime_ is now converted to milliseconds
+- Added a testcase to test the fix
+- changed tests in {{TestCapacityScheduler}} reflecting the change.
+
+Result of -test-patch_ is as follows 
+{code}
+[exec] +1 overall.  
+     [exec] 
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+     [exec] 
+     [exec]     +1 tests included.  The patch appears to include 3 new or modified tests.
+     [exec] 
+     [exec]     +1 javadoc.  The javadoc tool did not generate any warning messages.
+     [exec] 
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+     [exec] 
+     [exec]     +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+     [exec] 
+     [exec]     +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+{code}, Note that once a task is assigned, capacity scheduler is not updated to reflect the change. It waits for a heartbeat to update itself via {{updateQSIObjects()}}. I feel its better we update the scheduler after the tasks are assigned so that the scheduler is up to date. This needs benchmarking and discussion. Following is the use case
+- job1 is added
+- job1 takes up one slot more than guaranteed 
+- job2 is added
+- ideally the reclaim thread should detect the capacity violation and kill that one extra task but will not do as the count is stale and one less.
+- upon next heartbeat the scheduler will detect that job1 has violated and hence will start the reclaim process. , It's true that queue information is updated at the beginning of assignTasks(). It can be done at the end too, but it won't help much. In fact, we may call updateQSIObjects() once every few heartbeats, if the call is expensive. Any code that requires exact information about the state of the queues should call updateQSIObjects() and should not rely on when this method is called by assignTasks(). Hence, a better solution is for reclaimCapacity() to call updateQSIObjects() at the beginning. , Can you please remove the assignment of pending tasks in TaskSchedulingMgr.jobAdded(), the patch does not seem to apply cleanly on trunk, can you please check the same?
+
+The rest of the patch looks fine., Attaching a patch with changes.
+Result of _test-patch_
+{noformat}
+[exec] +1 overall.  
+     [exec] 
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+     [exec] 
+     [exec]     +1 tests included.  The patch appears to include 3 new or modified tests.
+     [exec] 
+     [exec]     +1 javadoc.  The javadoc tool did not generate any warning messages.
+     [exec] 
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+     [exec] 
+     [exec]     +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+     [exec] 
+     [exec]     +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+{noformat}, +1 to patch., This patch doesn't apply cleanly to trunk anymore. Possibly due to HADOOP-4035. Can you please create a new patch ?, Updating to trunk., Result of _test-patch_ on my box
+{noformat}
+[exec] +1 overall.  
+     [exec] 
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+     [exec] 
+     [exec]     +1 tests included.  The patch appears to include 3 new or modified tests.
+     [exec] 
+     [exec]     +1 javadoc.  The javadoc tool did not generate any warning messages.
+     [exec] 
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+     [exec] 
+     [exec]     +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+     [exec] 
+     [exec]     +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+{noformat}, Tested this patch on 50 nodes and the capacity gets reclaimed as expected., I ran the capacity scheduler tests, and they passed. Since the patch does not touch any other component, there was no need to run any other tests.
+
+I just committed this. Thanks, Amar !, Integrated in Hadoop-trunk #680 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/680/])
+    ]

@@ -1,0 +1,272 @@
+[Attaching logs, I've gone through the issue and attaching the analysis. Apologies in advance for the length of this comment - I'm trying to cover all the details.
+
+*Environment details:*
+ZK-91 -> Leader
+ZK-55 -> Follower
+ZK-102 -> Follower
+ZKClient session timeout -> 5seconds
+ZKClient side logic:- What I observed is, zclient is not waiting for any SyncConnected event before creating ephemeral znode 'ActiveStandbyElectorLock'. Also, on every connectionloss it is creating the ephemeral znode 'ActiveStandbyElectorLock'.
+
+
+*Root Cause:* I'm suspecting there is a race condition between session expiry and FinalRequestProcessor. I could see, the expiry logic is removing the SessionImpl and is raising the 'closesession' request, other side FinalRequestProcessor is creating new SessionImpl into the SessionTracker for the 'createsession' request.
+
+This case will come only if FinalRequestProcessor has some delay in processing the 'createsession' and in between the same session is getting expired.
+----
+
+I've done the analysis in perspective of Leader ZooKeeper server(ZK-91) and is as follows:
+
+*Stage-1)* Client has sent connection request and the transaction id is '0x200000070'
+Following log shows, the server has received connection request and after successful proposal, send committing request to the Follower. But the Leader side the transaction is in progress, as the request not reaches the FinalRequestProcessor.
+{noformat}
+2012-06-26 13:10:12,566 [myid:3] - DEBUG [ProcessThread(sid:3 cport:-1)::CommitProcessor@171] - Processing request:: sessionid:0x1382791d4e50004 type:createSession cxid:0x0 zxid:0x200000070 txntype:-10 reqpath:n/a
+
+2012-06-26 13:10:13,001 [myid:3] - DEBUG [ProcessThread(sid:3 cport:-1)::Leader@716] - Proposing:: sessionid:0x1382791d4e50004 type:createSession cxid:0x0 zxid:0x200000070 txntype:-10 reqpath:n/a
+
+2012-06-26 13:10:13,202 [myid:3] - DEBUG [LearnerHandler-/xx.xx.xx.102:13846:CommitProcessor@161] - Committing request:: sessionid:0x1382791d4e50004 type:createSession cxid:0x0 zxid:0x200000070 txntype:-10 reqpath:n/a
+{noformat}
+----
+
+*Stage-2)* Following log shows the Leader has'nt seen any pings from 0x1382791d4e50004 and expiring the session by creating 'closesession' request.
+ If we see the SessionTrackerImpl, it is removing the SessionImpl corresponding to the 0x1382791d4e50004 before raising the expiry request. 
+{code}
+     sessionsById.remove(s.sessionId);
+     expirer.expire(s);
+{code}
+At the same time, zkclient has sent 'create' command to the server - 0x200000072 transactionid, now the sessionTracker.checkSession(sessionId, owner) will not have the SessionImpl and get null then throwing the session expiry exception.
+{code}
+        SessionImpl session = sessionsById.get(sessionId);
+        if (session == null || session.isClosing()) {
+            throw new KeeperException.SessionExpiredException();
+        }
+{code}
+{noformat}
+2012-06-26 13:10:18,653 [myid:3] - INFO  [SessionTracker:ZooKeeperServer@325] - Expiring session 0x1382791d4e50004, timeout of 5000ms exceeded
+2012-06-26 13:10:18,803 [myid:3] - INFO  [ProcessThread(sid:3 cport:-1)::PrepRequestProcessor@627] - Got user-level KeeperException when processing sessionid:0x1382791d4e50004 type:create cxid:0x1 zxid:0x200000072 txntype:-1 reqpath:/hadoop-ha/hacluster/ActiveStandbyElectorLock Error Path:null Error:KeeperErrorCode = Session expired
+{noformat}
+----
+
+*Stage-3)* Following message shows, 'closesession' 0x200000074 has got enough Ack and committing. But it didn't reaches the FinalRequestProcessor, so the session info will exists in the sessionTracker except the 'SessionImpl' object(as session is expired). 
+{noformat}
+2012-06-26 13:10:18,834 [myid:3] - INFO  [ProcessThread(sid:3 cport:-1)::PrepRequestProcessor@476] - Processed session termination for sessionid: 0x1382791d4e50004
+2012-06-26 13:10:18,834 [myid:3] - DEBUG [ProcessThread(sid:3 cport:-1)::CommitProcessor@171] - Processing request:: sessionid:0x1382791d4e50004 type:closeSession cxid:0x0 zxid:0x200000074 txntype:-11 reqpath:n/a
+{noformat}
+----
+
+*Stage-4)* Following log shows, 'createSession' 0x200000070 has reached FinalRequestProcessor and same time received a 'create' request from the client.
+Now, the FinalRequestProcessor is processing the transaction and adding the SessionImpl back to the SessionTrackerImpl. The 'create' request is seeing this new SessionImpl and will continue successfully to next processor.
+{code}
+FinalRequestProcessor.java
+rc = zks.processTxn(hdr, txn);       
+{code}
+
+ZooKeeperServer.java
+{code}
+    public ProcessTxnResult processTxn(TxnHeader hdr, Record txn) {
+        ProcessTxnResult rc;
+        int opCode = hdr.getType();
+        long sessionId = hdr.getClientId();
+        rc = getZKDatabase().processTxn(hdr, txn);
+        if (opCode == OpCode.createSession) {
+            if (txn instanceof CreateSessionTxn) {
+                CreateSessionTxn cst = (CreateSessionTxn) txn;
+                sessionTracker.addSession(sessionId, cst
+                        .getTimeOut());
+            } else {
+                LOG.warn("*****>>>>> Got "
+                        + txn.getClass() + " "
+                        + txn.toString());
+            }
+        } else if (opCode == OpCode.closeSession) {
+            sessionTracker.removeSession(sessionId);
+        }
+        return rc;
+    }
+{code}
+
+{noformat}
+2012-06-26 13:10:19,886 [myid:3] - DEBUG [CommitProcessor:3:FinalRequestProcessor@88] - Processing request:: sessionid:0x1382791d4e50004 type:createSession cxid:0x0 zxid:0x200000070 txntype:-10 reqpath:n/a
+{noformat}
+----
+
+*Stage-5)* 'closesession' 0x200000074 request has come to the FinalRequestProcessor and do the session closure
+{noformat}
+2012-06-26 13:10:20,608 [myid:3] - DEBUG [CommitProcessor:3:FinalRequestProcessor@88] - Processing request:: sessionid:0x1382791d4e50004 type:closeSession cxid:0x0 zxid:0x200000074 txntype:-11 reqpath:n/a
+{noformat}
+----
+
+*Stage-6)* Now the 'create' 0x200000075 command, reaches in FinalRequestProcessor and resulting the orphan ephmeral znode.
+{noformat}
+2012-06-26 13:10:19,893 [myid:3] - DEBUG [ProcessThread(sid:3 cport:-1)::CommitProcessor@171] - Processing request:: sessionid:0x1382791d4e50004 type:create cxid:0x2 zxid:0x200000075 txntype:1 reqpath:n/a
+2012-06-26 13:10:20,278 [myid:3] - DEBUG [LearnerHandler-/xx.xx.xx.102:13846:CommitProcessor@161] - Committing request:: sessionid:0x1382791d4e50004 type:create cxid:0x2 zxid:0x200000075 txntype:1 reqpath:n/a
+2012-06-26 13:10:20,752 [myid:3] - DEBUG [CommitProcessor:3:FinalRequestProcessor@88] - Processing request:: sessionid:0x1382791d4e50004 type:create cxid:0x2 zxid:0x200000075 txntype:1 reqpath:n/a
+{noformat}
+
+
+-Rakesh, When I go through the SessionTrackerImpl, removing the session just before expiring as follows:
+{code}
+if (set != null) {
+   for (SessionImpl s : set.sessions) {
+      sessionsById.remove(s.sessionId);
+      expirer.expire(s);
+   }
+}
+{code}
+
+Instead of sessionsById.remove(s.sessionId); will mark the session as closing s.isClosing = true
+How does it sound?
+
+-Rakesh, Hi All,
+
+Attached the proposed fix based on my analysis, please help me to validate the proposal. 
+
+I'm trying to reproduce in my test case., Rakesh, when you have a patch ready please hit the "submit patch" option on the JIRA, which will trigger the patch to be picked up by the automated build and run.
+
+I am on vacation and don't have time to look at this right now but will try to take a closer look in the next few days if no one else can., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12533949/ZOOKEEPER-1496.patch
+  against trunk revision 1353683.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1112//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1112//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1112//console
+
+This message is automatically generated., Thanks Camille for the interest. I've attached an initial draft for reviewing the problem and proposed solution., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12533973/ZOOKEEPER-1496.1.patch
+  against trunk revision 1353683.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1113//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1113//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1113//console
+
+This message is automatically generated., +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12536199/ZOOKEEPER-1496.2.patch
+  against trunk revision 1357711.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1138//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1138//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1138//console
+
+This message is automatically generated., Attached the patch with test case. Please review the analysis and the proposed solution.
+
+In our NN-HA cluster, similar issue has been reported twice as the session expiry time is very small and default value is 5seconds.
+
+Thanks,
+Rakesh, This looks like a critical bugfix., Thanks Mahadev for the interest. Could you please review the proposed fix, that I had made in the patch., Rakesh,
+ I looked at the patch and it looks good, except for this one:
+
+{code}
+-                set = sessionSets.remove(nextExpirationTime);
++                SessionSet set = sessionSets.get(nextExpirationTime);
+{code}
+
+I think the remove still needs to happen else the session sets will keep growing in the hashset.
+
+Also, 
+
+{code}
+         if (s != null) {
+-            sessionSets.get(s.tickTime).sessions.remove(s);
++            SessionSet sessionSet = sessionSets.get(s.tickTime);
++            sessionSet.sessions.remove(s);
++            // Cleanup sessionSets, if no session exists
++            if (sessionSet.sessions.size() == 0) {
++                sessionSets.remove(s.tickTime);
++            }
+         }
+     }
+
+{code}
+
+I see that you are removing the sessionSet once the session cleans up but I think we need to still do the remove the session set when iterating for expiry.
+
+Does that make sense?
+, Thanks a lot Mahadev for the review.
+
+Yeah its true, attached latest patch addressing the comments. Also added one more test case for removeSession logic, as I feel its impacted.
+
+Could you please look at the latest one., Rakesh,
+ The patch looks good to me. Ill wait for hudson to check this in. We are good to go for 3.4 RC now! Thanks Rakesh!, +1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12545370/ZOOKEEPER-1496.3.patch
+  against trunk revision 1385378.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1183//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1183//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/1183//console
+
+This message is automatically generated., Just committed this to trunk and 3.4 branch. Thanks Rakesh!, Integrated in ZooKeeper-trunk #1682 (See [https://builds.apache.org/job/ZooKeeper-trunk/1682/])
+    ZOOKEEPER-1496. Ephemeral node not getting cleared even after client has exited. (Rakesh R via mahadev) (Revision 1386496)
+
+     Result = SUCCESS
+mahadev : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1386496
+Files : 
+* /zookeeper/trunk/CHANGES.txt
+* /zookeeper/trunk/src/java/main/org/apache/zookeeper/server/SessionTrackerImpl.java
+* /zookeeper/trunk/src/java/test/org/apache/zookeeper/server/SessionTrackerTest.java
+]

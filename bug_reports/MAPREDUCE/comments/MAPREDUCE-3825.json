@@ -1,0 +1,483 @@
+[Note the FileSystem interface was changed specifically to deal with multiple-filesystem file systems like viewfs (ie it returns an arrays of tokens not a single token).
+So the question is: what is broken? 
+* The fact that the token cache is keyed by file system uri or
+* That FileSystem has a method called getDelegationTokens and not a method called getEmbeddedFileSystems().
+
+When we changed from getDelegationToken() to getDelegationTokens() we had dismissed the alternate you are proposing since we  needed a method to get delegation token from a file system anyway.
+, The general idea is that that when a job is submitted one has a list of paths (input, output, defaultfs, etc). From that list of paths one gets a set of file systems, eliminates duplicates and then get delegation tokens for each. 
+This works except that it may not be efficient in some cases. Eg:
+
+* Input path is hdfs://foo/bar
+* default fs is viewfs:///  which has mounted hdfs://foo/
+
+In this case one will obtain the delegation tokens for hdfs://foo *twice*.
+
+The Jira description seems to suggest that the current implementation does not work (Bug/Major) while what i am concluding is that it is not optimal.
+
+, This jira was filed after discussions with Sid on other token/viewfs jiras.  There are multiple problems that this jira and the linked jira in common are trying to address:
+# {{FileSystem#getDelegationTokens(String, Credentials)}} will fetch duplicate tokens.
+# {{ViewFileSystem#getDelegationTokens(String)}} will fetch duplicate tokens, ie. a token for every mount point even if the filesystems are identical.
+# {{ViewFileSystem#getDelegationTokens(String, Credentials)}} will skip filesystems w/o a serviceName, even though that means that the filesystem doesn't have a token, although it may be filtering a filesystem that does have tokens.
+# {{ViewFileSystem#getDelegationTokens(String, Credentials)}} calls {{targetFileSystem.getDelegationTokens(String)}} which may acquire duplicate tokens, even for the services that viewfs thinks it's already seen.
+# {{ViewFileSystem#getDelegationTokens(String, Credentials}} will acquire multiple duplicate tokens for a filtered filesystem & its contained filesystem because it checks the service of the filtered fs, not the contained fs.  A duplicate token will be acquired for every path.  Although not implemented, unionfs will exasperate the multiple duplicate tokens.
+# {{TokenCache}} thinks the viewfs authority is a service name so it tries to resolve it as a hostname:port tuple and fails.
+# {{TokenCache}} assumes a 1 to 1 mapping between a filesystem's service and its token which is broken for a 1 to many token filesystem.  This causes {{TokenCache}} to repeatedly fetch tokens from a multi-token filesystem because it never gets a token with the expected service.
+
+Those are the issues that I can recall off the top of my head.  The approach I've taken is:
+* Allow the retrieval of unique set of filesystems used
+* Query each filesystem only once
+* Never retrieve duplicate tokens because the list is unique
+* Solve the 1 to many problem in {{TokenCache}}
+* Fix the filtered filesystem issue by querying its underlying filesystem
+* Fix the viewfs mount table problem by only requesting tokens from the mounted filesystems
+* Complete backwards compatibility with the existing api
+
+The current model is too complex and won't scale.  It arguably "works" in simple cases, but it acquires multiple tokens, errors out if the authority isn't a service, violates the contract that null service is no token, and won't work with more complex layering of filesystems.  By flattening out the list of filesystems, the {{ViewFileSystem}} implementation is dramatically simpler, and it will handle all types of filesystem layering w/o acquiring multiple tokens.
+
+bq. When we changed from getDelegationToken() to getDelegationTokens() we had dismissed the alternate you are proposing since we needed a method to get delegation token from a file system anyway.
+
+I'm not sure what this means.  If you are referring to token renewal, this jira is completely orthogonal and is not trying to implement any of those proposals.  (Although ironically, at that time I wanted to implement {{getDelegationTokens}} but told there was no use case...)  Again though, I believe I've maintained complete backwards compatibility.
+, There is a difference between broken api and not being efficient and having bugs.
+ - TokenCache is an internal impl and can be changed to work correctly with the existing API. For example "TokenCache thinks the viewfs authority is a service name so it tries to resolve it as a hostname:port tuple and fails." is the a problem with TokenCache. 
+hostname-port was never a guarantee of FS URIs and so if tokencache made that assumption it was a mistake. 
+ - Viewfilesysgtem can be fixed to ignore duplicate mounts and tokens (if it does not already)
+
+Getting duplicate tokens is an ineffciency and I gave an example above in my comment. You gave some additional examples in your comment. 
+
+Due to the inefficiency we can change things. However you conclusion that there is not multi-token support or that things are broken in some fundamental ways  or that this is bug/major are incorrect. For example if a NN has two addreses and two URI's the current impl and changes we may make will also result in duplicate tokens. , Sorry I hit the add button accidentally. I will correct in my next comment please wait before responding.
+
+
+
+, (sorry, have to leave for the day)
+
+Yes, there no question there is multi-token support, but the way it integrates with the TokenCache is broken.  The TokenCache expects a 1 to 1 mapping between the canonical service name and the filesystem's delegation token service.  This is because TokenCache uses the canonical service as a key in its credentials.  It doesn't work correctly for multi-token filesystems, or filtered filesystems using a different scheme than the underlying fs.  It's wrong, but it's what we've got to work with.  Eventually the token cache should have no knowledge about the canonical service at all.
+
+I agree the TokenCache does need an overhaul.  If it wasn't for the block of code that tries to load the binary token cache if a token is missing, then with the changes in common the whole method collapses into calling getDelegationTokens on the filesystems.  However, I'm paranoid of altering the behavior of the TokenCache in 23, so I created a backwards compatible solution that works perfectly with the way FileSystem tokens are currently designed.
+, Let me correct my previous comment where i hit the add button accidentally.
+* TokenCache is an internal impl and can be changed to work correctly with the existing API. For example "TokenCache thinks the viewfs authority is a service name so it tries to resolve it as a hostname:port tuple and fails." is the a problem with TokenCache.
+** hostname-port was never a guarantee of FS URIs and so if tokenCache made that assumption it was a mistake. 
+** hostname-port is needed for the renewal and is encoded in the token - hence this should not be an issue.
+** One issue is that tokenCache maps a fs-uri to a token when it could have mapped to set of tokens.
+* Viewfilesysgtem can be fixed to ignore duplicate mounts and tokens. 
+
+Both you and I have given examples of cases where duplicate tokens will be added; duplicate tokens is an inefficiency.
+
+Lets change code/interfaces to deal with the inefficiency. However your conclusion that there isn't multi-token support or that this is major-bug are incorrect.
+
+To start with I would like to change the jira to "improvement"  and change the title to "Improve token management to eliminate duplicate tokens"
+
+, Problem statement: 
+# MR needs to be able to automatically get delegation tokens for a MR job so that input, output and default file systems paths are automatically handled.
+** This should work for when input and output are different from the default file systems. It should work when any of above are viewfs.
+# A Job can add additional file systems that might be needed in a job by adding these to the job conf.
+** e.g. a job is known to access data from some other cluster.
+# An admin can add additional file systems that are commonly needed.
+** e.g. admin knows that there are symlinks to other clusters.
+
+The APIs should allow one to easily not *obtain* duplicate tokens (note I didn't say *eliminate*; we don't want to get unnecessary tokens because they cost a RPC calls during job submission.) Note we should be careful about *not overstating the urgency of this jira* because job submission is quite slow due to split calculations etc. However our APis should clearly allow this.
+
+
+
+
+
+        
+, Here are two possible solutions
+# Two APIs
+** tokens[] FileSystem#getDelegationTokens(string renewer);
+** URI[] FileSystems#getEmbeddedFileSystems();
+With this approach the caller calls getEmbeddedFileSystems across MR input, MR output and default and other fileSystems and eliminates the duplicate file systems. (Note ViewFs will eliminate duplicates before returning the set of file systems).
+At end call getDelegationTokens(renewer) for each of non-dulicate URIs;  getDelegationTokens will return only one token since it is guaranteed that the calls are for the leaf file systems. 
+# One API
+** void  FileSystem#addDelegationTokens(renewer, credentials) //adds  tokens to credentials if not already in.
+		Go through each of across MR input, MR output and default and other fileSystems and call addDelegationTokens(renewer, credentials) to add tokens to the credentials. Duplicates are eliminated by checking service name (host:port), We are in complete agreement.  #1 is what I implemented.  I suggested #2 in the original jiras for multi-token support (update the credentials) but it was turned down., I should clarify how I implemented #1.  Conceptually it does exactly what is proposed.
+* {{FileSystem#getDelegationTokens(renewer)}} unconditionally acquires all tokens
+* {{FileSystem#getDelegationTokens(renewer, creds)}} acquires only the tokens that are missing from the creds.  I would rather have added them to the creds and returned just the new tokens.  The idea was previously turned down, so I was striving for compatibility with existing api.  Note: existing impl causes token cache to log it acquired the same token multiple times when it really hasn't.  The method should probably add new tokens to the creds, and return only the new tokens instead of the full set.
+* {{FileSystem#getDelegationTokens(renewer, creds)}} gets a unique list of leaf filesystems and then gets their tokens
+* {{FileSystems#getEmbeddedFileSystems()}} is implemented w/o the word embedded and returns filesystems.  Returning a list of URIs isn't desirable since it forces a {{FileSystem.get}} which may create a new fs instance if the cache is off, or creates unnecessary overhead if the cache is on.  Both normal filesystems and viewfs already have instantiations of the filesystems so I thought it makes sense to return them.
+
+bq.  At end call getDelegationTokens(renewer) for each of non-dulicate URIs; getDelegationTokens will return only one token since it is guaranteed that the calls are for the leaf file systems.
+
+The patch does acquire tokens for only the unique set of leaf filesystems.  If {{getDelegationTokens}} is required to return only one token, then why not call {{getDelegationToken}} which is the existing method implemented by filesystems?  I don't think we want all subclasses to override {{getDelegationTokens}} since it will force them to copy-n-paste the default impl with a one line tweak.
+
+Thoughts?, -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12513831/MAPREDUCE-3825.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 3 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    -1 javac.  The patch appears to cause tar ant target to fail.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    -1 findbugs.  The patch appears to cause Findbugs (version 1.3.9) to fail.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed the unit tests build
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1826//testReport/
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1826//console
+
+This message is automatically generated., (build failed because it relies on HADOOP-7967), > I should clarify how I implemented #1.
+Your description has APIs from both #1 and #2. (ie you use a variation of getDelegationTokens(renewer, credentials)
+I am suggesting that one of the two sets is sufficient.
+
+>getDelegationTokens is required to return only one token, then why not call getDelegationToken
+Good question. If this method is  declared in FileSystem then ViewFileSystem has to implement it and it cannot return single token - it has multiple tokens. The fact that you will never ever call getDelegationToken on viewFileSystem and always call getEmbeddedFileSystems() does not matter - ViewFileSystem has to honor the contract for FileSystem since it extends it., bq. Good question. If this method is declared in FileSystem then ViewFileSystem has to implement it and it cannot return single token - it has multiple tokens. The fact that you will never ever call getDelegationToken on viewFileSystem and always call getEmbeddedFileSystems() does not matter - ViewFileSystem has to honor the contract for FileSystem since it extends it.
+
+I'd suggest the distinct is that {{getDelegationToken}} requests a token specifically for that filesystem.  {{ViewFileSystem}} has no intrinsic tokens so it honors the fs contract by returning null just like any other filesystem with no tokens.  OTOH, {{getDelegationTokens}} requests all tokens used by that filesystem, which in turn calls {{getDelegationToken}} on the actual leaf filesystems.  Those leafs either return null or their token., Solution 2 ( the one with a single API: void FileSystem#addDelegationTokens(renewer, credentials) ) has the advantage that the caller does not need to have the full list of file system and paths in order to eliminate duplicate tokens. (Vinod tell me that the MR is more like that.) Solution 1 requires that the caller has the full list of file systems  and then gets all the embedded file system and then eliminates the duplicate file systems followed by obtaining delegate tokens.
+
+I dislike the notion of passing in the credentials list parameter (actually a set or tokens) to a FileSystem method which is then updated by the method - a weird APi. But i can live with it., I'm open to alternatives, but performing the elimination of dups is actually pretty simple:
+{code}
+  static void obtainTokensForNamenodesInternal(Credentials credentials,
+       Path[] ps, Configuration conf) throws IOException {
+--- start new code ---
+    // use 2 passes to avoid redundant calls to the same filesystems
+    // start by getting unique set of filesystems for all paths
+    Set<FileSystem> pathFsSet = new HashSet<FileSystem>();
+    for (Path p : ps) {
+      pathFsSet.add(p.getFileSystem(conf));
+    }
+    // get the unique set of leaf filesystems
+    Set<FileSystem> tokenFsSet = new HashSet<FileSystem>();
+    for (FileSystem fs : pathFsSet) {
+      tokenFsSet.addAll(fs.getFileSystems());
+    }
+--- end new code ---
+    // get all the tokens from the now flattened list of leaf filesystems
+    for (FileSystem fs : tokenFsSet) {
+      obtainTokensForNamenodesPrivate(fs, credentials, conf);
+    }
+  }
+{code}
+
+If many files are in the same filesystem, then a lot of necessary processing occurs, esp. in the case of viewfs.
+
+I may be misunderstanding this variation, but the acquisition of tokens via recursive calls will require more changes that may break non-hadoop distributed filesystems.  I think it will require code duplication of the default {{getDelegationTokens(renewer, creds)}}, or a new api that overrides of this method can use to avoid getting dups.  The proposed default implementation of {{FileSystem#getDelegations(renewer, creds)}} simply iterates {{this.getFileSystems()}} too.  I'll write something up and then we can discuss a little more., Attach proposed design doc., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12514135/TokenCache.pdf
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-MAPREDUCE-Build/1836//console
+
+This message is automatically generated., Dryn, Read your doc.
+The solution you are proposing (let me call it solution 3) seems to needs 3 APIs: 
+a) FileSystem#getDelegationToken(renewer) - Same as Solution 1's method.
+b) FileSystem#getDelegationToken(renewer, credentials)
+c) FileSystem#getFIleSystems() - same as Solution 1's getEmbededFileSystems().
+
+I can't figure out if and how you are using (b)  FileSystem#getDelegationToken(renewer, credentials).
+I am arguing that solution 1 or 2 are sufficient. Your solution seems to be close to solution 1 and i can't figure out how and when you are using API (b)
+
+@Dryn> but performing the elimination of dups is actually pretty simple:
+*Yes yes yes* - that is what is used in solution 1. My text says "eliminates the duplicate file systems".
+I am not saying that this code is hard to write - we are in violent agreement.
+
+I like Solution 1. - it has clean APIs.
+But solution 2 has an advantage - see my comment at [solution2Advantage | https://issues.apache.org/jira/browse/MAPREDUCE-3825?focusedCommentId=13205209&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-13205209]
+
+Questions for you:
+A) Do you believe your solution 3 is different from solution 1. If so why do you need to add api (b).
+B) Do you agree or disagree with the advantage of solution 2 that i commented - i am reluctantly beginning to agree with it after talking to the MR folks based on the reasons given in my comment., I tried to explain in the last paragraph of the doc the alternate patch that I haven't posted which is what I'd ideally like to see:
+* {{TokenCache#obtainTokensForNamenodes}} does *not* use {{getFileSystems()}}, thus it does not flatten the filesystems
+* {{TokenCache#obtainTokensForNamenodes}} does *not* use {{getCanonicalServiceName()}} so it longer has a cross-dep on {{FileSystem}}
+* {{TokenCache#obtainTokensForNamenodes}} should only call {{getDelegationTokens(renewer, creds)}} on each path's filesystem
+* {{FileSystem#getFileSystems}} is used internally by {{getDelegationTokens(renewer, creds)}}
+
+The advantage of solution #2 is based on a misunderstanding.  Those requirements don't need to be met at all.  I was proposing TokenCache do that to reduce the unnecessary/redundant calls., Typo:
+(a) should be FileSystem#getDelegationToken*S*(renewer) - Same as Solution 1's method.
+ie Tokens not Token, Here is how Solution 2 will be used and implemented.
+
+{code}
+// Credentials is a map<serviceName, Token>
+void FileSystem#addDelegationTokens(renewer, credentials); // NewAPi for FileSystem
+// note the old #getDelegationTokens(...) methods in FileSystem are no longer needed.
+
+
+// A Useful Utility - so that the TokenCache in MR can be easily implemented
+FileUtil:GetTokens(renewer, path[] ps, credentials) {
+  foreach (p in ps) {
+    GetFileSystem(p).addDelegationTokens(renwer, credentials);
+  return;
+}
+
+// Two implementation examples - viewfs and DistributedFileSystem
+
+ViewFileSystem#addDelegationTokens(renewer, credentials) {// contains embedded FSs as mounts
+ foreach (mountFs in mountPoints) {
+    mountFs.addDelegationTokens(renewer, credentials);
+  }
+  return;
+}
+
+
+DistributedFileSystem#addDelegationTokens(renewer, credentials) { // a leaf file system.
+  // I am ignoring the race condition across contains() and add();
+  myServiceName = getCanonicalServiceName();
+  if (credentials.contains(myServiceName) {
+    return;
+  }
+  myDelegationToken = getDTfromMyNN();
+  credentials.add(myServiceName, myDelegationToken);
+  return;
+}
+
+{code}, I think requiring every filesystem to bracket its token retrieval with identical "check for my token" and "set my token" is brittle.  It's an invasive change that isn't backwards compatible, so any filesystem that doesn't properly do a copy-n-paste will cause duplicate tokens.  If we want to universally change the behavior, we have to change the filesystems again.
+
+I feel it's much safer for a filesystem to implement primitives that a common method uses.  My proposed FileSystem#getDelegationTokens does just that.  All a filesystem has to do is implement getDelegationToken & maybe getFileSystems if it has multiple tokens.  Everything else is managed for the filesystem.  I'd like to make FileSystem#getDelegationsTokens a final method to enforce the consistency and prevent any filesystem from trying to directly manipulate the credentials.  If we want to change the implementation in the future, there's only one place, in our control, that needs to be changed.
+
+The sample code also prevents viewfs from shorting out on calls to the same filesystem.  It can't be solved by uniquing the fs list.  Otherwise, it's a repeat of the TokenCache 1-to-1 mapping of service to a specific token problem.  We can't avoid this by uniquing the fs list in viewfs because the underlying mounts might have multiple filesystems, or it might be returning a null service (filtered) yet have a contained filesystem with a token.
+
+Once MAPREDUCE-3849 is incorporated, I can fix TokenCache to eliminate the 1-to-1 mapping problem by simply calling getDelegationTokens on the filesystems., > Isn't backward compatible
+What isn't backward compatible?
+The 2 variations of getDelegationTokens were added in 0.23 and can be safely removed without and
+compatibility issues and getDelegationToken is deprecated.
+
+, By not backwards-compatible, I'm referring to the fact that external filesystems, that may currently work fine, will need to be changed.  They must also be changed in a precise manner, involving copy-n-paste, to not introduce bugs.
+
+I believe the history of the api is {{getDelegationToken}} (singular) was deprecated after {{ViewFileSystem}} broke the paradigm of 1 filesystem, 1 token.  I think we agree that the replacement {{getDelegationTokens}}, as currently implemented in 23, is flawed.  However I think it is on the track with a few modification.
+
+The use cases I seek to satisfy:
+# I want this filesystem's delegation token - {{getDelegationToken(renewer)}}
+# I want all delegation tokens used by this filesystem - {{getDelegationTokens(renewer)}}
+# I want the delegation tokens that I don't already have for this filesystem.  I want to know which tokens were acquired - {{getDelegationTokens(renewer, creds)}}
+# I want to know all filesystems used by this filesystem - {{getFileSystems()}}
+# If I need to change the semantics of overall token acquisition, +I do not want to change any filesystem+.
+
+The counter-proposal provides:
+# I want all the delegation tokens that I don't already have for this filesystem, but don't tell me what they were - {{addDelegationTokens(renewer, creds)}}
+# If I want to change the semantics of overall token acquisition, +I want to require changes in all filesystems+.
+
+The final list items illustrate the core difference in the approaches: Do we want a decoupled design?  Or do we want a tightly coupled design?  We can achieve a decoupled design via use of filesystem primitives.  This removes the onus from all filesystems to include copy-n-paste logic.
+# Obtaining a token _is_ the responsibility of a filesystem.
+#* If a filesystem has a token, it should only override the +primitive+ {{getDelegationToken(renewer)}}, as it does today.
+#* If a filesystem provides multiple tokens, then it should override the +primitive+ {{getFileSystems()}}.  The default implementation is sufficient for existing filesystems, sans {{ViewFileSystem}} which should return its mounted filesystems.
+# Overall token acquisition _is not_ the responsibility of a filesystem.
+#* A consistent implementation should be provided via {{final}} methods {{getDelegationTokens(renewer)}} and {{getDelegationTokens(renewer, creds)}}
+
+Thoughts?, The purpose of this JIra is to get delegation tokens without duplication for MR. All the additional requirements that you state with "I want " "I want" "I want" belong in a different jira.
+
+>I want this filesystem's delegation token - getDelegationToken(renewer)
+I already argued above that i disagree that this is a reasonable API since a multi-filesystem cannot implement it and furthermore I disagree that a multifilesystem like viewfs should return null. 
+
+> I want all delegation tokens used by this filesystem - getDelegationTokens(renewer)
+Pass in a an empty credentials to addDTs(renewer, emptyCredentials).
+
+I agree that addDTs(renewer, cred) is a weird API, but your getDelegationTokens(renewer, creds) is equally weird.
+
+, @Daryn> By not backwards-compatible, I'm referring to the fact that external filesystems,.....
+
+Good point but the new apis in 23 or the new APIs you suggested will not be implemented by the external file systems and there is no default impl that works except for "not implemented" exception., bq. The purpose of this JIra is to get delegation tokens without duplication for MR. All the additional requirements that you state with "I want " "I want" "I want" belong in a different jira.
+
+It's true that the conversation has recently morphed into that, but the original description is more broad.
+
+{quote}
+>I want this filesystem's delegation token - getDelegationToken(renewer)
+I already argued above that i disagree that this is a reasonable API since a multi-filesystem cannot implement it and furthermore I disagree that a multifilesystem like viewfs should return null.
+{quote}
+The proposal I'm putting forth is: the distinction is that a filesystem _should not_ implement {{getDelegationToken}} unless the filesystem _itself_ has a token, ie. it needs to make an authorized connection.  {{ViewFileSystem}} does not make a connection, thus it does not have a distinct token.  It does however have contained filesystems that makes connections so that's what {{getDelegationTokens}} operations on.  The method should be common, ie. a filesystem _will not_ implement this method.
+
+If there isn't a {{getDelegationToken}}, then I believe we are forced into a tightly coupled design.  Ie. every filesystem needs to bracket their code that obtains a token with copy-n-paste code.  Is this desirable?  If there is a primitive {{getDelegationToken}}, then the standard/common code ({{getDelegationTokens}}) to acquire tokens will perform the bracketing, thus confining the logic to _one_ place where it can be changed in the future.
+
+{quote}
+> I want all delegation tokens used by this filesystem - getDelegationTokens(renewer)
+Pass in a an empty credentials to addDTs(renewer, emptyCredentials).
+{quote}
+
+That's what my patch does, but let's say I have a credentials with some tokens.  I want to acquire any missing tokens, yet I want to know what those tokens are so I can log that I got them and/or I need to do some special processing on them.  Ie. TokenCache.  How would I do that?
+
+bq.  I agree that addDTs(renewer, cred) is a weird API, but your getDelegationTokens(renewer, creds) is equally weird.
+
+It's not mine, it was already there. :)  I argued against it in an earlier jira, but after further thought, it seems reasonable.
+
+What if we make {{getDelegationToken}} a protected method to avoid external calls?  The only public facing api will be {{getDelegationTokens(renewer, creds)}}?
+, bq. Good point but the new apis in 23 or the new APIs you suggested will not be implemented by the external file systems and there is no default impl that works except for "not implemented" exception.
+
+Yes, my proposal will work because existing filesystems don't need to change.
+* A filesystem need only implement {{getDelegationToken}} as it does today.  Backwards-compatible
+* A filesystem optionally implements {{getFileSystems}}.  The default returns the filesystem itself.  Backwards-compatible.  Only {{ViewFileSystem}} needs to override {{getFileSystems}}.
+* {{getDelegationTokens}} should be common code that no filesystem needs to override, which is why I'm suggesting it as a {{final}} method., Per an offline request by Sanjay, here's a summary of the proposed changes that henceforth shall be referred to as "solution 3".
+
+Required {{FileSystem}} APIs:
+* {{getFileSystems()}} - proposed new api
+** returns leaf filesystems, returns this filesystem by default
+* {{getCanonicalServiceName()}} - existing api, no change; should consider reducing visibility
+** returns the service of this filesystem's token, or null if no intrinsic token
+* {{getDelegationToken(renewer)}} - existing api, no change; should consider reducing visibility
+** returns this filesystem's token, {{token.getService()}} must match {{getCanonicalServiceName()}}
+* {{getDelegationTokens(renewer, credentials)}} - existing api, new to 23; should be public api to acquire tokens
+** returns tokens not already acquired for this filesystem
+** propose adding new tokens to supplied creds
+* {{getDelegationTokens(renewer)}} - existing api, new to 23; proposed convenience method
+** returns all tokens for the filesystem
+
+Changes to:
+# {{FilterFileSystem}}
+#* Add:{code}
+  @Override
+  String getCanonicalServiceName() {
+    return null;
+  }
+  @Override
+  public List<FileSystem> getFileSystems() {
+    return fs.getFileSystems();
+  }{code}
+# {{DistributedFileSystem}}
+#* Delete {{getDelegationTokens(renewer)}}
+# {{ViewFileSystem}}
+#* Delete {{getDelegationTokens(renewer)}} and {{getDelegationTokens(renewer, creds)}}
+#* Add:{code}
+  @Override
+  String getCanonicalServiceName() {
+    return null;
+  }
+  @Override
+  List<FileSystem> getFileSystems() {
+    List<InodeTree.MountPoint<FileSystem>> mountPoints = fsState.getMountPoints();
+    Set<FileSystem> fsSet = new HashSet<FileSystem>();
+    for (InodeTree.MountPoint<FileSystem> mountPoint : mountPoints) {
+      FileSystem targetFs = mountPoint.target.targetFileSystem;
+      fsSet.addAll(targetFs.getFileSystems());
+    }
+    return new ArrayList<FileSystem>(fsSet);
+  }{code}
+# {{FileSystem}}
+#* Add:{code}
+  List<FileSystem> getFileSystems() {
+    List<FileSystem> list = new ArrayList<FileSystem>(1);
+    list.add(this);
+    return list;
+  }{code}
+#* Change:{code}
+  public final List<Token<?>> getDelegationTokens(String renewer, Credentials credentials) throws IOException {
+    List<Token<?>> newTokens = new ArrayList<Token<?>>();
+    // there shouldn't be dups, but use a set just to be safe
+    Set<FileSystem> fsLeafs = new HashSet<FileSystem>(getFileSystems());
+    for (FileSystem fs : fsLeafs) {
+      String serviceString = fs.getCanonicalServiceName();
+      if (serviceString != null) { // null service = no tokens
+        Text service = new Text(serviceString);
+        Token<?> token = credentials.getToken(service);
+        if (token == null) { // we don't have the token, so get it
+          token = fs.getDelegationToken(renewer);
+          if (token != null) { // add to the return list and to the creds
+            newTokens.add(token);
+            credentials.addToken(service, token);
+          }
+        }
+      }
+    }
+    return newTokens;
+  }
+
+  // just a convenience method, it's not strictly required.
+  public final List<Token<?>> getDelegationTokens(String renewer) throws IOException {
+    return getDelegationTokens(renewer, new Credentials());
+  }{code}
+# {{TokenCache}}
+#* Change: (note this is a big simplification){code}
+  static void obtainTokensForNamenodesInternal(FileSystem fs, 
+      Credentials credentials, Configuration conf) throws IOException {
+    String delegTokenRenewer = Master.getMasterPrincipal(conf);
+    if (delegTokenRenewer == null || delegTokenRenewer.length() == 0) {
+      throw new IOException(
+          "Can't get Master Kerberos principal for use as renewer");
+    }
+    mergeBinaryTokens(credentials, conf);
+    List<Token<?>> tokens = fs.getDelegationTokens(delegTokenRenewer, credentials);
+    if (tokens != null) {
+      for (Token<?> token : tokens) {
+        LOG.info("Got dt for " + fs.getUri() + 
+            ";t.service="+token.getService());
+      }
+    }
+  }{code}
+
+, On the backward compatibility issue for existing external file systems that extend FileSystem.
+Both getFileSystems() and addDelegationTokens(renewer, cred) will break file systems that have multiple
+file systems in them. So I don't think we can avoid that with either of solution 2 or your solution., If there are external multi-token filesystems, that currently work, then they have implemented {{getDelegationTokens(renewer, creds)}}.  Those filesystems will continue to work so long as {{getDelegationTokens(renewer, creds)}} isn't marked {{final}} as also proposed.  W/o {{final}}, the proposal is completely backwards compatible., 
+Solution 4
+* Has some elements from solutions 1, 2 and 3
+* Distinguishes between leaf FSs and FSs that embed other FSs
+** getCanonicaServiceName() and getDelegationToken() both return null for embedded FSs - don't like this but seems unavoidable.
+* FileSystem#getChidrenFSs() - can be used to get embedded FSs - note it only returns first level of children - this is more general and can have other uses down the road.
+* addDelegationTokens(renewer, credentials) has a default impl that will work for all embedded FSs
+** Perhaps this should be in FileUtil rather than FileSystem.
+
+
+
+
+{code}
+URI[] FileSystem#getChidrenFSs() { // return first level of children
+  return emptyList; // default - leaf file system return null 
+}
+URI[] ViewFileSystem#getChidrenFileSystems() {
+  return the mount points but don't recurse through.
+}
+
+String FileSystem#getCanonicaServiceName - no change except ViewFileSystem return null;
+
+Token getDelegationToken() - no change except ViewFileSystem returns null
+
+
+// Credentials is a map<serviceName, Token>
+void FileSystem#addDelegationTokens(renewer, credentials) {
+// this is new method - the old getDTs() is not needed.
+// Provide a default impl here - viewfs does not override it.
+ - Walk the tree using getChildredFSs and collect all the leafs,
+     - if a fs return null then you know it is leaf.
+ - eliminate dups
+ - add missing tokens
+ }
+
+
+// A Useful Utility - so that the TokenCache in MR can be easily implemented
+FileUtil:GetTokens(renewer, path[] ps, credentials) {
+  foreach (p in ps) {
+    GetFileSystem(p).addDelegationTokens(renwer, credentials);
+  return;
+}
+{code}
+, Upon first read, I think solution 4 seems reasonable.
+
+I think I like the distinction of fs children.  I used a recursive implementation in part due to the simplicity.  One option for increased flexibility might be to have both {{getChildFileSystems}} and {{getFileSystems}}.  {{getFileSystems}} would be implemented via {{getChildFileSystems}}, but offers more flexibility -- one example is when viewfs needs to spray an operation to its mounts, like {{setVerifyChecksum}}, it would loop over {{getFileSystems}} instead of having to do the same leaf collection and uniquing that {{addDelegationTokens}} has to do.
+
+I would suggest that we retain {{getDelegationTokens(renewer, creds)}}.  The only difference between it and {{addDelegations(renewer, creds)}} would be it returns a list of the new tokens it had to acquire.  In a void context, add & get would be identical in behavior.  That allows the caller the opportunity to process the new tokens in some way.  One simple example would be logging the new tokens., About to post a suggested implementation of solution 4.  The code isn't in MR so canceling patch to prevent a failed build., Posting solution 4 with a small twist to satisfy this shared dislike:
+bq. (Sanjay) I dislike the notion of passing in the credentials ... which is then updated by the method - a weird APi. But i can live with it.
+
+I don't want anyone to live in discomfort, so I'm proposing a {{getDelegationTokens(renewer, creds)}} that _does not modify_ the given creds.  Instead, it returns a {{Credentials}} that contains only the new creds not present in the given creds.
+
+I added a static flavor of {{FileSystem.getDelegationTokens}} since it seemed like a more natural location than an external class, but I'm open to alternatives.
+
+No tests included, pending approval of the approach., I dislike the credentials parameters in either variation. I will live with it.
+* The method should add the credentials since it is more convenient for recursive use. Hence call it addDelegationTokens but also return the newly added tokens as you suggested. If cred is null it clearly does not add.
+** Make it a non-static method so that the filesystem object does not need to passed in 
+** Don't make it final -  it can be overridden in future just in case.
+* add a similar method to file context.
+* add a FileUtil method FileUtil:AddTokens(renewer, path[] ps, credentials)  - this can use filesystem or filecontext in its impl., Thanks for the feedback!  I'll make the changes.
+
+bq. Make it a non-static method so that the filesystem object does not need to passed in
+
+I'm a bit confused.  Are you referring to the flavors of {{getDelegationTokens}}?  The static and non-static methods are neither final nor take a fs.  The static method takes paths instead of a fs., The static method that takes paths should be in FileUtil - it can be implemented using FileSystem or FileContext.
+The non-static method is in FileSystem and AbstractFileSystem and obviously does not take a fs parameter., Summary:
+# Solution 4 with following changes
+** FileSystem#addDelegationTokens returns the newly added tokens
+** non-static method  and also not-final
+** add similar method to AbstractFileSystem
+# in trunk, and 2.0  remove addDelegationTokens - it was added in 0.23. Some customers are testing 0.23 - and hence we could remove this later from 0.23
+# Add convenience method - FileUtil:AddTokens(renewer, path[] ps, credentials) - this can use filesystem or filecontext in its impl.
+, I see that HADOOP-7967 was fixed and the change needed for this fix has already been checked in with it.
+Resolving this issue as dup.]

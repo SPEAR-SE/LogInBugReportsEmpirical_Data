@@ -1,0 +1,602 @@
+[So, FsVolume removal can happen because of DN reconfiguration (HDFS-6727), or because a failure was detected in {{FsVolumeList#checkDirs}} (see HDFS-7489 for more discussion).  While we can prevent certain race conditions by locking the {{FsVolumeList}} object itself, other race conditions are more fundamental.  For example, if someone calls {{FsVolumeList#getNextVolume}}, the volume instance they get back may be removed before they use it, or even while they are using it.
+
+We can't fix this with a "big lock" unless we lock all operations which use volumes, which seems unreasonable.  We could fix this in a few different ways.  We could do explicit reference counting.  This is a bit tricky because someone might forget to unreference the volume after using it.  It's kind of like a file descriptor leak at that point.  Another way would be to use Java's {{PhantomReference}} stuff to determine when the {{FsVolumeImpl}} objects are no longer being referenced.
+
+A related point is that we often refer to volumes by their base path.  But actually, we could destroy a volume and re-create another volume with the same base path.  This leads to a lot of subtle races.  To solve this, we could try to start using storageIDs more heavily, because they are globally unique.  I'm not sure if there is any other good solution to this?, Eddy and I talked offline about fixing this issue by using {{CloseableReferenceCount}}.  We would increment the refcount whenever we used the volumes.  When removing the volumes, we'd close the refcount, preventing further increments.  The remove() call would loop (busy wait) until the refcount reached 0.
+
+This will prevent a lot of the scenarios we described, like someone removing volume /foo/bar and then adding a new volume under that path, and having "stale" operations from the first /foo/bar take effect on the new one unintentionally.  There are some other fixes we need in FsVolumeList... like adding a block pool is racy now.  Giving this JIRA to Eddy at his request., Thanks for the suggestions [~cmccabe].
+
+In this patch, I made the following changes:
+
+# Add {{FsVolumeImpl#reference}}, {{FsVolumeImpl#unreference}} and {{FsVolumeImpl#closeAndWait()}} to manage the liveness of a {{FsVolumeImpl}} instance. 
+# After calling {{closeAndWait()}}, all future {{reference()}}s on the same {{FsVolumeImpl}} will throw IOException. 
+# The functions that get stats on the {{FsVolume}} return 0 after close, e.g., {{getAverage()}}.
+# The functions that requires IOs return {{IOException}}, e.g., {{checkDirs()}} and {{getVolumeMap()}}. 
+# Since {{FsVolumeList#getNextVolume()}} exploits  {{FsVolume}} to other threads, we let {{BlockReceiver}} manages the reference of a volume that it is actively writing., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12689212/HDFS-7496.000.patch
+  against trunk revision 1454efe.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 5 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.TestEncryptionZonesWithKMS
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/9126//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/9126//artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9126//console
+
+This message is automatically generated., Thanks for looking at this.
+
+{code}
+@@ -125,6 +123,7 @@
+ 
+   private boolean syncOnClose;
+   private long restartBudget;
++  private boolean hasReference = false;
+ 
+   /**
+    * for replaceBlock response
+@@ -221,6 +220,11 @@
+               " while receiving block " + block + " from " + inAddr);
+         }
+       }
++      if (replicaInfo instanceof ReplicaInfo) {
++        // Hold a reference to protect IOs on the streams.
++        ((ReplicaInfo) replicaInfo).getVolume().reference();
++        hasReference = true;
++      }
+{code}
+A few comments:
+* Rather than having a {{boolean hasReference}}, let's have an actual pointer to the {{FsVolumeSpi}} object.  That makes it clear that we can access the volume whenever we want, because we're holding a refcount.
+* We should release the reference count in {{close()}}, not in the finally block, I think.  This is consistent with how we release the streams and so forth.
+* We don't need this code any more:
+
+{code}
+          if (lastPacketInBlock) {
+            // Finalize the block and close the block file
+            try {
+              finalizeBlock(startTime);
+            } catch (ReplicaNotFoundException e) {
+              // Verify that the exception is due to volume removal.
+              FsVolumeSpi volume;
+              synchronized (datanode.data) {
+                volume = datanode.data.getVolume(block);
+              }
+              if (volume == null) {
+                // ReplicaInfo has been removed due to the corresponding data
+                // volume has been removed. Don't need to check disk error.
+                LOG.info(myString
+                    + ": BlockReceiver is interrupted because the block pool "
+                    + block.getBlockPoolId() + " has been removed.", e);
+                sendAckUpstream(ack, expected, totalAckTimeNanos, 0,
+                    Status.OOB_INTERRUPTED);
+                running = false;
+                receiverThread.interrupt();
+                continue;
+              }
+              throw e;
+            }
+          }
+{code}
+Because it will no longer be possible for the volume to go away while we're using it, we can get rid of that whole code block in the "catch" block, right?
+
+{code}
+   @Override
+-  public synchronized void removeVolumes(Collection<StorageLocation> volumes) {
+-    Set<File> volumeSet = new HashSet<File>();
++  public synchronized void removeVolumes(Collection<StorageLocation> volumes)
++      throws IOException {
++    Set<String> volumeSet = new HashSet<>();
+     for (StorageLocation sl : volumes) {
+-      volumeSet.add(sl.getFile());
++      volumeSet.add(sl.getFile().getCanonicalPath());
+     }
+     for (int idx = 0; idx < dataStorage.getNumStorageDirs(); idx++) {
+       Storage.StorageDirectory sd = dataStorage.getStorageDir(idx);
+-      if (volumeSet.contains(sd.getRoot())) {
++      if (volumeSet.contains(sd.getRoot().getCanonicalPath())) {
+{code}
+This change seems unrelated to this JIRA... am I missing something?  Also, as I've said in the past, I'm strongly against {{removeVolumes}} throwing an {{IOException}}.  I don't see how the code is supposed to proceed if removal fails with an exception.
+
+{code}
+176	  DataNode getDatanode() {
+177	    return datanode;
+178	  }
+{code}
+This isn't necessary, since {{FsDatasetImpl#datanode}} already has package-private access and this accessor has the same level of access.
+
+{code}
+106	    if (dataset.getDatanode() == null) {
+107	      // FsVolumeImpl is used in test.
+108	      return null;
+109	    }
+{code}
+How about using {{Preconditions.checkNonNull}} here... might look nicer
+
+{code}
+401	  File createRbwFile(String bpid, Block b) throws IOException {
+402	    reference();
+403	    try {
+404	      reserveSpaceForRbw(b.getNumBytes());
+405	      return getBlockPoolSlice(bpid).createRbwFile(b);
+406	    } finally {
+407	      unreference();
+408	    }
+409	  }
+{code}
+This is kind of a weird approach, having the volume increment reference counts on itself.  What I was envisioning was having {{getNextVolume}} increment the reference count when it retrieved the volume, and having the caller decrement the reference count after the caller was done with the volume object., Thanks for the reviews, [~cmccabe]. They are very helpful. I have made changes accordingly, detailed as following:
+
+
+bq. * Rather than having a boolean hasReference, let's have an actual pointer to the FsVolumeSpi object. 
+bq. * We should release the reference count in close(), not in the finally block
+bq. * We don't need this code any more:
+
+Done
+
+bq. This change seems unrelated to this JIRA... 
+
+Yes, this is not related. I removed it from this patch. I should follow another JIRA to use {{File#canonicalPath}} to compare the volumes. But it should not throw {{IOE}} for {{File#getCanonicalPath()}}, as you mentioned above.
+
+bq. How about using Preconditions.checkNonNull here... might look nicer
+
+It is for simplifying the test code, i.e., it does not need to construct a {{Datanode}} object for {{FsVolumeImpl}} tests.
+
+bq. What I was envisioning was having getNextVolume increment the reference count when it retrieved the volume, 
+
+{{getNextVolume}} is not the only place to pass an _active_ volume. I have made the change that if BlockReceiver's constructor successes, it must hold a reference count from {{FsDatasetImpl#createRbw/createTemporary/append/recoverRbw/recoverAppend}}. Also I added a {{FsVolumeReference}} helper class to let the caller use {{try-with-resources}} on the reference count.
+, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12689628/HDFS-7496.001.patch
+  against trunk revision e2351c7.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 5 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/9134//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/9134//artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9134//console
+
+This message is automatically generated., The findbugs message is not relevant. , It is clever to have {{FsVolumeReference}} so that we can take advantage of the Java 7 close block idiom.  If we are going to do this, though, we should pass around {{FsVolumeReference}} rather than {{FsVolumeSpi}}, and provide a method to get the volume out of the VolumeReference.  That way, findbugs will warn if someone forgets to close something that was passed in.
+
+{{BlockReceiver.java}}: I see an {{unreference}} here, but no {{reference}}.  The constructor of {{BlockReceiver}} needs to take an {{FsVolumeReference}} so that we know we can actually write the block.
+
+{{FsDatasetAsyncDiskService#deleteAsync}}: we should not be passing in an {{FsVolumeSpi}}.  We should be passing in an {{FsVolumeReference}}. Let the caller handle closing it.
+
+{{FsDatasetAsyncDiskService#moveBlockAcrossStorage}}: I see an {{unreference}}, but no {{reference}}.  I assume it's hidden somewhere in the first part of the function.  Again, to repeat, we should be getting an {{FsVolumeReference}} here, so that it's clear who created the reference and how long it's supposed to last.
+
+Similar comments for the rest.  References, not raw volume objects.  Otherwise it gets too confusing.
+
+thanks Eddy, Thank you very much for these great comments, [~cmccabe]. 
+
+I have changed {{FsVolumeList#getNext()}} to return {{FsVolumeReference}} so that who holds an non-closed {{FsVolumeReference}} can write this volume. It indeed makes the logic simplier. 
+
+bq. {{FsDatasetAsyncDiskService#deleteAsync}}: we should not be passing in an FsVolumeSpi. We should be passing in an {{FsVolumeReference}}. Let the caller handle closing it.
+
+It is an async call, should we let {{ReplicaFileDeleteTask}} close {{FsVolumeReference}}?
+
+
+, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12691694/HDFS-7496.002.patch
+  against trunk revision ae7bf31.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestDatanodeManager
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestRetryCacheWithHA
+                  org.apache.hadoop.hdfs.TestDecommission
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/9184//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9184//console
+
+This message is automatically generated., Hi Eddy,
+
+I like the fact that BlockReceiver is now holding on to an {{FsVolumeReference}} object, and closing that reference in {{BlockReceiver#close}}.  I don't understand how this works, though:
+
+{code}
+224	      if (replicaInfo instanceof ReplicaInPipeline) {
+225	        // Hold a reference to protect IOs on the streams.
+226	        volumeRef = ((ReplicaInPipeline) replicaInfo).getVolumeReference();
+227	      }
+{code}
+
+It looks like {{ReplicaInPipeline#getVolumeReference}} just returns the reference.  So closing the {{BlockReceiver}} could close the {{VolumeReference}} that the {{ReplicaInPipeline}} object is holding on to, making it no longer valid.  That doesn't seem right.
+
+Does it make sense for {{ReplicaInfo}} objects to hold on to {{FsVolumeReference}} objects at all?  I would argue that it does not.  We don't want to keep volumes from being removed just because a {{ReplicaInfo}} exists somewhere in memory.  Plus, since there are potentially hundreds of thousands of {{ReplicaInfo}} objects, that is a lot of reference counting.  I think {{ReplicaInfo}} objects should just contain the unique {{storageID}} of a volume.  Then, when we need to create an {{FsVolumeReference}} for a given {{storageID}}, we can ask the {{FsDatasetSpi}} to do that.  (This operation can also fail, of course, if the storage ID is no longer present.), Hi, [~cmccabe] Thanks for the reviews.
+
+The original purpose of embedding {{FsVolumeReference}} in {{ReplicaInPipeline}} is that the volume obtained reference in {{FsVolumeList#getNextVolume}} and it needs to pass this reference object to {{BlockReceiver}}.
+
+In this updated patch , I added a new class {{ReplicaInPipelineWithVolumeReference}} to pass the the reference object with the {{replicaInfo}}.
+{code}
+public class ReplicaInPipelineWithVolumeReference {
+  private final ReplicaInPipelineInterface replica;
+  private final FsVolumeReference volumeReference;
+{code}
+
+So that {{BlockReceiver}} can claim the ownership of volume reference object, while the size of {{replicaInfo}} is not changed.
+
+bq. We don't want to keep volumes from being removed just because a ReplicaInfo exists somewhere in memory. 
+
+It should not happen, because in {{FsDatasetImpl#removeVolumes}}, after removing volumes, the replicaInfo on these volumes are also removed.
+
+bq. I think ReplicaInfo objects should just contain the unique storageID of a volume.
+
+{{ReplicaInfo}} already has a pointer {{ReplicaInfo#volume}} pointing to the volume object. Also, {{ReplicaInfo}} should be cleaned if the volume is removed. So it might not need to hold a {{storageId}}.
+
+Could you take another look?, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12692101/HDFS-7496.003.patch
+  against trunk revision 85aec75.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 9 new or modified test files.
+
+    {color:red}-1 javac{color:red}.  The patch appears to cause the build to fail.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9203//console
+
+This message is automatically generated., Rebase to trunk and trigger another run of tests., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12692153/HDFS-7496.003.patch
+  against trunk revision f92e503.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 9 new or modified test files.
+
+    {color:red}-1 javac{color:red}.  The patch appears to cause the build to fail.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9207//console
+
+This message is automatically generated., Fixed the compiling error., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12692285/HDFS-7496.004.patch
+  against trunk revision d336d13.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 9 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/9209//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9209//console
+
+This message is automatically generated., This test failure ({{TestPipelinesFailover}}) is not related, as it also fails in trunk., Thanks, [~eddyxu].  This looks very good.
+
+My only comment is that {{ReplicaInPipelineWithVolumeReference}} is a long name.  What if it were called {{ReplicaHandle}} or something?  Also, if this object implemented {{Closeable}}, this might help us avoid leaks.  Then in the {{BlockReceiver}}, we could hold on to the {{ReplicaHandle}} and call {{ReplicaHandle#close}} when necessary.
+
++1 once that's addressed, Thanks for the quick review, [~cmccabe]
+
+I have renamed {{ReplicaInPipelineWithVolumeReference}} to {{ReplicaHandler}} as you suggested. 
+
+, +1 pending jenkins, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12692374/HDFS-7496.005.patch
+  against trunk revision 6464a89.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 9 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The test build failed in hadoop-hdfs-project/hadoop-hdfs 
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/9217//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9217//console
+
+This message is automatically generated., The failure seems a false alarm. I could not see a failure test from the test report., Unfortunately, this no longer applies.  Can you rebase the patch?, Rebased the patch to resolve conflicts with the latest trunk., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12693384/HDFS-7496.006.patch
+  against trunk revision dd0228b.
+
+    {color:red}-1 patch{color}.  Trunk compilation may be broken.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9279//console
+
+This message is automatically generated., HDFS-5631 introduced {{ExternalVolumeImpl}} and {{ExternalDatasetImpl}}. I updated the patch to add missing functions in these two classes., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12693390/HDFS-7496.007.patch
+  against trunk revision dd0228b.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 11 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/9280//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/9280//console
+
+This message is automatically generated., +1.  Thanks, [~eddyxu]., SUCCESS: Integrated in Hadoop-trunk-Commit #6898 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/6898/])
+HDFS-7496. Fix FsVolume removal race conditions on the DataNode by reference-counting the volume instances (lei via cmccabe) (cmccabe: rev b7f4a3156c0f5c600816c469637237ba6c9b330c)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeReference.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDirectoryScanner.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/ReplicaInputStreams.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockRecovery.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeListTest.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetAsyncDiskService.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestWriteToReplica.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeList.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestWriteBlockGetsBlockLengthHint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/RamDiskAsyncLazyPersistService.java
+HDFS-7496: add to CHANGES.txt (cmccabe: rev 73b72a048f70c275051747d13dc948845f4cef17)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, Committed to trunk.  Can you make a version for branch-2?  The backport isn't straightforward here.
+
+In my branch-2 backport, I get this error:
+{code}
+2015-01-20 19:46:09,386 ERROR datanode.DataNode (DataXceiver.java:run(275)) - 127.0.0.1:33539:DataXceiver error processing WRITE_BLOCK operation  src: /127.0.0.1:53230 dst: /127.0.0.1:33539
+java.lang.IllegalStateException
+    at com.google.common.base.Preconditions.checkState(Preconditions.java:129)
+    at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsVolumeImpl.checkReference(FsVolumeImpl.java:208)
+    at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsVolumeImpl.unreference(FsVolumeImpl.java:175)
+    at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsVolumeImpl.access$100(FsVolumeImpl.java:61)
+    at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsVolumeImpl$FsVolumeReferenceImpl.close(FsVolumeImpl.java:193)
+    at org.apache.hadoop.hdfs.server.datanode.ReplicaHandler.close(ReplicaHandler.java:42)
+    at org.apache.hadoop.io.IOUtils.cleanup(IOUtils.java:244)
+    at org.apache.hadoop.hdfs.server.datanode.BlockReceiver.close(BlockReceiver.java:344)
+    at org.apache.hadoop.io.IOUtils.cleanup(IOUtils.java:244)
+    at org.apache.hadoop.io.IOUtils.closeStream(IOUtils.java:261)
+    at org.apache.hadoop.hdfs.server.datanode.DataXceiver.writeBlock(DataXceiver.java:799)
+    at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.opWriteBlock(Receiver.java:137)
+    at org.apache.hadoop.hdfs.protocol.datatransfer.Receiver.processOp(Receiver.java:74)
+{code}, FAILURE: Integrated in Hadoop-Yarn-trunk #814 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/814/])
+HDFS-7496. Fix FsVolume removal race conditions on the DataNode by reference-counting the volume instances (lei via cmccabe) (cmccabe: rev b7f4a3156c0f5c600816c469637237ba6c9b330c)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDirectoryScanner.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeReference.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/RamDiskAsyncLazyPersistService.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestWriteBlockGetsBlockLengthHint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeListTest.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockRecovery.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestWriteToReplica.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetAsyncDiskService.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/ReplicaInputStreams.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeList.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java
+HDFS-7496: add to CHANGES.txt (cmccabe: rev 73b72a048f70c275051747d13dc948845f4cef17)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Yarn-trunk-Java8 #80 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/80/])
+HDFS-7496. Fix FsVolume removal race conditions on the DataNode by reference-counting the volume instances (lei via cmccabe) (cmccabe: rev b7f4a3156c0f5c600816c469637237ba6c9b330c)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeList.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/RamDiskAsyncLazyPersistService.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockRecovery.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/ReplicaInputStreams.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetAsyncDiskService.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDirectoryScanner.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestWriteToReplica.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestWriteBlockGetsBlockLengthHint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeListTest.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeReference.java
+HDFS-7496: add to CHANGES.txt (cmccabe: rev 73b72a048f70c275051747d13dc948845f4cef17)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #77 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/77/])
+HDFS-7496. Fix FsVolume removal race conditions on the DataNode by reference-counting the volume instances (lei via cmccabe) (cmccabe: rev b7f4a3156c0f5c600816c469637237ba6c9b330c)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeReference.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestWriteBlockGetsBlockLengthHint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockRecovery.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetAsyncDiskService.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDirectoryScanner.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/ReplicaInputStreams.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeList.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestWriteToReplica.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeListTest.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/RamDiskAsyncLazyPersistService.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+HDFS-7496: add to CHANGES.txt (cmccabe: rev 73b72a048f70c275051747d13dc948845f4cef17)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk #2012 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2012/])
+HDFS-7496. Fix FsVolume removal race conditions on the DataNode by reference-counting the volume instances (lei via cmccabe) (cmccabe: rev b7f4a3156c0f5c600816c469637237ba6c9b330c)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockRecovery.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeListTest.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeReference.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/ReplicaInputStreams.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestWriteBlockGetsBlockLengthHint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/RamDiskAsyncLazyPersistService.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestWriteToReplica.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeList.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDirectoryScanner.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetAsyncDiskService.java
+HDFS-7496: add to CHANGES.txt (cmccabe: rev 73b72a048f70c275051747d13dc948845f4cef17)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #81 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/81/])
+HDFS-7496. Fix FsVolume removal race conditions on the DataNode by reference-counting the volume instances (lei via cmccabe) (cmccabe: rev b7f4a3156c0f5c600816c469637237ba6c9b330c)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeList.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestWriteToReplica.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetAsyncDiskService.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockRecovery.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/RamDiskAsyncLazyPersistService.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestWriteBlockGetsBlockLengthHint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeListTest.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeReference.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/ReplicaInputStreams.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDirectoryScanner.java
+HDFS-7496: add to CHANGES.txt (cmccabe: rev 73b72a048f70c275051747d13dc948845f4cef17)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk #2031 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2031/])
+HDFS-7496. Fix FsVolume removal race conditions on the DataNode by reference-counting the volume instances (lei via cmccabe) (cmccabe: rev b7f4a3156c0f5c600816c469637237ba6c9b330c)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestFsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/RamDiskAsyncLazyPersistService.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestBlockRecovery.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/extdataset/ExternalDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestSimulatedFSDataset.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/ReplicaHandler.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeList.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsDatasetSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeReference.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetAsyncDiskService.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeListTest.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestWriteToReplica.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockSender.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/ReplicaInputStreams.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/FsVolumeSpi.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDirectoryScanner.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestWriteBlockGetsBlockLengthHint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
+HDFS-7496: add to CHANGES.txt (cmccabe: rev 73b72a048f70c275051747d13dc948845f4cef17)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+, Uploaded for branch-2, committed to 2.7.  Thanks., The trunk commit for this patch (git hash b7f4a3156c0f5c600816c469637237ba6c9b330c) included a test class named {{FsVolumeListTest}}.  It appears that this class was not included in the cherry-pick to branch-2 (git hash 5ec2b6caa9d63123a88f407f734319d4ac6038a9).  Can one of the original contributors or reviewers please clarify whether or not this class was intended to be committed?  I ask because it's causing a merge conflict now for HDFS-7604.
+
+Also, if the intention is to keep this class, then it will need to be renamed.  It has not actually been running in pre-commit.  That's because our maven-surefire-plugin configuration in hadoop-project/pom.xml is set to match only on test classes beginning with "Test" in the name:
+
+{code}
+          <includes>
+            <include>**/Test*.java</include>
+          </includes>
+{code}
+
+This is done to prevent the plugin from erroneously trying to run helper classes under src/test/java as if they were JUnit suites., Hi, [~cnauroth] 
+
+This was my fault to misname the {{FsVolumeListTest}} and not include this test in branch-2. Very sorry for the inconvenience. Shall I make a patch to correct it in this JIRA or file a follow JIRA? , [~eddyxu], thanks for the response.  Let's handle it in a new jira, since this one has been closed for a while.  Please feel free to contact me on the new jira for code review., Good find, [~cnauroth]!]

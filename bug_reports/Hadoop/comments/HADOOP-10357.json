@@ -1,0 +1,121 @@
+[This has been verified with loginUserFromKeytabAndReturnUGI as well as with a patch for getUGIFromSubject from HADOOP-10342.
+Using VisualVM we can identify UgiInstrumentation as a source of some of this leak - we end up with an instance for every connection established and subsequently closed., Please provide more detail.  A new UGI is expected to be created for each connection, and the UGI should be GC'ed after the connection/request is complete.  What is still holding a reference to the "leaked" UGIs?, Hi Daryn - Yes, the UGI is created and disposed of per connection. I believe the trouble comes from the static UgiInstrumentation field within the UGI. Which is why we end up with at least 1 UgiInstrumentation instance per connection that was made and dropped. I guess it should be characterized as a UgiInstrumentation leak from within UGI? Anyway, I will be following up with a VisualVM screen capture showing that accumulation of UgiInstrumentation instances as well as a test program that can be used to reproduce it., Also, note that this is against the 1.2 codebase. 
+The UgiInstrumentation class is no longer in use in recent releases.
+
+I have not tried to reproduce the issue on the 2 line yet though., The following class can be used to watch the memory footprint grow while it makes 200,000 connections and just closes them:
+
+{code}
+package org.apache.hadoop.examples;
+
+import java.security.PrivilegedExceptionAction;
+import java.sql.*;
+
+import org.apache.hadoop.security.UserGroupInformation;
+
+
+public class HiveMemoryExample {
+
+	//  JDBC credentials
+	static final String JDBC_DRIVER = "org.apache.hive.jdbc.HiveDriver";
+	static final String KEYTABDIR = "/etc/security/keytabs/hive.service.keytab";
+	static final String HIVE_PRINCIPAL = "hive/example.com@EXAMPLE.COM";
+	static final String JDBC_DB_URL = "jdbc:hive2://127.0.0.1:10000/default;principal=" + HIVE_PRINCIPAL;
+	static final String USER = null; 
+	static final String PASS = null; 
+	
+	
+	static Connection getConnection() throws Exception{
+		final UserGroupInformation ugi = UserGroupInformation.
+		        loginUserFromKeytabAndReturnUGI(HIVE_PRINCIPAL, KEYTABDIR);
+		
+				Connection conn = (Connection) ugi.doAs(new PrivilegedExceptionAction<Object>() {
+					public Object run() {    	        	  
+						Connection con = null;
+						try {
+							Class.forName(JDBC_DRIVER);
+							con =  DriverManager.getConnection(JDBC_DB_URL,USER,PASS);
+						} catch (SQLException e) {
+							e.printStackTrace();
+						} catch (ClassNotFoundException e2) {
+							e2.printStackTrace();
+						}
+						return con;
+					}
+				});
+
+		return conn;
+	}
+	
+	public static void main(String[] args) {
+
+		UserGroupInformation.setConfiguration(new org.apache.hadoop.conf.Configuration());
+		
+		System.out.println("-- Test started ---");
+		Runtime rtime = Runtime.getRuntime();
+
+		
+		for(int i=0; i<200000; i++) {
+			Connection conn = null;
+			try {
+				conn = getConnection();		
+			} catch (Exception e){
+				e.printStackTrace();
+			} finally {
+				try {
+					conn.close();
+				} catch (SQLException e) {}
+			}
+			
+			//Print used memory
+			System.out.println("Iteration = " + i + " Used Memory:" 
+				+ (rtime.totalMemory() - rtime.freeMemory())  + " Bytes " );
+
+			
+		}
+
+		System.out.println("Test ended  ");
+	}
+}
+{code}, For a simple maven project that you can pull and build: 
+https://github.com/lmccay/ugihivememory
+
+, Haven't had time to look at 1.x code, but are you sure it's a real leak?  In the sample code although those temporary objects are going to look like a leak unless/until GC kicks in.  Trying calling {{System.gc()}} twice if you want to force a full sweep before printing stats.
+
+If this parallels the "real" code, why is {{UGI.loginUserFromKeytabAndReturnUGI}} being invoked on every invocation?  You should create it and reuse it.  Also, if possible you want to wrap your loop with the doAs, instead of a frequent operation in the loop, because doAs isn't particularly cheap to enter/exit.
+, Hi Daryn - thanks for the comments. Yes, it is a real leak. Usecase background: this is a sccenario where - say a webapp - is authenticating every user through UGI and attempting a doAs for JDBC access to HS2.
+
+The problem lies in the fact that we are holding on to an instance of UGI for the doAs that has a static metrics registry map inside. Inside of UGI initialize UgiInstrumentation instance is acquired through a create method that creates and registers the ugiInstrumentation in the static registry. This is all fine - except for the fact that there is a new UGI instance for every hive connection and each of those have initialize called  and a new ugiInstrumentation class is registered into the static registry. Therefore, we end up with UgiI's for every connection. The metrics themselves - consisting of char[]'s, byte[]'s, etc accumulate overtime and we eventually OOM.
+
+I just realized that I haven't posted the VisualVM screen capture yet. I will dig that up.
+
+We need to make sure that the new metrics implementation that is in the 2 line isn't leaking yet., Notice that the number of UgiInstrumentation instances in this screenshot is the same as the number of connections made and closed., This intrigued me enough to download the 1.x source and take a quick look.  There is indeed a subtle bug but in practice it shouldn't be tickled.  Multiple initializations of the metrics (which creates the UgiInstrumentation) should be prevented by the isInitialized boolean.  This can only be bypassed by directly calling {{UGI.setConfiguration}} which the sample code is not doing.  Maybe the metrics system is cloning the object??
+
+Aside, the screenshot shows 1004 instances which is not equal to 200k?  Unless you aborted early, this seems to indicate GC should eventually cleanup the instances., It was aborted early actually.
+The 1004 is the number of connections that were made at the time it was
+killed.
+
+Also, the ensureInitialized method isn't going to work for the static
+metrics registry.
+I believe initialize is being called for each hive connection UGI instance.
+
+The sample code does indeed call setConfiguration in the main().
+
+Maybe setConfiguration is also being called by the hive driver?
+That would be the only explanation for the static conf check not working in
+ensureInitialized.
+I haven't checked that.
+
+
+
+, I see that HadoopThriftAuthBridge20S calls setConfiguration in:
+
+   @Override
+   public Client createClientWithConf(String authType) {
+     Configuration conf = new Configuration();
+     conf.set(HADOOP_SECURITY_AUTHENTICATION, authType);
+     UserGroupInformation.setConfiguration(conf);
+     return new Client();
+   }
+
+If this class is in play that would explain the multiple calls to initialize., That's rather bad behavior.  It's universally changing the auth type which will affect all connections.  RPCv9 should be able to work due to negotiation, but earlier RPC versions like 1.x will likely fail if thrift enables security and the client attempts a kerberized connection to an insecure NN/JT/etc., I assume that you are referring to the code in HadoopThriftAuthBridge20S - right?
+Given the fact that it is the source of the leak as well - what should we change it to do instead?]

@@ -1,0 +1,245 @@
+[RM failed with NPE during failover if FairScheduler configurations were changed.
+
+An application was not finished yet, so, application final state = null and also, the last app attempt doesn't have the final state too.
+
+2018-02-28 15:50:51,576 INFO org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppImpl: Recovering app: application_1517497680557_565955 *with 2 attempts and final state = null*
+2018-02-28 15:50:54,761 INFO org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptImpl: Recovering attempt: appattempt_1517497680557_565955_000001 with *final state: FAILED*
+2018-02-28 15:50:54,766 INFO org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptImpl: Recovering attempt: appattempt_1517497680557_565955_000002 with *final state: null*
+
+In my case, an *ACL configuration in fair-scheduler.xml was changed* as a result we no longer have a rights to submit this application.
+
+In FairScheduler#addApplication() we skip it application. We do not add this application to the scheduler application map and send event APP_REJECTED to go an application to the state FAILED.
+{code:java}
+if (!queue.hasAccess(QueueACL.SUBMIT_APPLICATIONS, userUgi) && !queue
+    .hasAccess(QueueACL.ADMINISTER_QUEUE, userUgi)) {
+  String msg = "User " + userUgi.getUserName()
+      + " cannot submit applications to queue " + queue.getName()
+      + "(requested queuename is " + queueName + ")";
+  LOG.info(msg);
+  rmContext.getDispatcher().getEventHandler().handle(
+      new RMAppEvent(applicationId, RMAppEventType.APP_REJECTED, msg));
+  return;
+} 
+{code}
+Then we try to recovery app attempts. When we try to recovery the last app attempt we should check the final state of attempt and the final state of the application (See RMAppAttemptImpl#transition()). As I said before, application final state = null and also, the last app attempt doesn't have the final state too. So, we check RM app current state in method "isAppInFinalState".
+{code:java}
+public static boolean isAppInFinalState(RMApp rmApp) {
+  RMAppState appState = ((RMAppImpl) rmApp).getRecoveredFinalState();
+  if (appState == null) {
+    appState = rmApp.getState();
+  }
+  return appState == RMAppState.FAILED || appState == RMAppState.FINISHED
+      || appState == RMAppState.KILLED;
+}
+{code}
+For now, the *current state of the application is NEW because the APP_REJECTED event has not been processed yet* (the same issue described in YARN-7913). *This lead to the wrong decision to recover attempt*. We try to get a user of the application in FairScheduler#addApplicationAttempt and get NPE because the application nod found in the scheduler.
+{code:java}
+SchedulerApplication<FSAppAttempt> application = applications.get(
+    applicationAttemptId.getApplicationId());
+String user = application.getUser(); //NPE
+{code}
+java.lang.NullPointerException
+at org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler.addApplicationAttempt(FairScheduler.java:740)
+at org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler.handle(FairScheduler.java:1327)
+at org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler.handle(FairScheduler.java:117)
+at org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptImpl$AttemptRecoveredTransition.transition(RMAppAttemptImpl.java:1100)
+at org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptImpl$AttemptRecoveredTransition.transition(RMAppAttemptImpl.java:1046)
+
+ 
+
+*Ideally, we should process APP_REJECTED event before we try to recovery attempts.* But for now, I didn't find an easy way to do that.
+
+*We can check whether an application is null.* If it true then skip this attempt. The same way as in CapacityScheduler and as was proposed in YARN-2025.
+{code:java}
+SchedulerApplication<FSAppAttempt> application = applications.get(
+    applicationAttemptId.getApplicationId());
+if (application == null) {
+  LOG.warn("Application " + applicationAttemptId.getApplicationId() +
+      " cannot be found in scheduler.");
+  return;
+}
+String user = application.getUser();
+{code}
+As a result, RM not failed now but we will get InvalidStateTransitonException because APP_REJECTED event will be processed too late.
+{noformat}
+2018-02-28 16:00:24,847 ERROR org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppImpl: Can't handle this event at current state
+org.apache.hadoop.yarn.state.InvalidStateTransitonException: *Invalid event: APP_REJECTED at ACCEPTED.*
+{noformat}
+If we also add transition from ACCEPTED state to FAILED to the RMAppImpl StateMachineFactory
+{code:java}
+.addTransition(RMAppState.ACCEPTED, RMAppState.FINAL_SAVING,
+RMAppEventType.APP_REJECTED,
+new FinalSavingTransition(new AppRejectedTransition(),
+RMAppState.FAILED))
+
+{code}
+the application will be failed correctly but we get the same problem with attempt:
+
+2018-03-01 16:26:23,899 ERROR org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppImpl: Can't handle this event at current state
+org.apache.hadoop.yarn.state.InvalidStateTransitonException: *Invalid event: ATTEMPT_FAILED at FAILED*
+
+Perhaps, we can kill this application to avoid exceptions related to an invalid event.
+{code:java}
+if (!queue.hasAccess(QueueACL.SUBMIT_APPLICATIONS, userUgi) && !queue
+    .hasAccess(QueueACL.ADMINISTER_QUEUE, userUgi)) {
+  String msg;
+  if (isAppRecovering) {
+    msg = "Application " + applicationId +
+        " will be killed since ACL configuration was changed and user " +
+        userUgi.getUserName() + " no longer have a rights to submit applications to queue " +
+        queue.getName();
+    rmContext.getDispatcher().getEventHandler().handle(
+        new RMAppEvent(applicationId, RMAppEventType.KILL, msg));
+  } else {
+    msg = "User " + userUgi.getUserName()
+        + " cannot submit applications to queue " + queue.getName()
+        + "(requested queuename is " + queueName + ")";
+    rmContext.getDispatcher().getEventHandler().handle(
+        new RMAppEvent(applicationId, RMAppEventType.APP_REJECTED, msg));
+  }
+  LOG.info(msg);
+  return;
+} {code}
+{{Thanks for any comments.}}, [^YARN-7998.000.patch], I have added JUnit test that reproduces the issue and tests the fix. [^YARN-7998.001.patch]
+Could someone kindly review it?, Added minor changes [^YARN-7998.002.patch], | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 44s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 15m 50s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 37s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 30s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 57s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 26s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 37s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 27s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 5 new + 142 unchanged - 0 fixed = 147 total (was 142) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 36s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  0m  0s{color} | {color:red} The patch has 5 line(s) that end in whitespace. Use git apply --whitespace=fix <<patch_file>>. Refer https://git-scm.com/docs/git-apply {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 34s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m  6s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 22s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 68m 49s{color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}112m  2s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:d4cc50f |
+| JIRA Issue | YARN-7998 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12913194/YARN-7998.002.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 723e1eff4992 4.4.0-64-generic #85-Ubuntu SMP Mon Feb 20 11:50:30 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 12ecb55 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/19897/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/19897/artifact/out/whitespace-eol.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/19897/testReport/ |
+| Max. process+thread count | 892 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/19897/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Fixed whitespaces [^YARN-7998.003.patch], | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 21s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 20m 50s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 50s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 38s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 52s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 31s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 29s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 32s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 35s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager: The patch generated 5 new + 142 unchanged - 0 fixed = 147 total (was 142) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 28s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 24s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 73m 56s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 29s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}129m 13s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestCapacitySchedulerSchedulingRequestUpdate |
+|   | hadoop.yarn.server.resourcemanager.scheduler.TestSchedulingWithAllocationRequestId |
+|   | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestIncreaseAllocationExpirer |
+|   | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestContainerResizing |
+|   | hadoop.yarn.server.resourcemanager.TestWorkPreservingRMRestart |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:d4cc50f |
+| JIRA Issue | YARN-7998 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12913213/YARN-7998.003.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux ea664b44c8ba 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / e6f99e2 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/19900/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/19900/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/19900/testReport/ |
+| Max. process+thread count | 859 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/19900/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, The failed tests are not related to the patch. I have rerun all failed test classes locally and all tests passed successfully.
+
+Could someone review the last patch?, Could someone look at this issue? It looks like as frequently used case.
+Any comments will be greatly appreciated.
+Thanks., I don't think we should fail restore of a running application at all when the ACL was changed. Logging the failure is good but just killing the application is not the right thing to do. We should either not start up at all and tell the end user to fix the configuration or allow the application to be restored and finish. The ACL change when made on a running RM is also not triggering a running application review.  You do not kill any running application that is not allowed by the ACL when it gets changed. Restore should not behave any different.
+
+Based on the details in YARN-7913 I think we need to close this as a duplicate and come up with a general fix that handles all these cases and not do one of changes to fix a specific corner case., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  6s{color} | {color:red} YARN-7998 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | YARN-7998 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12913213/YARN-7998.003.patch |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20835/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, Thank you [~wilfreds]. Closed as the duplicate of YARN-7913.]

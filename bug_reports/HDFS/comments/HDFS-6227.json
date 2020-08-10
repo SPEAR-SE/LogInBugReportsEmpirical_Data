@@ -1,0 +1,184 @@
+[Exception trace:
+{code}
+2014-04-09 16:41:32,593 WARN  hdfs.DFSClient (DFSInputStream.java:readBuffer(751)) - Exception while reading from BP-1658582001-206.190.52.172-1396975134578:blk_1073742131_1307 of /user/hrt_qa/.hiveJars/hive-exec-0.13.0.2.1.1.0-339-7661bf8dbdb8573b5b0718483090cc7c43a0bd91160da9345b8bfb9b9b365852.jar from 206.190.52.172:50010
+java.nio.channels.ClosedChannelException
+        at sun.nio.ch.FileChannelImpl.ensureOpen(FileChannelImpl.java:94)
+        at sun.nio.ch.FileChannelImpl.read(FileChannelImpl.java:665)
+        at org.apache.hadoop.hdfs.BlockReaderLocal.fillBuffer(BlockReaderLocal.java:312)
+        at org.apache.hadoop.hdfs.BlockReaderLocal.fillDataBuf(BlockReaderLocal.java:444)
+        at org.apache.hadoop.hdfs.BlockReaderLocal.readWithBounceBuffer(BlockReaderLocal.java:575)
+        at org.apache.hadoop.hdfs.BlockReaderLocal.read(BlockReaderLocal.java:539)
+        at org.apache.hadoop.hdfs.DFSInputStream$ByteArrayStrategy.doRead(DFSInputStream.java:683)
+        at org.apache.hadoop.hdfs.DFSInputStream.readBuffer(DFSInputStream.java:739)
+        at org.apache.hadoop.hdfs.DFSInputStream.readWithStrategy(DFSInputStream.java:796)
+        at org.apache.hadoop.hdfs.DFSInputStream.read(DFSInputStream.java:837)
+        at java.io.DataInputStream.read(DataInputStream.java:100)
+        at org.apache.hadoop.io.IOUtils.copyBytes(IOUtils.java:78)
+        at org.apache.hadoop.io.IOUtils.copyBytes(IOUtils.java:52)
+        at org.apache.hadoop.io.IOUtils.copyBytes(IOUtils.java:112)
+        at org.apache.hadoop.fs.FileUtil.copy(FileUtil.java:366)
+        at org.apache.hadoop.yarn.util.FSDownload.copy(FSDownload.java:251)
+        at org.apache.hadoop.yarn.util.FSDownload.access$000(FSDownload.java:58)
+        at org.apache.hadoop.yarn.util.FSDownload$2.run(FSDownload.java:343)
+        at org.apache.hadoop.yarn.util.FSDownload$2.run(FSDownload.java:341)
+        at java.security.AccessController.doPrivileged(Native Method)
+        at javax.security.auth.Subject.doAs(Subject.java:415)
+        at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1556)
+        at org.apache.hadoop.yarn.util.FSDownload.call(FSDownload.java:340)
+        at org.apache.hadoop.yarn.util.FSDownload.call(FSDownload.java:57)
+        at java.util.concurrent.FutureTask$Sync.innerRun(FutureTask.java:334)
+        at java.util.concurrent.FutureTask.run(FutureTask.java:166)
+        at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:471)
+        at java.util.concurrent.FutureTask$Sync.innerRun(FutureTask.java:334)
+        at java.util.concurrent.FutureTask.run(FutureTask.java:166)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1145)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:615)
+        at java.lang.Thread.run(Thread.java:722)
+{code}, I quickly checked the code, in ShortCircuitCache#unref, we close the replica when the ref count is 0, but I did not find the corresponding code to remove the replica object. Thus is it possible that the cause of the issue is a closed ShortCircuitReplica object was still retrieved from the ShortCircuitCache and used for reading? [~cmccabe], could you provide some input?, Went through the ShortCircuitCache code. I have not found any place that can trigger a race causing the ClosedChannelException. Will do more investigation in the test., bq. I quickly checked the code, in ShortCircuitCache#unref, we close the replica when the ref count is 0, but I did not find the corresponding code to remove the replica object. Thus is it possible that the cause of the issue is a closed ShortCircuitReplica object was still retrieved from the ShortCircuitCache and used for reading? Colin Patrick McCabe, could you provide some input?
+
+That should not be possible.  See this code in {{ShortCircuitCache#unref}}:
+
+{code}
+      int newRefCount = --replica.refCount;
+      if (newRefCount == 0) {
+        // Close replica, since there are no remaining references to it.
+        Preconditions.checkArgument(replica.purged,
+            "Replica " + replica + " reached a refCount of 0 without " +
+            "being purged");
+        replica.close();
+{code}
+
+Notice that we would throw a precondition exception if the replica hadn't been purged.  ("Purged" means that it has been removed from the cache and will not be handed out to new readers.)  There is no other path to calling {{ShortCircuitReplica#close}}.
+
+Can you say a little bit more about the platform and version that you saw this on?  Can you reproduce it?  Also, are there any other messages in the log?, Checked the test log and had some offline discussion with [~vinodkv]. Looks like the issue is that in Yarn some container got killed while reading a local file through short circuit read. The corresponding file channel thus got interrupted. Future readers for the same file will then hit this ClosedChannelException when they fetch the file channel from short circuit cache.
+
+The attached test can regenerate the issue.
+
+While Yarn may want to do more graceful close instead of directly interrupting the thread while it's still blocked in the reading, maybe HDFS should also provide better recovery mechanism for this case (e.g., to purge the closed file channel out of the cache and retry)., bq. Checked the test log and had some offline discussion with Vinod Kumar Vavilapalli. Looks like the issue is that in Yarn some container got killed while reading a local file through short circuit read. The corresponding file channel thus got interrupted. Future readers for the same file will then hit this ClosedChannelException when they fetch the file channel from short circuit cache.
+More specifically, the issue is that a YARN container got killed during localization and so the resource-localization process got interrupted, thereby interrupting the DFS client read also., I'm not familiar with the ShortCircuitCache code. I'm thinking if force the ShortCircuitCache to purge/close the replica when hit an exception while reading can solve the issue, since DFSInputStream can handle the retry logic. The uploaded patch demos the idea. In my local test looks like this can let other readers continue.
+
+[~cmccabe], thanks for taking this. Please let me know if I can help test your fix., It seems that whenever you deliver an {{InterruptedException}} while in {{FileChannel#read}}, the channel is immediately closed.  This causes problems for short-circuit reads, since multiple threads may be (p)reading from a single pair of file descriptors (for the block and the checksum).
+
+We can certainly check if either channel was closed in {{BlockReaderLocal#close}}, and mark the replica as stale in that case.  That will limit the harm somewhat.  But there isn't any easy way to save concurrent readers from getting the same {{ClosedChannelException}}.  Theoretically we could wrap every call to {{blockReader#read}} in a retry block that treated this problem differently from a regular I/O error.  But there are a lot of callers and that retry code is already a little complex.
+
+For the purposes of YARN, I think checking whether the channel is closed in {{BlockReaderLocal#close}} is enough, since each container will only be running one thing at a time, as I understand., bq. But there isn't any easy way to save concurrent readers from getting the same ClosedChannelException. 
+
+Yes, agree. But I think we may first want to guarantee that new incoming readers will not reuse this closed file channel and hit the same issue again, i.e., we should purge the replica from the cache. In the current code, the replica still exists in the cache and cannot be purged any more (since DFSInputStream#readWithStrategy does not close the block reader in the final try)., It should be sufficient to just check if the stream is open in {{ShortCircuitCache#unref}}.  I also added a regression test to {{TestBlockReaderFactory}}., Thanks for the fix, [~cmccabe]! The current patch looks good to me. Only some minor comments:
+# Can we wrap the following check into a separate method in ShortCircuitReplica?
+{code}
++        if (!replica.getDataStream().getChannel().isOpen()) {
++          purgeReason = "purging replica because its data channel is closed.";
++        } else if (!replica.getMetaStream().getChannel().isOpen()) {
++          purgeReason = "purging replica because its meta channel is closed.";
+{code}
+# Let's add a "dfs.close()" at the end of the new unit test testPurgingClosedReplicas.
+# In testPurgingClosedReplicas, we may also want to call "sem.release()" if we catch a throwable other than ClosedByInterruptException. It is not necessary right now since we know we will catch a ClosedByInterruptException. But in case that some new code brings into another type of throwable, the test may get blocked for acquiring the semaphore., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12646418/HDFS-6227.001.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/6957//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/6957//console
+
+This message is automatically generated., bq. Can we wrap the following check into a separate method in ShortCircuitReplica?
+
+It seems like this would be awkward, since then we couldn't print out which stream was closed (block or meta).  Additionally, we only ever do this check when we're in {{unref}}, so it would be confusing to add a method like "{{isClosed}}".
+
+bq. Let's add a "dfs.close()" at the end of the new unit test testPurgingClosedReplicas.
+
+OK
+
+bq. In testPurgingClosedReplicas, we may also want to call "sem.release()" if we catch a throwable other than ClosedByInterruptException. It is not necessary right now since we know we will catch a ClosedByInterruptException. But in case that some new code brings into another type of throwable, the test may get blocked for acquiring the semaphore.
+
+OK, bq. Additionally, we only ever do this check when we're in unref, so it would be confusing to add a method like "isClosed".
+
+This makes sense to me. +1 after addressing the other two comments., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12646418/HDFS-6227.001.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/6960//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/6960//console
+
+This message is automatically generated., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12646643/HDFS-6227.002.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.TestCacheDirectives
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/6970//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/6970//console
+
+This message is automatically generated., I've committed this to trunk and branch-2. Thanks for the fix [~cmccabe]!, SUCCESS: Integrated in Hadoop-trunk-Commit #5611 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/5611/])
+HDFS-6227. ShortCircuitCache#unref should purge ShortCircuitReplicas whose streams have been closed by java interrupts. Contributed by Colin Patrick McCabe. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1597829)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/ShortCircuitCache.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestBlockReaderFactory.java
+, Thanks, Jing.  Test failure appears to be HDFS-6257, not related., FAILURE: Integrated in Hadoop-Yarn-trunk #566 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/566/])
+HDFS-6227. ShortCircuitCache#unref should purge ShortCircuitReplicas whose streams have been closed by java interrupts. Contributed by Colin Patrick McCabe. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1597829)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/ShortCircuitCache.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestBlockReaderFactory.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #1757 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1757/])
+HDFS-6227. ShortCircuitCache#unref should purge ShortCircuitReplicas whose streams have been closed by java interrupts. Contributed by Colin Patrick McCabe. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1597829)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/ShortCircuitCache.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestBlockReaderFactory.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #1784 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1784/])
+HDFS-6227. ShortCircuitCache#unref should purge ShortCircuitReplicas whose streams have been closed by java interrupts. Contributed by Colin Patrick McCabe. (jing9: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1597829)
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/shortcircuit/ShortCircuitCache.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestBlockReaderFactory.java
+]

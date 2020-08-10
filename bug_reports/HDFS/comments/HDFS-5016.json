@@ -1,0 +1,184 @@
+[The jstack output from one of the lost DNs., Based on the thread dump, the following code path causes the issue (this code corresponds to current branch-2.1.0-beta):
+# Block is being recovered, which interrupts the current writer thread (receiving the block) at FsDatasetImpl.recoverRbw(FsDatasetImpl.java:738).
+* This hold FSDatasetImpl lock and calls for writer.join() at ReplicaInPipeline.stopWriter(ReplicaInPipeline.java:157)
+# Writer thread is interrupted. It in turn interrupts the responder thread and calls join on the responder at BlockReceiver.receiveBlock(BlockReceiver.java:709)
+# Responder thread is stuck doing flush on the socket to write response to the node that has been firewalled.
+#* Flush cannot be interrupted.
+#* We cannot enable socket write timeouts (in java only socket read timeouts can be set)
+
+To summarize, responder thread is stuck in flush call, writer thread is stuck on calling join() on the responder thread, FSDataset recoverRbw is holding the FSDataset lock and is stuck waiting on join() for the responder thread. Since the FSDataset lock is held, which is crucial for the datanode, the heart beat thread, data transceiver threads are blocked waiting on FSDataset lock.
+
+Here is a simple patch that adds timeouts to the join call. Devaraj, can you see if this fixes the issue you are seeing?
+
+, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12593439/HDFS-5016.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4702//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4702//console
+
+This message is automatically generated., I think it should throw an IOException in both cases.  It will then fail receiveBlock(..) and stopWriter() (i.e. block recovery).  Otherwise, these operations may fail silently., > ... throw an IOException in both case. ...
+
+I mean throw an IOException when timeout., I think throwing an IOException seems unnecessary. As I described earlier, in this case, writer can be interrupted successfully, since it is reading the socket and socket timeout can be configured for reads. So join called on writer thread should not block. That is not the case with responder that is writing to a socket. 
+
+Since writer can be interrupted successfully, no more block data is received and hence no further change can occur to the block. 
+
+
+, > ..., in this case, writer can be interrupted successfully, ...
+
+But would there be other cases that the writer stuck for different reasons?  Then, it may continue writing to the block later on., bq. But would there be other cases that the writer stuck for different reasons? Then, it may continue writing to the block later on.
+The only legitimate reasons I can think of are - lock related issues as we have seen in this case or socket related. Given we have socket timeout, it should not hang forever.
+
+What is the impact of throwing IOException on the replica recovery and the impact seen at the client because of that?, Like other failure cases, the corresponding operation (block recovery/write block/replace block) will fail.  The client will retry the operation (possibly with a different datanode).  The major impact is that the wait-time will increase., We need to guarantee that no unintended data modification occurs after block recoveries. If a writer could not be stopped right away, either 1) it has to stop writing when it unblocks, or 2) the block shouldn't be considered as recovered.
+
+I think Suresh is saying 1) will happen and Nicholas is saying 2) will be safer. I agree with Suresh for this particular scenario, but am not 100% sure about all possible cases. E.g. if a writer is in the middle of slow disk write, it can continue to write. As a result, data on disk can get modified after successful recoverRbw(). I would prefer failing block recovery after timeout.
+
+, I am fine throwing an IOException. I will post an updated patch once Devaraj is done with testing., Happy to say that with a variant of this patch (that is, throw exception when there is a timeout in the join), the HDFS has been running pretty stably., Updated patch to throw IOException., +1 
+(only minor nit is that we should fix the hardcoded 60 seconds to something that we derive out of some related configuration etc.), {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12594084/HDFS-5016.1.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestBlocksWithNotEnoughRacks
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4729//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4729//console
+
+This message is automatically generated., Is this a duplicate of HDFS-4851? Seems similar if not the same, I agree with Todd, this looks like the same deadlock (and basically the same fix) as what we have at HDFS-4851., > ... only minor nit is that we should fix the hardcoded 60 seconds to something that we derive out of some related configuration etc.)
+
+The timeout period could depend on dfs.datanode.socket.write.timeout.  The default of it is HdfsServerConstants.WRITE_TIMEOUT = 8 minutes., I considered it and decided against it. It is a very long time to hold the fsdataset lock and block all other threads. I recommend adding a static constant DATANODE_XCIEVER_STOP_TIMEOUT. If there is a need, in the future we could make this configurable. Thoughts?
+
+Sent from a mobile device
+
+
+, nice analysis. as Devaraj, I think the timrout should be configurable from day 1.
+ what will happen to the writer thread in this scenario?, > ...  I think the timrout should be configurable from day 1.
+
+Making it configurable sounds good., bq. I agree with Todd, this looks like the same deadlock (and basically the same fix) as what we have at HDFS-4851.
+This patch is slightly different in that it adds timeout for writer thread as well. I prefer to get this in (I am going to post a patch in a couple of minutes) with timeout configurable, as soon as possible, given this is marked as release blocker (and rightfully so).
+
+Lets either close HDFS-4851 as duplicate or if you want some of the changes from that, do it as part of HDFS-4851., New patch adds an undocumented configuration for xceiver thread stop timeouts. I also liked the way HDFS-4815 captured the stack trace. I have folded equivalent change in to this patch., Patch looks good, and I agree we can just close out HDFS-4851 after this one goes in.
+
+Some nitty comments:
+
+bq. +          final String msg = "Join on writer thread timedout "
+bq. +            String msg = "Responder thread join timedout\n"
+Needs a space in "timed out".
+
+{code}
+        if (writer.isAlive()) {
+          final String msg = "Join on writer thread timedout "
+              + writer.toString() + "\n" + StringUtils.getStackTrace(writer);
+          DataNode.LOG.warn(msg);
+          throw new IOException(msg);
+{code}
+
+We probably don't want to stick the entire stack trace in the IOException msg. Same for BlockReceiver.
+
+It's somewhat ambiguous from the log message who's name and trace we're printing here, could we instead say "Timeout while stopping writer thread <thread name>:" followed by the stack trace?
+
+For BlockReceiver, how about "Timeout while aborting responder thread <thread name>:" for consistency? Unsure if you wanted to put the thread name here, since it's missing right now., bq. We probably don't want to stick the entire stack trace in the IOException msg. Same for BlockReceiver.
+Can you explain why it is not a good idea? Note that this issue should happen quite rarely.
+
+As regards to your other comment, you want some thing like this?
+{code}
+            String msg = "Join on responder thread " + responder
+                + " timed out\n" + StringUtils.getStackTrace(responder);
+{code}, bq. Can you explain why it is not a good idea?
+
+I think it'll be confusing when this gets printed in the log, since first the writer's stack gets WARN logged, then when the exception gets caught and printed, we'll see the writer's stack again since it's part of the exception msg and then the waiter's stack after that. Kinda spew-y, and it makes it look like the exception was thrown from the writer since it comes first when the exception is printed.
+
+FWIW, we saw this triggering daily on a customer cluster. Not that common, but not that rare either.
+
+bq. you want some thing like this?
+
+Sure, that works., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12594301/HDFS-5016.2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4733//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4733//console
+
+This message is automatically generated., Updated patch to address the comments., +1 LGTM. It'd be great if you dupe HDFS-4851 too when you resolve this one., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12594319/HDFS-5016.3.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/4735//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/4735//console
+
+This message is automatically generated., I committed the patch to trunk, branch-2 and branch-2.1. Thank you Devaraj for reporting the issue. Thank you Andrew for the review.]

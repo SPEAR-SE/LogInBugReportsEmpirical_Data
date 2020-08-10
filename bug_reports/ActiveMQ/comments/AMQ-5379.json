@@ -1,0 +1,82 @@
+[Fixed with http://git-wip-us.apache.org/repos/asf/activemq/commit/838bbebe
+
+The value can be set on the transport like
+
+{code}<transportConnector name="amqp" uri="amqp://0.0.0.0:5672?maximumConnections=1000&amp;wireFormat.maxFrameSize=104857600&amp;transport.prefetch=10"/>{code}
+
+Also, the value of the remote link credit will be respected if set., I just came across the update on http://activemq.apache.org/amqp.html which notes regarding the prefetch config toggle "that the same value will be used for broker-side amqp receiver link that handles incoming messages". This is probably going to lead to people accidently reducing the producer credit window to smaller values, which will then hammer producer performance, since even the default value of 100 is likely to be limiting in certain cases already. I would suggest adding a seperate config toggle to alter the credit window for producers independently from the vaue used for consumers., Separately, the consumer prefetching has some issues from an AMQP perspective, possibly due to a bit of a mismatch between how the internal consumer prefetch handling of the broker works (being set to a particular size window initially), and how the explicit handling of credit in AMQP 1.0 works (consumers explicitly grant/retract credit for the server to use to send messages, as and when appropriate to satisfy the consumer clients needs).
+
+From an AMQP perspective, a consumer can attach without any credit initiall, then grant it later when it is deemed appropriate to receive messages, and also retract it to ensure it doesnt get any messages during a period when it doesnt want any. These behaviours could be combined to implement 0-prefetch synchronous recieve for example. Currently it would seem that due to the default prefetch value the broker may send messages to the client in cases where it hasnt yet 'asked' (provided any credit) for them, or in cases where it has asked not to get any more until further notice, which could cause problems. It is possible that Proton will handlethis, by buffering all the messages that there is not credit to send, which in itself could cause problems later or lead to some interesting memory usage., Hi [~gemmellr]], thanks for these comments. It totally makes sense to do these changes. I pushed a commit that now configures producer side with the producerCredit property. On the other hand, the size of activemq consumer prefetch is dynamically set using the credit supplied in the link flow.
+
+https://github.com/apache/activemq/commit/ab3de0c4c2b8af83090558ebbea4ef91ce04024b
+
+Can you take a look at it and see if does what I mean it does. As link flow is sent for every message, I change the prefetch only after credit  reaches 0 and if it's different value than the one we have at the moment.
+
+All tests work with this change, but as there are no way to customise the prefetch with current proton jms client, I couldn't test more advanced scenarios., Given his familiarity with the broker as a whole, [~tabish121] is possibly in a better position to comment overall on how the changes will work with the broker generally. That said, in terms of the AMQP related code change:
+
+The new 'producerCredit' field in AmqpProtocolConverter is only being used during the initial opening of the producer (i.e proton receiver object). The existing 'prefetch' field value is still being used to replenish the producers credit when it gets used up later by incoming messages, which may mean the wrong amount of credit will be granted if the config values differ, so that process also needs update to use the producerCredit field.
+
+The 'client preference' check here should probably be removed. The producer doesn't really get a say in the credit they are given from the server/receiver, any link credit value they set in a Flow frame is a reflection of the last value they know based on Flows sent to them from the server. AmqpProtocolConverter, Line 824:
+{noformat}
+        // Client is producing to this receiver object
+        org.apache.qpid.proton.amqp.transport.Target remoteTarget = receiver.getRemoteTarget();
+        int flow = producerCredit;
+        // use client's preference if set
+        if (receiver.getRemoteCredit() != 0) {
+            flow = receiver.getRemoteCredit();
+        }
+{noformat}
+
+
+Slight aside: Flow frames dont need to be sent after processing every message. Some clients may do that currently but when attention turns to efficiency and performance, adjusting the credit in batches and only sending the Flows more sparingly is what most will lkely do.
+
+I think the updated consumer prefetch handling should work in a more AMQP-like fashion in more cases, though I'm not sure if it yet fully handles the desire of a consumer to completely stop message delivery by moving the link credit back down to 0 (e.g using the flow drain flag, or by simply not replenishing credit as it is used for earlier consumed messages), and it may lead to some weirdness around configuring the ActiveMQ consumer prefetch repeatedly to a different values which are lower than the currently outstanding number of already prefetched messages. The main thing I wonder around that is, how would the broker as a whole react to reducing the ActiveMQ consumer prefetch setting below the number of messages that are already prefetched?
+
+(also, the null on the context is redundant since instanceof check handles that)
+{noformat}
++    protected void processLinkFlow(Link link) throws Exception {
++        Object context = link.getContext();
++        int credit = link.getRemoteCredit();
++        if (context != null && context instanceof ConsumerContext) {
++            ConsumerContext consumerContext = (ConsumerContext)context;
++            // change ActiveMQ consumer prefetch if needed
++            if (consumerContext.credit == 0 && consumerContext.consumerPrefetch != credit && credit > 0) {
++                ConsumerControl control = new ConsumerControl();
++                control.setConsumerId(consumerContext.consumerId);
++                control.setDestination(consumerContext.destination);
++                control.setPrefetch(credit);
++                consumerContext.consumerPrefetch = credit;
++                sendToActiveMQ(control, null);
++            }
++            consumerContext.credit = credit;
++        }
++        ((AmqpDeliveryListener) link.getContext()).drainCheck();
++    }
+{noformat}
+
+Perhaps confusingly, the link Flow event is raised by Proton for reasons other than simply receiving a Flow frame for the link, and incoming flow frames may not actually change the credit (but could effectively add or remote some), so this method may execute for a sending link even without a credit change. Using link.getRemoteCredit() doesnt return the amount of credit previously given by the remote receiver, but rather calculates the currently unused amount by doing '<remaining unused credit> - <messages still queued to send by procesing the transport>' (which I'm not certain of, but seems like it could even be negative if more messages have already attempted to be sent than there is now actually remaining credit for, which I believe makes proton buffer them). As a result, if all of the originally existing link credit had been used by prefetching at this point, only some of that amount of credit has been replenished so far by the remote receiver, link.getRemoteCredit() will presumably yeild a smaller number than the original credit window was, which could make it set the ActiveMQ consumer prefetch to this lower-than-previous value if consumerContext.credit has previously been recorded as 0 while the credit was all used. At this point <up to original credit window> messages may already be prefetched and still awaiting actual consumption, though the ActiveMQ prefetch may now set to a smaller value, only the as-yet-unused remaining AMQP credit. How would the broker react to that? Further, if that credit is then also used, and 'remote credit' hits 0 again, and the client subsequently Flows new credit as it consumes earlier messages, that could lead to 'remote credit' changing again to a different non-zero value than previously, possibly being used to update the ActiveMQ consumer prefetch again to match. This is to say, it could lead to the ActiveMQ consumer prefetch continuously being configured to new values whenever the available AMQP credit changes after previously being all used for a time.
+
+In terms of testing, later releases of the 'old' Qpid AMQP 1.0 JMS client do let you configure the consumer prefetch, though the way of configuring SSL seems to have changed so other tests might need updated to update to using such a release. It would probably even be useful to test the prefetch related behaviour of the broker at a lower level, perhaps suing the proton engine directly, in order to get more fine grained control over the protocol interactions, though that is probably a task for later :), Thanks for the comments Robbie. 
+
+The latest commit have the following changes:
+
+- now using producerCredit instead of prefetch in all places related to the producer
+- I bumped the default prefetch (and producer credit value) to 1000
+- We decided to simplify things in terms of prefetch and credit, as currently we can't control it fully. The user can set the value for the prefetch on the transport connector and if it does it will be used and not changed. If the value is not set, the consumer will use default value until we get the first flow and initial client preference. We will use that value afterwards and not change it. I think this is good enough for the most current use cases. We can refine logic later with the real use cases.
+- The problem with redelivery flag on the messages being set is fixed, as we now track the last delivered sequence id and inform the broker on consumer close, Hi Dejan,
+
+I think we need to change how the credit is observed after the initial flow, patch attached. As AMQPProtocolConverter could create the 'ActiveMQ consumer' with a 1000 msg prefetch (if we havent already also had a Flow before the Attach actually gets processed), it is likely it could buffer up to that many messages sends before we ever get a Flow, at which point the way the credit is currently observed (via getRemoteCredit()) wont actually give the amount of credit we received but rather what is currently believed to be left unused after accounting for buffered messages, leading us to underestimate the actual prefetch (it could even be negative if it already buffered sends for more messages than the actual received credit). I think getCredit() seems to be what to use instead.
+
+Having said all that, I am now also thinking that a better way to go for now might be creating the 'ActiveMQ consumer' with 0 prefetch until the first flow arrives, and then giving it that much prefetch, since the AMQP consumer cant/wont actually be sent any messages over the wire until it gives the broker/proton credit anyway. This would help with multiple consumers etc by avoiding the 'ActiveMQ consumers' prefetching lots of messages they cant actually transmit to the AMQP consumer yet.
+
+The above may possibly make the general issue underlying AMQ-5453 a little worse, since the 'ActiveMQ consumer' wouldnt have any 'advance credit' to use to get messages buffered ready to send before a 'drain' flow occurs. As it is currently almost entirely broken anyway, I'm not sure this would really be much more of an issue than already exists, which will still need a general fix either way. A possible saving grace in this specific case though is that I see that client is sending two flows, one with drain false then one with it true, which might still appear to work occasionally if messages get sent inbetween them.
+
+I think the changes here mean that anyone using ClientAcknowledge with the JMS clients will find it isnt able to recieve more messages than the consumers configured prefetch size within a single ack window, since the desire for more messages is communicated by granting more credit, which would now have no effect. That in itself isnt necessarily worse than it was in ActiveMQ 5.10, which had an internal fixed window of 100 messages, the only difference is that if AMQP clients set their prefetch down below the old fixed 100 (e.g, to 1) they then wont be able to exceed that, whereas previously they would have apparently been able to since up to 99 messages would have actually been buffered awaiting the new credit. I guess that by using the new 'transport.prefetch' config to set a value will essentially force it to behave as it did previously, which may be a workaround in some cases.
+
+When looking an issue relating to transactions, I came across the 'prefetch extension' concept in PrefetchSubscription. It currently looks to mainly use acknowlegement of specific messages to operate, but perhaps it could be modified to use credit (since we cant tell which specific messages, if any, that incoming credit may have been previously associated with) and help toward enabling things to work more along the lines of expectation for AMQP.
+
+Sorry for writing another book size comment, I really dont mean to when I start :P
+
+Robbie, I'd agree with Robbie's analysis here.  I think we should investigate whether we really need to be jumping the gun on granting prefetch instead of waiting for the client to tell us what it wants.  , Yeah, I also agree with it. The thing is that when I was trying to do that against 0.26 clients, I never got any flow from the client until I send something to it first. Also, setting the prefetch using transport.prefetch option is only for this legacy client as well. We have users that want to use 0.26 clients and control the prefetch, so that's the only way I managed to make it work.
+
+Let me try to write some test that demonstrates this initial prefetch 0 problem with 0.26 client, and maybe we can give it a more thought on how to make it work., Can we just encourage them to move onto a later QPid client release as I think that problem is addressed along with other fixes and improvements in later releases.  I've been testing out 0.30+ and been having good luck with a minor problem with QueueBrowsers that I'm trying to track down.  , I pushed the change that sets zero prefetch when nothing else is specified, and then use the first flow packet to adjust it. After upgrade to qpid 0.30 [AMQ-5405], all tests looks good. The commit also contains Robbie's patch.]

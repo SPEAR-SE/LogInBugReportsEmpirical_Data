@@ -1,0 +1,133 @@
+[I'm not really sure why it's doing that because all of the usage and limit calculations use a long.  Since none of the developers have anything near that size of disk space to test on you will probably have to do some more debugging on your end to see what the problem is.  The code where the limits are checked is here: https://github.com/apache/activemq/blob/master/activemq-broker/src/main/java/org/apache/activemq/broker/BrokerService.java#L2044
+
+You could try setting up a remote debugger and some break points to see where the value is going bad.  The other option is you can add some logging statements to the code and rebuild it, etc. and deploy the rebuilt version., I have a theory that a long is not large enough to represent 8,796,093,022,208 megabytes, and we are running into an overflow issue.
+
+Given that a long primitive type in Java 7 has a range of -2 to the 63rd power and a maximum value of 2 to the 63rd power -1.
+
+This means that a long can have values -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807.
+
+If I convert 8796093022208 megabytes into bytes then that value is 9,223,372,036,854,780,000 which is 4,193 outside the maximum value of a long.
+
+If you happen to be running Java 8, then a unsigned 64-bit long can have a maximum value of 18,446,744,073,709,500,000 which would be large enough.
+
+This means that the call to Java's java.io.File.getTotalSpace() would overflow since it returns a long: https://docs.oracle.com/javase/7/docs/api/java/io/File.html#getTotalSpace()
+
+In Java 8, this probably works fine.  Could I propose changing the variable on line 2050 of org.apache.activemq.broker.BrokerService to a double instead of a long?
+
+...
+double totalSpace = dir.getTotalSpace();
+...                                                              
+                                                                 
+From the link: https://docs.oracle.com/javase/tutorial/java/nutsandbolts/datatypes.html
+
+"The double data type is a double-precision 64-bit IEEE 754 floating point.", I think you are right, I was thinking that the value would still fit into a long but looks like it is just a bit too large as you pointed out to fit in a long value.
+
+But I don't see how changing totalSpace to a double would do anything.  java.io.File.getTotalSpace() would still overflow and return a negative long value which would then just become a negative double., Unfortunately, I think you are right.  The user would need to move to JDK 1.8 so an unsigned long is returned., Yep, nothing can really be done here because it's a JDK api method that returns a long.  The only real solution is to use something like the BigInteger class but that can't be done in this case since we don't control the method call.  So you probably will need to just configure a smaller partition for your broker., Closing as not a problem as we use the Java File api and can't control if the value overflows a long., An OpenJDK bug was opened about this issue: https://bugs.openjdk.java.net/browse/JDK-8162520.  Presumably that means that a fix would be part of HotSpot and other non-open JDKs as well.  But since it would require an API change, I suspect we wouldn't see it until Java 9, if they can convince the Java 9 people to include it there as well., I don't agree that there's nothing we can do, and I think this bug should be reopened.
+
+One option would be to explicitly work around this particular use case, by assuming that if the long we get back from getTotalSpace() is negative, that means the filesystem is plenty big enough to hold the broker's data files.  Obviously you can construct cases where the overflow will result in a small positive number and we'll still give the wrong answer, but the hack would still cover anyone with an 8EB filesystem (including the reporter of this bug).  16 EB or any multiple thereof, however, would be a problem.
+
+Another option would be to provide a config flag that allows you to skip the filesystem free space check, eliminating the problem entirely for all filesystem sizes when the flag is used.  We should do this at a minimum, whether or not we try to do hacks based on negative return values from getTotalSpace()., I agree with Tim.  I would like to see this fixed with the workaround Tim proposed., Contributions are always welcomed, Let's start with reopening the bug.  No one will contribute code for a bug with a Resolution of "Not A Problem.", Reopening the issue so that a workaround can be done for too large of a filesystem size., I can work on this, but I do not have an 8 exabyte volume to test this on.  Does AWS provision volumes like this for no cost?  Or a trial?, This should be tested in a unit test regardless so my recommendation is to not worry about that and see if you could use something like mockito to mock/spy on the File api interface and then you can configure it to return whatever value you want (ie 8 EB) to test.  Off the top of my head maybe something like mocking out what the getPersistenceAdapter() method returns in BrokerService could work so that when the usage checks get the directory to check the size it will return your Directory/File mock etc., I am able to reproduce it like this:
+
+import java.io.File;
+import org.junit.Before;
+import org.junit.Test;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+public class FileApiTest {
+	private File mockFile;
+	
+    @Before
+    public void setUp() {
+        mockFile = mock(File.class);
+    }
+
+    @Test
+    public void test1() {
+        when(mockFile.getTotalSpace()).thenReturn(9223372036854775807L + 4193L);
+        long totalSpace = mockFile.getTotalSpace();
+        //totalSpace will be equal to -9223372036854771616
+    }
+}, Right that's basically what I had in mind with mocking the File API, but you'll want to wire that in for a test with the BrokerService to test that a real Broker instance still starts up when the value is negative (if the new flag is set to disable the disk usage check, etc).  If you take a look at the unit test project you'll see a ton of examples of tests and how to configure a BrokerService to start a real broker in JUnit.
+
+I'm not sure how familiar you are with the code base so if you can't figure out how to set up a test or don't have time then I should be able to do it when I get a chance., I think you might be referring to activemq-unit-tests' org.apache.activemq.broker.BrokerServiceTest.java.  I am also checking out BrokerTest.java and BrokerTestSupport.java in that same package., I am concerned that if I introduce this flag that skips the file system check, then users with smaller file systems will set this flag to true and not understand the repercussions.  This may cause problems with the store outgrowing the size of the file system and cause instability., I think it should be whenever JDK call returns negative value for max file system size then BrokerService method set it to Long.MAX_VALUE will avoid any other side effects. 
+
+If file system is small then it should do normal operation of resetting max size to actual file size., GitHub user wcrowell opened a pull request:
+
+    https://github.com/apache/activemq/pull/202
+
+    Fixes AMQ-6441 where a negative value can be returned with large AWS EFS files systems when calling java.io.File.getTotalSpace()
+
+    Fixes AMQ-6441
+    
+    A test, testLargeFileSystem(), was added to org.apache.activemq.broker.BrokerServiceTest for checking if the total space on a volume was too large to fit into a primitive long.  If this happens, then totalSpace is set to java.lang.Long.MAX_VALUE.
+
+You can merge this pull request into a Git repository by running:
+
+    $ git pull https://github.com/wcrowell/activemq master
+
+Alternatively you can review and apply these changes as the patch at:
+
+    https://github.com/apache/activemq/pull/202.patch
+
+To close this pull request, make a commit to your master/trunk branch
+with (at least) the following in the commit message:
+
+    This closes #202
+    
+----
+commit c94b1a2eec78a0fd15763b64dcdff455bfc66e52
+Author: William Crowell <william.crowell@roguewave.com>
+Date:   2016-09-29T12:22:46Z
+
+    Fixes AMQ-6441 where a negative value can be returned with large AWS EFS files systems when calling java.io.File.getTotalSpace()
+
+commit 0c98ecfa2b903ce1301802617b8c5152048364f4
+Author: William Crowell <william.crowell@roguewave.com>
+Date:   2016-09-29T12:24:41Z
+
+    Fixes AMQ-6441 where a negative value can be returned with large AWS EFS files systems when calling java.io.File.getTotalSpace()
+
+----
+, This approach addresses the immediate problem, with an 8 EB volume.  It will do nothing for a 16EB volume, a 32 EB volume, or any other multiple of 16 EB, because those volumes will all show as small positively-sized volumes.  (If 8EB is 4193 bytes over half the range of a long, double that - 16 EB - will be 4193 * 2 = 8386 bytes over the full range of a long, and will mod down to the small but positive remainder: 8386 bytes.  And multiplying that number by anything will result in a volume that is 8386 bytes times the multiplier, which will probably be smaller than the KahaDB store.)  So the proposed (and implemented) algorithm fixes today's problem, but does nothing for the next problem.
+
+The only safe way to allow people to not be bit by this in the future is to implement the flag.  It would be defaulted to false, and enabled only when they deem it necessary based on their own knowledge of their storage situation.  People don't go changing values randomly, so no one's going to make the change unless they believe they need it, and if they know about the setting to misconfigure it, they'll know what to set back when it causes them problems.
+
+Based on the above, I recommend rejecting the pull request that was just made, and reworking the change to include a flag.  Otherwise, we're going to get to do this all over again whenever Amazon increases the default EFS volume size to 16EB., I recommend rejecting this pull request, and reworking the change to include a flag.  See the details of my reasoning in my reply to the previous comment., So if totalSpace is negative do we just fail starting up the broker?  If we introduce the flag and set it to true and totalSpace is negative, then would that not have other consequences (e.g. looking strange in the JMX and web consoles and other issues)?, I would probably do a combination of the two things.
+
+First, as Tim said, I would implement a flag (defaulting to false) that can be turned on that would disable the usage check altogether.  Also note that there is a task that gets scheduled to periodically check the usage and this flag should also make sure this task is not scheduled.
+
+Second, as a sanity check, I see no harm in also adding a check for a negative value of totalSpace.  If the value is negative then I would think the safest thing to do is to throw an exception with a good error message that explains why the error most likely happened (probably an overflow) and how to fix it (enable the new flag to true to disable the check).  You could also just allow the broker to start up with the negative value and skip the check but I would think it's better to error to make sure the user is aware of the issue and can explicitly decide if they want to disable the check or use a smaller partition., Is anyone working on implementing the last suggestions from Christopher about that flag to turn on | off., I don't think anything has been done since the original PR.  I haven't gotten around to it yet but if no one else does then it's something I can work on for a future 5.14.x or 5.15.0 release., I would love to take this on, but I am swamped., I had a peek at this and think maybe this can be recast as allowing the user to specify the quantity of disk that is available to the broker; i.e: allow the dependency on the file.getTotalSpace and getUsableSpace to be overridden.
+
+The typical use case is to limit the brokers disk usage through flow control or blocking. 
+In the case where the broker does not have exclusive access to a disk partition, or in the case of the partition giving bad information, it is useful to be able to specify the expected hard limit.
+
+I am thinking that an StoreUsage.setTotalSpace(long v) option will suffice. Any value > 0 will be taken as the total available space and the filesystem will not be queried further.
+Any limit will then be relative to the actual store usage (index and journal data files) as a portion of the totalSpace value. Irrespective of what the actual file system reports.
+This feature then allows a user to partition a shared disk between brokers.
+In the EFS case, it allows the user to specify the value of disk space that is to be used by the broker.
+, Commit f225120f61c9acfbe64b5f7590fbd72bb668525f in activemq's branch refs/heads/master from [~william.crowell]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=f225120 ]
+
+Fixes AMQ-6441 where a negative value can be returned with large AWS EFS files systems when calling java.io.File.getTotalSpace()
+, Commit 41bec0d65814448d0495462a6eafe7cbd54b36e0 in activemq's branch refs/heads/master from [~william.crowell]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=41bec0d ]
+
+Fixes AMQ-6441 where a negative value can be returned with large AWS EFS files systems when calling java.io.File.getTotalSpace()
+, Commit 8a28c065554750ea5063333e2ff479a84d689a51 in activemq's branch refs/heads/master from [~gtully]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=8a28c06 ]
+
+[AMQ-6441] add option to specify the hard limits on a usage such that spurious values from the file system can be overridden. this closes #202 thanks William Crowell for the patch with test
+, No problem.  Thank you!, with the above changes a negative value from the filesystem will error out. To workaround the problem a user provides a hard limit via the  usage where there limit is specified via the total attribute. This value is then taken as the available space, negating the need to ask the file system.
+Maybe a negative value should default, but I think if there are limits set then it is best to error out if they won't be respected.
+feedback most welcome. 
+[~william.crowell] I reused your mock and LargeFile - thanks!, Commit 4b3f07e90ea497164aaf9cc00591e8e0f868f83b in activemq's branch refs/heads/master from [~cshannon]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=4b3f07e ]
+
+https://issues.apache.org/jira/browse/AMQ-6441
+https://issues.apache.org/jira/browse/AMQ-6526
+
+Adding missing license headers
+, Looks good to me, 5.14.2 is under vote already but this can go into 5.14.3 (if there is one) and 5.15.0, The one downside to Gary's implementation is that if you use this option, we're no longer going to detect a disk that's nearly full and doesn't have enough space for the broker's data store.  As long as this is only used in cases where you've got exadata-scale storage where that's not a realistic concern, that's probably just an academic concern, but we need to make very clear in the wiki documentation that you should use Gary's setting only if you have storage on that scale; anyone whose storage is smaller than MAX_INT should not use it under any circumstances, and the documentation should say that explicitly to protect newbies from themselves., Sounds good, why don't you go ahead and add that to the Wiki, I added a PercentUsage section at the end of[1] that covers the percentLimit and total attributes that are common to the Store and Temp Usage. With a note on the caveat.
+
+[1] https://cwiki.apache.org/confluence/display/ACTIVEMQ/Producer+Flow+Control]

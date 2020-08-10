@@ -1,0 +1,62 @@
+[Seems it gets stuck trying to copy output files. These messages loop until it times out.
+
+     [exec]     [junit] 2008-11-23 08:19:01,944 INFO  mapred.TaskTracker (TaskTracker.java:reportProgress(1898)) - attempt_200811230815_0001_r_000000_0 0.10666667% reduce > copy (16 of 50 at 0.00 MB/s) >
+     [exec]     [junit] 2008-11-23 08:19:03,104 INFO  mapred.TaskTracker (TaskTracker.java:tryToGetOutputSize(1514)) - org.apache.hadoop.util.DiskChecker$DiskErrorException: Could not find taskTracker/jobcache/job_200811230815_0001/attempt_200811230815_0001_r_000000_0/output/file.out in any of the configured local directories
+, Johan, it might look like the line
+{code}
+[exec] [junit] 2008-11-23 08:19:01,944 INFO mapred.TaskTracker (TaskTracker.java:reportProgress(1898)) - 
+  attempt_200811230815_0001_r_000000_0 0.10666667% reduce > copy (16 of 50 at 0.00 MB/s) >
+{code}
+is in a loop but if you observe the part 
+{code}
+copy (16 of 50 at 0.00 MB/s)
+      ^^
+{code}
+you will see that the number (marked with ^^) keeps on changing. The job runs 50 map tasks and hence the reducer copies 50 maps outputs.  Let me know if this is not the case. I ran this test on my box and it passed. I will run it in a loop to see if I can reproduce this. Can you attach the logs for this test?, Here's an example of a similar behavior. As you can see it gets stuck when trying to copy the map output, in this case for roughly 10 minutes before the test times out., The JobTracker upon restart rebuilds the _task-completion-event_ list. Here there are events from the tracker which was lost upon restart. When the task-tracker (re)connects it re-sizes its own _task-completion-event_ list. Hence the tracker retains the missing map's events. After some time the jobtracker finds out that the tracker is lost and kills all the maps that were run on the lost tracker and re-executes them. The tracker will have the _task-completion-event_ list like 
+{code}
+1. SUC m1-t1
+2. SUC m2-t2
+3. SUC m3-t1
+4. SUC m4-t2
+5. KIL m1-t1
+6. KIL m3-t1
+7. SUC m1-t2
+8. SUC m3-t2
+{code}
+The reducer takes _m1-t1_ and starts pulling map output from _t1_. Note that when the reducer fails on _m1_ it checks that _m1_ is _OBSOLETE_ and then ignores it. The test case times out because it takes fair amount of time (~3mins) to fail once. So this doesnt look like a bug but a limitation. The reason this issue is not commonly seen  is because the reducer actually starts late and hence the tracker has the latest updates which prevents the reducer to take up maps from the lost tracker. I could easily reproduce this problem when the reducer was scheduled early. 
+----
+One thing that can be done here is to make _num-reducers=0_ as the test case doesnt actually require reducers. But actually its better to have reducers as it makes the testcase strict and hence better. So if we decide to keep reducers then there should be some way to control the timeout (~3min --> ~5 secs). Thoughts?, Also, the reducers build up a list of known map outputs from the map completion events obtained from the task-tracker. Upon restart (HADOOP-3245), the reducer doesn't clear this list. The problem arises (on a very small cluster e.g. test cases) when a map completes and this completion event is not flushed to the history file (in buffer)  and the tracker on which it ran gets lost. In such a case the (new) JobTracker has no idea about the map and since the reducer's list is stale, it takes some time to figure out that the map location is bad and use the other (re-executed by the _new_ JobTracker) one.  Note than on a large cluster, this should not be an issue as, upon failure, new maps from different host will be tried and after sometime the new location for such (dangling) maps will be passed by the JobTracker. We have 2 choices
+- stale data : This can help in cases where a tracker has not yet joined but the data (map's output) is still valid/available. The drawback being the case where a tracker is lost and data becomes unavailable. In such a case the location will be retried again and again until the (newly re-executed) map's output is pulled from some other tracker. Here the time will be wasted in pulling map output from a lost tracker/node and waiting for the (dangling) maps (from that node) to be re-executed.
+- fresh data : This can help in cases where few trackers go down. The drawback being that trackers that are up and ready to serve the map output will be ignored since they are yet to join. Here the time will be wasted in waiting for the tracker to _formally_ join back., Also the following tweaks causes the test _TestJobTrackerRestartWithLostTracker_ to pass consistently.
+- _timeout_ : Set DEFAULT_READ_TIMEOUT = 3 sec (default = 3min) and DEFAULT_CONNECT_TIMEOUT = 100 msecs (default = 3 secs) in {{ReduceTask.java}}.
+- _freshness_ : clearing the _known output_ list in {{ReduceTask.java}} upon a restart., I think we should not expose such low-level timeouts to the configuration (at least not until it is really required to do so).. 
+Also, in this testcase, it seems reasonable to not have the reducer at all., Attaching a patch that 
+- reduced max backoff so that the retries happen frequently
+- cleared the _known-outputs_ structure so that the reducer doesnt consider events not known to jobtracker
+ 
+Tested on my box and works fine. Not tested it throughly though. Somethings that would also help :  
+- decrease the num-maps from 50 to 30. This will reduce the test's runt time., Marking as a blocker, as multiple patches are failing on Hudson on this., Looks like HADOOP-4683 solves this issue for now. The way HADOOP-4683 solves this issue is that it fetches all the events in one go and latest events are fetched faster. So the fact that a map location is faulty/missing is immediately passed onto the reducer which adds the map output location to the _ignore list_. I couldn't reproduce this bug with trunk. Also HADOOP-4220 tries to reduce the run-time of this testcase. , Looks like {{TestJobTrackerRestartWithLostTracker}} can still fail. Consider a map that is 
+- hosted by a tracker that will be lost 
+- the map completion event is not logged to the job history (i.e its in the buffer)
+
+Call it a _hanging-map_. Once the reducer reaches the _hanging-map_, it will be stuck there forever as the map location is not known to the jobtracker and hence wont be added to the _ignore-list_. The previous fix solves the issue. What it does is :
+- clears the old/stale mapping of map output locations
+- reduces the backoff time so that the reducer doesnt back off for long
+
+Updates the patch to trunk.
+, You missed one check for null for the returned list from mapLocations. That should be added.., Incorporated Devaraj's comments. Result of _test-patch_ 
+{noformat}
+[exec] +1 overall.  
+     [exec] 
+     [exec]     +1 @author.  The patch does not contain any @author tags.
+     [exec] 
+     [exec]     +1 tests included.  The patch appears to include 3 new or modified tests.
+     [exec] 
+     [exec]     +1 javadoc.  The javadoc tool did not generate any warning messages.
+     [exec] 
+     [exec]     +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+     [exec] 
+     [exec]     +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+     [exec] 
+     [exec]     +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+{noformat}, if knownOutputsByLoc is null, we should break out of the loop instead of continuing, In this patch we make no implicit assumption. Let it run in the loop. It should not be a hit as retry-fetches and num-hosts are not expected to be much. Added comments., I just committed this. Thanks, Amar!]

@@ -1,0 +1,306 @@
+[zoo_multi and zoo_amulti crash for the same reason.  Made some local fixes here., Is it possible to submit a patch for this if it has been fixed?, This still happens with latest (3.4.x). On Windows it actually crashes even earlier actually, at the inital lock. 
+
+The cleanup code should ideally detect that the lists haven't been initialized and skip the teardown logic. From a cursory look it looks like this might require some explicit flags to indicate the current state to the cleanup code.
+
+I'd have a go myself but I am unfortunately very new to the codebase, and it seems like there's not a whole lot of interest in fixing this fairly serious issue... which in turn makes me wonder if I should use Zookeeper from C/C++! Because if this doesn't get fixed, who knows what other issues exist?
+, This causes serious issues with clustering software e.g. Mesos has a critical bug open over this:
+https://issues.apache.org/jira/browse/MESOS-2186, We just had an hour long outage of our production Mesos cluster due to this bug.  Is there any hope for a fix?  :(, The ZooKeeper client should probably just keep retrying the lookups from the IO thread (i.e.: it could very well be transient). I don't think a failed DNS lookup should be coupled with failing the ZK handler (at all). 
+, Doubly so if only one of the hostnames does not resolve -- in a cluster, name resolution failure should be at most a warning as long as at least one "in-sync" server is reachable., I am raising the priority of this issue to 'Blocker' as it 1) is a complete crash of the ZK client 2) affects multiple users 3) affects production stability 4) has been open for a very long time.  Hopefully it can be considered for the next releases of the 3.4.x and 3.5.x series?
+, We have the same problem. We use zookeper in cocaine cloud engine and cocaine-runtime can not start if one of the zk node is unresolvable(f.e. hostname changed) despite the fact that we have zk quorum., Ok, so the bug is that we don't initialize the zh struct after calling calloc() in zookeeper_init:
+
+https://github.com/apache/zookeeper/blob/branch-3.4/src/c/src/zookeeper.c#L788
+
+Since we don't, zh->adaptor_priv might not be NULL, which means that when doing the following chain of calls:
+
+{code}
+destroy() -> cleanup_bufs() -> enter_critical()
+{code}
+
+zh->adaptor_priv might be != NULL:
+
+{code}
+void enter_critical(zhandle_t* zh)
+{
+    struct adaptor_threads *adaptor = zh->adaptor_priv;
+    if(adaptor)
+        pthread_mutex_lock(&adaptor->zh_lock);
+}
+{code}
+
+At which point, the World crumbles into pieces. So memset() should be all we need to be able to safely cleanup after a failed.
+
+Still haven't looked at [~rdermer]'s case for zoo_multi and zoo_amulti. Attaching a patch for the first case. , The patch also fixes broken calls to LOG_DEBUG (due to ZOOKEEPER-2253).
+
+Lets get this in so I can cut an RC for 3.4.7.
+
+cc: [~fpj], [~rakeshr], [~cnauroth]
+
+cc: [~cchen] (about the broken LOG_DEBUG calls from ZOOKEEPER-2253), I take that back, calloc() does initialize the memory to zero. Hmm, let me try to build a repro. , Actually, I can't repro this using https://gist.github.com/rgs1/998684a0e93c072cb65d
+
+Can someone provide a repro?, Does it mean that if you pass a bad hostname, the client doesn't crash as this issue describes?
+, Okey, so re-reading the initial description it is true that we don't check if the locks have been properly initialized, but even if that's wrong, it shouldn't crash. 
+
+[~stevenschlansker]: could you provide a repro for the mesos case you report?, From the description of the issue, the problem is that we do this:
+
+{noformat}
+    if (zh->hostname == 0) {
+        goto abort;
+    }
+    if(getaddrs(zh)!=0) {
+        goto abort;
+    }
+
+{noformat}
+
+before calling adaptor_init. I'm wondering if the problem is that in the lock and unlock calls we don't have anything in in sent_requests:
+
+{noformat}
+// In free_completions called from abort->destroy->cleanup_bufs:
+
+    lock_completion_list(&zh->sent_requests);
+    tmp_list = zh->sent_requests;
+    zh->sent_requests.head = 0;
+    zh->sent_requests.last = 0;
+    unlock_completion_list(&zh->sent_requests);
+
+// Lock/Unlock calls
+void lock_completion_list(completion_head_t *l)
+{
+    pthread_mutex_lock(&l->lock);
+}
+void unlock_completion_list(completion_head_t *l)
+{
+    pthread_cond_broadcast(&l->cond);
+    pthread_mutex_unlock(&l->lock);
+}
+{noformat}, But that shouldn't cause a crash, if cond and lock are NULL then pthread_cond_broadcast and pthread_mutex_lock will just return EINVAL.
+
+It's still needs to be fixed, but the MESOS related problem seems to cause a crasher. I want to separate the issues. , I was actually referring to l being null, not cond and lock. , But that's not correct, sent_requests is a struct (not a struct *) with cond and lock members. It's initialized to 0 as part of the calloc call(). So there won't be a NULL pointer dereference.
+
+I think the Mesos crasher is not in ZK, but in Mesos proper.
+
+[~vinod@twitter.com] might know better. , Would it work if we do something like this in destroy(..)
+
+{code}
+     /* call any outstanding completions with a special error code */
+-    cleanup_bufs(zh,1,ZCLOSING);
++    if (zh->addrs != 0) {
++        cleanup_bufs(zh,1,ZCLOSING);
++    }
+{code}
+
+The rationale is that if the addresses are not set, and can't possibly have any buffers to cleanup. It's a bit hacky and I wish there were a better way to spot that the initialization between getaddrs and adaptor_init in zookeeper_init hasn't been done., [~fpj]: I am not sure if that doesn't leak memory.. have you checked?
+, Sorry, you are right: there is nothing to cleanup. That's probably as good as it can get without adding more exit/cleanup branches to zookeeper_init..., Here is a preliminary patch for branch 3.4., Patch for branch 3.4., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12769566/ZOOKEEPER-1029-3.4.patch
+  against trunk revision 1711151.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2936//console
+
+This message is automatically generated., [~fpj]; thanks - lgtm. Fixing the log calls isn't necessary though (it has been fixed here: https://github.com/apache/zookeeper/commit/ad9e978b32ba7b7d7dfeb0b749ace2ae99384035). Could you rebase and re-post? I can merge afterwards. Thanks!, I'm wondering how to test this. It is simple enough that it seems to do the job, but it'd be good to make sure., We have these test cases:
+
+{code}
+    void testInvalidAddressString1()
+    {
+        const string INVALID_HOST("host1");
+        zh=zookeeper_init(INVALID_HOST.c_str(),0,0,0,0,0);
+        CPPUNIT_ASSERT(zh==0);
+        CPPUNIT_ASSERT_EQUAL(EINVAL,errno);
+    }
+
+   void testInvalidAddressString2()
+    {
+        const string INVALID_HOST("host1:1111+host:123");
+        zh=zookeeper_init(INVALID_HOST.c_str(),0,0,0,0,0);
+        CPPUNIT_ASSERT(zh==0);
+        CPPUNIT_ASSERT((ENOENT|EINVAL) & errno);
+    }
+{code}
+
+Why isn't this verifying the problem described here? CC [~dheerajagrawal]
+, [~fpj]: what are you trying to verify? As I said before, trying to lock/unlock uninitialized locks doesn't actually change cleanup code path (i.e.: we just don't acquire the lock, but it doesn't matter since the IO & event thread haven't started...)., One of the comments mentioned a crash and it confused me, I thought the problem described here was causing a crash, so I was simply trying to avoid that execution path through cleanup_bufs. After reading the description again, I think the solution is simply to check the return value of the lock call, like in the latest patch I submitted, but let me know if I got it wrong again., Yeah - the crash is actually in Mesos (MESOS-2186). , and what do you think of the latest patch, does it make any sense?, I think it's a good start, though we might want to check return codes for these ones too:
+
+{code}
+void enter_critical(zhandle_t* zh)
+{
+    struct adaptor_threads *adaptor = zh->adaptor_priv;
+    if(adaptor)
+        pthread_mutex_lock(&adaptor->zh_lock);
+}
+
+void leave_critical(zhandle_t* zh)
+{
+    struct adaptor_threads *adaptor = zh->adaptor_priv;
+    if(adaptor)
+        pthread_mutex_unlock(&adaptor->zh_lock);
+}
+{code}
+
+We can probably leave that for another round. Unless there's anything else you'd like to add, I'll go ahead and merge this. , meant to say: "although we can probably leave these two methods for later...", I made the changes you suggested., lgtm - thanks [~fpj]!
+
+cc: [~cnauroth], [~rakeshr] - in case you want to take a look, otherwise i'll merge it tomorrow. , -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12769667/ZOOKEEPER-1029-3.4.patch
+  against trunk revision 1711151.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2937//console
+
+This message is automatically generated., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12769759/ZOOKEEPER-1029-3.4.patch
+  against trunk revision 1711151.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2938//console
+
+This message is automatically generated., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12769766/ZOOKEEPER-1029-3.4.patch
+  against trunk revision 1711151.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2939//console
+
+This message is automatically generated., Looks good/./. one quick note . I see in the patch return codes are added to all pthread wrapper functions, please check the windows impl / defines of the all the pthread methods, to make sure they return the same error code. many times unix/windows return code may be different. I think there is a file which has all the windows defines for those pthreads.
+for eg.
+return pthread_mutex_unlock
+, Error code as in 0 vs > 0, < 0 etc. 
+on success on unix we may get 1 for certain call, and on windows for the same call we may get 0. I had seen some differences like this. Just wanted to make sure none of the apis here in the patch, dont have that..else the branching may not be correct on windows., Canceling patch to address comments., [~dheerajagrawal] I have checked winport.c and the value returned on success is 0 out of a call to WaitForSingleObject. The success value is also 0 on linux. Are we good or do you see any problem? Feel free to double check if you want, otherwise I'll resubmit the patch.
+
+I have also run tests and they pass fine for me., +1 for the branch-3.4 patch.  Thank you, Flavio.  I can review a trunk/branch-3.5 patch too when it's available., I wanted to primarily unblock [~rgs] so that we can finally produce an RC for 3.4.7. If you could check this one in [~cnauroth], I'd appreciate.
+
+I'll generate a patch for 3.5 and trunk and soon as I have a chance, but I don't want it to block 3.4.7., Sounds good.  I have committed this to branch-3.4.  I'll leave the JIRA opened, pending commits to trunk and branch-3.5.  Flavio and Raul, thank you for your work on this., Thanks, [~cnauroth].
+
+Branch 3.4: Committed revision 1711566
+, [~fpj]: can you forward port your patch to trunk/3.5?, [~cnauroth] could you have a look at this, please? this is the version for 3.5 and trunk of the patch so that we can close this issue., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12776638/ZOOKEEPER-1029-3.5.patch
+  against trunk revision 1718758.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2992//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2992//artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Console output: https://builds.apache.org/job/PreCommit-ZOOKEEPER-Build/2992//console
+
+This message is automatically generated., [~fpj]: a few comments:
+
+* in lock_reconfig/unlock_reconfig and enter_critical/leave_critical if the the adaptor is not initialized we return 0 (lock or unlock succeeded) - is this actually desired? If so, maybe add a comment explaining why this is so?
+
+* in:
+
+{code}
+-    lock_completion_list(&zh->sent_requests);
+-    tmp_list = zh->sent_requests;
+-    zh->sent_requests.head = 0;
+-    zh->sent_requests.last = 0;
+-    unlock_completion_list(&zh->sent_requests);
+-    while (tmp_list.head) {
+....
+
++    if (lock_completion_list(&zh->sent_requests) == 0) {
++        tmp_list = zh->sent_requests;
++        zh->sent_requests.head = 0;
++        zh->sent_requests.last = 0;
++        unlock_completion_list(&zh->sent_requests);
++        while (tmp_list.head) {
+{code}
+
+we are now iterating over tmp_list.head *only if* zh->requests was locked - do we need to couple them? Or should it be:
+
+{code}
++    if (lock_completion_list(&zh->sent_requests) == 0) {
++        tmp_list = zh->sent_requests;
++        zh->sent_requests.head = 0;
++        zh->sent_requests.last = 0;
++        unlock_completion_list(&zh->sent_requests);
++     }
++     while (tmp_list.head) {
++     ...
+{code}
+
+?
+
+* similarly, in:
+
+{code}
+-    a_list.completion = NULL;
+-    a_list.next = NULL;
+-    zoo_lock_auth(zh);
+...
++    if (zoo_lock_auth(zh) == 0) {
++        a_list.completion = NULL;
++        a_list.next = NULL;
++
++        get_auth_completions(&zh->auth_h, &a_list);
++        zoo_unlock_auth(zh);
+{code}
+
+setting a_list.completion = NULL and a_list.next = NULL didn't previously depend on obtaining zoo_lock_auth.. but now they do. Again, should it just be:
+
+{code}
++    a_list.completion = NULL;
++    a_list.next = NULL;
++    if (zoo_lock_auth(zh) == 0) {
++        get_auth_completions(&zh->auth_h, &a_list);
++        zoo_unlock_auth(zh);
++     }
+{code}
+
+?, [~rgs] thanks for the review and comments. 
+
+# Previously, the return value was void, so if there was no adaptor, then we'd silently move on. By returning 0, I'm essentially keeping the same behavior and saying that it is OK to make progress. The case this patch is covering is focused on the one that it does try to acquire the lock, but the lock operation fails. Also, if you want to make this change here, then we will need to fix it in the 3.4 branch as well. With this patch, I'm just porting what we've done for the 3.4 branch so far. 
+# I don't think it is ok to move the while loop out of the if block because we aren't initializing tmp_list. Even if we were, there isn't going to be any iteration of the while loop because there is no head.
+# It sounds ok to make this change, but I don't see much advantage or any correction of behavior. If we don't call the if block as you define it, then we'll have a_list.completion = NULL and a_list.next = NULL, so there will be no iteration of the subsequent while loop., Waiting for feedback., Hi [~fpj].  The patch mostly looks good to me, pending resolution of the feedback from Raul.  I ran some successful manual testing on both Linux and Windows.
+
+I just have a minor request.  There are some coding style differences in the branch-3.5 patch compared to what got committed to branch-3.4.  For example, indentation is different in {{unlock_buffer_list}}, and {{enter_critical}} uses a different brace style for a single-line if/else body.  Can we please match style as closely as possible between the 2 branches?  That will reduce the likelihood of merge conflicts if there are later backports to branch-3.4.
+
+Thanks!, Thanks [~fpj] - it makes sense. I am +1 with the patch as is. , [~cnauroth]: i checked Flavio's replies, I am +1 with the patch as is. Thanks!, [~cnauroth] I have fixed the if/else blocks, but the extra space in {{unlock_buffer_list}} was accidental, not a conscious style choice. Just remove it next time you commit a patch. , +1 for the branch-3.5 patch.  I have committed this to trunk and branch-3.5  [~fpj], thank you for the patch.  [~rgs], thank you for the thorough code reviews., SUCCESS: Integrated in ZooKeeper-trunk #2828 (See [https://builds.apache.org/job/ZooKeeper-trunk/2828/])
+ZOOKEEPER-1029: C client bug in zookeeper_init (if bad hostname is given) (fpj via cnauroth) (cnauroth: [http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1719528])
+* trunk/CHANGES.txt
+* trunk/src/c/src/mt_adaptor.c
+* trunk/src/c/src/st_adaptor.c
+* trunk/src/c/src/zk_adaptor.h
+* trunk/src/c/src/zookeeper.c
+]

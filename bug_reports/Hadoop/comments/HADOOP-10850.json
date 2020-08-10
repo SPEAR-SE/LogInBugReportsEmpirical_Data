@@ -1,0 +1,162 @@
+[I've spent a good few hours looking into this.
+
+Making {{KerberosAuthenticator}} to use JDK SPNEGO is straight forward, simply removing code. Still we want to continue using the {{AuthenticatedURL}} because it sets the hadoop-auth cookie which avoids triggering SPENGO every time (and failing with doing a PUT/POST with a payload).
+
+But there is problem, (IMO) a nasty bug in the JDK SPNEGO implementation that makes it unusable in a reliable way.
+
+The (Sun) JDK {{sun.net.www.protocol.http.HttpURLConnection}} class uses the {{NegotiateAuthentication}} class to keep track of hostnames that support SPNEGO. 
+
+The {{NegotiateAuthentication}} class uses a static {{HashMap<String, Boolean> supported}} where it keeps if a hostname supports SPNEGO or not.
+
+The first time the JDK gets a {{WWW-Authenticate: NEGOTIATE}} for hostname it will try to obtain the Kerberos service ticket for {{HTTP/<hostname>}}.
+
+If the service ticket is obtained, then the entry in the {{supported}} map will be {{(<hostname>,TRUE)}}, if the service ticket is not obtained the entry will be {{(<hostname>, FALSE)}}.
+
+The {{supported}} map is never purged, this means a given hostname will be blacklisted for the lifetime of the JVM (the singleton is kept in the bootstrap classloader, so it affects the whole JVM).
+
+The problem is that the service ticket may not be obtained for different reasons:
+
+* JVM client is not within  Kerberos login context
+* KDC is not available at the time of the call
+* {{HTTP/<hostname>}} principal does not exist at the time of the call
+
+All these reasons can be 'transient'. If they ever happen before a successful attempt, the hostname is blacklisted for the lifetime of the JVM.
+
+When running testcases, depending on the order testcases run, they pass or the fail.
+
+It is also reasonable to say these 'transient' errors can happen in production in a long running service (NN, Oozie).
+
+The good thing is, and that is why {{AuthenticatedURL}}/{{KerberosAuthenticator}} works fine, is that the {{HttpURLConnection}} checks if the user code is doing SPNEGO handling and lets the user code handle it. And because {{KerberosAuthenticator}} does not blacklists hostnames, things work and recover if necessary.
+
+Based on these finding, I would close this JIRA and HADOO-10453 as invalid., [~daryn], [~atm], others, ping!
+
+, Interesting.  Let me look into the jdk code too.  We had to remove AuthenticatedURL because it was causing all kinds of problems like replay attacks, retries when spnego failed for a completely valid reason, and fallbacks to the pseudo authenticator causing the same thing.
+
+Speaking wrt to webhdfs, POST/PUT isn't a problem because the client explicitly does a "two-step write".  The redirect that actually does the POST/PUT to DN uses a token.  Kerberos isn't valid because the DN's DFSClient must have a token.  Webhdfs also specifically requests a token on the first call, and always uses it after that to avoid repeated spnego negotiations., As best I can tell, the determining factor for whether spnego is not supported is if "Negotiator.getNegotiator(hci)" returns null.  I don't think a false blacklisting can occur.  A host is:
+# Whitelisted if an instance is instantiated
+# Blacklisted if class "sun.net.www.protocol.http.spnego.NegotiatorImpl" is not available, or a reflection error occurs instantiating an instance.
+# No-op for any non-reflection related exceptions.  Next attempt will try again until null or no exception.
+, I've was running the testcases with a KA leveraging JDK SPNEGO and testcases were failing when running all together and succeeding when running one at the time. Debugging I've run into the host being blacklisted. This happens because the NegotiatorImpl is being instantiated (in a negative testcase) without a kerberos context and that throws an exception that makes the host to be blacklisted (for the life of the JVM), then other tests (positive ones) fail., Either {{Class.forName("xxx.NegotiatorImpl")}} must throw {{ClassNotFoundException}}, or {{NegotiatorImpl.newInstance}} must throw {{ReflectiveOperationException}} in order to blacklist.  Which JDK version exhibited the behavior you are describing?, {{NegotiatorImpl}} constructor throws the exception calling its {{init()}} method if you are not within a Keberos login context:
+
+{code}
+    private void init(final String hostname, String scheme) throws GSSException {
+        // "1.2.840.113554.1.2.2" Kerberos
+        // "1.3.6.1.5.5.2" SPNEGO
+        final Oid oid;
+        
+        if (scheme.equalsIgnoreCase("Kerberos")) {
+            // we can only use Kerberos mech when the scheme is kerberos
+            oid = GSSUtil.GSS_KRB5_MECH_OID;
+        } else {
+            String pref = (String)java.security.AccessController.doPrivileged( 
+                    new java.security.PrivilegedAction() {
+                        public Object run() {
+                            return System.getProperty(
+                                "http.auth.preference",
+                                "spnego");
+                        }
+                    });
+            if (pref.equalsIgnoreCase("kerberos")) {
+                oid = GSSUtil.GSS_KRB5_MECH_OID;
+            } else {
+                // currently there is no 3rd mech we can use
+                oid = GSSUtil.GSS_SPNEGO_MECH_OID;
+            }
+        }
+        
+        GSSManagerImpl manager = new GSSManagerImpl(
+                GSSUtil.CALLER_HTTP_NEGOTIATE);
+
+        String peerName = "HTTP/" + hostname;
+
+        GSSName serverName = manager.createName(peerName, null);
+        context = manager.createContext(serverName,
+                                        oid,
+                                        null,
+                                        GSSContext.DEFAULT_LIFETIME);
+        
+	context.requestCredDeleg(true);
+        oneToken = context.initSecContext(new byte[0], 0, 0);
+    }
+{code}
+, I think you are looking too deep.  Here's slightly condensed code for how the white/black list is populated.  Negotiator.getNegotiator must return null to blacklist.
+
+NegotiateAuthentication:
+{code}
+        Negotiator neg = Negotiator.getNegotiator(hci);
+        if (neg != null) {
+            supported.put(hostname, true);
+            cache.put(hostname, neg);
+            return true;
+        } else {
+            supported.put(hostname, false);
+            return false;
+        }
+{code}
+
+Here's the relevant part of Negotiator.getNegotiator.  Null (blacklist) is only returned for ClassNotFoundException or ReflectiveOperationException.  Otherwise an instance is returned (whitelist), or a different exception is thrown (no action).  The snippet of code you posted is invoked via the ctor called by c.newInstance.  Any exception will rip up the stack w/o updating the white/black list.
+{code}
+        try {
+            clazz = Class.forName("sun.net.www.protocol.http.spnego.NegotiatorImpl", true, null);
+            c = clazz.getConstructor(HttpCallerInfo.class);
+        } catch (ClassNotFoundException cnfe) {
+            return null;
+        } catch (ReflectiveOperationException roe) {
+            throw new AssertionError(roe);
+        }
+
+        try {
+            return (Negotiator) (c.newInstance(hci));
+        } catch (ReflectiveOperationException roe) {
+            return null;
+        }
+{code}
+
+I don't doubt you saw an issue, but are you sure it's due to blacklisting?  If yes, did the test maybe tinker with class loaders?  Otherwise it would require a ReflectiveOperationException originating in the GSS code.
+
+More likely you saw manifestations of bugs in {{AuthenticatedURL}} that caused me to remove it from webhdfs., 100% positive was due to blacklisting, I was debugging JDK classes. 
+
+Run {{TestKerberosAuthenticator}}, if you run test by test, things work fine. If you run all tests together, depending on the order they run, they fail. See attached testFailures.png file (from my IDE run).
+
+Attached you have the patch I was using.
+, The tests pass for me.  Which JDK are you using?, [~daryn], I believe the tests are passing for you because the order they are running. If the {{testNotAuthenticated()}} runs before the {{testAuthenticated()}}, then localhost will be blacklisted as not supported, if the run in the opposite order, then things work because localhost is not blacklisted.
+
+I'm attaching a patch with a new test {{TestX}} (based on the {{TestKerberosAuthenticator}} test) which demonstrates this, it has 2 methods: {{testOrderOk()}} and {{testOrderFailing()}}. these method simply invoke in diff order the original 2 testcases. 
+
+*Using hadoop-auth client SPNEGO*:
+
+Apply the {{testorder.patch}} patch on trunk and run  2 diff mvn test invocations, one running {{TestX#testOrderOk}} and the other running {{TestX#testOrderFailing}}:
+
+{code}
+$ mvn test -Dtest=TestX#testOrderOk
+
+$ mvn test -Dtest=TestX#testOrderFailing
+{code}
+ 
+Both testcases run OK.
+
+*Using JDK client SPNEGO*:
+
+Apply both, the {{testorder.patch}} and the HADOOP-10850.patch, patches on trunk and run  2 diff mvn test invocations, one running {{TestX#testOrderOk}} and the other running {{TestX#testOrderFailing}}:
+
+{code}
+$ mvn test -Dtest=TestX#testOrderOk
+
+$ mvn test -Dtest=TestX#testOrderFailing
+{code}
+ 
+Now one test fails.
+
+This is using both Sun JDK6 and JDK7:
+
+java version "1.7.0_51"
+Java(TM) SE Runtime Environment (build 1.7.0_51-b13)
+Java HotSpot(TM) 64-Bit Server VM (build 24.51-b03, mixed mode)
+
+java version "1.6.0_65"
+Java(TM) SE Runtime Environment (build 1.6.0_65-b14-462-11M4609)
+Java HotSpot(TM) 64-Bit Server VM (build 20.65-b04-462, mixed mode)
+
+
+
+, [~daryn], have you had a chance to think about this? Does seems reasonable to you to close it as invalid?, Moving bugs out of previously closed releases into the next minor release 2.8.0.]

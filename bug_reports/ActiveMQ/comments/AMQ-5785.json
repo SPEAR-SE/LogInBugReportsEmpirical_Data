@@ -1,0 +1,46 @@
+[Attaching the thread dump. This issue is occurring everyday at peak hours. We have upgraded to 5.10.0 from 5.6.0 about 4 months ago. This issue has started occurring since a week.  , This appears to probably be the same race condition issue I reported here: https://issues.apache.org/jira/browse/AMQ-5712
+
+[~tabish121] uploaded a patch to that Jira that I've been running for a while and it has solved the deadlock problem for me.  It hasn't been committed to master yet but if you don't mind applying the patch yourself it should at least help you stop the deadlock until it gets fixed permanently.
+, Given this is logged against 5.10 it may be a different issue so it'd be a good idea to try out a later release 5.11.1+, Agree with Timothy. This seems to be a different issue. This issue occurs in one of our several AMQ environments and cannot be replicated anywhere else.
+
+I can go with the upgrade if I can find a root cause of the issue and for sure know that 5.11.1 will fix it as an AMQ upgrade in our environment is non trivial.
+The issue again occurred yesterday and the thread dumps from yesterday tell the same story. If you need any activemq logs either in trace/debug mode I will be able to attach them here.
+
+I am going through the ActiveMQ source code to corner this issue. Any pointers/help in this regard is greatly appreciated., Yes, I think you are right that it is different.  At first glance it looked like the same issue based on the addMessageLast thread being the same.  The patch I suggested helps with timing out while waiting to add a message on a store, but this is different. 
+
+Based on your thread dump, the NIO worker has acquired the {{messagesLock}} in the {{sendMessage}} method of the Queue class (line 1853 in the Queue.java) and is waiting on the intrinsic lock of FilePendingMessageCursor on the {{addMessageLast}} method (line 207 in FilePendingMessageCursor.java).  The BrokerService thread has acquired the intrinsic lock of FilePendingMessageCursor in {{onUsageChanged}} (line 394 of FilePendingMessageCursor.java)  and is waiting on {{messagesLock}} in the {{messageExpired}} method (line 1841 of Queue.java)....a pretty classic deadlock.  In version 5.11.1 some of this has been refactored a bit, {{sendMessage}} method has been replaced with {{cursorAdd}}, etc.  However, at a glance I think the deadlock issue would still exist in 5.11.1.
+
+Tim, do you think it would be worth replacing the {{messagesLock.writeLock().lock()}} calls with {{messagesLock.writeLock().tryLock()}} and handle the lock timeout to prevent a potential deadlock?
+
+
+, it looks like the onUsageChanged of the filecursor needs to remove expired messages from the cursor and then process them as expired *without* holding the cursor lock. So break out discardExpiredMessages from expireOldMessages and call discardExpiredMessages with some list, without the lock, Commit 8b23e072eeab2beebf62fd267bf8d9f88d05b5c2 in activemq's branch refs/heads/master from [~tabish121]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=8b23e07 ]
+
+https://issues.apache.org/jira/browse/AMQ-5785
+
+Avoid holding the intrinsic lock on the cursor when expiring the
+messages.  , [~gtully] , Good idea, I meant to come back to this issue and take a closer look at solving it but it got lost in the backlog. :), Reviewing the commit I found that it introduces new mistake.
+I believe that commit solves the deadlock problem, but...
+
+It breaks original implementation of method {{expireOldMessages()}} which is:
+# still used by other methods - {{tryAddMessageLast(MessageReference, long)}}, {{addMessageFirst(MessageReference)}}
+# protected, so potentially used by extending classes
+
+Problem caused by changing {{expireOldMessages()}} is that it breaks the functionality of freeing space when adding new messages to the cursor. Currently after this fix it only creates a an unnecessary load of expired messages to the list which is never used.
+
+Commenting on these lines in code (which are shared by both addMessageX methods):
+{code}
+  if (!hasSpace()) {
+    if (isDiskListEmpty()) {
+      expireOldMessages(); // this will not clear anything!
+      if (hasSpace()) { // this probably won't happen
+        memoryList.addMessageFirst(node);
+        node.incrementReferenceCount();
+        return;
+      } else { // will always fallback to flushing data to disk
+        flushToDisk();
+      }
+    }
+  }
+{code}
+]

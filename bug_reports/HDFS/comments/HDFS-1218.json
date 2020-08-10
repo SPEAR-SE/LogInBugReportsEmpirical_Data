@@ -1,0 +1,156 @@
+[Here's a patch, but won't apply on top of the branch currently. Requires HDFS-1057 and possibly some other FSDataset patches first to apply without conflict (possibly HDFS-1056), a few questions
+
+1. this assumes a DN goes down with the client (either in tandem, or on the same box) and that the NN initiates lease recovery later correct?
+
+2. the idea here is that RBW should have lengths longer than RWR, but both will have the same genstamp?
+ 
+If so, why aren't we just taking the replica with the longest length? Is there a reason to 
+
+3.  if sync() did not complete, there is no violation.  do I follow?  i agree we can try to recover more data if it's there, but i just want to make sure i'm on the same page
+
+, I realize in the hadoop code we already swallow InterruptedException frequently, but I think you can change the trend here:
+
+{code}
+        // wait for all acks to be received back from datanodes
+        synchronized (ackQueue) {
+          if (!closed && ackQueue.size() != 0) {
+            try {
+              ackQueue.wait();
+            } catch (InterruptedException e) {
+              Thread.currentThread.interrupt();  //add this 
+            }
+            continue;
+          }
+        }
+{code}
+
+otherwise, it's very easy to have a thread that I own and manage that has a DFSOutputStream in it that swallows an interrupt.  when i check Thread.currentThread.isInterrupted() to see if one of my other threads has interrupted me, i will not see it
+
+(the crux here is that swallowing interrupts in threads that hadoop controls are less harmful--this is directly in client code when you call sync()/close())
+, disregard comment above, was meant for hdfs-895
+, bq. 1. this assumes a DN goes down with the client (either in tandem, or on the same box) and that the NN initiates lease recovery later correct?
+
+Really, this applies any time that recovery is initiated after the node has come back to life. The most likely case is a hard lease expiry like you suggest above, since it gives a full hour for the DN to restart, but it could be a manually triggered recovery as well.
+
+bq. 2. the idea here is that RBW should have lengths longer than RWR, but both will have the same genstamp?
+
+yep, s/should/could/ though (in many cases, RWR will have the right length)
+
+bq. If so, why aren't we just taking the replica with the longest length? Is there a reason to
+
+In a normal pipeline failure, it's likely that the earlier DNs in the pipeline will have longer length than the later ones, right? So if we always just took the longest length, we'd usually recover to a pipeline of length 1 even when other replicas are available that satisfy correct semantics. At least, I assume this is the reasoning - in this patch I was just trying to maintain the semantics elsewhere.
+
+bq. 3. if sync() did not complete, there is no violation. do I follow? i agree we can try to recover more data if it's there, but i just want to make sure i'm on the same page
+
+The issue here is that sync() could complete, but the post-power-failure replica could still be truncated. Recall that hflush() doesn't actually fsync to disk, so after an actual power failure of the local node, it will usually come back with a truncated replica after EXT3 journal replay., 1. how can there be a pipeline recovery by a client when the client goes down?  in client-initiated recovery, it sends in the list of nodes which excludes the node that went down.  Even if a node goes down and comes back up, it won't participate in recovery.
+
+The only case I can see that this can occur is if the client is not the one to initiate lease recovery--ie hard or soft limits in the NN.
+
+I only point this out because I wonder if this recovery code can be simplified.  We already pass in a flag that is a surrogate for indicating NN initiated lease recovery (closeFile == true => NN).  
+
+maybe not, but I wanted to throw it out there.
+
+2. hmm, i think i see, it's sort of like using RBW and RWR as 1 and 0, and tacking to the genstamp so that you take the highest appended genstamp and take the shortest length of those as the length of the block.  in this way, you are auto-incrementing the genstamp in a way...
+
+but I think there's still an edge case:  
+
+  i. client node has network trouble (slow, falls off) and transfer to next DN in pipeline from primary slowed/stops (going to timeout)
+  ii. DN-1 writes after putting bytes into network buffer
+  iii. bytes make it to first DN disk, but do not leave OS network stack
+  iv. DN-1 comes up before NN starts hard expiry lease recovery
+  v. we use the other DNs length which is shorter
+
+or do I misunderstand?
+, re #1: I was referring to client-initiated recovery after a soft lease expiration (like what we do in all of the TestFileAppend4 tests). In that case, the targets for recovery come from the "targets" field of the last block, which will include the previously-down node, which may well have restarted by this time.
+
+Regarding simplifying code, perhaps... but I think it's a bit late in the game to change it much now :)
+
+re #2. I think that's fine - we'll use a shorter length, but in this case the client never received ACK for those extra bytes. Thus, no sync() could have succeeded, and it's OK to truncate those extra bytes, even though we happen to have them., ah, interesting.  so the point of this fix isn't to get the best block, but to maintain sync semantics?, right - the block will get truncated to a length *smaller than* the last sync, in the following not-too-rare circumstance:
+1) node loses power
+2) node reboots, replays EXT3 journal (almost always results in truncation of replica)
+3) lease recovery occurs and includes the rebooted node as a recovery target, re: the patch
+
+shouldn't the skipping of RWRs be inside the else block?  if keepLength is passed by a client, the fact the block length matches should be the sole criteria for accepting it right?  there is not a notion of "better".
+
+(tho, I don't think it will ever be the case that we have RWRs participating in a client-initiated recovery.  soft expiry even comes from the NN where keepLength=false)
+
+{code}
+        if (!shouldRecoverRwrs && info.wasRecoveredOnStartup()) {
+          LOG.info("Not recovering replica " + record + " since it was recovered on "
+              + "startup and we have better replicas");
+          continue;
+        }
+        if (keepLength) {
+          if (info.getBlock().getNumBytes() == block.getNumBytes()) {
+            syncList.add(record);
+          }
+        } else {          
+          syncList.add(record);
+          if (info.getBlock().getNumBytes() < minlength) {
+            minlength = info.getBlock().getNumBytes();
+          }
+        }
+{code}, Yea, I see your point that we could move it inside. Like you said, though, I don't think it's material because the situation shouldn't happen in practice, and I think the code is a little clearer to skip at the top of the loop like that. Let me know if you want me to upload a new patch.
+
+(btw, I haven't mentioned above, but I've been running with this patch for a couple weeks with lots of testing, it should be pretty stable), I racked my brain and can't come up with a case that this could actually occur--keepLength is only set true when doing an append.  If any nodes had gone down and come back up (RWR), they either have an old genstamp and will be ignored, or soft lease expiry recovery is initiated by the NN with keepLength = false first.
+
+i think the idea + patch look good to me
+(and thanks for taking the time to explain it)
+, sorry, to clarify my previous comment, "this" = the case in my previous(previous comment) that was talking about moving the recovery-state check inside the else block. 
+
+so just to clarify, i think this patch is good for 0.20-append.
+
+todd:  do we need to port this to trunk?  or does trunk already handle this since it has the RBW/RWR?
+, bq. todd: do we need to port this to trunk? or does trunk already handle this since it has the RBW/RWR?
+
+Trunk should already handle this case. We should port forward these test cases at some point, but there's already an open JIRA to move forward all the new TestFileAppend4 cases - hopefully we can do that after we finish getting everything in this branch., This looks ready for commit into 0.20-append. Todd: can you pl upload a patch that merges with 0-20-append branch? Thanks a lot., The patch has a lot of conflicts unless we do HDFS-1057 and HDFS-1056 first. Rather than try to resolve those conflicts, I think it's safer to get those patches in first, and then have less confict resolution work to do here (I'm afraid of switching around the application order too much - too easy to flub resolution and introduce a bug)., Ok no problem. then we will just have to wait for HDFS-1056 and HDFS-1057 to be committed into trunk first., Todd, is this similar to HDFS-1103?
+will the problem goes away
+if we don't take the replica at the reboot node
+in the recovery target?
+I.e., we only take RBW replicas into lease recovery,
+but not RWR?, Patch ported to 0.20-security.
+
+TestFileAppend4#testFullClusterPowerLoss() fails in this patch. The test involves lease recovery post DN restart, triggered by append. Since DN ipc ports change between restarts and NN does not update the IPC port for the DNs upon re-registration, the lease recovery uses ipc port from the previous registration. This results in RPC failure and the test failure.
+
+I have change DatanodeID#updateRegInfo() to update ipc port along with other fields., +1 for the patch., I committed the patch to 0.20-security., Sounds like you incorporated HDFS-894?, Suresh committed this to 0.20.205, Closed upon release of 0.20.205.0, {code}
+ if (!shouldRecoverRwrs && info.wasRecoveredOnStartup()) {
++          LOG.info("Not recovering replica " + record + " since it was recovered on "
++              + "startup and we have better replicas");
++          continue;
++        }{code}
+
+@Todd, can you please tell why this check added?
+
+Take a case,  
+
+ 1) DN1->DN2->DN3 are in pipeline.
+ 2) Client killed abruptly
+ 3) one DN has restarted , say DN3
+ 4) In DN3 info.wasRecoveredOnStartup() will be true
+ 5) NN recovery triggered, DN3 skipped from recovery due to above check.
+ 6) Now DN1, DN2 has blocks with generataion stamp 2 and DN3 has older generation stamp say 1 and also DN3 still has this block entry in ongoingCreates
+ 7) as part of recovery file has closed and got only two live replicas ( from DN1 and DN2)
+ 8) So, NN issued the command for replication. Now DN3 also has the replica with newer generation stamp.
+ 9) Now DN3 contains 2 replicas on disk. and one entry in ongoing creates with referring to blocksBeingWritten directory.
+ 
+When we call append/ leaseRecovery, it may again skip this node for that recovery as blockId entry still presents in ongoingCreates with startup recovery true.
+It may keep continue this dance for evry recovery.
+And this stale replica will not be cleaned untill we restart the cluster. Actual replica will be trasferred to this node only through replication process.
+
+Also unnecessarily that replicated blocks will get invalidated after next recoveries....
+
+I understood that check might be because to exclude the restarted node for calculating the min lengths to truncate.
+, Hi Uma. The idea was to exclude the restarted node for length calculation. It looks like you're right that we aren't putting them in syncList at all, whereas we could put them in syncList in the case that they have length >= the calculated minlength.
+
+However, it's still the case that DN3 might be shorter than the good replicas, and not included in recovery. In that case, it should be deleted when it reports the block with the too-low GS later. I guess the real issue is that we don't include all RBW blocks in block reports in the 1.0 implementation, so it sticks around forever?, Since this issue has been closed a long time, mind opening a new one against branch-1? If you could come up with a test case that would also be great. Seems like you could modify the existing test cases just to make sure that the other replica eventually gets removed., Thanks a lot Todd.
+
+{quote}
+However, it's still the case that DN3 might be shorter than the good replicas, and not included in recovery. In that case, it should be deleted when it reports the block with the too-low GS later. I guess the real issue is that we don't include all RBW blocks in block reports in the 1.0 implementation, so it sticks around forever?
+{quote}
+
+Exactly.
+
+{quote}
+Since this issue has been closed a long time, mind opening a new one against branch-1? If you could come up with a test case that would also be great. Seems like you could modify the existing test cases just to make sure that the other replica eventually gets removed.
+{quote}
+Sure. I will file one new bug and come up with testcase., Todd, here is the JIRA filed HDFS-3161]

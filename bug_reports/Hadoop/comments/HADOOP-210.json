@@ -1,0 +1,61 @@
+[I'd guess you're out of file handles or threads (both which can appear as OutOfMemoryError).  Each DFS client JVM and each datanode keeps a connection open to the namenode with a corresponding thread.  The number of threads per process in some older kernels was limited, but more recent kernels have mostly removed that limit, and the scheduler now also supports large numbers of threads effectively.  But you may need to change some limits.  Use 'ulimit -n' to see how many file handles you are permitted, and increase that to at least 4x the number of nodes in your cluster.  You may need to change some kernel options to increase the number of threads:
+
+http://www.kegel.com/c10k.html#limits.threads
+
+You can monitor the number of open file handles with 'lsof', and the number of threads with 'ps'.
+
+I spent some time trying to get Hadoop's IPC to use non-blocking IO a while back (and hence far fewer threads).  The problem is that, since IPC requests include objects, we cannot start processing a request until we've recieved the complete request, and requests can be bigger than a single packet.  Moreover, the end of one request and the beginning of the next can be combined in a packet.  So it's easy to accumulate buffers for many connections using just a single thread, the problem is knowing when a buffer has a complete request that should be dispatched to a worker thread.  So we'd need to length-prefix requests, or break them into length-prefixed chunks.  This may be required for effective operation of very large clusters, or perhaps Linux kernel threads are now up to the task.  We'll soon see.
+, The file handles are fine at 32768.
+The kernel is 2.6.9, so it should be fine too.
+
+The problem seems to be that the default thread stack size is 512k, which is more than a gig of stack for his 2036 threads. Mahadev is going to take the stack size on the Listener threads down to 128k, which should take the pressure off., 
+Reducing stack size may relieve the problem temporally, but will not solve the problem completely.
+It seems to me that the problem is due to the fact that a thread is created per RPC connection. A better solution is to use a thread pool and a connection queue. This way, it is easier to manage the resource limits.
+
+, > Reducing stack size may relieve the problem temporally, but will not solve the problem completely.
+
+This remains to be seen.  What you say is possible, but it is also possible that, e.g., 2GB heap may gracefully  handle 10k or more connection threads.  We need to determine this.
+
+It's a question of constants.  We know we need to allocate some buffer memory per connection, perhaps a few K, but perhaps more in some cases (e.g., block reports).  With a thread, we need some stack space, but less buffer space; probably more memory on the whole.  But there's no point in optimizing this if we can handle as many threads as we need with the amount of memory we have., It seems clear to me that before we get to a 2000 node Hadoop cluster, we will be using select to manage the incoming connections. Even with the 128k stack the 8000 threads would need 1 gig of ram, which is too much on our current hardware. The servers already have thread pools, but they just also have a thread per a socket., Let's not argue the point in the abstract. 
+
+If someone does submit a patch that reduces the overhead of having many RPCs/connections without complicating the programming model or tanking performance, I assume it would be acceptable, right?
+
+If someone feels they can achieve these aims, I'd encourage them to sign up / implement something.  Then we can test it.
+
+Otherwise, let's let it lie.
+
+, > Let's not argue the point in the abstract.  If someone [...] it would be acceptable, right?
+
+Is that a question for me?  I can't answer in the abstract.  Show me code & I'll give an opinion.  Other committers can too, folks can cause me to change my opinion, etc.  Heck, if someone convincingly demonstrates that the thread-per-connection model has reached the end of its tether, then I might implement it myself.
+
+Having explored this a few times now, I currently think some sort of chunked encoding for requests is required.  We could also chunk responses, which might solve some other issues., I'm exploring possible solutions to this problem, kicking off a discussion...
+
+a) Procrastinate
+
+  Get a really beefy 64-bit namenode. 
+  Run it with lots of RAM in 64-bit (assuming none of the code needs changes and the JVM works) or with (almost) full 4GB virtual address space in 32-bit mode.
+
+b) Thread pool
+   
+  i) Create one thread-per (persistent) connection for the datanodes and then use a thread-pool to handle incoming client-connections. It would ensure that only during times of very high memory usage incoming client connections are penalized while the datanodes themselves have a persistent connection to the namenode.
+
+  ii) Everyone (clients & datanodes) go through the (possibly separate) thread-pool(s).
+
+c) Selectors
+
+ Owen: I'm not very clear how selects will help could you please chime in (I'm only casually acquainted with Selectors)?
+
+thanks,
+Arun, Threads are already pooled, with a single thread per client JVM.
+
+The solution is either to not cache connections, using a new connection per request, or to use selectors, so that a single thread can efficiently handle requests on all connections.  In the latter case, we need to alter the request protocol so that incoming requests can be buffered until they are complete, and then dispatched to a worker thread.  Currently a request cannot be parsed except by a readFields method, so there's no way for generic server code to tell when one request ends and the next begins.  So we can simply first write requests to a buffer on the client, then send them length-prefixed., I think we need to break the one thread per connection model.  otherwise our servers will not scale, so "selectors" are needed.
+
+Also we probably need to break the very long connection caching model and the invarient of one connection per VM.  Connection setup is nearly free and serializing requests from different threads creates race conditions and other failure cases.
+, It's looking clear to me that we need to change the RPC server to use java.nio.channels.ServerSocketChannel instead of the current connection/thread model.
+Is that what we're talking about?
+
+Who is the nio expert here? :-), Alan, yes, changing Server.java to use nio's Selector is what's under discussion, using a single thread on the server to buffer requests until they are complete, then dispatching each request to a worker thread.  Client.java must also be modified to buffer request objects so that they can be written preceded by their size, permitting Server.java to determine when each request has fully arrived., I am implementing this. For now I am using nio only for client accepts and subsequent reads from the client. The handler threads write the output/response directly by themselves to the clients concerned. Clients are disconnected if they don't communicate within a certain timeout. The thing is that time intervals could potentially be different for different protocols (e.g., dfs datanodes' heartbeats and client leases). So for now I am assuming a maximum timeout for the IPC communication (read from the conf file) and that is applicable for all RPC protocol communication. The servers keep track of when a client last communicated with it (either through TCP connect or through TCP write). Comments?, Attached is the patch for doing selector-based RPC communication., This looks great to me & passes my tests.
+
+One improvement I'd like to see is for Client.java to not serialize the call twice.  This could easily be done with Hadoop's DataOutputBuffer: write the call to a DataOutputBuffer, write the length, then write the data from the buffer.
+
+Thanks!, Thanks Doug for the comment. I have updated the patch accordingly., I just committed this.  Thanks, Devaraj!, I'm having problems with this patch seeming to cause servers to stop serving requests. Usually, I can do a bit of work, but when I try to submit a job it, the job never seems to show up in the webapp., I reverted this for now, since it (for unknown reasons) seemed to break distributed operation., I think I will need to work with Owen to have a quick resolution on this., This patch was tested by Owen., I just committed this.  Thanks, Devaraj!]

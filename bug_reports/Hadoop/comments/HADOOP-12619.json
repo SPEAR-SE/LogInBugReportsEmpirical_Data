@@ -1,0 +1,105 @@
+[The code of hadoop 2.7.1 changes the implement of GzipCodec.createOutputStream as 
+
+{code}
+  @Override
+  public CompressionOutputStream createOutputStream(OutputStream out) 
+    throws IOException {
+    if (!ZlibFactory.isNativeZlibLoaded(conf)) {
+      return new GzipOutputStream(out);
+    }
+    return CompressionCodec.Util.
+        createOutputStreamWithCodecPool(this, conf, out);
+  }
+
+  @Override
+  public CompressionOutputStream createOutputStream(OutputStream out, 
+                                                    Compressor compressor) 
+  throws IOException {
+    return (compressor != null) ?
+               new CompressorStream(out, compressor,
+                                    conf.getInt("io.file.buffer.size", 
+                                                4*1024)) :
+               createOutputStream(out);
+  }
+
+    static CompressionOutputStream createOutputStreamWithCodecPool(
+        CompressionCodec codec, Configuration conf, OutputStream out)
+        throws IOException {
+      Compressor compressor = CodecPool.getCompressor(codec, conf);
+      CompressionOutputStream stream = null;
+      try {
+        stream = codec.createOutputStream(out, compressor);
+      } finally {
+        if (stream == null) {
+          CodecPool.returnCompressor(compressor);
+        } else {
+          stream.setTrackedCompressor(compressor);
+        }
+      }
+      return stream;
+    }
+ 
+{code}
+
+but CompressorStream override the close method and still not return the compressor to pool
+
+, Observed this behavior in 2.7.1 with org.apache.hadoop.io.compress.BZip2Codec::createOutputStream(OutputStream) - the process would eventually exhaust the native memory on the host and crash.  Here's the relevant code:
+{code}
+@Override
+  public CompressionOutputStream createOutputStream(OutputStream out)
+      throws IOException {
+    return CompressionCodec.Util.
+        createOutputStreamWithCodecPool(this, conf, out);
+  }
+{code}
+createOutputStreamWithCodecPool gets a compressor from the CodecPool, calls codec.createOutputStream (out, compressor), and then calls CompressionOutputStream::setTrackedCompressor(compressor) so that the compressor can be cleaned up later by the CompressionOutputStream  
+{code}
+static CompressionOutputStream createOutputStreamWithCodecPool(
+        CompressionCodec codec, Configuration conf, OutputStream out)
+        throws IOException {
+      Compressor compressor = CodecPool.getCompressor(codec, conf);
+      CompressionOutputStream stream = null;
+      try {
+        stream = codec.createOutputStream(out, compressor);
+      } finally {
+        if (stream == null) {
+          CodecPool.returnCompressor(compressor);
+        } else {
+          stream.setTrackedCompressor(compressor);
+        }
+      }
+      return stream;
+    }
+{code}
+CompressionOutputStream has a private trackedCompressor attribute that it returns to the CodecPool on close():
+{code}
+   private Compressor trackedCompressor;
+   
+   void setTrackedCompressor(Compressor compressor) {
+    trackedCompressor = compressor;
+  }
+
+    @Override
+  public void close() throws IOException {
+    finish();
+    out.close();
+    if (trackedCompressor != null) {
+      CodecPool.returnCompressor(trackedCompressor);
+      trackedCompressor = null;
+    }
+  }
+{code}
+This would be great, but when CompressionCodec.Util.createOutputStreamWithCodecPool calls codec.createOutputStream(out, compressor), the BZip2Codec never actually creates a CompressionOutputStream.  It creates one of two subclasses:
+{code}
+ @Override
+  public CompressionOutputStream createOutputStream(OutputStream out,
+      Compressor compressor) throws IOException {
+    return Bzip2Factory.isNativeBzip2Loaded(conf) ?
+      new CompressorStream(out, compressor, 
+                           conf.getInt("io.file.buffer.size", 4*1024)) :
+      new BZip2CompressionOutputStream(out);
+  }
+{code}
+Each of these subclasses (CompressorStream and BZip2CompressionOutputStream) in turn overrides the close() method, and it will be one of these two implementations that will be called when the returned stream is closed.  Neither implementation returns the compressor to the pool, so every time you ask the CodecPool for a compressor it creates a new one, allocating more native memory.  
+
+One workaround is to deal directly with the CodecPool, and use the BZip2Codec::createOutputStream method that takes a compressor as a second argument - and of course to return the compressor to the CodecPool yourself as soon as you're finished with it., Related to HADOOP-12007?]

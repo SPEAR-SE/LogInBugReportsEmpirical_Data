@@ -1,0 +1,113 @@
+[Here's some behavior I verified:
+
+- cat spits out the correct contents. Not the appended corrupt data.
+- fsck doesn't detect anything either
+- Even an hdfs -cp copies over the correct file. i.e. the copied file's block is clean.
+
+So we need to make a call on whether we should "fix this". i.e. should a block be marked corrupt in this case?, I noticed this change when toying with 0.23.0 as well. Its only the appending of data to blocks that causes this. I'm guessing we've gotten stricter on registered block lengths and do not consider reads or checksums beyond known length?
+
+I'm inclined to call any block that has been modified in any way outside of HDFS as a corrupt block, and that it ought to be invalidated and re-replicated., As best I can tell based on a cursory read of the code, append will add to the block but not immediately update the file size until the block is committed -- block fills or the stream is closed.  Client readers will only get the committed block size and data, which means the spurious bytes are "harmless" to a client.  I think an append will seek to the end of the committed data, and then overwrite the spurious bytes.  
+
+I'm not a DN expert, but detecting the incorrectly sized blocks is probably something best left to fsck and/or the block scanner.  It also might be possible to have the NN issue a truncate in response to a block report that doesn't match the NN's view of the world.  Maybe hadoop already does something like this.  A DN expert should weigh in., Hey Daryn,
+
+Sorry to have misguided with the 'append' word but I loosely meant something like:
+
+$ cat >> blk_XYZ_FOO
+thisisbadlyappendeddataonexistingblock
+^D
+
+This is probably also what the OP is talking about., I'd suggest that the corrective action for an otherwise valid block should be a truncate rather than invalidate., Yes, OP meant physically appending to the block.  I was referring to hadoop appends because I think the design of append masks the OP's issue., I was experimenting more and I noticed that after restarting the cluster, if I try to cat the file it finally notices the corruption. So we definitely have an inconsistency that we should fix., After the restart, I suspect {{hadoop fs -ls}} on the file reports the new physical size of the block?, Nopes After the restart, the filesize is still the correct, uncorrupted size :(, The problem seems to be in BlockSender.java:258-285
+
+Imagine our file was originally 100 bytes and got corrupted to 110 bytes.
+{noformat}
+      // end is either last byte on disk or the length for which we have a 
+      // checksum
+      long end = chunkChecksum != null ? chunkChecksum.getDataLength()
+          : replica.getBytesOnDisk();
+      if (startOffset < 0 || startOffset > end
+          || (length + startOffset) > end) {
+        String msg = " Offset " + startOffset + " and length " + length
+        + " don't match block " + block + " ( blockLen " + end + " )";
+        LOG.warn(datanode.getDNRegistrationForBP(block.getBlockPoolId()) +
+            ":sendBlock() : " + msg);
+        throw new IOException(msg);
+      }
+      
+      // Ensure read offset is position at the beginning of chunk
+      offset = startOffset - (startOffset % chunkSize);
+      if (length >= 0) {
+        // Ensure endOffset points to end of chunk.
+        long tmpLen = startOffset + length;
+        if (tmpLen % chunkSize != 0) {
+          tmpLen += (chunkSize - tmpLen % chunkSize);
+        }
+        if (tmpLen < end) {
+          // will use on-disk checksum here since the end is a stable chunk
+          end = tmpLen;
+        } else if (chunkChecksum != null) {
+          // last chunk is changing. flag that we need to use in-memory checksum 
+          this.lastChunkChecksum = chunkChecksum;
+        }
+      }
+      endOffset = end;
+{noformat}
+Then "end" here will be 110, because of replica.getBytesOnDisk()
+The calculation of endOffset seems to be missing its mark.
+
+Either that or BlockSender:sendPacket() should be properly checking the checksum till endOffset which it is not, Can someone please tell me if a datanode is supposed to verify the checksums of the chunks in a block it is serving up before sending it onto the network? If so why is DataXceiver.java:215 setting verifyChecksum to false?
+
+{noformat}
+        blockSender = new BlockSender(block, blockOffset, length,
+            true, false, datanode, clientTraceFmt);
+{noformat}, Ouch! This JIRA is turning out to be more of a pickle than I expected. First, to answer my own question (Thanks Bobby). No. The DN doesn't verify the checksum before serving up the data. That responsibility falls to the client which is receiving the data. Presumably this was done so that checksum verification is not done twice. 
+
+Now here's what I discovered.
+1. Each datanode has a ReplicasMap. On startup, the DN loads the metadata about each block in this map.
+2. Every subsequent request for that metadata (e.g. request for the length of the block) is fulfilled from this in-memory map. If the block file has been changed (e.g. appended to), the ReplicasMap has no knowledge of the fact.
+
+So when a client requests a block, the DN serves data until the uncorrupted length. Its only after a DN is restarted that it serves up the corrupted data, which the Client then notices.
+
+I talked with Kihwal, and he told me we should figure out what happens in an append. Does the corrupt data get over-written? What happens when the block is corrupted, the DN is restarted, and then data is appended to the block?, BlockPoolSliceScanner is not going to detect this kind of corruption either. BlockPoolSliceScanner.java:406
+{noformat}
+        blockSender = new BlockSender(block, 0, -1, false, true, datanode,
+            null);
+{noformat}
+Its using BlockSender with verifyChecksum set to be true. But that code still picks up the block replica size from replicasMap which is WRONG (after corruption).
+
+So the periodic (by default once every 3 weeks) scan won't detect the corruption either., Ran append on a corrupted file. The corruption is simply overwritten. So we're good on that front. If the corrupted data is longer than the appended data, then the corrupt data still extends beyond the correct data.
+
+If I restart the DN, and then try appending again, it detects the corruption successfully.
+{noformat}
+$ java TestHadoop23 #My test append program
+2012-02-02 16:18:44,083 INFO  hdfs.DFSClient (DFSOutputStream.java:createBlockOutputStream(1059)) - Exception in createBlockOutputStream
+java.io.EOFException: Premature EOF: no length prefix available
+        at org.apache.hadoop.hdfs.protocol.HdfsProtoUtil.vintPrefixed(HdfsProtoUtil.java:158)
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.createBlockOutputStream(DFSOutputStream.java:1038)
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.setupPipelineForAppendOrRecovery(DFSOutputStream.java:939)
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.run(DFSOutputStream.java:461)
+2012-02-02 16:18:44,087 WARN  hdfs.DFSClient (DFSOutputStream.java:run(549)) - DataStreamer Exception
+java.lang.NullPointerException
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.run(DFSOutputStream.java:510)
+Exception in thread "main" java.io.IOException: All datanodes <someip>:50010 are bad. Aborting...
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.setupPipelineForAppendOrRecovery(DFSOutputStream.java:907)
+        at org.apache.hadoop.hdfs.DFSOutputStream$DataStreamer.run(DFSOutputStream.java:461)
+{noformat}, Talked to Nathan. He discovered that DirectoryScanner.java:374 should discover the corruption. It runs once every 6 hours by default.
+{noformat}
+          } else if (info.getGenStamp() != memBlock.getGenerationStamp()
+              || info.getBlockFile().length() != memBlock.getNumBytes()) {
+            // Block metadata file is missing or has wrong generation stamp,
+            // or block file length is different than expected
+            statsRecord.mismatchBlocks++;
+            addDifference(diffRecord, statsRecord, info);
+          }
+{noformat}, Thanks Kihwal, Nathan, Daryn and Bobby for all your help. :)
+
+We've determined that this bug will be closed as Won't Fix because:
+1. The periodic DirectoryScanner (used for block reports every 6 hours) DOES detect the corruption. 
+2. During the time between the DirectoryScanner runs, the DN continues to serve the correct, uncorrupted data. 
+3. If the DN is restarted between the DirectoryScanner runs, corruption is again detected.
+4. Appends work fine and overwrite the corrupt data. 
+
+So bad data is never served. And corruption is detected frequently if not instantaneously. 
+
+If anyone has any objections, please speak now. Or forever hold your peace :-D, Closing as discussed.]

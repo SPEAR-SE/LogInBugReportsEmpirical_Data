@@ -1,0 +1,64 @@
+[We can definitely check into this bug, but when sending async (or non-persistent) like you are, you may wish to consider using producer windows so you don't run into this type of producer flow control which blocks the entire connection.
+
+See here:
+
+http://activemq.apache.org/producer-flow-control.html, You should be able to interrupt the Thread that's blocked in the sync send call so that the application can shutdown normally., I had tried both of those tricks before without fixing the issue. The key was to do both at the same time. By turning on producer windowing I am not blocking on a socket write which means the Thread.interrupt will work because we blocking on a regular lock. I'll update the example project showing the workaround. That solves my immediate issue, is this otherwise considered a "wont fix"?, To be clear: Thread.interrupt() while in SocketOutputStream.socketWrite doesn't work. I needed to be in the "window blocking" for thread.interrupt to work., You're welcome to figure out a clever fix and submit a patch, not sure there's a whole lot that can be done in this case. , So it makes sense to me why the non-producer window version blocks; native socket writes don't react to thread.interrupt(). I can't think of a way around that problem. The only thing I would imagine helping is to default to the other strategy and then require people to opt-in to this more dangerous (and less performant?) mode.
+
+However I was annoyed by the fact I need a Thread.interrupt even with the other version. This means I need to add an extra level of synchronized bookkeeping to perform a clean shutdown. I dug into the source code of activemq and the issue is there is a tight wait loop in org.apache.activemq.usage.MemoryUsage where it only checks the "percentUsed" field. I believe it should also look at the "started" field and bail if the usage counter has been stopped. I have to imagine that was what the developers of that class were planning, on the stop method they notify on the same mutex to wake up all the listeners (presumably so they can bail quickly). I looked at all of the implementations of Usage and they all seem to have the same issue. Shouldn't they all check "started" and bail if the condition they are trying to reach can never be reached?, Create a test case and propose a patch to the issue, we can review it and see if it makes sense / doesn't break anything.  Sounds like something that would be a benefit.  , Fixed the MemoryUsage waitForSpace code throws an InterruptedException so that the windowed producer send will throw an JMSException when the Producer is closed.  , We recently updated to 5.12.0 and a test I had put in place to track the "higher level" shutdown started failing occasionally. I still haven't worked out the cause of that but I did try enabling ProducerWindowSize to verify the fix to this bug. So technically it closes quickly but it is throwing an IllegalMonitorStateException. There is a bug in the waitForSpace method where we don't relock the readLock if the waitForSpaceCondition throws.
+
+{code}
+java.lang.IllegalMonitorStateException: attempt to unlock read lock, not locked by current thread
+	at java.util.concurrent.locks.ReentrantReadWriteLock$Sync.unmatchedUnlockException(ReentrantReadWriteLock.java:447)
+	at java.util.concurrent.locks.ReentrantReadWriteLock$Sync.tryReleaseShared(ReentrantReadWriteLock.java:431)
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer.releaseShared(AbstractQueuedSynchronizer.java:1340)
+	at java.util.concurrent.locks.ReentrantReadWriteLock$ReadLock.unlock(ReentrantReadWriteLock.java:883)
+	at org.apache.activemq.usage.MemoryUsage.waitForSpace(MemoryUsage.java:87)
+	at org.apache.activemq.ActiveMQMessageProducer.send(ActiveMQMessageProducer.java:282)
+	at org.apache.activemq.ActiveMQMessageProducer.send(ActiveMQMessageProducer.java:223)
+	at org.apache.activemq.ActiveMQMessageProducerSupport.send(ActiveMQMessageProducerSupport.java:269)
+	at org.springframework.jms.connection.CachedMessageProducer.send(CachedMessageProducer.java:181)
+	at org.springframework.jms.core.JmsTemplate.doSend(JmsTemplate.java:636)
+	at org.springframework.jms.core.JmsTemplate.doSend(JmsTemplate.java:607)
+	at org.springframework.jms.core.JmsTemplate$3.doInJms(JmsTemplate.java:572)
+	at org.springframework.jms.core.JmsTemplate.execute(JmsTemplate.java:494)
+	at org.springframework.jms.core.JmsTemplate.send(JmsTemplate.java:569)
+	at org.springframework.jms.core.JmsTemplate.send(JmsTemplate.java:560)
+	at com.sms.jms.FastInterruptibleSingleDestinationJmsOutClient.send(FastInterruptibleSingleDestinationJmsOutClient.java:77)
+	at com.sms.jms.FastInterruptibleSingleDestinationJmsOutClient.publishAsBytesMessage(FastInterruptibleSingleDestinationJmsOutClient.java:68)
+	at com.sms.jms.FastInterruptibleSingleDestinationJmsOutClientTest$2.run(FastInterruptibleSingleDestinationJmsOutClientTest.java:83)
+	at java.lang.Thread.run(Thread.java:744)}}
+{code}
+
+{code}
+public boolean waitForSpace(long timeout) throws InterruptedException {
+        if (parent != null) {
+            if (!parent.waitForSpace(timeout)) {
+                return false;
+            }
+        }
+        usageLock.readLock().lock();
+        try {
+            if (percentUsage >= 100) {
+                usageLock.readLock().unlock();
+                usageLock.writeLock().lock();
+                try {
+                    while (percentUsage >= 100 ) {
+                        waitForSpaceCondition.await(timeout, TimeUnit.MILLISECONDS);
+                    }
+                    // I believe this relocking needs to be in the finally block.
+                    usageLock.readLock().lock();
+                } finally {
+                    usageLock.writeLock().unlock();
+                }
+            }
+
+            return percentUsage < 100;
+        } finally {
+            usageLock.readLock().unlock();
+        }
+    }
+{code}, Commit 9ddd162d2584f39c8e3b303db91dc43143381ecc in activemq's branch refs/heads/master from [~gtully]
+[ https://git-wip-us.apache.org/repos/asf?p=activemq.git;h=9ddd162 ]
+
+https://issues.apache.org/jira/browse/AMQ-4361 - implement suggestion from Sam hendley with thanks, avoid the IllegalMonitorStateException
+, [~shendley] thanks, sorted that IllegalMonitorStateException]

@@ -1,0 +1,534 @@
+[Scanning the AM logs, it looks like this may be a situation where the AM is waiting for the RM to allocate a new container but the RM thinks all asks are fulfilled.  We would need to look into the RM logs to try to verify.
+
+I noticed this odd sequence in the AM log:
+{noformat}
+2015-04-20 21:36:37,225 INFO [RMCommunicator Allocator] org.apache.hadoop.mapreduce.v2.app.rm.RMContainerAllocator: Got allocated containers 2
+[...]
+2015-04-20 21:36:37,236 INFO [RMCommunicator Allocator] org.apache.hadoop.mapreduce.v2.app.rm.RMContainerAllocator: Assigned container container_1428390739155_23973_01_000002 to attempt_1428390739155_23973_m_000000_0
+[...]
+2015-04-20 21:36:37,246 INFO [RMCommunicator Allocator] org.apache.hadoop.mapreduce.v2.app.rm.RMContainerAllocator: Assigned container container_1428390739155_23973_01_000003 to attempt_1428390739155_23973_m_000001_0
+[... container 3 proceeds to fail to launch ...]
+2015-04-20 21:36:38,259 INFO [RMCommunicator Allocator] org.apache.hadoop.mapreduce.v2.app.rm.RMContainerAllocator: Received completed container container_1428390739155_23973_01_000003
+[...]
+2015-04-20 21:36:39,276 INFO [RMCommunicator Allocator] org.apache.hadoop.mapreduce.v2.app.rm.RMContainerAllocator: Received completed container container_1428390739155_23973_01_000004
+2015-04-20 21:36:39,276 ERROR [RMCommunicator Allocator] org.apache.hadoop.mapreduce.v2.app.rm.RMContainerAllocator: Container complete event for unknown container id container_1428390739155_23973_01_000004
+{noformat}
+
+I see the AM received two containers from the "Got allocated 2 containers" log message, presumably for containers 000002 and 000003.  Then suddenly the AM is notified of a released container 000004 that apparently was never allocated?  I do not see a corresponding "Got allocated" message that would indicate the AM ever saw container 000004.  That may explain why the AM is stuck.  If the RM thought it allocated a container to the AM and it was released then it will think all asks are satisfied.  However the AM would need to re-ask for the final map container or the job will not progress.  We need to look into the RM log and find the RM's perspective of what happened to container_1428390739155_23973_01_000004., YARN RM log for app, Thanks [~jlowe] for looking at this.
+I uploaded RM log for this app. It seems like AM release container_1428390739155_23973_01_000004.
+
+And I'll take some time to investigate this issue tomorrow., The RM log shows the two map containers being allocated, container 3 terminating, then container 4 being allocated.  All of this seems normal with the map task failing and the AM requesting a new container.  However this is the interesting part in the RM log:
+{noformat}
+2015-04-20,21:36:38,633 INFO org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerImpl: container_1428390739155_23973_01_000004 Container Transitioned from ALLOCATED to KILLED
+2015-04-20,21:36:38,633 INFO org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FSAppAttempt: Completed container: container_1428390739155_23973_01_000004 in state: KILLED event:KILL
+{noformat}
+
+Note that the container was allocated yet killed before it was ACQUIRED.  That means the container was never received by the AM.  That's why the AM was confused about receiving the completed container -- it had never seen the container allocated in the first place.  So the next question: is there anything in the RM log indicating why the container transitioned from ALLOCATED to KILLED?  Was it preempted or...?
+
+This seems like a bug in YARN.  The RM is telling the AM a container completed that it never told the AM about before.  The completion info doesn't tell the AM enough to know, in the general case, which of its requests this could correspond to and therefore which one it would need to re-request if it still needs it.  If a container is killed before it is ACQUIRED then the RM should not treat the corresponding ask for that container as being fulfilled., bq. is there anything in the RM log indicating why the container transitioned from ALLOCATED to KILLED?
+This would be probably because during rolling upgrade , NM was down for some time. So Node_Removed event might have occurred either because of expiry or reconnected event. Node removed event kills all the running containers which has been done before container is pulled by AM., But I don't see any Node removed event from attached logs. The question remains unanswered!!, bq. This would be probably because during rolling upgrade , NM was down for some time. So Node_Removed event might have occurred either because of expiry or reconnected event. Node removed event kills all the running containers which has been done before container is pulled by AM.
+
+That doesn't add up, since the container was just allocated by the node heartbeating in.  Therefore I don't see how the RM could reasonably be expiring the node, nor should the node be unregistering.  Re-registration does _not_ kill containers on the node.  If it did then NM restart could not possibly work, since the NM re-registers when it starts up., bq. Therefore I don't see how the RM could reasonably be expiring the node, nor should the node be unregistering
+Agree, practically thinking it won't be possible. 
+
+bq. Re-registration does not kill containers on the node
+Without NM work-preserving restart enabled , RM should kill the running containers on re-registration. IIRC, It is legacy behavior. , Thanks [~jlowe] & [~rohithsharma] for discussion. 
+Two points to clarify firstly:
+# I enabled NM restart and continuous scheduling in FairScheduler in cluster.
+# Log "rm-app.log" is generate by grep app id from log, so some event log of NM is not included. Container 000004 is killed because NM re-connect, log as below:
+{noformat}
+2015-04-20,21:36:38,631 INFO org.apache.hadoop.yarn.util.RackResolver: Resolved instance-200.bj to /default-rack
+2015-04-20,21:36:38,632 INFO org.apache.hadoop.yarn.server.resourcemanager.ResourceTrackerService: Reconnect from the node at: instance-200.bj
+2015-04-20,21:36:38,632 INFO org.apache.hadoop.yarn.server.resourcemanager.ResourceTrackerService: NodeManager from node instance-200.bj(cmPort: 22400 httpPort: 22401) registered with capability: <memory:10240, vCores:4>, assigned nodeId instance-200.bj:22400
+2015-04-20,21:36:38,633 INFO org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerImpl: container_1428390739155_23973_01_000004 Container Transitioned from ALLOCATED to KILLED
+{noformat}
+
+Following your thoughts, I try to describe the issue sequence as below:
+# AM got allocated container 000003 from instance-200.
+# AM try to launch container 000003 on instance-200, NM reject request because it just restarted and has not registered with RM.
+# AM ask new map request with RM.
+# RM's continuos scheduling assigned container 000004 on instance-200 to AM (because RM doesn't know NM has restarted)
+# NM register with RM with 0 container report, RM change container 000004 from ALLOCATED to KILLED.
+# AM heartbeat and got released container 000004, and ignore it because it didn't get this id before.
+# At this point, RM think it has fulfilled AM's all requests, but AM was still be waiting for RM's scheduling of map request.
+
+If the sequence is right, I think like [~rohithsharma]'s point, this is a bug of YARN: 
+bq. If a container is killed before it is ACQUIRED then the RM should not treat the corresponding ask for that container as being fulfilled.
+, Sorry, my mistake. It's [~jlowe]'s saying., Thanks Peng Zhang for your analysis.. 
+As [~jlowe] said, this is bug in YARN.
+
+[~peng.zhang] Would you like to provide patch for this issue?
+, OK, I'll try to fix it.
+Should I create a new issue in YARN project？, No need to create new JIRA in YARN..This issue only can be moved.. , Moved to YARN and updated the description as per real issue., Thanks [~rohithsharma] for help., I think we need to fix the RMContainerImpl ALLOCATED to KILLED transition, but I think there's another bug here.  I believe the container was killed in the first place because the RMNodeImpl reconnect transition makes an assumption that is racy.  When the node reconnects, it checks if the node reports no applications running.  If it has no applications then it sends a removed node eventfollowed by a added node event to the scheduler.  This will cause the scheduler to kill all containers allocated on that node.  However the node will only know about a container iff the AM acquires the container and tries to launch the container on the node.  That can take minutes to transpire, so it's dangerous to assume that a node not reporting any applications on the node means it doesn't have anything pending.
+
+I think we'll have to revisit the solution to YARN-2561 to either eliminate this race or make it safe if it does occur.  Ideally we shouldn't be sending a remove/add event to the scheduler if the node is reconnecting, but we need to make sure we cancel containers on the node that are no longer running.  Since the node reports what containers it has when it reconnects, it seems like we can convey that information to the scheduler to correct anything that doesn't match up.  Any container in the RUNNING state that no longer appears in the list of containers when registering can be killed by the scheduler, as it does when a node is removed, and I believe that will fix YARN-2561 and also avoid this race.
+
+cc: [~djp] as this also has potential ramifications for graceful decommission.  If we try to graceful decommission a node that isn't currently reporting applications we may also need to verify the scheduler hasn't allocated or handed out a container for that node that hasn't reached the node yet., As per [~jlowe]'s thoughts, I understand here are two separated thing:
+# During NM reconnection, RM and NM should do sync at container level. For this issue's scenario, container 000004 should not be killed and rescheduled, so AM can acquire and launch it  on NM after NM registered.
+# Still need fix in RMContainerImpl: restore request during transition from  ALLOCATED to KILLED. Because NM's real lost may cause transition from ALLOCATED to KILLED with very small possibility(AM may heartbeat and acquire container after NM heartbeats timeout).
+
+I think first thing is an improvement to save time or scheduling work done before. Or did I get any mistake? , The first item is to avoid containers failing due to an NM restart.  As it is now, a container handed out by the RM to an idle NM can fail if the NM restarts before the AM launches the container., Sorry for coming late on this. Discussion above sounds good to me.
+bq. Junping Du, as this also has potential ramifications for graceful decommission. If we try to graceful decommission a node that isn't currently reporting applications we may also need to verify the scheduler hasn't allocated or handed out a container for that node that hasn't reached the node yet.
+That's a good point. [~jlowe]! I will put a note on YARN-3212 for applying the right check., [~jlowe], [~peng.zhang] and [~rohithsharma], from my comments in YARN-3212 (https://issues.apache.org/jira/browse/YARN-3212?focusedCommentId=14514182&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14514182), may be we should still support the case/transition from ALLOCATED to KILLED but make sure AM/RM can sync on the same page in some way, e.g. probably, adding back resource request in this case?, Adding RR back to scheduler makes more sense to me. 
+
+Since RM identifies NM restart enabled or not using running applications that reported during registration call, it will be difficult to distinguish between NM restart enabled with 0 applications reporting to RM VS NM restart disabled where all the time NM restarts reports 0 applications to RM. Why can't NM register with additional flag indicating to RM that NM restart is enabled. Any thoughts? 
+I was created to refactor the code for RMNodeImpl#ReconnectedNodeTransition in YARN-3286, but did not progress since it was changing the behavior of killing running container on NM restart., Yes, the resource request needs to be added back.  That's by far the simplest fix.  The AM has no idea the request was fulfilled before it was killed, so from the AM's perspective the request is still outstanding.
+
+I'm +1 for adding a new flag indicating whether the NM reconnect is container-preserving or not, as long as we work through the upgrade scenarios to verify we don't introduce regressions., Attached patch to restore ResourceRequest for transition ALLOCATED to KILLED.
+
+Added test case for FairScheduler and I added getter for SchedulerDispatcher in RMContextImpl to start it in test. 
+I've tested rolling update operation in small cluster: found issue transition is triggered, and MR job works well., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 35s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | javac |   7m 31s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 36s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   5m 23s | The applied patch generated  8  additional checkstyle issues. |
+| {color:green}+1{color} | install |   1m 34s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 14s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:red}-1{color} | yarn tests |  59m 40s | Tests failed in hadoop-yarn-server-resourcemanager. |
+| | | 100m 37s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRestart |
+|   | hadoop.yarn.server.resourcemanager.TestRM |
+|   | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestCapacityScheduler |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12728784/YARN-3535-001.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 99fe03e |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/7523/artifact/patchprocess/checkstyle-result-diff.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/7523/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/7523/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf905.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7523/console |
+
+
+This message was automatically generated., Sorry, I only run all tests in FairScheduler package, I'll fix others tomorrow.
+
+And how to know the specific checkstyle errors? I am using code formatter from cloudera in Intellij.
+, # Remove call of recoverResourceRequestForContainer from preemption to avoid duplication of recover RR.
+# Fix broken tests., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  14m 55s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | javac |   7m 42s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 58s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   5m 22s | The applied patch generated  7  additional checkstyle issues. |
+| {color:green}+1{color} | install |   1m 35s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 18s | The patch does not introduce any new Findbugs (version 2.0.3) warnings. |
+| {color:red}-1{color} | yarn tests |  53m 45s | Tests failed in hadoop-yarn-server-resourcemanager. |
+| | |  95m 32s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRestart |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12729146/YARN-3535-002.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 8f82970 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/7538/artifact/patchprocess/checkstyle-result-diff.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/7538/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/7538/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf907.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7538/console |
+
+
+This message was automatically generated., I think TestAMRestart failure is not related with this patch. 
+I found YARN-2483 is to resolve it., Thanks [~peng.zhang] for working on this issue..  
+Some comments
+# I think the method {{recoverResourceRequestForContainer}} should be synchronized, any thought?
+# Why do we require {{RMContextImpl.java}} changes? I think this we can avoid, not necessarily required.
+
+Tests : 
+# Any specific reason for chaning {{TestAMRestart.java}}?
+# IIUC, this issue can occur in all the scheduler given AM-RM heart beat is lesser than NM-RM heart beat interval. So can it include FT test case that applicable for both CS and FS. May it you can add test in the extending class {{ParameterizedSchedulerTestBase}} i.e TestAbstractYarnScheduler.
+, Recently in test we faced same issue,  [~peng.zhang] would you mind updating the patch?, Sorry for late reply.
+
+Thanks for your comments.
+
+bq. 1. I think the method recoverResourceRequestForContainer should be synchronized, any thought?
+I notice it's not with synchronized originally. I checked this method and found only "applications" need to be protected( get by calling "getCurrentAttemptForContainer()" ). "applications" is instantiated using ConcurrentHashMap in derived scheduler, so I think it's no need to add synchronized.
+
+Other three comments are all related with test. 
+# Changing TestAMRestart.java is because that case testAMRestartWithExistingContainers will trigger this logic. After this patch, one more container may be scheduled, and attempt.getJustFinishedContainers().size() may be bigger than expectedNum and loop never ends. So I simply change the situation.
+# I agreed that this issue exist in all scheduler, and should be tested generally. But I didn't find good way to reproduce it. I'll take a try with ParameterizedSchedulerTestBase.
+# I change RMContextImpl.java to get schedulerDispatcher and start it in test TestFairScheduler. Otherwise event handler cannot be triggered. I'll check if this can also be solved based on ParameterizedSchedulerTestBase.
+, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12729146/YARN-3535-002.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / d667560 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8517/console |
+
+
+This message was automatically generated., [~peng.zhang] I rebased the patch to trunk and added FT test. The test simulates reported scenarion and fails with timeout if this fix is not present. After this fix, test passes. 
+In  you previous patch, I have one doubt that , why the below method is removed in both FS and CS? Any specific reason?
+{code}
+-    recoverResourceRequestForContainer(cont);
+{code}, \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  16m  2s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 1 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 42s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 38s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   0m 48s | The applied patch generated  4 new checkstyle issues (total was 338, now 342). |
+| {color:red}-1{color} | whitespace |   0m  2s | The patch has 2  line(s) that end in whitespace. Use git apply --whitespace=fix. |
+| {color:green}+1{color} | install |   1m 20s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 25s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:red}-1{color} | yarn tests |  51m 51s | Tests failed in hadoop-yarn-server-resourcemanager. |
+| | |  89m 47s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRestart |
+|   | hadoop.yarn.server.resourcemanager.TestApplicationCleanup |
+|   | hadoop.yarn.server.resourcemanager.rmapp.TestRMAppTransitions |
+|   | hadoop.yarn.server.resourcemanager.TestResourceTrackerService |
+|   | hadoop.yarn.server.resourcemanager.applicationsmanager.TestAMRMRPCNodeUpdates |
+|   | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestCapacityScheduler |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12744980/0003-YARN-3535.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 5ed1fea |
+| checkstyle |  https://builds.apache.org/job/PreCommit-YARN-Build/8518/artifact/patchprocess/diffcheckstylehadoop-yarn-server-resourcemanager.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/8518/artifact/patchprocess/whitespace.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/8518/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/8518/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf905.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8518/console |
+
+
+This message was automatically generated., Thanks for working on this [~peng.zhang].
+We seem to be hitting this on our scale clusters as well.. so would be good to get this in soon.
+In our case the NM re-registration was caused by YARN-3842
+
+The Patch looks good to me. Any idea why the tests failed ?, [~rohithsharma]
+
+Thanks for rebase and adding tests.
+
+As for removing {{recoverResourceRequestForContainer}}, in my notes, it caused test {{CapacityScheduler#testRecoverRequestAfterPreemption}} failed. 
+But I cannot remember my old thoughts:
+bq. Remove call of recoverResourceRequestForContainer from preemption to avoid duplication of recover RR.
+
+I applied my patch {{YARN-3535-002.patch}} on our production cluster, preemption works well with FairScheduler.
+
+Failure of {{TestAMRestart.testAMRestartWithExistingContainers}} , I met it before. And I think it's because:
+bq. Changing TestAMRestart.java is because that case testAMRestartWithExistingContainers will trigger this logic. After this patch, one more container may be scheduled, and attempt.getJustFinishedContainers().size() may be bigger than expectedNum and loop never ends. So I simply change the situation.
+
+
+
+, bq. Remove call of recoverResourceRequestForContainer from preemption to avoid duplication of recover RR.
+
+I remembered the reason.
+For preemption, container killed has two cases: container already pulled by AM or not. For 1st case, AM should know container is killed, and AM will re-ask container for task. For the case container not pull by AM, preemption killing caused the same case of this issue. So I think it should not be recovered twice., Apologies for the late suggestion.
+
+[~djp], Correct me if I am wrong here.. I was just looking at YARN-2561. It looks like the basic point of it was to ensure that on a reconnecting node, running containers were properly killed. This is achieved by the node removed and node added event. This happens in the {{if (noRunningApps) ..}} clause of the YARN-2561 patch.
+
+But I also see that a later patch has also handled the issue by introducing the following code inside the {{else ..}} clause of the above mentioned if.
+
+{noformat}
+        for (ApplicationId appId : reconnectEvent.getRunningApplications()) {
+          handleRunningAppOnNode(rmNode, rmNode.context, appId, rmNode.nodeId);
+        }
+{noformat}
+
+This correctly kills only the running contains and does not do anything to the allocated containers (which I guess should be the case).
+
+Given the above, do we still need whatever is contained in the if clause ? wouldn't removing the if clause just solve this ?
+
+Thoughts ?, bq. wouldn't removing the if clause just solve this ?
+Yes, Just removing if clause should sovle the this issue problem. But problem is with legacy behaviour i.e if RM/NM work preserving restart feature is NOT enabled, then on NM restart, running containers should be killed which is currently achieved by if-clause. So retaining the existing behaviour, this issue fix is required. And the YARN-3286 is tracking jira for Reconnected event clean up change as you have mentioned., bq. For preemption, container killed has two cases: container already pulled by AM or not. For 1st case, AM should know container is killed, and AM will re-ask container for task. For the case container not pull by AM, preemption killing caused the same case of this issue. So I think it should not be recovered twice.
+ahh, you are right. Basically if RMContainer is not pulled by AM, then its state is ALLOCATED. On preempting RMContainer, resource request was recovered twise i.e 1. This jira fix 2. Kill Container event in CS. So removing *recoverResourceRequestForContainer(cont);* is make sense to me., I was not handled recovering twise RR, I will make a change and update the patch soon. , bq.  .. then on NM restart, running containers should be killed which is currently achieved by if-clause.
+I am probably missing something... but It looks like this is in fact being done in the else clause. (the code snippet I pasted in my comment [above|https://issues.apache.org/jira/browse/YARN-3535?focusedCommentId=14627370&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14627370]. lines 658 - 660 of RMNodeImpl in trunk)., {code}
+for (ApplicationId appId : reconnectEvent.getRunningApplications()) {
+          handleRunningAppOnNode(rmNode, rmNode.context, appId, rmNode.nodeId);
+        }
+{code}
+IIUC, This code will update RMApp about node details so that RMApp get to know that its some containers has run on this  node. And this part of code does not kill the existing running containers. Running containers are killed when the NodeRemoved event is triggered to schedulers, and this event will be triggered by RMNodeImpl#Reconnected transition if noAppsRunning., makes sense... thanks for clarifying.., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  16m  8s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 39s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  10m  3s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   0m 46s | The applied patch generated  3 new checkstyle issues (total was 337, now 340). |
+| {color:red}-1{color} | whitespace |   0m  2s | The patch has 1  line(s) that end in whitespace. Use git apply --whitespace=fix. |
+| {color:green}+1{color} | install |   1m 20s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 26s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | yarn tests |  51m 31s | Tests passed in hadoop-yarn-server-resourcemanager. |
+| | |  89m 55s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12745422/0004-YARN-3535.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / edcaae4 |
+| checkstyle |  https://builds.apache.org/job/PreCommit-YARN-Build/8545/artifact/patchprocess/diffcheckstylehadoop-yarn-server-resourcemanager.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/8545/artifact/patchprocess/whitespace.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/8545/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/8545/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf903.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8545/console |
+
+
+This message was automatically generated., bq. This jira fix 2. Kill Container event in CS. So removing recoverResourceRequestForContainer(cont); is make sense to me..
+Any reason why we don't remove {{recoverResourceRequestForContainer}} from the {{warnOrKillContainer}} method in the FairSheduler ? wont the above situation happen in the FS as well.. , Also... Is it possible to simulate the 2 cases in the testcase ?, Yes, {{TestCapacityScheduler#testRecoverRequestAfterPreemption}} simulates this., ahh, right.. it can be removed., One point to be clear that , here the assumption made is if RMContainer is ALLOCATED then only recover ResourceRequest. If RMcontainer is in RUNNING, then  completed container will go to AM in allocate response and AM will ask new ResourceRequest. , Thanks [~rohithsharma] for updating patch. 
+patch LGTM.
+
+bq. One point to be clear that , here the assumption made is if RMContainer is ALLOCATED then only recover ResourceRequest. If RMcontainer is in RUNNING, then completed container will go to AM in allocate response and AM will ask new ResourceRequest.
+
+During running in our scale cluster with FS and preemption enabled, MapReduce app works good with this assumption.
+Basically, I think this assumption make sense for other type app., I meant for the FairScheduler... but looks like your new patch has it... thanks, The patch looks good !!
+Thanks for working on this [~peng.zhang] and [~rohithsharma]
+
++1, Pending successful jenkins run with latest patch, Sorry for coming late into this issue.
+The latest Patch looks good to me except one nit:
+Can we make {{ContainerRescheduledTransition}} child class of {{FinishedTransition}} similar as {{KillTransition}}?
+So we can call {{super.transition(container, event);}} instead of {{new FinishedTransition().transition(container, event);}}.
+I think this will make the code more readable and match other transition class implementation., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  16m 14s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 3 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 44s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 41s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 24s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   0m 46s | The applied patch generated  5 new checkstyle issues (total was 338, now 343). |
+| {color:green}+1{color} | whitespace |   0m  2s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 22s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 25s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | yarn tests |  51m 30s | Tests passed in hadoop-yarn-server-resourcemanager. |
+| | |  89m 45s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12745572/0005-YARN-3535.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 3ec0a04 |
+| checkstyle |  https://builds.apache.org/job/PreCommit-YARN-Build/8554/artifact/patchprocess/diffcheckstylehadoop-yarn-server-resourcemanager.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/8554/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/8554/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf909.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8554/console |
+
+
+This message was automatically generated., Hi [~rohithsharma] and [~peng.zhang]
+After seeing this patch, I feel there may a synchronization problem. Please correct me if I am wrong.
+In ContainerRescheduledTransition code, its been used like
+{code}
++      container.eventHandler.handle(new ContainerRescheduledEvent(container));
++      new FinishedTransition().transition(container, event);
+{code}
+Hence ContainerRescheduledEvent is fired to Scheduler dispatcher and it will process the {{recoverResourceRequestForContainer}} is a separate thread. Meantime in RMAppImpl, {{FinishedTransition().transition}} will be invoked and it will be processed for closure for this container. If the Scheduler dispatcher is slower in processing due to pending event queue length, there are chances that recoverResourceRequest may not be correct.
+
+I feel we can introduce a new Event in {{RMContainerImpl}} from ALLOCATED to WAIT_FOR_REQUEST_RECOVERY and scheduler can fire back an event to {{RMContainerImpl}} indicate recovery of resource request is completed. This can move the state forward to KILLED in {{RMContainerImpl}}. 
+Please share your thoughts., bq. there are chances that recoverResourceRequest may not be correct.
+
+Sorry, I didn't catch this, maybe I missed sth?. 
+
+I think {{recoverResourceRequest}} will not be affected by whether container finished event is processed faster. 
+Cause {{recoverResourceRequest}} only process the ResourceRequest in container and not care its status. , bq. I think recoverResourceRequest will not be affected by whether container finished event is processed faster. Cause recoverResourceRequest only process the ResourceRequest in container and not care its status.
+I agree with [~peng.zhang] here. IIUC, The {{recoverResourceRequest}} only affects state of the Scheduler and the SchedulerApp. In any case, the fact that the container is killed (the outcome of the {{RMAppAttemptContainerFinishedEvent}} fired by {{FinishedTransition#transition}}) will be notified to the Scheduler.. and that notification will happen only AFTER the recoverResourceRequest has completed.. since it will be handled by the same dispatcher., Thank you [~peng.zhang] and [~asuresh] for correcting.
+bq.that notification will happen only AFTER the recoverResourceRequest has completed.. since it will be handled by the same dispatcher
+Yes. I missed this. Ordering will be corrected here.  , Also because {{containerCompleted}} and {{pullNewlyAllocatedContainersAndNMTokens}} are synchronized, it will guarantee if AM gets the container, {{ContainerRescheduledEvent}}({{recoverResourceRequestForContainer}}) won't be called.
+, Updated patch fixing [~zxu] comment. , \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  16m 18s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 3 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 48s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 39s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   0m 47s | The applied patch generated  5 new checkstyle issues (total was 337, now 342). |
+| {color:green}+1{color} | whitespace |   0m  2s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 24s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   1m 26s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | yarn tests |  51m 21s | Tests passed in hadoop-yarn-server-resourcemanager. |
+| | |  89m 43s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12745756/0006-YARN-3535.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / ee36f4f |
+| checkstyle |  https://builds.apache.org/job/PreCommit-YARN-Build/8568/artifact/patchprocess/diffcheckstylehadoop-yarn-server-resourcemanager.txt |
+| hadoop-yarn-server-resourcemanager test log | https://builds.apache.org/job/PreCommit-YARN-Build/8568/artifact/patchprocess/testrun_hadoop-yarn-server-resourcemanager.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/8568/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf905.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/8568/console |
+
+
+This message was automatically generated., +1, Committing this shortly.
+Thanks to everyone involved., FAILURE: Integrated in Hadoop-trunk-Commit #8179 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/8179/])
+YARN-3535. Scheduler must re-request container resources when RMContainer transitions from ALLOCATED to KILLED (rohithsharma and peng.zhang via asuresh) (Arun Suresh: rev 9b272ccae78918e7d756d84920a9322187d61eed)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerRescheduledEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/SchedulerEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #256 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/256/])
+YARN-3535. Scheduler must re-request container resources when RMContainer transitions from ALLOCATED to KILLED (rohithsharma and peng.zhang via asuresh) (Arun Suresh: rev 9b272ccae78918e7d756d84920a9322187d61eed)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/SchedulerEventType.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerRescheduledEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+, FAILURE: Integrated in Hadoop-Mapreduce-trunk #2205 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2205/])
+YARN-3535. Scheduler must re-request container resources when RMContainer transitions from ALLOCATED to KILLED (rohithsharma and peng.zhang via asuresh) (Arun Suresh: rev 9b272ccae78918e7d756d84920a9322187d61eed)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerRescheduledEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/SchedulerEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+, Should this go in to 2.7.2?  It's been seen by multiple users and seems appropriate for that release., FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #260 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/260/])
+YARN-3535. Scheduler must re-request container resources when RMContainer transitions from ALLOCATED to KILLED (rohithsharma and peng.zhang via asuresh) (Arun Suresh: rev 9b272ccae78918e7d756d84920a9322187d61eed)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/SchedulerEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerRescheduledEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+, FAILURE: Integrated in Hadoop-Yarn-trunk #990 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/990/])
+YARN-3535. Scheduler must re-request container resources when RMContainer transitions from ALLOCATED to KILLED (rohithsharma and peng.zhang via asuresh) (Arun Suresh: rev 9b272ccae78918e7d756d84920a9322187d61eed)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/SchedulerEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerRescheduledEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #2187 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2187/])
+YARN-3535. Scheduler must re-request container resources when RMContainer transitions from ALLOCATED to KILLED (rohithsharma and peng.zhang via asuresh) (Arun Suresh: rev 9b272ccae78918e7d756d84920a9322187d61eed)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerRescheduledEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/SchedulerEventType.java
+* hadoop-yarn-project/CHANGES.txt
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #249 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/249/])
+YARN-3535. Scheduler must re-request container resources when RMContainer transitions from ALLOCATED to KILLED (rohithsharma and peng.zhang via asuresh) (Arun Suresh: rev 9b272ccae78918e7d756d84920a9322187d61eed)
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fifo/FifoScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/SchedulerEventType.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/applicationsmanager/TestAMRestart.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/FairScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/rmcontainer/RMContainerImpl.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/TestAbstractYarnScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/event/ContainerRescheduledEvent.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/capacity/CapacityScheduler.java
+* hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/scheduler/fair/TestFairScheduler.java
+* hadoop-yarn-project/CHANGES.txt
+, [~jlowe], yup.. ill check it into the 2.7 branch as well..., FAILURE: Integrated in Hadoop-trunk-Commit #8182 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/8182/])
+Pulling in YARN-3535 to branch 2.7.x (Arun Suresh: rev 176131f12bc0d467e9caaa6a94b4ba96e09a4539)
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Yarn-trunk #991 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/991/])
+Pulling in YARN-3535 to branch 2.7.x (Arun Suresh: rev 176131f12bc0d467e9caaa6a94b4ba96e09a4539)
+* hadoop-yarn-project/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Yarn-trunk-Java8 #261 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/261/])
+Pulling in YARN-3535 to branch 2.7.x (Arun Suresh: rev 176131f12bc0d467e9caaa6a94b4ba96e09a4539)
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk #2188 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2188/])
+Pulling in YARN-3535 to branch 2.7.x (Arun Suresh: rev 176131f12bc0d467e9caaa6a94b4ba96e09a4539)
+* hadoop-yarn-project/CHANGES.txt
+, FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #250 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/250/])
+Pulling in YARN-3535 to branch 2.7.x (Arun Suresh: rev 176131f12bc0d467e9caaa6a94b4ba96e09a4539)
+* hadoop-yarn-project/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk-Java8 #258 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/258/])
+Pulling in YARN-3535 to branch 2.7.x (Arun Suresh: rev 176131f12bc0d467e9caaa6a94b4ba96e09a4539)
+* hadoop-yarn-project/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Mapreduce-trunk #2207 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2207/])
+Pulling in YARN-3535 to branch 2.7.x (Arun Suresh: rev 176131f12bc0d467e9caaa6a94b4ba96e09a4539)
+* hadoop-yarn-project/CHANGES.txt
+, Does this issue exist in 2.6.x? Should this be backported to branch-2.6?, Yes, this issue exists in 2.6.x, I just committed this patch to branch-2.6., Thanks [~zxu]:-)  Somehow I missed Sangjin Lee comment!!, You are welcome! I think this will be a very critical fix for 2.6.4 release., FAILURE: Integrated in Hadoop-trunk-Commit #8969 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/8969/])
+Update CHANGES.txt to add YARN-3857 and YARN-3535 to branch-2.6 (zxu: rev 0c3a53e5a978140e56b9ebbc82c8d04fc978e640)
+* hadoop-yarn-project/CHANGES.txt
+, SUCCESS: Integrated in Hadoop-Hdfs-trunk-Java8 #694 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/694/])
+Update CHANGES.txt to add YARN-3857 and YARN-3535 to branch-2.6 (zxu: rev 0c3a53e5a978140e56b9ebbc82c8d04fc978e640)
+* hadoop-yarn-project/CHANGES.txt
+, [~djp] Recently YARN-4502 fixed which was caused in one of the very corner case of this JIRA fix, I think we need to back port YARN-4502 to 2.7.2.]

@@ -1,0 +1,169 @@
+[[~gopalv] Is this resulting in wrong results (because NULL key got emitted incorrectly) or this resulting in lower perf (because it resulted in a skew towards NULL) ?, [~ashutoshc]: Incorrect results as well.
+
+Ran the same query with Tez & MR, got different results.
+
+MR doesn't hit the same scenario becuase of the empty Map task, which doesn't have any input columns named reducesinkkey0.
+
+Tez seems to hit a corner case where there are 2 shuffle joins one after the other - there is an input col named KEY.reducesinkkey0 and an output col named reducesinkkey0, which have no relation to each other.
+
+{code}
+$ diff -y -W 72  results/q5.tez.txt results/q5.mr.txt 
+CHINA   985314.0848                |    VIETNAM 1.897236998313891E10
+INDIA   819113.4418000001          |    CHINA   1.894405687452681E10
+VIETNAM 637407.2255                |    INDONESIA       1.89306456994551
+JAPAN   523754.9791                |    JAPAN   1.892184676125508E10
+INDONESIA       517900.1924        |    INDIA   1.886882412417209E10
+{code}, Seems like this also can get triggered  for MR path. I think latest patch on HIVE-5771 is failing for test like subquery_in.q because they are hitting into this issue., Fail of  subquery_in.q in HIVE-5771 seemed not caused by HIVE-4867 but strongly related with it because HIVE-4867 have (intentionally) broken internal assumption on keys/values of RS. With constant propagation optimizer, subquery_in.q is making different keys for each aliases of join, which seemed not valid.
+{code}
+-- sq_1
+Reduce Output Operator
+  key expressions: _col1 (type: int)
+  sort order: ++
+  Map-reduce partition columns: _col1 (type: int)
+{code}
+and
+{code}
+-- others
+Reduce Output Operator
+  key expressions: _col0 (type: int), _col1 (type: int)
+  sort order: ++
+  Map-reduce partition columns: _col0 (type: int), _col1 (type: int)
+{code}, For this problem, I cannot understand that the RS which is a child of JOIN can get ROW of format,
+{noformat}
+{"reducesinkkey0":442}
+{noformat}
+In my reading, join would emit ROW and rowOI which is labeled with output columns, like below
+{noformat}
+_col0    {KEY.reducesinkkey0} 
+_col3    {VALUE._col2}
+_col10  {VALUE._col0}
+_col11  {KEY.reducesinkkey0} 
+_col14  {VALUE._col3}
+{noformat}
+
+I don't have environment for hadoop-2, so it's hard to verify, so it might take some time. , [~navis]: I can run tests for you, if you have a patch file with log lines.
+
+I can reproduce this issue consistently for all recent runs of this query., [~gopalv] Could you attach full explain result and query? Explain result on my notebook is different with yours (For me, it's Reducer 6 not Reducer 3). Seemed hard to reproduce with small sized data (used factor 1)., Could you print out whole row instead of keys?
+{noformat}
+x1.append("row="+ SerDeUtils.getJSONString(row, rowInspector));
+{noformat}
+Thanks,, The queries, explain and logging patch attached.
+[~navis]: This is the output for extra logging (logging patch, explain and query attached)
+
+{code}
+2014-06-16 13:46:44,716 WARN [TezChild] org.apache.hadoop.hive.serde2.objectinspector.StandardStructObjectInspector: Trying to access 1 fields inside a list of 5 elements: [184, 21, null, 184, 1994-07-02]
+2014-06-16 13:46:44,716 WARN [TezChild] org.apache.hadoop.hive.serde2.objectinspector.StandardStructObjectInspector: ignoring similar errors.
+2014-06-16 13:46:44,716 INFO [TezChild] org.apache.hadoop.hive.ql.exec.ReduceSinkOperator: GOPAL: numDistributionKeys = 1
+null --> ExprNodeColumnEvaluator(_col10)
+key_row={"reducesinkkey0":184}
+full_row={"_col0":184,"_col3":21,"_col10":null,"_col11":184,"_col14":"1994-07-02"}
+col_names=reducesinkkey0,
+{code}, _col10 is null which is "VALUE._col0" of MAP2, which is again "o_orderkey"
+{noformat}
+Reduce Output Operator
+  key expressions: o_custkey (type: int)
+  sort order: +
+  Map-reduce partition columns: o_custkey (type: int)
+  Statistics: Num rows: 166666666 Data size: 86571942280 Basic stats: COMPLETE Column stats: NONE
+  value expressions: o_orderkey (type: int), o_orderdate (type: string)
+{noformat}
+Is the table "orders" contains nulls?, [~navis]: TPC-H data shouldn't have any NULLs in the join keys.
+
+I will re-run the scans tomorrow. I can see one case where the schema from HIVE-600 might be completely broken. The Integer requirement in TPC-H requires only -2,147,483,646 to 2,147,483,647. 
+
+Though rethinking this a bit, I think HIVE-600's schema a bug which assumed O_ORDERKEY would be an int (might not be 32-bit anymore at 1Tb scale). I will verify that we're not overflowing that integer limit at a higher scale tomorrow & producing nulls.
+
+I can confirm that. But that aside, I am more concerned about the difference in output between Tez & MR.
+
+In MR, no stage with a reduce sink will have a key row fed by a reduce input.  
+
+I will debug this more tomorrow to narrow down the query to a pair of shuffle-joins and compare output between MR & Tez plans., [~navis]: I found out that there are indeed o_orderkey entries which show up as 2148000000 in text, which lies outside the range of the TPC-H Identifier column spec.
+
+I will reload the data using bigint for o_orderkey soon.
+
+But I still want to locate and confirm the different results between MR and Tez here., Looks like something is wrong in broadcast join. I'll look into this., I've reproduced the problem. It occurs on mapjoin + vetorization combination. , [~gopalv] Could you try the query with pre HIVE-7121? Seemed caused by that., [~navis]: I tested this with git commit id 50f517a3930 - it has been broken from before HIVE-7121.
+
+{code}
+$ hive --version
+Hive 0.14.0-SNAPSHOT
+Subversion git://cn041.l42scl.hortonworks.com/grid/5/dev/gopalv/tez-autobuild/hive -r 50f517a3930da0a987e6f6e908a91a7705bf9c60
+Compiled by gopal on Tue Jun 17 23:16:51 PDT 2014
+From source with checksum 8f75b133edadf23e29096f5e9b5d0f99
+{code}
+
+Sorry about the reducesinkkey0 confusion. 
+
+I have assigned this to myself for more investigation - will edit the bug tomorrow to the actual issue of incorrect results., updated bug report with analysis, 
+
+{color:red}Overall{color}: -1 at least one tests failed
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12650983/HIVE-7232.1.patch.txt
+
+{color:red}ERROR:{color} -1 due to 3 failed/errored test(s), 5654 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestMinimrCliDriver.testCliDriver_root_dir_external_table
+org.apache.hadoop.hive.cli.TestNegativeCliDriver.testNegativeCliDriver_authorization_ctas
+org.apache.hive.jdbc.miniHS2.TestHiveServer2.testConnection
+{noformat}
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-Build/513/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-Build/513/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-Build-513/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 3 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12650983, [~gopalv] Do you want to review this one?, [~ashutoshc]: Yes, I will review this today., [~navis]: LGTM +1. I will commit this.
+
+As part of my review, I found that 
+
+{code}
+--- ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorReduceSinkOperator.java
++++ ql/src/java/org/apache/hadoop/hive/ql/exec/vector/VectorReduceSinkOperator.java
+@@ -210,6 +210,9 @@ public void assign(VectorExpressionWriter[] writers,
+       if (limit >= 0 && memUsage > 0) {
+         reducerHash.initialize(limit, memUsage, conf.isMapGroupBy(), this);
+       }
++
++      autoParallel = conf.isAutoParallel();
++
+{code}
+
+is the smallest patch needed to fix this issue., [~gopalv] Right. Others are included tracking the problem. I'm good in either way., Need to rebase patch to match recent qtest changes made HIVE-7258, 
+
+{color:red}Overall{color}: -1 at least one tests failed
+
+Here are the results of testing the latest attachment:
+https://issues.apache.org/jira/secure/attachment/12652546/HIVE-7232.2.patch.txt
+
+{color:red}ERROR:{color} -1 due to 1 failed/errored test(s), 5654 tests executed
+*Failed tests:*
+{noformat}
+org.apache.hadoop.hive.cli.TestMinimrCliDriver.testCliDriver_root_dir_external_table
+{noformat}
+
+Test results: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-Build/594/testReport
+Console output: http://ec2-174-129-184-35.compute-1.amazonaws.com/jenkins/job/PreCommit-HIVE-Build/594/console
+Test logs: http://ec2-174-129-184-35.compute-1.amazonaws.com/logs/PreCommit-HIVE-Build-594/
+
+Messages:
+{noformat}
+Executing org.apache.hive.ptest.execution.PrepPhase
+Executing org.apache.hive.ptest.execution.ExecutionPhase
+Executing org.apache.hive.ptest.execution.ReportingPhase
+Tests exited with: TestsFailedException: 1 tests failed
+{noformat}
+
+This message is automatically generated.
+
+ATTACHMENT ID: 12652546, Committed to trunk, thanks!, Committed to trunk, thanks!, The result of tez_join_hash.q seemed not updated after HIVE-7159. I'll do that., This has been fixed in 0.14 release. Please open new jira if you see any issues.
+]

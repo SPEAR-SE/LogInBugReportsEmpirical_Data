@@ -1,0 +1,103 @@
+[
+This is a little problematic. N connections in a tx need some coordination and avoiding the N using useInboundSession is the simplest approach.
+An alternative approach is to force 2pc using connection url param rmIdFromConnectionId=true.
+
+In that way, each connection gets an xa-end and can force an sync with the broker. The end/sync is important to be sure that all work is visible to the broker before the prepare/commit call (on one of the connections).
+
+Without that, for an ack, there is no way to know that the broker has got the command before the commit/prepare
+For sends, there is alwaysSyncSend, which should work (I think) but for acks there is no such option at the moment.
+
+This all points to the need to do transaction completion on each connection, which would avoid this leak.
+
+, Thanks Gary,
+
+yes, moving to {{useInboundSession}} is indeed what we are going to do in the meantime. 
+
+The connections are getting xa-end, just the commit is reaching only the topmost one. If it is OK for broker to receive commit command for single transaction from multiple connections, then the solution appears to be easy - [afterCommit|https://github.com/apache/activemq/blob/a65f5e7c2077e048a2664339f6425d73948d71ce/activemq-client/src/main/java/org/apache/activemq/TransactionContext.java#L596] is fired for all participating transaction contexts already, they just need to send the transaction info if they already didn't.
+
+I'll see if I can build a testcase for this, and can try this approach.
+
+And for reference, I originally asked this on user mailing list: http://activemq.2283324.n4.nabble.com/Messages-piling-up-in-FailoverTranport-td4715072.html, This test reproduces the issue. I'll try modifying TransactionContext and submitting a PR., Apparently sending multiple commit {{TransactionInfo}} commands is not an option. This is what the other transaction context will get:
+{code}
+activemq.TransactionContext: ignoring exception from after completion on ended transaction: javax.jms.JMSException: Transaction 'XID:[86,globalId=0000003ffffffd6,branchId=0000003ffffffd6]' has not been started. xaErrorCode:-4
+javax.jms.JMSException: Transaction 'XID:[86,globalId=0000003ffffffd6,branchId=0000003ffffffd6]' has not been started. xaErrorCode:-4
+	at org.apache.activemq.util.JMSExceptionSupport.create(JMSExceptionSupport.java:54)
+	at org.apache.activemq.ActiveMQConnection.syncSendPacket(ActiveMQConnection.java:1399)
+	at org.apache.activemq.ActiveMQConnection.syncSendPacket(ActiveMQConnection.java:1428)
+	at org.apache.activemq.TransactionContext.sendXaCommitInfo(TransactionContext.java:630)
+	at org.apache.activemq.TransactionContext.commit(TransactionContext.java:595)
+	at org.apache.activemq.bugs.AMQ6391Test.commit(AMQ6391Test.java:195)
+	at org.apache.activemq.bugs.AMQ6391Test.access$200(AMQ6391Test.java:64)
+	at org.apache.activemq.bugs.AMQ6391Test$1.onMessage(AMQ6391Test.java:116)
+	at org.apache.activemq.ActiveMQMessageConsumer.dispatch(ActiveMQMessageConsumer.java:1401)
+	at org.apache.activemq.ActiveMQSessionExecutor.dispatch(ActiveMQSessionExecutor.java:131)
+	at org.apache.activemq.ActiveMQSessionExecutor.iterate(ActiveMQSessionExecutor.java:202)
+	at org.apache.activemq.thread.PooledTaskRunner.runTask(PooledTaskRunner.java:133)
+	at org.apache.activemq.thread.PooledTaskRunner$1.run(PooledTaskRunner.java:48)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+	at java.lang.Thread.run(Thread.java:745)
+Caused by: javax.transaction.xa.XAException: Transaction 'XID:[86,globalId=0000003ffffffd6,branchId=0000003ffffffd6]' has not been started. xaErrorCode:-4
+	at org.apache.activemq.transaction.Transaction.newXAException(Transaction.java:212)
+	at org.apache.activemq.broker.TransactionBroker.getTransaction(TransactionBroker.java:351)
+	at org.apache.activemq.broker.TransactionBroker.commitTransaction(TransactionBroker.java:251)
+	at org.apache.activemq.broker.MutableBrokerFilter.commitTransaction(MutableBrokerFilter.java:118)
+	at org.apache.activemq.broker.TransportConnection.processCommitTransactionOnePhase(TransportConnection.java:535)
+	at org.apache.activemq.command.TransactionInfo.visit(TransactionInfo.java:100)
+	at org.apache.activemq.broker.TransportConnection.service(TransportConnection.java:333)
+	at org.apache.activemq.broker.TransportConnection$1.onCommand(TransportConnection.java:197)
+	at org.apache.activemq.transport.ResponseCorrelator.onCommand(ResponseCorrelator.java:116)
+	at org.apache.activemq.transport.MutexTransport.onCommand(MutexTransport.java:50)
+	at org.apache.activemq.transport.vm.VMTransport.iterate(VMTransport.java:273)
+	... 5 more
+{code}
+
+The code can be seen at https://github.com/pdudits/activemq/commit/98985af1d4e5800e550562d68a2879697a5051ea, [~pdudits] having a unit test is a great start :-)
+This use case make me thing that tracking transactions by the failover transport is not such a good idea. Maybe an alternative approach is to allow that option to be disabled. It is is always on at the moment, see: https://github.com/apache/activemq/blob/31c55f75108b06020eb6206c52361b04f49656a9/activemq-client/src/main/java/org/apache/activemq/transport/failover/FailoverTransport.java#L134
+
+If the connection/transaction dies, the mdb can rollback the onMessage.
+
+If you are using failover just for discovery or loadbalancing, and use something like maxReconnectAttempts=0, there would be no recovery of the failover transport and it would not make any sense to track transactions., I use it for failover during upgrades, but it's not a master - slave setup, the brokers are just networked, so I assume that transaction tracking would really not help here anyway. 
+
+But I think that this can be solved by ConnectionStateTracker having static multi map from transactions to connections. Since all of these connections are managed by same resource adapter, they are in same class loader. , Statics may not work as well in karaf/osgi, GitHub user pdudits opened a pull request:
+
+    https://github.com/apache/activemq/pull/197
+
+    https://issues.apache.org/jira/browse/AMQ-6391
+
+    Test case for multiple connections participating in one phase commit,
+    causing leak in ConnectionStateTracker.
+    
+    Keep all the connections participating in an transaction in a static multimap
+    similar to the one in TransactionContext.
+    
+    Even though Garry  says that static fields may cause issues in OSGi, I am offering this as a solution. This static map has same lifecycle, classloading and  source bundle as the one already present in TransactionContext, therefore I assume it cannot really make things worse.
+
+You can merge this pull request into a Git repository by running:
+
+    $ git pull https://github.com/pdudits/activemq amq-6391
+
+Alternatively you can review and apply these changes as the patch at:
+
+    https://github.com/apache/activemq/pull/197.patch
+
+To close this pull request, make a commit to your master/trunk branch
+with (at least) the following in the commit message:
+
+    This closes #197
+    
+----
+commit 1c36bac35f7ad9ccb4b7dd9f981dc915e78947ea
+Author: Patrik Dudits <patrik@dudits.net>
+Date:   2016-08-09T14:41:46Z
+
+    https://issues.apache.org/jira/browse/AMQ-6391
+    
+    Test case for multiple connections participating in one phase commit,
+    causing leak in ConnectionStateTracker.
+    
+    Keep all the connections participating in an transaction in a static multimap
+    similar to the one in TransactionContext.
+
+----
+]

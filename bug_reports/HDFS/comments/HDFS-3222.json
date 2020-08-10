@@ -1,0 +1,191 @@
+[Nice catch, Uma. I think we can use the length field of the block in the NN metadata to solve this, right? The first hflush()/sync() call from the client will cause persistBlocks() to be called, which should write down the block with a non-zero length. Then on restart, we can use this length instead of 0 when the replicas aren't found., Yes, I think that should solve the problem.
+
+As we are persisting the number bytes for block, we can use block size of that partial block. Let me write some tests to replicate this.
+
+{code}
+public static void writeCompactBlockArray(
+      Block[] blocks, DataOutputStream out) throws IOException {
+    WritableUtils.writeVInt(out, blocks.length);
+    Block prev = null;
+    for (Block b : blocks) {
+      long szDelta = b.getNumBytes() -
+          (prev != null ? prev.getNumBytes() : 0);
+      long gsDelta = b.getGenerationStamp() -
+          (prev != null ? prev.getGenerationStamp() : 0);
+      out.writeLong(b.getBlockId()); // blockid is random
+      WritableUtils.writeVLong(out, szDelta);
+      WritableUtils.writeVLong(out, gsDelta);
+      prev = b;
+    }
+{code}
+
+
+There are 2 cases here, 
+
+1) found the loations, but not able to connect to any of them. then replicaNotFoundCount  will be decrented on each trail. and if replicaNotFoundCount == 0, then it returns 0.
+2) if there no loactions for that block. Then obviously replicaNotFoundCount will be 0 and returns length as 0.
+
+
+I think for both cases we can go for this persisted blockSize.
+, @Todd, 
+ I think our proposal won't work here, because by the time of hsync, DN will not report to NN anyway. So, NN can not know the length and will persist that length as 0 only. So, even if we retun block size when we find the locations 0, will not help to solve the problem. am i missing?
+
+I updated the patch for simulating the issue. Even if we fix in our proposed way, test will fail.
+So, we may have to think alternative approach for this issue.
+, bq. I think our proposal won't work here, because by the time of hsync, DN will not report to NN anyway.
+
+On the first hflush() for a block, it calls NN.fsync(), which internally calls persistBlocks(). Currently, the fsync call doesn't give a length, but perhaps it could?
+
+The other thought is that, after a restart, a block that was previously being written would be in the under construction state, but with no expectedTargets. This differs from the case where a block has been allocated but not yet written to replicas. We could use that to set a new flag in the LocatedBlock response indicating that it's not a 0-length, but instead that it's corrupt.
+, {quote}
+On the first hflush() for a block, it calls NN.fsync(), which internally calls persistBlocks(). Currently, the fsync call doesn't give a length, but perhaps it could?
+{quote}
+My point is, even though client flushed the data, DNs will not report to NN right. Did you check the test above?
+I have changed the code as per our proposal and debugged as well. It was persisting length as 0.
+
+
+{quote}
+The other thought is that, after a restart, a block that was previously being written would be in the under construction state, but with no expectedTargets. This differs from the case where a block has been allocated but not yet written to replicas. We could use that to set a new flag in the LocatedBlock response indicating that it's not a 0-length,
+{quote}
+I was thinking in the same lines:-). I got your point. I feel this would be possible to do. But my actual question is, after we distinguish, what we can do from client?
+You mean we will retry until we get the locations? If yes, there would be another problem, 
+because when 
+1) client wants to read some partial data which exists in first block itself,
+2) open may try to get complete length, and that will block if we retry until DNs reports to NN.
+3) But really that DNs down for long time.
+This time, we can not read even until the specified length, which is less than the start offset of partial block. 
+
+Your suggestion might be something else here. what is your thought here?, bq. My point is, even though client flushed the data, DNs will not report to NN right. Did you check the test above?
+Right, but the client reports to the NN. So, the client could report the number of bytes hflushed, and the NN could fill in the last block with that information when it persists it.
+
+bq. You mean we will retry until we get the locations?
+Yea -- treat it the same as we treat a corrupt file.
+
+{quote}
+1) client wants to read some partial data which exists in first block itself,
+2) open may try to get complete length, and that will block if we retry until DNs reports to NN.
+3) But really that DNs down for long time.
+
+This time, we can not read even until the specified length, which is less than the start offset of partial block.
+{quote}
+
+That's true. Is it possible for us to change the client code to defer this code path until either (a) the client wants to read from the partial block, or (b) the client explictly asks for the file length?
+
+Alternatively, maybe this is so rare that it doesn't matter, and it's OK to disallow reading from an unrecovered file whose last block is missing all of its block locations after a restart., Thanks a lot, Todd for your time.
+
+{quote}
+Yea – treat it the same as we treat a corrupt file.
+{quote}
+It may be difficult for the clients to differ whether this is real corruption or it will be recovered after DN reports to NN.
+
+
+{quote}
+Alternatively, maybe this is so rare that it doesn't matter, and it's OK to disallow reading from an unrecovered file whose last block is missing all of its block locations after a restart.
+{quote}
+
+Let's take others opinion also on this?
+Others also, please comment on this point.
+
+{quote}
+That's true. Is it possible for us to change the client code to defer this code path until either (a) the client wants to read from the partial block, or (b) the client explictly asks for the file length?
+{quote}
+you mean reader will pass the option? (a) or (b).
+
+, bq. It may be difficult for the clients to differ whether this is real corruption or it will be recovered after DN reports to NN.
+
+What's the difference? If none of the DNs holding a block have reported a replica, it's missing/corrupt. The same is true of finalized blocks - if three DNs crash, and we have no replicas anymore, it still might come back if an admin fixes one of the DNs.
+
+bq. you mean reader will pass the option? (a) or (b).
+
+Sorry, I wasn't clear. Right now, the behavior is that, when we call open() on a file which is under construction, we always go to the DNs holding the last block to find the length. My proposal is the following:
+- on open(), do not determine the visible length of the file. Set the member variable to something like "-1" to indicate it's still unknown
+- in the code that opens a block reader, change it to check if it's about to read from the last block. If it is, try to determine the visible length.
+- in the explicit getVisibleLength() call, if it's not determined yet, try to determine the visible length
+
+With the above changes, we can allow a client who only wants to access the first blocks of a file to do so without having to contact the DNs holding the last block. But as soon as the client wants to access the under-construction block, or explicitly wants to know the visible length, then we go to the DNs.
+, {quote}
+What's the difference? If none of the DNs holding a block have reported a replica, it's missing/corrupt. The same is true of finalized blocks - if three DNs crash, and we have no replicas anymore, it still might come back if an admin fixes one of the DNs.
+{quote}
+you convinced me :-). I like your other proposal, but when reader calls explicit getVisibleLength call, if DNs still did not report, then situation would be same right. So, I am ok to retry 3 times and throw the exception to user as corrupt in this situation. Let the user take action.
+What is your opinion?
+, Sounds good to me., Before moving.....
+
+{quote}
+The other thought is that, after a restart, a block that was previously being written would be in the under construction state, but with no expectedTargets. This differs from the case where a block has been allocated but not yet written to replicas. We could use that to set a new flag in the LocatedBlock response indicating that it's not a 0-length, but instead that it's corrupt.
+{quote}
+On restart case, block is there and there is no locations means there must be a sync call before. So, some data must have been written to it. If there is no sync means, that partial block itself will not be noted by NN.
+
+In your above comment, what is the other case you are pointing? 
+
+So, we need not set any flag from namenode right? I can decide directly from client it self., Attached the initial patch with the proposed idea., -1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12523528/HDFS-3222.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 1 new or modified test files.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    -1 findbugs.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2310//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/2310//artifact/trunk/hadoop-hdfs-project/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2310//console
+
+This message is automatically generated., @Todd, could you please take a look at this for review?, Could some one please review the patch before going into stale?, Hi Uma, thanks for work on this.  openInfo() updates locatedBlocks and other stuffs.  How about we move the retry logic outside openInfo() and retry the entire openInfo() call?  Otherwise, we have to check oldIter and newIter in the retry., Thanks a lot, Nicholas. for taking a look!
+Yep, you are right, I have to compare with olderIter values. Now I am doing the retries outside of previous openInfo API., +1 the new patch looks good., Seems like Jenkins did not paste the results here.
+https://builds.apache.org/job/PreCommit-HDFS-Build/2336/
+But actually it ran the tests. There are no failures due to this patch.
+
+Thanks a lot Nicholas, for the reviews!, Integrated in Hadoop-Hdfs-trunk-Commit #2214 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/2214/])
+    HDFS-3222. DFSInputStream#openInfo should not silently get the length as 0 when locations length is zero for last partial block. Contributed by Uma Maheswara Rao G. (Revision 1331061)
+
+     Result = SUCCESS
+umamahesh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1331061
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFileLengthOnClusterRestart.java
+, Integrated in Hadoop-Common-trunk-Commit #2140 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/2140/])
+    HDFS-3222. DFSInputStream#openInfo should not silently get the length as 0 when locations length is zero for last partial block. Contributed by Uma Maheswara Rao G. (Revision 1331061)
+
+     Result = SUCCESS
+umamahesh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1331061
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFileLengthOnClusterRestart.java
+, I have just committed this to trunk and branch-2, Integrated in Hadoop-Mapreduce-trunk-Commit #2157 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Commit/2157/])
+    HDFS-3222. DFSInputStream#openInfo should not silently get the length as 0 when locations length is zero for last partial block. Contributed by Uma Maheswara Rao G. (Revision 1331061)
+
+     Result = SUCCESS
+umamahesh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1331061
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFileLengthOnClusterRestart.java
+, Integrated in Hadoop-Hdfs-trunk #1027 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1027/])
+    HDFS-3222. DFSInputStream#openInfo should not silently get the length as 0 when locations length is zero for last partial block. Contributed by Uma Maheswara Rao G. (Revision 1331061)
+
+     Result = FAILURE
+umamahesh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1331061
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFileLengthOnClusterRestart.java
+, Integrated in Hadoop-Mapreduce-trunk #1062 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1062/])
+    HDFS-3222. DFSInputStream#openInfo should not silently get the length as 0 when locations length is zero for last partial block. Contributed by Uma Maheswara Rao G. (Revision 1331061)
+
+     Result = FAILURE
+umamahesh : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1331061
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestFileLengthOnClusterRestart.java
+]

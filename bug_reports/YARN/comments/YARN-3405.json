@@ -1,0 +1,235 @@
+[And there is another related case which will cause live lock during preemption and scheduling.
+If necessary, I will create a separated issue for it.
+
+Queue hierarchy described as below:
+{noformat}
+                      root
+              /        |        \
+          queue-1    queue-2    queue-3     
+          /    \
+queue-1-1      queue-1-2
+{noformat}
+
+# Assume cluster resource is 100G in memory
+# Assume queue-1 has max resource limit 20G
+# queue-1-1 is active and it will get max 20G memory(equal to its fairshare)
+# queue-2 is active then, and it require 30G memory(less than its fairshare)
+# queue-3 is active, and it can be assigned with all other resources, 50G memory(larger than its fairshare)
+# queue-1-2 is active, it will cause new preemption request(10G memory and intuitively it can only preempt from its sibling queue-1-1)
+# Actually preemption starts from root, and it will find queue-3 is most over fairshare, and preempt some resources form queue-3.
+# But during scheduling, it will find queue-1 itself arrived it's max fairshare, and cannot assign resource to it. Then resource's again assigned to queue-3
+
+And then it repeats between last two steps., It looks like the code will still check queue-1-1(leaf queue) even queue-1(parent queue)  is not over fair share.
+This is the code for FSParentQueue#preemptContainer, for this case candidateQueue will become queue-1 because candidateQueue is null at the beginning.
+{code}
+  public RMContainer preemptContainer() {
+    RMContainer toBePreempted = null;
+
+    // Find the childQueue which is most over fair share
+    FSQueue candidateQueue = null;
+    Comparator<Schedulable> comparator = policy.getComparator();
+    for (FSQueue queue : childQueues) {
+      if (candidateQueue == null ||
+          comparator.compare(queue, candidateQueue) > 0) {
+        candidateQueue = queue;
+      }
+    }
+
+    // Let the selected queue choose which of its container to preempt
+    if (candidateQueue != null) {
+      toBePreempted = candidateQueue.preemptContainer();
+    }
+    return toBePreempted;
+  }
+{code}
+Only leaf queue will not be checked if it is not over fair share.
+The following is the code for FSLeafQueue#preemptContainer
+{code}
+  public RMContainer preemptContainer() {
+    RMContainer toBePreempted = null;
+
+    // If this queue is not over its fair share, reject
+    if (!preemptContainerPreCheck()) {
+      return toBePreempted;
+    }
+
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Queue " + getName() + " is going to preempt a container " +
+          "from its applications.");
+    }
+
+    // Choose the app that is most over fair share
+    Comparator<Schedulable> comparator = policy.getComparator();
+    FSAppAttempt candidateSched = null;
+    readLock.lock();
+    try {
+      for (FSAppAttempt sched : runnableApps) {
+        if (candidateSched == null ||
+            comparator.compare(sched, candidateSched) > 0) {
+          candidateSched = sched;
+        }
+      }
+    } finally {
+      readLock.unlock();
+    }
+
+    // Preempt from the selected app
+    if (candidateSched != null) {
+      toBePreempted = candidateSched.preemptContainer();
+    }
+    return toBePreempted;
+  }
+{code}
+preemptContainerPreCheck is only called at leaf queue. So for this case,  leaf queue queue-1-1 is over fair share, it will be preempted.
+Do I miss the code which prevent queue-1(parent queue) to be recursively preempted?
+, Thanks, my mistake on the code detail. And I will verify it works now.
+
+And If queue1 level has some other sibling queue(like queue-2) that equals to queue-1's usage/fairshare,  "candidateQueue" still may be not the queue-1 itself, because they are equal by comparing, and will depends on the queue order.
+Then queue-1-2 still cannot preempt its sibling, and cause some live lock issue like above second scenario.
+, [~zxu]
+I have verified that there's no problem in first scenario. 
+Second scenario problem still exists.  
+
+bq. And If queue1 level has some other sibling queue(like queue-2) that equals to queue-1's usage/fairshare, "candidateQueue" still may be not the queue-1 itself, because they are equal by comparing, and will depends on the queue order.Then queue-1-2 still cannot preempt its sibling, and cause some live lock issue like above second scenario.
+
+I think for above scenario it maybe results in preemptContainerPreCheck() for queue-2 (leaf queue) will fail, and queue-1-2 cannot get preempt any resources. Live lock will not happen.
+
+I'll update description once you committed above bad cases.
+Thanks., [~peng.zhang] - I haven't looked at the code yet; I think the issue described in the description exists, but don't quite see the livelock. Is this the confirmation you are looking for? 
+
+The back-and-forth is a little confusing, could you update the description with what you think the real problem is. If there is a second problem, let us handle that in a different JIRA and link the two if necessary. , [~kasha] is right, There is a possibility for the first scenario. If we have another queue queue-2 which is queue-1's sibling and queue-2 is greater than queue-1 when compare queue-1 and queue-2, then queue-2 will always be picked for preemption and queue-1 won't have chance to be preempted., bq. There is a possibility for the first scenario. If we have another queue queue-2 which is queue-1's sibling and queue-2 is greater than queue-1 when compare queue-1 and queue-2, then queue-2 will always be picked for preemption and queue-1 won't have chance to be preempted.
+
+For this case "queue-2 is greater than queue-1 when compare queue-1 and queue-2":
+I think firstly preempt from queue-2(if it is LeafQueue) or queue-2's child Queue is reasonable.
+And then when preemption and scheduling cause queue-1 greater than queue-2, it should preempt from queue-1-1 ideally. (I think this may not happen in time by checking code, and maybe cause queue-1 is over preempted. But even if queue-1 is over preempted, during scheduling, the preempted containers will not be all assigned to queue-1, because queue-2 itself is under fair share. Finally it will got a balance & fair state.)
+, [~kasha]
+What the real problem I met in our cluster is livelock. After checking code, I think it has some other bad cases like we talked above.
+I list them together because I think they has the same basic problem: "calculation of preemption request and preemption of container are separated as two phases", lot of necessary info is lost between these two phases.
+
+For less confusion, I created YARN-3414 to discuss livelock problem.
+And I'll update this description to show non-livelock case that I think.
+, This issue looks like a Comparator issue, It will be better to consider their child queues also when compare two parent queues.
+In this case,  queue-1 could be considered as over fair share because its child queue queue-1-1 is over fair share., Yes, changing comparator may solve this specific case, but what if queue-2 has same sub-queue hierarchy like queue-1, and at the same period, the second queue of them get active? Recursive compare still return equal, and the two latter sub-queue will be waiting.
+
+As for this issue and YARN-3414, IMPO we should combine "calculation of preemption request and preemption". For each preemption request of leaf queue, starts preempt upside. If parent queue is under faieshare, found the most over fairshare from sibling, otherwise go up again. Finally when get to the root, it end because root definitively under fairshare.
+
+This idea can also solve YARN-3414. When found parent has got fairshare(limited by max), it will preempt its sibling., I test this case in cluster: queue-2 will be preempted until its ResourceUsage( consumption - preempted resources)  equal to its fair share, and will not be over preempted.
+And then no preemption from sibling queue-1-1, and hang there., I've a primitive idea to fix this and YARN-3414 under current preemption architecture.
+
+1. When calculation preemption request, update parent's preemption request.
+2. if parent's usage reached its fair share, it will not propagate preemption request upside again. So preemption request in parent queue means preemption needed between its children.
+3. During preempting phase, walk from root to downside
+  a. if parent queue has preemption request, it will do preemption between its children for the request(process like now, find the most over fair, and preempt recursively).  
+  b. And then(including after doing 3.a and the case not need preempt between children), traverse its children and repeat 3.a;
+
+This process bring in traverse of the tree. And I think this will not affect performance severely because there are usually small amount of queues., bq. 
+2. if parent's usage reached its fair share, it will not propagate preemption request upside again. So preemption request in parent queue means preemption needed between its children.
+
+make above statement more clear:
+If request from children added with current usage less than fair share, parent queue will propagate request upside. This means current queue is under fair share, it need preempt from its sibling that who is over scheduled. When the amount reached current queue's fair share, the above request amount will be stored on current queue. This means these request amount need happen between current queue's children, , I uploaded one patch for this.
+This patch updated TestFairSchedulerPreemption to test the preemption process and final usage share of queues.
+And this patch can also resolve YARN-3414, tested by TestFairSchedulerPreemption#testPreemptionWithFreeResources.
+
+It now works good for fair policy, but for drf policy it still has some work to do related YARN-3453. I'll fix them in that issue after finishing this.
+
+, Other issues for preemption during development, need confirmation:
+# Jobs in the same queue will not trigger preemption, cause resToPreemption() only considers unfair between queues. 
+# MapReduce's map task will cause unneeded preemption request, because FSAppAttempt.updateDemand() will count all of ANY, rack and host request, so preemption demand will be triple for one map task. I want to change it to only counting for ANY request, but do not know whether it will affect Non-MapReduce framework. 
+# Notion of "MinResources" is confusing and easy to misconfigure. Because calculation of fair share considers min, max & weight, when min of one queue is above cluster resources or its parent queue, other queue's fair share is 0, also I found sometimes sum of children's fair share can be larger than parent queue's fair share. I have some suggestions for these notion like below:
+* max resources means maximum resources that one queue can get
+* min resources means under which threshold the queue cannot not be preempted
+* weight notion changed to "expected fair share"  - like <10240mb 10cores> (I see weight implementation has memory and cpu, but we use only memory now), and make "expected fair share" as the only considered element during calculation of fair share., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12724934/YARN-3405.01.patch
+  against trunk revision 174d8b3.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/7315//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/7315//artifact/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/7315//console
+
+This message is automatically generated., [~kasha] & [~zxu]
+plz take a look and give some feedback. 
+Thanks., Update patch: only preempt from children when queue is not starved and add test case., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12727548/YARN-3405.02.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 18eb5e7 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/7468/console |
+
+
+This message was automatically generated., (!) The patch artifact directory on has been removed! 
+This is a fatal error for test-patch.sh.  Aborting. 
+Jenkins (node H8) information at https://builds.apache.org/job/PreCommit-YARN-Build/7469/ may provide some hints., \\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12727554/YARN-3405.02.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 332b520 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/9109/console |
+
+
+This message was automatically generated., | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red} 0m 5s {color} | {color:red} YARN-3405 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12727554/YARN-3405.02.patch |
+| JIRA Issue | YARN-3405 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/10683/console |
+| Powered by | Apache Yetus 0.3.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+, | (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 0s {color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red} 0m 6s {color} | {color:red} YARN-3405 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12727554/YARN-3405.02.patch |
+| JIRA Issue | YARN-3405 |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/12961/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+]

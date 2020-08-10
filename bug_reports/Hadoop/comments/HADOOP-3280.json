@@ -1,0 +1,256 @@
+[I guess HADOOP-2765 missed the use case that the 32-bit/64-bit java Map-Reduce framework could inter-op with 32-bit/64-bit streaming/pipes processes... but we *do* need to set a limit, and cannot rely on the pipes/streaming task to do it - many apps don't and then proceed to hog the cluster.
+
+Should we just add another config called mapred.child.ulimit? (sigh! I know I don't want to do this... *smile*)
+
+For now (i.e. for 0.17.0) mapred.child.ulimit could just provide the memory limit, in future we can probably extend it to be a comma-separated list of key/value pairs for memory, cpu, open files etc.
+
+Thoughts?, Clarification - mapred.child.ulimit's limit for memory should default to the -Xmx value, users can override if necessary., Patch for consideration... incomplete in the sense that it needs to update docs.
+
+Added a mapred.child.ulimit config knob..., This patch looks reasonable. The other option is to have an option to completely disable the ulimit setting (apps like the ones Rick talks about will work without any issues). Thoughts?, I'd guess there are many users who do not want Hadoop to limit tasks (be they Java or streaming). When a cluster exists to run specific tasks, it seems reasonable that they can use all of its resources.
+
+On this issue, a default {{ulimit -v}} will cause some pretty strange failures while also failing to prevent resource exhaustion in other cases. For example, some tasks may mmap multi-GB files but touch only a few pages. Others may link libraries that require 100s of MB of address space for code that's never executed (and thus never read). Still others may fork off lots of sub-processes and thus ultimately consume more RAM than any single process's virtual address space. (Btw, these examples are all taken from our deployed Hadoop apps.)
+
+Further, when these tasks hit the virtual address space limit, it's likely they'll fail in confusing, difficult to debug ways, since few apps are written to gracefully handle that case, and when run outside of Hadoop the same commands will work fine unless the user reads the streaming code and notices that it is imposing this limit. (This is in contrast to the -Xmx limit, which can actually influence the garbage collector to be more aggressive, is a commonly used java option, and produces relatively clear OutOfMemoryErrors on failure.)
+
+This is why I don't think {{ulimit -v}} is the right approach *in general*. That doesn't mean it's not the right approach for specific situations, and hence the original proposal for a wrapper script (possibly one mandated by the cluster admin) is attractive. In other specific situations, {{ulimit -m}} might be more effective than {{ulimit -v}}, or some {{jail}}-like mechanism might be employed, and of course Windows users will need something else. Adding support for all the different ways resources might be limited to streaming does not seem practical.
+
+(I realize this would all have been much more useful to bring up in the original issue, and apologize for not following that one more closely. As one path forward, we could reopen 2765 and continue this discussion there.), > For example, some tasks may mmap multi-GB files but touch only a few pages. Others may link libraries that require 100s of MB of address space for code that's never 
+> executed ...
+
+Fair point. It seems to me we have 3 options:
+
+- Have a way of disabling the ulimit. This doesn't address the general problem of constraining/permitting resource usage in arbitrary ways, among other things.
+- Allow users/admins to specify a wrapper script. This will clearly work but feels like it creates unnecessary work for users and admins. Users/Admins have to worry about obtaining the command line from the Tasktracker and execing it. This is a chore if all you want to do is set a ulimit or specify a couple of environment variables.
+- Allow users/admins to specify a prologue script. The prologue is run before the task under the same shell. This will let people set resource limits, environment variables etc. that affect the task. This may be more limiting than a wrapper in some cases, but in those scenarios one always has the option of baking the wrapper into the job.
+
+Thoughts?, For the prologue, we'd introduce a config variable _mapred.task.prologue_ which can be used to specify a command line to run before the task., The prologue idea seems to support the variety of uses easily. I like it. To make sure I understand:
+
+The prologue setting would first be tokenized using the same parser as is used for the regular command, and we'd then concatenate the list of prologue tokens with the list of regular command tokens.
+
+Use cases would include:
+
+Setting a ulimit: {{prologue="bash -c ulimit -v NNN; exec"}}
+
+Adding a wrapper: {{prologue="wrapper.sh"}}
+where wrapper.sh could be:
+{code}
+#!/bin/bash
+
+...set environment variables, ulimits, etc...
+
+exec "$@"
+{code}
+
+Or just directly executing the command: {{prologue=""}}.
+
+Since this will only apply to streaming (and possibly pipes), should the setting name be {{stream.task.prologue}}?
+
+, In the shell where the executable is going to be run, doing a "source <prologuescript>" before running the executable seems good enough. Thoughts?, Actually Sameer's suggestion on having a config variable for the prologue works too if that is convenient enough for users to set up., Why are we limiting this from within Hadoop and not relying upon the OS to do the limits for us?  Does ulimit even work on Windows?
+
+, Very good point, Allen. I think we should just revert HADOOP-2765 and just assume that the admin configuring the cluster sets it in $conf/hadoop-env.sh on the task trackers. The only downside is that the task trackers would be under the same ram limitation as the sub-processes. But that seems ok., On Linux, we should be able to do this as part of /etc/security/limits.conf.  Solaris has the whole rctl subsystem.  I'm sure other UNIX and UNIX-like systems have similar things.  Point is, ops folks should be able to limit memory consumption without modifying hadoop at all, even the hadoop-env.sh file., > On Linux, we should be able to do this as part of /etc/security/limits.conf.
+
+limits.conf is a blunt tool. Anything set there will apply to all processes belonging to a particular user or group. Tasks in Hadoop run with the uid of the tasktrackers, so restricting processes by username/group has no effect. Even in a world with HoD it is reasonable to expect tasks to be constrained differently from tasktrackers and jobtrackers.
+
+Long term we will likely run tasktrackers as root and setuid to the submitting user and at that point limits.conf will suffice.
+
+
+
+
+
+
+
+
+
+
+, > The prologue setting would first be tokenized using the same parser as is used for the regular command, and we'd then concatenate the list of prologue tokens with the list of 
+> regular command tokens.
+
+Hadoop already does some environment setup (redirecting stdout and stderr) that I believe will be difficult to change. What I had in mind was that the prologue setting would be executed before the regular command. So to address your use cases:
+
+Setting a limit: prologue="ulimit -v NNN"
+
+Adding a wrapper: prologue="source wrapper.sh" where wrapper.sh could be
+
+{noformat}
+#!/bin/bash
+
+set foo=bar
+ulimit -v NNN
+{noformat}
+
+Or nothing: prologue=""
+
+Will this create any problems?
+, +1 for Sameer's suggestion.
+
+What should be the default behavior?
+1. We can have mapred.task.prologue="" as default behavior. This would make no ulimit setting on the streaming/pipes tasks. 
+2. We can have the existing default behavior, ie ulimit memory setting should default to the -Xmx value. In this case 64-bit streaming app might have to increase -Xmx value or make no prologue by mapred.task.prologue="none" , Allen and Owen's proposals have the significant advantage of applying to non-streaming tasks as well. Perhaps the prologue idea could be applied there --- a prologue executed before running the per-task JVM could {{setuid}}, {{setrusage}}, etc.
+
+bq. Hadoop already does some environment setup (redirecting stdout and stderr) that I believe will be difficult to change. What I had in mind was that the prologue setting would be executed before the regular command. So to address your use cases:
+
+PipeMapRed uses a shell post-HADOOP-2765 to set the ulimits, but doesn't need to assume a particular shell otherwise., Sigh!  I missed that  mapred.task.prologue can be a script, used to set resource limits, environment variables etc. that affect the task. 
+Then, it looks like option (2) for the default behavior is ruled out, because we dont know whether setting the ulimit is already part of prologue or not. And if it is not,  we assume that user does not want to set ulimit.
+
+So, the default behavior will be _no ulimit setting_ for the streaming/pipes tasks.
+
+Thoughts?, The prologue setting, if implemented, should IMO apply in all task contexts: streaming, pipes or plain old Java. I don't think that it should default to setting a memory limit based on -Xmx. The -Xmx switch can be used if needed in JVM args to specify a threshold that triggers garbage collection. It can, for example,  be set to a value lower than a memory limit specified through a ulimit.
+
+> PipeMapRed uses a shell post-HADOOP-2765 to set the ulimits, but doesn't need to assume a particular shell otherwise.
+
+The ulimit was certainly introduced in HADOOP-2765, but the _TaskLog.captureOutAndErr_ method has existed and assumed bash for quite a while now. I believe the consensus at the time was that assuming bash was pretty benign. I'm not entirely sure about this, Owen or Devaraj likely know better., bq. TaskLog.captureOutAndErr method has existed and assumed bash for quite a while now. I believe the consensus at the time was that assuming bash was pretty benign. I'm not entirely sure about this, Owen or Devaraj likely know better.
+
+That's true (except for streaming where we don't want to capture out and err, but even there the streaming command is wrapped with 'bash -c', but, yes, that got introduced in HADOOP-2765)., Here is a patch adding "mapred.task.prologue". The prologue is added to get executed, before streaming, pipes or plain Java tasks starts execution. The default behavior of ulimit setting introduced in HADOOP-2765 is removed.
+
+TestUlimit is updated to use prologue to set ulimit. TestUlimit tests setting the ulimit directly in prologue. and also tests using wrapper.sh for setting ulimit., Added documentation in mapred-tutorial, This approach taken in this patch seems reasonable to me. What do others think? , * Bash is currently an implementation detail of TaskLog. Defining the prologue as something that runs in the shell locks bash into the API (as users will then have bash-specific fragments in config files), which is a quite different level of requirement.
+
+* Task startup is a very powerful place to have a hook, and I think many desired customizations could be framed as task wrappers. But many of them also require a true wrapper, not just a command run before the real command. For example, I've long wanted a hook to run commands after the task exits (e.g. task log collection). A wrapper could provide that. Sameer mentioned wanting to setuid to the user who submitted the job; that could also be done by supplying a wrapper (it it had someway to get the submitter's username). 
+
+* For more complicated setup tasks, it may be desirable to use a language besides bash.
+
+For these reasons, I'm still in favor of the prologue being defined as a prefix to the command rather than a fragment of bash that is run before the command.
+
+On the latest patch: since TaskRunner applies the prologue to all tasks, will it still be necessary in PipeMapRed and Application too?, Of the alternatives so far, I like the approach of Arun's patch. I would make the slight modification that the default ulimit is the Xmx + 30% so that for java tasks, we don't hit it. I think that Rick's point that exposing the bash dependence to users and config is problematic., I really don't think a default ulimit is a good idea. The solution seems very specific to a particular problem, and, though we're heavy users of streaming, we've never encountered this need. Will most streaming users run into processes using too much virtual address space? And will they expect that hadoop, by default, would limit that? 
+
+The flip side is that many streaming users will conservatively set Xmx (since Java's behavior with that setting is not comparable to ulimit -v, and the real work is being done by the streaming app anyway), and then wonder why their streaming processes refuse to start or fail randomly. For example, here's what {{ls}} does when it exceeds the {{ulimit -v}} on RHEL3:
+
+{code}
+$ bash -c 'ulimit -v 10; ls'
+$
+{code}
+
+No error message is produced (bash -c doesn't even print the "Killed" message). The exit status is 137, but otherwise, there's no indication of what happened or why, and when the user tries to reproduce it outside of hadoop, it probably won't happen unless they know to set the ulimit -v., Summarizing the points: 
+1) We don't want to have bash related dependencies in the config.
+2) We ideally want to have a wrapper for tasks.
+3) We don't want to have default values for the ulimit setting.
+4) Allen, in an offline email, brought up another point - that tasks can spawn processes from within. In that case, the problem gets to be managing the ulimit for all of them. 
+
+For (3) and (4), sounds like we should somehow cap the memory usage on a per user basis and that should address the needs. Most OS already supports that. But today hadoop can't make use of that feature since all tasks run with the uid of the tasktracker. (2) is a possible way to inject the ulimit and other env settings in the config (and also have some actions taken after a task exits). (2), in its entirety, doesn't seem to be in the scope of this issue.
+
+So, in short, it seems like we cannot do a very good job of restricting resource usage without knowing the uid of the tasks on a per task basis when the tasks could be from different jobs submitted by different users.
+
+IMO, options we are left with are: (1) do at least what Arun did in his patch with the default value set to _no limit_ (2) revert 2765 and deal with this problem when we have better infrastructure to do with uids for tasks.
+
+Thoughts?, Thanks for the summary. Since the ability to set the ulimit has been cited as important, at least in some cases, option 1 (Arun's patch with no default) seems reasonable. The only issue I see is that we'd need to deprecate or continue supporting it in any more general solution., +1 on Arun's patch with no default, Looks like we do have consensus on the new config variable 'mapred.child.ulimit' for 0.17.0, here is an updated patch for consideration while I hunt down documentation fixes...
+
+On Sameer's suggestion I have changed to using 'ulimit -m' rather than 'ulimit -v' since it seems better to control the process' resident memory rather than it's virtual memory limit., bq. I have changed to using 'ulimit -m' rather than 'ulimit -v' since it seems better to control the process' resident memory rather than it's virtual memory limit.
+With this change org.apache.hadoop.streaming.TestUlimit will not work, because the test assumes virtual memory is limited by ulimit., You can remove the isCygwin check in streaming also(done already in pipes),  as you are taking care of it in getUlimitMemoryCommand()., Should "mapred.child.ulimit" be applied to java tasks as well? 
+If so, as Rick pointed out, TaskRunner should apply it to all tasks, and  it need not be done in PipeMapRed and Application . , bq. Should "mapred.child.ulimit" be applied to java tasks as well? 
+
+I'm not sure we want to introduce that right-away into 0.17.0.
+
+Medium/long term we could let mapred.child.ulimit be used for passing limits like no. of files, max. user processes etc. (i.e. -m, -n etc.). Thoughts?
+
+Btw, I can't seem to get TestUlimit to work with 'ulimit -m', Devaraj suggested I rework the testcase to use a simple streaming script which will just do 'ulimit -m' and check that the user-defined value is honoured... I'll rework the patch.
+
+bq. You can remove the isCygwin check in streaming also(done already in pipes), as you are taking care of it in getUlimitMemoryCommand().
+
+No, unfortuanately that check is necessary since streaming doens't use bash in Windows..., Here is patch with "mapred.child.ulimit" applied to all tasks from TaskRunner. 
+Changes to do with ulimit setting in pipes and streaming (introduced in 2765) are removed. 
+
+I reworked on TestUlimit to get the value of ulimit -m and assert it with the value set.
+
+bq. Medium/long term we could let mapred.child.ulimit be used for passing limits like no. of files, max. user processes etc. (i.e. -m, -n etc.
++1 
+, -1 overall.  Here are the results of testing the latest attachment 
+http://issues.apache.org/jira/secure/attachment/12380834/patch-3280-1.txt
+against trunk revision 645773.
+
+    @author +1.  The patch does not contain any @author tags.
+
+    tests included +1.  The patch appears to include 11 new or modified tests.
+
+    javadoc +1.  The javadoc tool did not generate any warning messages.
+
+    javac +1.  The applied patch does not generate any new javac compiler warnings.
+
+    release audit +1.  The applied patch does not generate any new release audit warnings.
+
+    findbugs +1.  The patch does not introduce any new Findbugs warnings.
+
+    core tests +1.  The patch passed core unit tests.
+
+    contrib tests -1.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2316/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2316/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2316/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2316/console
+
+This message is automatically generated., Looks like lucene.zones (Solaris) doesn't support 'ulimit -m'... sigh!
+I'm reverting back to ulimit -v ..., Updated patch to use 'ulimit -v', passes 'ant patch-test' locally too..., -1 overall.  Here are the results of testing the latest attachment 
+http://issues.apache.org/jira/secure/attachment/12380888/HADOOP-3280_2_20080424.patch
+against trunk revision 645773.
+
+    @author +1.  The patch does not contain any @author tags.
+
+    tests included +1.  The patch appears to include 11 new or modified tests.
+
+    javadoc +1.  The javadoc tool did not generate any warning messages.
+
+    javac +1.  The applied patch does not generate any new javac compiler warnings.
+
+    release audit +1.  The applied patch does not generate any new release audit warnings.
+
+    findbugs +1.  The patch does not introduce any new Findbugs warnings.
+
+    core tests +1.  The patch passed core unit tests.
+
+    contrib tests -1.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2322/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2322/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2322/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2322/console
+
+This message is automatically generated., Looks like 1024K as virtual memory is not sufficient for launching jvm. , This patch is Arun's latest patch with SET_MEMORY_LIMIT increased to 1GB in i.e 1048576K in the TestUlimit, Increasing it to 2GB, trying to run Hudson, +1 overall.  Here are the results of testing the latest attachment 
+http://issues.apache.org/jira/secure/attachment/12380895/patch-3280-3.txt
+against trunk revision 645773.
+
+    @author +1.  The patch does not contain any @author tags.
+
+    tests included +1.  The patch appears to include 11 new or modified tests.
+
+    javadoc +1.  The javadoc tool did not generate any warning messages.
+
+    javac +1.  The applied patch does not generate any new javac compiler warnings.
+
+    release audit +1.  The applied patch does not generate any new release audit warnings.
+
+    findbugs +1.  The patch does not introduce any new Findbugs warnings.
+
+    core tests +1.  The patch passed core unit tests.
+
+    contrib tests +1.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2324/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2324/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2324/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2324/console
+
+This message is automatically generated., I'm worried about setting ulimit -m too high, I'll bump it down to 768M - I've tested it to ensure TestUlimit works on both Linux & Solaris., ulimit set to 768M in the test case., +1 overall.  Here are the results of testing the latest attachment 
+http://issues.apache.org/jira/secure/attachment/12380972/HADOOP-3280_3_20080425.patch
+against trunk revision 645773.
+
+    @author +1.  The patch does not contain any @author tags.
+
+    tests included +1.  The patch appears to include 11 new or modified tests.
+
+    javadoc +1.  The javadoc tool did not generate any warning messages.
+
+    javac +1.  The applied patch does not generate any new javac compiler warnings.
+
+    release audit +1.  The applied patch does not generate any new release audit warnings.
+
+    findbugs +1.  The patch does not introduce any new Findbugs warnings.
+
+    core tests +1.  The patch passed core unit tests.
+
+    contrib tests +1.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2333/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2333/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2333/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch/2333/console
+
+This message is automatically generated., I just committed this. Thanks, Arun!, Integrated in Hadoop-trunk #475 (See [http://hudson.zones.apache.org/hudson/job/Hadoop-trunk/475/])]

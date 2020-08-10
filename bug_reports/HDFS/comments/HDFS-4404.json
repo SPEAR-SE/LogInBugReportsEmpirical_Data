@@ -1,0 +1,244 @@
+[failure reason is that create file marked as not idempotent.
+
+org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolTranslatorPB.create. Not retrying because the invoked method is not idempotent, and unable to determine whether it was invoked
+
+here is not related to BK.
+
+log:
+
+013-01-12 09:52:47,834 WARN retry.RetryInvocationHandler (RetryInvocationHandler.java:invoke(95)) - Exception while invoking class org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolTranslatorPB.create. Not retrying because the invoked method is not idempotent, and unable to determine whether it was invoked
+
+when client create file,the client will connect the first NameNode,but client don't connect to the first NameNode,because machine of first NameNode is shutdown.the create function mark as not idempotent,and create file op don't retry.so the create file op is failure. I think that when client don't connect to namenode,not idempotent will be retry. 
+, Hi Liaowenrui. I think you're correct -- we should retry even non-idempotent IPCs on ConnectException. Want to work on a patch?, yes,I will submit the patch.
+todd help check it ,thanks!, Hi Liaowenrui,
+
+- Please double check that you maintain the correct indentation. It looks like your patch inserts tabs in a couple places. We use hard spaces in Hadoop.
+- I don't think you need to change inside RetryInvocationHandler.java. RetryPolicies.FailoverOnNetworkExceptionRetry#shouldRetry already checks against ConnectException and will initiate the failover regardless of idempotence.
+- Please don't leave commented-out code in SocketIOWithTimeout.
+
+Thanks
+, Good find, liaowenrui. Though this is a good bug to fix to be sure, I don't think this should be considered a blocker, and hence I'm lowering to critical. Please feel free to put it back if you disagree.
+
+Also, not a big deal, but in the future please do not set the "fix version" field until the JIRA is actually committed. Please use the "target version" field to indicate which branch you think an issue should be fixed on., bq.  I don't think this should be considered a blocker
+Configuration provides two namenodes. If the first one happens to be down, all the clients creating files will fail. This happens even though a second namenode is active and providing service. Is that correct understanding of the problem? If it is, then this should be a blocker bug, right?
+
+
+, bq. Configuration provides two namenodes. If the first one happens to be down, all the clients creating files will fail. This happens even though a second namenode is active and providing service. Is that correct understanding of the problem? If it is, then this should be a blocker bug, right?
+
+That's how I understand the problem, yes. Whether or not this should be considered a blocker is a subjective matter, however. I think it should be marked "critical" because I don't think it should hold up the next release, given that it's been around for quite a while and we haven't seen many (any?) reports of it up until now., bq. given that it's been around for quite a while and we haven't seen many (any?) reports of it up until now.
+I think that is because not many people have deployed the alpha release in production.
+
+If you bring down a namenode and pretty much all clients that create files fail. That to me means file system appears to be down and not Available. This is a very serious issue and is a blocker. I would like to block 2.0.3 until this gets fixed., Marking it blocker since it's a small patch and has had one round of review, also I'm still awaiting HADOOP-9215 for 2.0.3.
+
+If this is going to take forever, we can revisit this decision., Sounds fine. I agree that I doubt it will take a long time to address, so no big deal., Given that folks want to get this in for 2.0.3, I'll take over and rev Liaowenrui's patch based on my above review comments. Should have a patch up by EOD., Looked into this a bit... I think it's actually a little more complicated than we originally though. Liaowenrui's proposed fix has a couple problems I didn't think about at first glance:
+
+- The SocketIOWithTimeout code is supposed to "act like" the normal Java Socket stuff. The normal Socket code does throw SocketTimeoutException on timeout to connect, and ConnectException explicitly means that the connect call failed. Changing NetUtils.connect could cause issues for other users downstream such as HBase as well.
+- In {{Client.setupConnection}} we are explicitly treating the SocketTimeoutException differently than IOException -- it retries up to 45 times by default for non-HA. Changing connect to throw ConnectException would break this code and make the ipc.client.connect.max.retries.on.timeouts config meaningless.
+
+In the HA case, the HDFS {{ConfiguredFailoverProxyProvider}} resets that configuration before constructing the proxy. It sets it to the value of dfs.client.failover.connection.retries.on.timeouts, default 0 (see HDFS-2682). Judging by the description of that JIRA, it looks like it used to fallback to the retry policy provider, which would cause a failover (Uma mentions "rethrow the exception to RetryPolicy"). Looking back on the history of Connection.java, it seems like HDFS-3504 rejiggered some of this code and might have broken the behavior.
+
+
+Regardless, now that I have looked into it a bit more, I think it may be OK to skip for 2.0.3. It's certainly a bug, but in practice I don't think we see this much, because almost all use cases involve doing one or more read-only (idempotent) ops before doing any non-idempotent ones. For example, when I tried to reproduce from the shell, I was unable to since {{hadoop fs -put}} will stat the file before creating it. Similarly any MR task is likely to read some input before creating any output. These non-idempotent calls serve to find the correct active NN, and then the following non-idempotent ones succeed. Pushing out to 2.0.4 should give us time to make the correct fix instead of accidentally regressing some other change in the process.
+, critical typo above... should have written:
+
+These *idempotent* calls serve to find the correct active NN, and then the following non-idempotent ones succeed, Great analysis, Todd. This also serves to explain why we haven't seen many reports of it up to now - most clients will incidentally work just fine., The crux of the issue here is that we want to communicate from the RPC call back to the caller whether the call was actually sent or not. Timeout on connect is one case where we failed before sending, but it's also possible that we'd get some kind of timeout during SASL negotiation, etc. For example, if one of the two NNs has lost contact with the KDC and won't authenticate people, we still want to failoer.
+
+So, we'd like some more generic way to pass along the call status in the response beyond just making connect() timeouts throw ConnectException.
+
+This is tough to do, since the only way we can pass back information from the IPC.Client layer to the FailoverProxyProvider is via an exception, and critically, by making a new exception class which has the requisite info. The problem with making a new class, though, is that any callers who were depending on IPC calls throwing particular IOException subclasses like SocketTimeoutException or ConnectException will get broken (since they'd now end up with something like an IpcTransportException).
+
+We could handle the current specific case of timeout-on-connect by making a subclass of SocketTimeoutException like ConnectTimeoutException, and throw that. This would be compatible but not a complete solution. A more radical change would be to make a new IOException subclass like IpcTransportException, which is thrown for any case where the transport layer had a problem, with various subclasses for the different cases. This would be a bit difficult since it would be user-visible.
+
+Thoughts?, Here's a kind of crappy patch which does something like the above -- makes NetUtils.connect throw ConnectTimeoutException (subclass of SocketTimeoutException) on timeout. Then changed the FailoverOnNetworkException policy to check for this type. I also had to change the NetUtils.wrapException code so that when wrapping, it would re-throw with the correct subclass instead of recreating the superclass.
+
+I don't like it, because it doesn't deal with the other cases of failure to connect, but this is by far the most common case, so maybe it's an OK stopgap for now. The only problem with this as a stopgap is that users might come to rely on this new exception type flowing all the way out to user code., (btw, I verified that it works on a test setup.. will write an actual unit test if people think this is the right approach), {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12565235/hdfs-4404.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 1 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common:
+
+                  org.apache.hadoop.ipc.TestIPC
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/3853//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/3853//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/3853//console
+
+This message is automatically generated., Test failed due to an incorrect mock -- had to update the mock to throw the new exception type to simulate a connection failure, {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12565271/hdfs-4404.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 1 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/3856//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/3856//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/3856//console
+
+This message is automatically generated., Thanks a lot, Todd for the patch!
+some minor comments:
+- Why can't we use newly added wrap method for this last else case?
+
+{code}
+else {
+       return (IOException) new IOException("Failed on local exception: "{code}
+
+- Please include exception also?
+{code}
+ catch (Exception e) {
++      LOG.warn("Unable to wrap exception of type " +
++          clazz + ": it has no (String) constructor");
+{code}
+
+ Also there is warning for this from findbugs. handle  NoSuchMethodException explicitely instead of generic?, Todd - do you want me to hold up 2.0.3 for this?, Todd, thanks for working on this.
+
+Some comments:
+# I might have missed this part of the discussion - is there a reason to introduce ConnectTimeoutException and not just use SocketTimeoutException?
+# wrapWithMessage() is a good change. Is that necessary in this jira? I am okay if you want to include it.
+# Minor - optionally some empty line changes could be removed
+, bq. I might have missed this part of the discussion - is there a reason to introduce ConnectTimeoutException and not just use SocketTimeoutException?
+
+Yes, we need some way to communicate to the FailoverProxyProvider whether it was a failure to connect or a timeout in reading the response. In the current code, SocketTimeoutException is thrown in either case, so the layer which does failover can't know whether or not the call might have been invoked.
+
+bq. wrapWithMessage() is a good change. Is that necessary in this jira? I am okay if you want to include it.
+
+Per above, it's necessary because, now that we construct a subclass of SocketTimeoutException, it would have caused wrapWithException to convert it back to the superclass -- the exception is still instanceof SocketTimeoutException, so the rethrow wouldn't preserve the right class. The new rethrow method preserves the right class.
+
+bq. Minor - optionally some empty line changes could be removed
+Yep, will fix that as well as add a unit test if folks agree on the change. Will also address Uma's feedback above. Do people agree this is an OK approach? Does anyone have a better way of solving it?, thanks Todd!you are very good!, Attached patch adds a unit test and addresses some of the feedback above.
+
+Uma -- I didn't change the "Local Exception" wrapping case to use the new code, since that would be a behavioral change which I think is outside the scope of this bug fix., {color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12567643/hdfs-4404.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 1 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/3938//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/3938//console
+
+This message is automatically generated., Fix the javadoc warning (missed a '}' character), The latest patch looks good to me. +1 pending Jenkins., {color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12567696/hdfs-4404.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/3941//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/3941//console
+
+This message is automatically generated., +1, I'm going to commit this momentarily., Integrated in Hadoop-trunk-Commit #3321 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/3321/])
+    HDFS-4404. Create file failure when the machine of first attempted NameNode is down. Contributed by Todd Lipcon. (Revision 1442461)
+
+     Result = SUCCESS
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1442461
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/ConnectTimeoutException.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/NetUtils.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestIPC.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSClientFailover.java
+, I've just committed this to trunk and branch-2. Thanks a lot for the contribution, Todd, and thanks to all for the reviews., Integrated in Hadoop-Yarn-trunk #118 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/118/])
+    HDFS-4404. Create file failure when the machine of first attempted NameNode is down. Contributed by Todd Lipcon. (Revision 1442461)
+
+     Result = FAILURE
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1442461
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/ConnectTimeoutException.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/NetUtils.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestIPC.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSClientFailover.java
+, Integrated in Hadoop-Hdfs-trunk #1307 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1307/])
+    HDFS-4404. Create file failure when the machine of first attempted NameNode is down. Contributed by Todd Lipcon. (Revision 1442461)
+
+     Result = FAILURE
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1442461
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/ConnectTimeoutException.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/NetUtils.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestIPC.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSClientFailover.java
+, Integrated in Hadoop-Mapreduce-trunk #1335 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1335/])
+    HDFS-4404. Create file failure when the machine of first attempted NameNode is down. Contributed by Todd Lipcon. (Revision 1442461)
+
+     Result = SUCCESS
+atm : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1442461
+Files : 
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/retry/RetryPolicies.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ipc/Client.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/ConnectTimeoutException.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/NetUtils.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ipc/TestIPC.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSClientFailover.java
+]
