@@ -33,7 +33,7 @@ LogInBugReportsEmpirical_Data
 │   ├── ...
 ├── code_changes				Detailed Java file changes for each bug report 
 ├── commits					List of bug fixing commits
-├── resolution_time			Resolution time for BRWL and BRNL
+├── resolution_time				Resolution time for BRWL and BRNL
 └── processed_data
 	 ├── apache_overlapping_br.json		Apache bug reports with fixed class overlapping with logged classes
 	 ├── aspectj_overlapping_br.json	AspectJ bug reports with fixed class overlapping with logged classes
