@@ -1,9 +1,9 @@
 # LogInBugReportsEmpirical_Data
 
-###Description### 
+### Description
 LogInBugReportsEmpirical_Data is a collection of bugs collected through ten open-source projects.
 
-###Summary###
+### Summary
 
 |Project|# studied bugs|total # bugs collected|
 |---|---|---|
@@ -19,7 +19,7 @@ LogInBugReportsEmpirical_Data is a collection of bugs collected through ten open
 |ZooKeeper|288|1,827|
 |Total|8,848|44,033|
 
-###Project structure###
+### Project structure
 
 ```
 LogInBugReportsEmpirical_Data
