@@ -1,0 +1,270 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ *  with the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+package org.apache.hadoop.ozone.web.localstorage;
+
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.ozone.web.exceptions.OzoneException;
+import org.apache.hadoop.ozone.web.handlers.BucketArgs;
+import org.apache.hadoop.ozone.web.handlers.UserArgs;
+import org.apache.hadoop.ozone.web.handlers.VolumeArgs;
+import org.apache.hadoop.ozone.web.interfaces.StorageHandler;
+import org.apache.hadoop.ozone.web.request.OzoneQuota;
+import org.apache.hadoop.ozone.web.response.BucketInfo;
+import org.apache.hadoop.ozone.web.response.ListBuckets;
+import org.apache.hadoop.ozone.web.response.ListVolumes;
+import org.apache.hadoop.ozone.web.response.VolumeInfo;
+
+import java.io.IOException;
+
+
+/**
+ * PLEASE NOTE : This file is a dummy backend for test purposes
+ * and prototyping effort only. It does not handle any Object semantics
+ * correctly, neither does it take care of security.
+ */
+@InterfaceAudience.Private
+public class LocalStorageHandler implements StorageHandler {
+  /**
+   * Constructs LocalStorageHandler.
+   */
+  public LocalStorageHandler() {
+  }
+
+  /**
+   * Creates Storage Volume.
+   *
+   * @param args - volumeArgs
+   *
+   * @throws IOException
+   */
+  @Override
+  public void createVolume(VolumeArgs args) throws IOException, OzoneException {
+    OzoneMetadataManager oz = OzoneMetadataManager.getOzoneMetadataManager();
+    oz.createVolume(args);
+
+  }
+
+  /**
+   * setVolumeOwner - sets the owner of the volume.
+   *
+   * @param args volumeArgs
+   *
+   * @throws IOException
+   */
+  @Override
+  public void setVolumeOwner(VolumeArgs args)
+      throws IOException, OzoneException {
+    OzoneMetadataManager oz = OzoneMetadataManager.getOzoneMetadataManager();
+    oz.setVolumeProperty(args, OzoneMetadataManager.VolumeProperty.OWNER);
+  }
+
+  /**
+   * Set Volume Quota Info.
+   *
+   * @param args - volumeArgs
+   * @param remove - true if the request is to remove the quota
+   *
+   * @throws IOException
+   */
+  @Override
+  public void setVolumeQuota(VolumeArgs args, boolean remove)
+      throws IOException, OzoneException {
+    OzoneMetadataManager oz = OzoneMetadataManager.getOzoneMetadataManager();
+
+    if(remove) {
+      OzoneQuota quota = new OzoneQuota();
+      args.setQuota(quota);
+    }
+    oz.setVolumeProperty(args, OzoneMetadataManager.VolumeProperty.QUOTA);
+  }
+
+
+  /**
+   * Checks if a Volume exists and the user specified has access to the
+   * volume.
+   *
+   * @param args - volumeArgs
+   *
+   * @return - Boolean - True if the user can modify the volume.
+   * This is possible for owners of the volume and admin users
+   *
+   * @throws IOException
+   */
+  @Override
+  public boolean checkVolumeAccess(VolumeArgs args)
+      throws IOException, OzoneException {
+    OzoneMetadataManager oz = OzoneMetadataManager.getOzoneMetadataManager();
+    return oz.checkVolumeAccess(args);
+  }
+
+
+  /**
+   * Returns Info about the specified Volume.
+   *
+   * @param args - volumeArgs
+   *
+   * @return VolumeInfo
+   *
+   * @throws IOException
+   */
+  @Override
+  public VolumeInfo getVolumeInfo(VolumeArgs args)
+      throws IOException, OzoneException {
+    OzoneMetadataManager oz = OzoneMetadataManager.getOzoneMetadataManager();
+    return oz.getVolumeInfo(args);
+  }
+
+
+  /**
+   * Deletes an Empty Volume.
+   *
+   * @param args - Volume Args
+   *
+   * @throws IOException
+   */
+  @Override
+  public void deleteVolume(VolumeArgs args) throws IOException, OzoneException {
+    OzoneMetadataManager oz = OzoneMetadataManager.getOzoneMetadataManager();
+    oz.deleteVolume(args);
+
+  }
+
+  /**
+   * Returns the List of Volumes owned by the specific user.
+   *
+   * @param args - UserArgs
+   *
+   * @return - List of Volumes
+   *
+   * @throws IOException
+   */
+  @Override
+  public ListVolumes listVolumes(UserArgs args)
+      throws IOException, OzoneException {
+    OzoneMetadataManager oz = OzoneMetadataManager.getOzoneMetadataManager();
+    return oz.listVolumes(args);
+  }
+
+  /**
+   * true if the bucket exists and user has read access
+   * to the bucket else throws Exception.
+   *
+   * @param args Bucket args structure
+   *
+   * @throws IOException
+   */
+  @Override
+  public void checkBucketAccess(BucketArgs args)
+      throws IOException, OzoneException {
+
+  }
+
+  /**
+   * Creates a Bucket in specified Volume.
+   *
+   * @param args BucketArgs- BucketName, UserName and Acls
+   *
+   * @throws IOException
+   */
+  @Override
+  public void createBucket(BucketArgs args) throws IOException, OzoneException {
+
+  }
+
+  /**
+   * Adds or Removes ACLs from a Bucket.
+   *
+   * @param args - BucketArgs
+   *
+   * @throws IOException
+   */
+  @Override
+  public void setBucketAcls(BucketArgs args)
+      throws IOException, OzoneException {
+
+  }
+
+  /**
+   * Enables or disables Bucket Versioning.
+   *
+   * @param args - BucketArgs
+   *
+   * @throws IOException
+   */
+  @Override
+  public void setBucketVersioning(BucketArgs args)
+      throws IOException, OzoneException {
+
+  }
+
+  /**
+   * Sets the Storage Class of a Bucket.
+   *
+   * @param args - BucketArgs
+   *
+   * @throws IOException
+   */
+  @Override
+  public void setBucketStorageClass(BucketArgs args)
+      throws IOException, OzoneException {
+
+  }
+
+  /**
+   * Deletes a bucket if it is empty.
+   *
+   * @param args Bucket args structure
+   *
+   * @throws IOException
+   */
+  @Override
+  public void deleteBucket(BucketArgs args) throws IOException, OzoneException {
+
+  }
+
+  /**
+   * Returns all Buckets of a specified Volume.
+   *
+   * @param args --User Args
+   *
+   * @return ListAllBuckets
+   *
+   * @throws OzoneException
+   */
+  @Override
+  public ListBuckets listBuckets(VolumeArgs args)
+      throws IOException, OzoneException {
+    return null;
+  }
+
+  /**
+   * Returns Bucket's Metadata as a String.
+   *
+   * @param args Bucket args structure
+   *
+   * @return Info about the bucket
+   *
+   * @throws IOException
+   */
+  @Override
+  public BucketInfo getBucketInfo(BucketArgs args)
+      throws IOException, OzoneException {
+    return null;
+  }
+}
